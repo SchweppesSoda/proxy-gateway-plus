@@ -1,0 +1,41 @@
+$ErrorActionPreference = "Stop"
+
+$root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+$template = Get-Content -Path (Join-Path $root "dnsdist.conf.template") -Raw -Encoding UTF8
+$install = Get-Content -Path (Join-Path $root "install.sh") -Raw -Encoding UTF8
+$rules = Get-Content -Path (Join-Path $root "update-rules.sh") -Raw -Encoding UTF8
+
+function Assert-Contains {
+    param(
+        [string]$Haystack,
+        [string]$Needle,
+        [string]$Description
+    )
+
+    if (-not $Haystack.Contains($Needle)) {
+        throw "Missing DNS policy marker: $Description ($Needle)"
+    }
+}
+
+Assert-Contains $template 'local proxyExtraList = newSuffixMatchNode()' 'proxy extra suffix tree'
+Assert-Contains $template 'local directExtraList = newSuffixMatchNode()' 'direct extra suffix tree'
+Assert-Contains $template '__PROXY_EXTRA_RULES__' 'proxy extra placeholder'
+Assert-Contains $template '__DIRECT_EXTRA_RULES__' 'direct extra placeholder'
+Assert-Contains $template 'local otherPolicy = "__OTHER_POLICY__"' 'other policy placeholder'
+Assert-Contains $template 'return otherPolicy == "proxy"' 'other policy proxy spoof'
+
+Assert-Contains $rules 'PROXY_EXTRA_FILE="${BASE_DIR}/proxy-extra-local.txt"' 'proxy local file'
+Assert-Contains $rules 'DIRECT_EXTRA_FILE="${BASE_DIR}/direct-extra-local.txt"' 'direct local file'
+Assert-Contains $rules 'CUSTOM_PROXY_LISTS_FILE="${BASE_DIR}/custom-proxy-lists.txt"' 'custom proxy URL list'
+Assert-Contains $rules 'CUSTOM_DIRECT_LISTS_FILE="${BASE_DIR}/custom-direct-lists.txt"' 'custom direct URL list'
+Assert-Contains $rules 'write_extra_list_lua "${PROXY_EXTRA_FILE}" "${CUSTOM_PROXY_LISTS_FILE}"' 'proxy list generation'
+Assert-Contains $rules 'write_extra_list_lua "${DIRECT_EXTRA_FILE}" "${CUSTOM_DIRECT_LISTS_FILE}"' 'direct list generation'
+
+Assert-Contains $install 'configure_dns_policy()' 'interactive DNS policy function'
+Assert-Contains $install 'configure_custom_lists_menu()' 'custom list menu'
+Assert-Contains $install 'main_menu()' 'main menu function'
+Assert-Contains $install 'Proxy Gateway Plus' 'main menu title'
+Assert-Contains $install '0-11' 'main menu input range'
+Assert-Contains $install 'DNS_CACHE_SIZE' 'cache size configuration'
+
+Write-Output "DNS policy extensibility markers OK"
