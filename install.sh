@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # install.sh - High-performance transparent proxy + Smart DNS (DoT) one-click installer
-# Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12, CentOS 7/8/9 Stream,
+# Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12/13, CentOS 7/8/9 Stream,
 #           Rocky Linux 8/9, AlmaLinux 8/9, RHEL 8/9, Fedora 39+
 #
 
@@ -595,14 +595,22 @@ install_deps() {
     case "$PKG_MGR" in
         apt-get)
             export DEBIAN_FRONTEND=noninteractive
+            if [[ "$OS" == "debian" ]] && ! getent hosts deb.debian.org >/dev/null 2>&1; then
+                err "DNS resolution failed for deb.debian.org. Fix /etc/resolv.conf or system DNS, then rerun this installer."
+                exit 1
+            fi
             apt-get update -qq
+            local pcre_dev_pkg="libpcre3-dev"
+            if ! apt-cache show "$pcre_dev_pkg" >/dev/null 2>&1; then
+                pcre_dev_pkg="libpcre2-dev"
+            fi
             apt-get install -y -qq \
                 build-essential git wget curl ca-certificates \
-                libev-dev libpcre3-dev libudns-dev libssl-dev \
+                libev-dev "$pcre_dev_pkg" libudns-dev libssl-dev \
                 autoconf automake libtool pkg-config \
                 dnsdist certbot python3-certbot-dns-cloudflare \
                 python3 python3-pip jq libcap2-bin \
-                nftables qrencode || true
+                nftables qrencode
             ;;
         dnf|yum)
             $PKG_MGR install -y -q \
