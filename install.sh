@@ -25,6 +25,7 @@ GFWLIST_URL="https://github.com/gfwlist/gfwlist/raw/master/gfwlist.txt"
 CHINALIST_URL="https://github.com/felixonmars/dnsmasq-china-list/raw/master/accelerated-domains.china.conf"
 DEFAULT_OVERSEAS_DNS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
 DEFAULT_PUBLIC_OVERSEAS_DNS=("1.1.1.1" "8.8.8.8")
+BOOTSTRAP_SYSTEM_DNS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
 DEFAULT_DNS_CACHE_SIZE=200000
 DEFAULT_CLIENT_CIDR="172.22.0.0/16"
 DEFAULT_FIREWALL_MODE="additive"
@@ -175,6 +176,76 @@ random_secret() {
         openssl rand -base64 18 | tr -d '=+/[:space:]' | cut -c1-24
     else
         tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+    fi
+}
+
+resolv_conf_lacks_external_nameserver() {
+    local ns has_nameserver=0 has_external=0
+
+    [[ -r /etc/resolv.conf ]] || return 0
+    while read -r _ ns _; do
+        [[ -z "${ns:-}" ]] && continue
+        has_nameserver=1
+        case "$ns" in
+            127.*|0.0.0.0|::1) ;;
+            *) has_external=1 ;;
+        esac
+    done < <(awk '$1 == "nameserver" {print $0}' /etc/resolv.conf)
+
+    [[ "$has_nameserver" -eq 0 || "$has_external" -eq 0 ]]
+}
+
+write_static_resolv_conf() {
+    local reason="${1:-system DNS bootstrap}"
+    local backup="/etc/resolv.conf.proxy-gateway.bak"
+    local resolver
+
+    if [[ ! -e "$backup" && ! -L "$backup" ]]; then
+        if [[ -L /etc/resolv.conf ]]; then
+            readlink /etc/resolv.conf > "${backup}.symlink" 2>/dev/null || true
+        elif [[ -e /etc/resolv.conf ]]; then
+            cp -a /etc/resolv.conf "$backup" 2>/dev/null || true
+        fi
+    fi
+
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+    fi
+
+    {
+        echo "# Written by proxy-gateway installer: ${reason}"
+        for resolver in "${BOOTSTRAP_SYSTEM_DNS[@]}"; do
+            echo "nameserver ${resolver}"
+        done
+        echo "options timeout:2 attempts:2"
+    } > /etc/resolv.conf
+}
+
+ensure_system_dns_ready() {
+    local probe_host="${1:-deb.debian.org}"
+    local reason="${2:-package installation}"
+
+    getent hosts "$probe_host" >/dev/null 2>&1 && return 0
+
+    if resolv_conf_lacks_external_nameserver; then
+        warn "System DNS cannot resolve ${probe_host}; /etc/resolv.conf has no external resolver."
+        write_static_resolv_conf "$reason"
+    fi
+
+    if ! getent hosts "$probe_host" >/dev/null 2>&1; then
+        err "DNS resolution failed for ${probe_host}. Fix /etc/resolv.conf or system DNS, then rerun this installer."
+        exit 1
+    fi
+
+    ok "System DNS is available via /etc/resolv.conf"
+}
+
+ensure_resolver_survives_dns_owner_stop() {
+    local owner="${1:-local DNS service}"
+
+    if resolv_conf_lacks_external_nameserver; then
+        warn "/etc/resolv.conf depends on ${owner}; switching system resolver before stopping it."
+        write_static_resolv_conf "before stopping ${owner}"
     fi
 }
 
@@ -683,6 +754,8 @@ stop_port53_owner() {
     local unit
     unit=$(systemd_unit_for_pid "$pid")
 
+    ensure_resolver_survives_dns_owner_stop "$proc"
+
     if [[ -n "$unit" ]]; then
         info "Stopping systemd unit owning port 53: $unit"
         systemctl stop "$unit" 2>/dev/null || true
@@ -719,10 +792,9 @@ install_deps() {
     case "$PKG_MGR" in
         apt-get)
             export DEBIAN_FRONTEND=noninteractive
-            if [[ "$OS" == "debian" ]] && ! getent hosts deb.debian.org >/dev/null 2>&1; then
-                err "DNS resolution failed for deb.debian.org. Fix /etc/resolv.conf or system DNS, then rerun this installer."
-                exit 1
-            fi
+            local dns_probe_host="deb.debian.org"
+            [[ "$OS" == "ubuntu" ]] && dns_probe_host="archive.ubuntu.com"
+            ensure_system_dns_ready "$dns_probe_host" "apt dependency installation"
             apt-get update -qq
             local pcre_dev_pkg="libpcre3-dev"
             if [[ "$(apt-cache policy "$pcre_dev_pkg" | awk '/Candidate:/ {print $2; exit}')" == "(none)" ]]; then
@@ -1097,6 +1169,9 @@ install_reverse_proxy_deps() {
     case "$PKG_MGR" in
         apt-get)
             export DEBIAN_FRONTEND=noninteractive
+            local dns_probe_host="deb.debian.org"
+            [[ "$OS" == "ubuntu" ]] && dns_probe_host="archive.ubuntu.com"
+            ensure_system_dns_ready "$dns_probe_host" "reverse proxy dependency installation"
             apt-get update -qq
             local pcre_dev_pkg="libpcre3-dev"
             if [[ "$(apt-cache policy "$pcre_dev_pkg" | awk '/Candidate:/ {print $2; exit}')" == "(none)" ]]; then
@@ -2707,7 +2782,6 @@ main_install() {
     check_root
     detect_os
     get_public_ip
-    check_port_53
 
     echo ""
     echo "=========================================="
@@ -2716,6 +2790,7 @@ main_install() {
     echo ""
 
     install_deps
+    check_port_53
     generate_domain
     verify_domain_dns
     install_cert
