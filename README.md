@@ -93,6 +93,29 @@ SNIPROXY_DNS            sniproxy 后端解析器
 
 ## 交互安装
 
+### 远程使用
+
+推荐在 VPS 上下载公开仓库 tarball 后再运行交互脚本。脚本依赖同目录的 `dnsdist.conf.template`、`sniproxy.conf`、`update-rules.sh`、Go 源码和续期 hook，不支持只下载单个 `install.sh` 直接安装。
+
+```bash
+sudo -i
+workdir="$(mktemp -d)"
+cd "$workdir"
+curl -fL -o proxy-gateway-plus.tar.gz https://github.com/SchweppesSoda/proxy-gateway-plus/archive/refs/heads/main.tar.gz
+tar -xzf proxy-gateway-plus.tar.gz
+cd proxy-gateway-plus-main
+chmod +x install.sh update-rules.sh renew-hook.sh
+./install.sh
+```
+
+如果 VPS 已安装 `git`，也可以直接克隆公开仓库后运行：
+
+```bash
+git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
+cd proxy-gateway-plus
+sudo ./install.sh
+```
+
 上传仓库文件到 VPS 后运行：
 
 ```bash
