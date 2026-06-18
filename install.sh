@@ -11,6 +11,10 @@ set -euo pipefail
 # Configurable defaults
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_OWNER="SchweppesSoda"
+REPO_NAME="proxy-gateway-plus"
+REPO_BRANCH="${PROXY_GATEWAY_BRANCH:-main}"
+REPO_ARCHIVE_URL="${PROXY_GATEWAY_ARCHIVE_URL:-https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz}"
 BASE_DIR="/opt/proxy-gateway"
 CONF_DIR="${BASE_DIR}/etc"
 LOG_DIR="${BASE_DIR}/log"
@@ -29,6 +33,14 @@ DEFAULT_SOCKS5_USER="pgw"
 DEFAULT_WG_PORT=51820
 DEFAULT_WG_SERVER_ADDR="10.66.0.1/24"
 DEFAULT_WG_CLIENT_ADDR="10.66.0.2/32"
+REQUIRED_REPO_FILES=(
+    "dnsdist.conf.template"
+    "sniproxy.conf"
+    "update-rules.sh"
+    "renew-hook.sh"
+    "quic-proxy.go"
+    "china-dns-race-proxy.go"
+)
 
 # =============================================================================
 # Colors
@@ -43,6 +55,63 @@ info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
 ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()   { echo -e "${RED}[ERR]${NC}  $*" >&2; }
+
+has_required_repo_files() {
+    local file
+    for file in "${REQUIRED_REPO_FILES[@]}"; do
+        [[ -f "${SCRIPT_DIR}/${file}" ]] || return 1
+    done
+    return 0
+}
+
+download_repo_archive() {
+    local output="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --connect-timeout 15 --retry 2 -o "$output" "$REPO_ARCHIVE_URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$output" "$REPO_ARCHIVE_URL"
+    else
+        err "curl or wget is required to download ${REPO_ARCHIVE_URL}"
+        return 1
+    fi
+}
+
+bootstrap_full_repo_if_needed() {
+    has_required_repo_files && return 0
+
+    if [[ "${PROXY_GATEWAY_BOOTSTRAPPED:-}" == "1" ]]; then
+        err "Required repository files are still missing under ${SCRIPT_DIR}"
+        exit 1
+    fi
+    if [[ "${PROXY_GATEWAY_NO_BOOTSTRAP:-}" == "1" ]]; then
+        err "Required repository files are missing under ${SCRIPT_DIR}"
+        exit 1
+    fi
+    if ! command -v tar >/dev/null 2>&1; then
+        err "tar is required to extract ${REPO_ARCHIVE_URL}"
+        exit 1
+    fi
+
+    local workdir archive extracted_dir
+    workdir="$(mktemp -d "${TMPDIR:-/tmp}/${REPO_NAME}.XXXXXX")"
+    archive="${workdir}/${REPO_NAME}.tar.gz"
+
+    info "Current directory does not contain the full repository."
+    info "Downloading ${REPO_ARCHIVE_URL}"
+    download_repo_archive "$archive"
+    tar -xzf "$archive" -C "$workdir"
+
+    extracted_dir="$(find "$workdir" -mindepth 1 -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n 1 || true)"
+    if [[ -z "$extracted_dir" || ! -f "${extracted_dir}/install.sh" ]]; then
+        err "Failed to locate extracted ${REPO_NAME} repository under ${workdir}"
+        exit 1
+    fi
+
+    chmod +x "${extracted_dir}/install.sh" "${extracted_dir}/update-rules.sh" "${extracted_dir}/renew-hook.sh" 2>/dev/null || true
+    export PROXY_GATEWAY_BOOTSTRAPPED=1
+    info "Switching to ${extracted_dir}/install.sh"
+    exec "${extracted_dir}/install.sh" "$@"
+}
 
 tty_read() {
     local __var="$1"
@@ -2168,6 +2237,7 @@ case "${1:-}" in
         usage
         ;;
     "")
+        bootstrap_full_repo_if_needed "$@"
         main_menu
         ;;
     *)

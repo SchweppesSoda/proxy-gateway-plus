@@ -27,4 +27,21 @@ if [[ "${install_body}" != *'systemd-resolved.service'* ]]; then
     exit 1
 fi
 
+if [[ "${install_body}" != *'bootstrap_full_repo_if_needed'* ]]; then
+    echo "install.sh must bootstrap the full repository when run as a single downloaded file." >&2
+    exit 1
+fi
+
+if [[ "${install_body}" != *'https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz'* ]]; then
+    echo "install.sh must know how to download the public repository tarball." >&2
+    exit 1
+fi
+
+for required in dnsdist.conf.template sniproxy.conf update-rules.sh renew-hook.sh quic-proxy.go china-dns-race-proxy.go; do
+    if [[ "${install_body}" != *"\"${required}\""* ]]; then
+        echo "install.sh bootstrap must require ${required}." >&2
+        exit 1
+    fi
+done
+
 echo "install entrypoint policy OK"
