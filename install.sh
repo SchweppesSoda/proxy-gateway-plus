@@ -601,7 +601,7 @@ install_deps() {
             fi
             apt-get update -qq
             local pcre_dev_pkg="libpcre3-dev"
-            if ! apt-cache show "$pcre_dev_pkg" >/dev/null 2>&1; then
+            if [[ "$(apt-cache policy "$pcre_dev_pkg" | awk '/Candidate:/ {print $2; exit}')" == "(none)" ]]; then
                 pcre_dev_pkg="libpcre2-dev"
             fi
             apt-get install -y -qq \
