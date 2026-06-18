@@ -40,7 +40,7 @@ render_overseas_dns_servers() {
     for item in "${dns_list[@]}"; do
         [[ -z "$item" ]] && continue
         if [[ ! "$item" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-            echo "[!] Skipping invalid overseas DNS address: $item" >&2
+            echo "[!] 跳过无效的海外 DNS 地址: $item" >&2
             continue
         fi
         name="${prefix}${order}"
@@ -204,6 +204,9 @@ write_chinalist_chunks() {
         echo "chinaList:add(newDNSName(\"${domain}\"))" >> "${chunk_file}"
         count=$((count + 1))
         entries_in_chunk=$((entries_in_chunk + 1))
+        if (( count % 10000 == 0 )); then
+            echo "[*] ChinaList 已解析 ${count} 个域名..." >&2
+        fi
         if [[ ${entries_in_chunk} -ge ${CHINALIST_CHUNK_SIZE} ]]; then
             entries_in_chunk=0
         fi
@@ -237,7 +240,7 @@ if ! wget -qO "${GFWLIST_FILE}" "${GFWLIST_URL}" 2>/dev/null; then
     echo "[!] Failed to download GFWList"
     touch "${GFWLIST_LUA}" 2>/dev/null || true
 else
-    echo "[*] Parsing GFWList..."
+    echo "[*] Parsing GFWList (上游文件是 Base64 编码，先解码再抽取域名)..."
     decoded="${BASE_DIR}/gfwlist.decoded"
     >"${decoded}"
     base64 -d "${GFWLIST_FILE}" > "${decoded}" 2>/dev/null || \
@@ -265,7 +268,9 @@ if ! wget -qO "${CHINALIST_FILE}" "${CHINALIST_URL}" 2>/dev/null; then
     echo "[!] Failed to download ChinaList"
     touch "${CHINALIST_LUA}" 2>/dev/null || true
 else
-    echo "[*] Parsing ChinaList..."
+    source_count=$(grep -c '^server=/' "${CHINALIST_FILE}" 2>/dev/null || true)
+    source_count="${source_count:-0}"
+    echo "[*] Parsing ChinaList... 源文件约 ${source_count} 条 server=/domain/ 规则"
     tmp_chunk_dir=$(mktemp -d "${BASE_DIR}/chinalist.d.tmp.XXXXXX")
     tmp_loader=$(mktemp "${BASE_DIR}/chinalist.lua.tmp.XXXXXX")
     count=$(write_chinalist_chunks "${tmp_chunk_dir}" "${tmp_loader}")

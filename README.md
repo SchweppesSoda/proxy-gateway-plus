@@ -38,6 +38,8 @@ RethinkDNS 兜底路径是附加路径（add-on fallback），不参与正常 Do
 - GFWList: `https://github.com/gfwlist/gfwlist/raw/master/gfwlist.txt`
 - ChinaList: `https://github.com/felixonmars/dnsmasq-china-list/raw/master/accelerated-domains.china.conf`
 
+GFWList 上游文件本身是 Base64 编码，直接打开会像乱码。`update-rules.sh` 会先把它解码成文本规则，再抽取 `||domain^`、URL、裸域名等格式里的域名并写入 dnsdist 的 `SuffixMatchNode`。
+
 安装后会创建 weekly systemd timer：
 
 ```text
@@ -67,7 +69,39 @@ GFWList   -> proxy
 /etc/dnsdist/custom-direct-lists.txt
 ```
 
-`gfwlist-extra-local.txt` 兼容原项目，用来手动补充 GFWList。`proxy-extra-local.txt` 和 `direct-extra-local.txt` 每行一个域名。`custom-*-lists.txt` 每行一个远程列表 URL，支持常见裸域名、Adblock、dnsmasq `server=/domain/`、`address=/domain/` 风格。
+`gfwlist-extra-local.txt` 兼容原项目，用来手动补充 GFWList。`proxy-extra-local.txt` 和 `direct-extra-local.txt` 每行一个域名。`custom-*-lists.txt` 每行一个远程列表 URL，远程列表支持常见裸域名、Adblock、dnsmasq `server=/domain/`、`address=/domain/` 风格。
+
+本地域名文件建议使用最简单的一行一个域名：
+
+```text
+example.com
+google.com
+youtube.com
+```
+
+远程列表内容可解析这些格式：
+
+```text
+example.com
+*.example.com
+||example.com^
+|https://example.com/path
+|http://example.com/path
+server=/example.com/1.1.1.1
+address=/example.com/1.2.3.4
+```
+
+当前不解析 Clash/Surge/Loon 的策略行、关键字、IP 段或正则，例如：
+
+```text
+DOMAIN-SUFFIX,example.com,Proxy
+DOMAIN-KEYWORD,google,Proxy
+IP-CIDR,1.2.3.0/24,Proxy
+/regex/
+0.0.0.0 example.com
+```
+
+解析时会去掉行尾 `#` 注释、首尾空白、末尾点号，并把 `www.example.com` 归一成 `example.com`。
 
 海外 DNS 仍支持原项目变量：
 
@@ -131,6 +165,8 @@ chmod +x install.sh
 ./install.sh
 ```
 
+安装时会先让你输入用于 DoT 和证书的域名。这个域名不绑定 ClouDNS，可以使用 Cloudflare、阿里云、腾讯云、Namecheap、ClouDNS 或任意 DNS 服务商；只要把该域名的 A 记录解析到 VPS 公网 IP，脚本验证通过后就会继续证书步骤。脚本会先检查本机 `/etc/letsencrypt/live/` 里是否已有覆盖当前域名且未临近过期的 existing certificate；有的话直接复制给 dnsdist 使用，不会重新申请。找不到可复用证书时才调用 certbot 申请。
+
 主菜单：
 
 ```text
@@ -139,12 +175,15 @@ chmod +x install.sh
   3) 管理自定义分流列表
   4) 添加 RethinkDNS WireGuard 兜底入口
   5) 添加 RethinkDNS SOCKS5 兜底入口
-  6) 安装可选 VPS2 SOCKS5 出口
-  7) 立即更新 DNS 规则
-  8) 查看状态
-  9) 续期证书
- 10) 重新生成 iOS 描述文件
- 11) 卸载
+  6) 配置 VPS1 转发到 VPS2 SNI/QUIC 后端
+  7) 安装 VPS2 SNI/QUIC 后端
+  8) 安装可选 VPS2 SOCKS5 出口
+  9) 立即更新 DNS 规则
+ 10) 查看状态
+ 11) 续期证书
+ 12) 重新生成 iOS 描述文件
+ 13) 清空 DNS 设置
+ 14) 卸载
   0) 退出
 ```
 
@@ -180,7 +219,38 @@ SOCKS5 默认：
 来源限制: 172.22.0.0/16 或用户输入 CIDR
 ```
 
-VPS2 出口是可选项。VPS2 只安装 SOCKS5 出口时，脚本使用 SOCKS-only 防火墙，只放行 SSH 和来自 VPS1 的 SOCKS5。
+VPS2 出口是可选项。VPS2 只安装 SOCKS5 出口时，脚本默认使用 additive 防火墙模式，只追加 proxy-gateway 自有链，不清空整机防火墙；如选择 `managed-exclusive` 专用机器模式，才会接管整机防火墙。
+
+## VPS1 转发到 VPS2 SNI/QUIC 后端
+
+如果不希望 VPS1 本机跑 `sniproxy` / `quic-proxy`，可以把 VPS1 作为入口，转发到 VPS2 后端：
+
+```text
+客户端 -> VPS1:80/443/TCP 或 443/UDP
+VPS1 DNAT + MASQUERADE -> VPS2:80/443/TCP 或 443/UDP
+VPS2 sniproxy/quic-proxy -> 真实网站
+```
+
+配置步骤：
+
+```bash
+./install.sh --vps2-backend   # 在 VPS2 上执行，安装 sniproxy/quic-proxy
+./install.sh --vps1-forward   # 在 VPS1 上执行，输入 VPS2 IP 和客户端 CIDR
+```
+
+VPS1 forward 模式会停止并禁用本机 `sniproxy` / `quic-proxy`，避免和 DNAT 入口抢占 80/443/TCP、443/UDP。DNS 仍然返回 VPS1，客户端不会拿到 VPS2 IP。
+
+UDP/QUIC 使用内核 NAT + conntrack，不使用 `socat`。VPS1 会对转发到 VPS2 的 TCP/UDP 流量做 MASQUERADE，因此 VPS2 看到的来源是 VPS1，回包会稳定回到 VPS1，再由 VPS1 返回客户端。
+
+防火墙模式：
+
+```text
+FIREWALL_MODE=additive           默认，只追加 proxy-gateway 自有链
+FIREWALL_MODE=managed-exclusive  专用机器模式，接管整机防火墙
+FIREWALL_MODE=disabled           不改防火墙，只输出提示
+```
+
+脚本会在写防火墙规则前检测实际 SSH 端口：优先 `sshd -T`，再读 `/etc/ssh/sshd_config` 和 `/etc/ssh/sshd_config.d/*.conf`，再查正在监听的 `sshd`，最后保留当前 SSH 会话端口。检测失败时才默认保留 TCP/22，也可以用 `SSH_PORTS=22,2222` 手动指定。
 
 ## 客户端配置
 
@@ -206,8 +276,9 @@ RethinkDNS 中建议：
 
 ## 安全边界
 
-- DNS 53 仅允许 `172.22.0.0/16`，DoT 853 可对外但按来源分流。
-- 80/443 SNI/QUIC 反代端口默认只允许 `172.22.0.0/16`。
+- 默认防火墙模式是 `additive`，脚本只追加/刷新 `proxy-gateway` 自有规则，不清空整机防火墙、不修改默认 policy。
+- 选择 `managed-exclusive` 时才会接管整机防火墙；该模式会先检测并保留实际 SSH 端口，不再硬编码只放行 22。
+- DNS 53、DoT 853、80/443 SNI/QUIC 反代端口的最终暴露面取决于当前防火墙模式和已有系统规则；脚本自有规则会把 80/443/TCP 和 443/UDP 限制到 `172.22.0.0/16` 或用户配置的 CIDR。
 - SOCKS5 默认强制用户名密码，并且防火墙限制来源 CIDR。
 - WireGuard/SOCKS5/VPS2 都不是主路径，只有用户在菜单中启用才安装。
 - 公开仓库不包含任何密钥；安装时生成的密码、WireGuard 私钥和证书只保存在目标服务器。
@@ -218,6 +289,9 @@ RethinkDNS 中建议：
 ./install.sh --status
 ./install.sh --update-rules
 ./install.sh --renew-cert
+./install.sh --clear-settings
+./install.sh --vps1-forward
+./install.sh --vps2-backend
 ./install.sh -ios
 ./install.sh --uninstall
 ```

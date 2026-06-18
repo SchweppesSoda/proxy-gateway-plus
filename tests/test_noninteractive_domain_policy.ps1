@@ -16,6 +16,8 @@ function Assert-Contains {
 }
 
 Assert-Contains 'DOMAIN_PRECONFIGURED=1' 'preconfigured domain flag'
-Assert-Contains 'Skipping ClouDNS registration prompt for pre-configured domain' 'skip ClouDNS prompt'
+Assert-Contains 'verify_domain_dns()' 'generic DNS verification function'
+Assert-Contains 'Pre-configured domain to verify and use for DoT/certificates' 'noninteractive domain help'
+Assert-Contains 'Cloudflare' 'interactive custom DNS provider prompt'
 
 Write-Output "noninteractive domain markers OK"

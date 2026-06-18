@@ -4,6 +4,7 @@ $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $template = Get-Content -Path (Join-Path $root "dnsdist.conf.template") -Raw -Encoding UTF8
 $install = Get-Content -Path (Join-Path $root "install.sh") -Raw -Encoding UTF8
 $rules = Get-Content -Path (Join-Path $root "update-rules.sh") -Raw -Encoding UTF8
+$readme = Get-Content -Path (Join-Path $root "README.md") -Raw -Encoding UTF8
 
 function Assert-Contains {
     param(
@@ -33,9 +34,14 @@ Assert-Contains $rules 'write_extra_list_lua "${DIRECT_EXTRA_FILE}" "${CUSTOM_DI
 
 Assert-Contains $install 'configure_dns_policy()' 'interactive DNS policy function'
 Assert-Contains $install 'configure_custom_lists_menu()' 'custom list menu'
+Assert-Contains $install 'clear_settings_menu()' 'clear DNS settings menu'
+Assert-Contains $install '--clear-settings' 'clear DNS settings CLI option'
 Assert-Contains $install 'main_menu()' 'main menu function'
 Assert-Contains $install 'Proxy Gateway Plus' 'main menu title'
-Assert-Contains $install '0-11' 'main menu input range'
+Assert-Contains $install '0-14' 'main menu input range'
 Assert-Contains $install 'DNS_CACHE_SIZE' 'cache size configuration'
+Assert-Contains $install 'DOMAIN-SUFFIX' 'custom list menu explains unsupported formats'
+Assert-Contains $readme 'server=/example.com/1.1.1.1' 'README documents accepted custom rule formats'
+Assert-Contains $readme 'DOMAIN-SUFFIX,example.com,Proxy' 'README documents unsupported custom rule formats'
 
 Write-Output "DNS policy extensibility markers OK"

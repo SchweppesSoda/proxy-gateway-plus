@@ -23,11 +23,12 @@ WWW_DIR="${BASE_DIR}/www"
 IOS_PROFILE_PORT=8111
 GFWLIST_URL="https://github.com/gfwlist/gfwlist/raw/master/gfwlist.txt"
 CHINALIST_URL="https://github.com/felixonmars/dnsmasq-china-list/raw/master/accelerated-domains.china.conf"
-CLOUDNS_FREE_TLDS=("abrdns.com" "cloud-ip.cc")
 DEFAULT_OVERSEAS_DNS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
 DEFAULT_PUBLIC_OVERSEAS_DNS=("1.1.1.1" "8.8.8.8")
 DEFAULT_DNS_CACHE_SIZE=200000
 DEFAULT_CLIENT_CIDR="172.22.0.0/16"
+DEFAULT_FIREWALL_MODE="additive"
+DEFAULT_REVERSE_PROXY_MODE="local"
 DEFAULT_SOCKS5_PORT=1080
 DEFAULT_SOCKS5_USER="pgw"
 DEFAULT_WG_PORT=51820
@@ -157,7 +158,7 @@ tty_yes_no() {
         case "$answer" in
             y|Y|yes|YES) printf -v "$__var" '%s' "y"; return 0 ;;
             n|N|no|NO) printf -v "$__var" '%s' "n"; return 0 ;;
-            *) warn "Invalid input, please enter y or n." ;;
+            *) warn "无效输入，请输入 y 或 n。" ;;
         esac
     done
 }
@@ -165,7 +166,7 @@ tty_yes_no() {
 pause_return() {
     local _
     if [[ -r /dev/tty || -t 0 ]]; then
-        tty_read _ "Press Enter to return" ""
+        tty_read _ "按 Enter 返回" ""
     fi
 }
 
@@ -194,7 +195,7 @@ render_overseas_dns_servers() {
     for item in "${dns_list[@]}"; do
         [[ -z "$item" ]] && continue
         if [[ ! "$item" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-            warn "Skipping invalid overseas DNS address: $item"
+            warn "跳过无效的海外 DNS 地址: $item"
             continue
         fi
         name="${prefix}${order}"
@@ -218,7 +219,7 @@ render_sniproxy_dns_nameservers() {
     for item in "${dns_list[@]}"; do
         [[ -z "$item" ]] && continue
         if [[ ! "$item" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-            warn "Skipping invalid sniproxy DNS address: $item"
+            warn "跳过无效的 sniproxy DNS 地址: $item"
             continue
         fi
         printf '    nameserver %s\n' "$item"
@@ -233,13 +234,13 @@ configure_overseas_dns() {
 
     if [[ -z "$private_selected" && -t 0 ]]; then
         echo ""
-        tty_read private_selected "Private overseas DNS upstreams" "1.1.1.1,8.8.8.8,9.9.9.9"
+        tty_read private_selected "私网客户端海外 DNS 上游" "1.1.1.1,8.8.8.8,9.9.9.9"
     fi
     if [[ -z "$public_selected" && -t 0 ]]; then
-        tty_read public_selected "Public overseas DNS upstreams" "1.1.1.1,8.8.8.8"
+        tty_read public_selected "公网 DoT 客户端海外 DNS 上游" "1.1.1.1,8.8.8.8"
     fi
     if [[ -z "$sniproxy_selected" && -t 0 ]]; then
-        tty_read sniproxy_selected "sniproxy resolver upstreams" ""
+        tty_read sniproxy_selected "sniproxy 后端解析 DNS 上游（留空则跟随私网海外 DNS）" ""
     fi
 
     if [[ -z "$private_selected" ]]; then
@@ -262,9 +263,9 @@ configure_overseas_dns() {
     echo "$PRIVATE_OVERSEAS_DNS" > "${CONF_DIR}/.overseas_private_dns"
     echo "$PUBLIC_OVERSEAS_DNS" > "${CONF_DIR}/.overseas_public_dns"
     echo "$SNIPROXY_DNS" > "${CONF_DIR}/.sniproxy_dns"
-    info "Private overseas DNS upstreams: $PRIVATE_OVERSEAS_DNS"
-    info "Public overseas DNS upstreams: $PUBLIC_OVERSEAS_DNS"
-    info "sniproxy resolver upstreams: $SNIPROXY_DNS"
+    info "私网客户端海外 DNS 上游: $PRIVATE_OVERSEAS_DNS"
+    info "公网 DoT 客户端海外 DNS 上游: $PUBLIC_OVERSEAS_DNS"
+    info "sniproxy 后端解析 DNS 上游: $SNIPROXY_DNS"
 }
 
 valid_domain() {
@@ -273,6 +274,27 @@ valid_domain() {
     domain="${domain%.}"
     domain="${domain#www.}"
     [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?)+$ ]]
+}
+
+valid_ipv4() {
+    local ip="$1" o1 o2 o3 o4
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r o1 o2 o3 o4 <<< "$ip"
+    for octet in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$octet" -ge 0 && "$octet" -le 255 ]] || return 1
+    done
+}
+
+valid_ipv4_cidr() {
+    local cidr="$1" ip prefix
+    if [[ "$cidr" == */* ]]; then
+        ip="${cidr%/*}"
+        prefix="${cidr#*/}"
+        valid_ipv4 "$ip" || return 1
+        [[ "$prefix" =~ ^[0-9]+$ && "$prefix" -ge 0 && "$prefix" -le 32 ]]
+    else
+        valid_ipv4 "$cidr"
+    fi
 }
 
 configure_dns_policy() {
@@ -348,17 +370,19 @@ configure_dns_policy() {
     fi
     DNS_CACHE_SIZE="$cache_size"
 
-    touch "${CONF_DIR}/proxy-extra-local.txt" \
+    touch "${CONF_DIR}/gfwlist-extra-local.txt" \
+        "${CONF_DIR}/proxy-extra-local.txt" \
         "${CONF_DIR}/direct-extra-local.txt" \
         "${CONF_DIR}/custom-proxy-lists.txt" \
         "${CONF_DIR}/custom-direct-lists.txt"
     if [[ -d /etc/dnsdist ]]; then
-        touch /etc/dnsdist/proxy-extra-local.txt \
+        touch /etc/dnsdist/gfwlist-extra-local.txt \
+            /etc/dnsdist/proxy-extra-local.txt \
             /etc/dnsdist/direct-extra-local.txt \
             /etc/dnsdist/custom-proxy-lists.txt \
             /etc/dnsdist/custom-direct-lists.txt
     fi
-    ok "DNS policy saved (other: ${OTHER_POLICY}, cache: ${DNS_CACHE_SIZE})"
+    ok "DNS 分流策略已保存（其他域名: ${OTHER_POLICY}, cache: ${DNS_CACHE_SIZE}）"
 }
 
 append_line_if_missing() {
@@ -383,14 +407,19 @@ configure_custom_lists_menu() {
         echo "=================================================="
         echo "  自定义分流列表"
         echo "=================================================="
+        echo "  格式: 本地域名每行一个，如 example.com；远程列表每行一个 URL。"
+        echo "  远程列表支持裸域名、Adblock ||domain^、http(s) URL、dnsmasq server=/domain/ 或 address=/domain/。"
+        echo "  不支持 Clash/Surge 的 DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR 或正则。"
+        echo "=================================================="
         echo "  1) 添加走代理的远程 list URL"
         echo "  2) 添加直连的远程 list URL"
         echo "  3) 添加本地代理域名"
         echo "  4) 添加本地直连域名"
         echo "  5) 查看当前列表"
+        echo "  6) 清空当前自定义列表"
         echo "  0) 返回主菜单"
         echo "=================================================="
-        tty_read choice "请输入序号 (0-5)" ""
+        tty_read choice "请输入序号 (0-6)" ""
         case "$choice" in
             1)
                 tty_read value "远程 proxy list URL" ""
@@ -417,7 +446,7 @@ configure_custom_lists_menu() {
                 ok "已添加直连域名: $value"
                 ;;
             5)
-                for file in proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
+                for file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
                     echo ""
                     echo "== ${policy_dir}/${file} =="
                     if [[ -s "${policy_dir}/${file}" ]]; then
@@ -428,8 +457,96 @@ configure_custom_lists_menu() {
                 done
                 pause_return
                 ;;
+            6)
+                clear_custom_policy_lists "$policy_dir"
+                ;;
             0) return 0 ;;
-            *) warn "无效输入，请重新输入 0-5 之间的数字" ;;
+            *) warn "无效输入，请重新输入 0-6 之间的数字" ;;
+        esac
+    done
+}
+
+clear_custom_policy_lists() {
+    local policy_dir="${1:-$CONF_DIR}"
+    local confirm="" file
+
+    warn "这会清空本地追加的代理/直连域名和远程列表 URL，不会删除下载的 GFWList/ChinaList 源规则。"
+    tty_yes_no confirm "确认清空当前自定义列表？" "N"
+    [[ "$confirm" == "y" ]] || { info "已取消清空"; return 0; }
+
+    mkdir -p "$policy_dir"
+    for file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
+        : > "${policy_dir}/${file}"
+        if [[ "$policy_dir" != "$CONF_DIR" ]]; then
+            mkdir -p "$CONF_DIR"
+            : > "${CONF_DIR}/${file}"
+        fi
+    done
+    ok "已清空自定义分流列表"
+    warn "运行“立即更新 DNS 规则”或 $0 --update-rules 后才会从 dnsdist 运行配置中移除旧规则。"
+}
+
+clear_dns_policy_settings() {
+    local dir file
+    for dir in "$CONF_DIR" /etc/dnsdist; do
+        [[ -d "$dir" ]] || continue
+        for file in .overseas_dns .overseas_private_dns .overseas_public_dns .sniproxy_dns .other_policy .cache_size; do
+            rm -f "${dir}/${file}"
+        done
+    done
+    unset OVERSEAS_DNS PRIVATE_OVERSEAS_DNS PUBLIC_OVERSEAS_DNS SNIPROXY_DNS OTHER_POLICY DNS_CACHE_SIZE
+    ok "已恢复 DNS 上游、分流默认策略和缓存大小为默认值"
+    warn "运行“立即更新 DNS 规则”或 $0 --update-rules 后才会应用到 dnsdist 运行配置。"
+}
+
+clear_settings_menu() {
+    check_root
+    local choice="" confirm="" file policy_dir="$CONF_DIR"
+    [[ -d /etc/dnsdist ]] && policy_dir="/etc/dnsdist"
+
+    while true; do
+        echo ""
+        echo "=================================================="
+        echo "  清空 DNS 设置"
+        echo "=================================================="
+        echo "  1) 清空自定义分流列表"
+        echo "  2) 恢复 DNS 上游/默认分流/缓存设置"
+        echo "  3) 执行以上两项"
+        echo "  0) 返回主菜单"
+        echo "=================================================="
+        tty_read choice "请输入序号 (0-3)" ""
+        case "$choice" in
+            1)
+                clear_custom_policy_lists "$policy_dir"
+                pause_return
+                ;;
+            2)
+                warn "这会删除已保存的 DNS 上游、其他域名默认策略和 cache size，之后使用脚本默认值。"
+                tty_yes_no confirm "确认恢复默认 DNS 设置？" "N"
+                [[ "$confirm" == "y" ]] && clear_dns_policy_settings || info "已取消恢复默认设置"
+                pause_return
+                ;;
+            3)
+                warn "这会清空自定义列表，并恢复 DNS 上游、默认分流和 cache size。"
+                tty_yes_no confirm "确认清空以上 DNS 设置？" "N"
+                if [[ "$confirm" == "y" ]]; then
+                    mkdir -p "$policy_dir"
+                    for file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
+                        : > "${policy_dir}/${file}"
+                        if [[ "$policy_dir" != "$CONF_DIR" ]]; then
+                            mkdir -p "$CONF_DIR"
+                            : > "${CONF_DIR}/${file}"
+                        fi
+                    done
+                    clear_dns_policy_settings
+                    ok "已清空自定义列表并恢复 DNS 设置默认值"
+                else
+                    info "已取消清空"
+                fi
+                pause_return
+                ;;
+            0) return 0 ;;
+            *) warn "无效输入，请重新输入 0-3 之间的数字" ;;
         esac
     done
 }
@@ -442,22 +559,29 @@ usage() {
 Usage: $0 [OPTION]
 
 Options:
-  (none)         Full interactive installation
-  --status       Show service status
-  --update-rules Update GFWList/ChinaList and reload dnsdist
-  --renew-cert   Force renew certificates and reload services
-  --uninstall    Remove all installed components
+  (none)           Full interactive installation
+  --status         Show service status
+  --update-rules   Update GFWList/ChinaList and reload dnsdist
+  --renew-cert     Force renew certificates and reload services
+  --clear-settings Clear local DNS policy/list settings
+  --vps1-forward   Configure VPS1 to forward SNI/QUIC traffic to a VPS2 backend
+  --vps2-backend   Install VPS2 SNI/QUIC backend services
+  --uninstall      Remove all installed components
   -ios          Regenerate iOS DoT profile and QR code
-  -h, --help     Show this help
+  -h, --help       Show this help
 
 Environment variables (for non-interactive use):
-  DOMAIN         Pre-configured domain (skip ClouDNS registration)
+  DOMAIN         Pre-configured domain to verify and use for DoT/certificates
   OVERSEAS_DNS   Backward-compatible alias for PRIVATE_OVERSEAS_DNS
   PRIVATE_OVERSEAS_DNS  Overseas upstream DNS for 172.22.0.0/16 DoT clients
   PUBLIC_OVERSEAS_DNS   Overseas upstream DNS for non-private DoT clients
   SNIPROXY_DNS   Resolver upstream DNS for TCP sniproxy backends
-  CLOUDNS_ID     ClouDNS API auth-id
-  CLOUDNS_PASS   ClouDNS API auth-password
+  FIREWALL_MODE  additive (default), managed-exclusive, or disabled
+  SSH_PORTS      Comma/space separated SSH ports to preserve in firewall rules
+  REVERSE_PROXY_MODE local (default) or forward
+  REVERSE_PROXY_BACKEND_IP  VPS2 backend IP for VPS1 forward mode
+  REVERSE_PROXY_CLIENT_CIDR Allowed client CIDR for VPS1 reverse proxy ports
+  REVERSE_PROXY_BACKEND_ALLOWED_CIDR  VPS1 IP/CIDR allowed on VPS2 backend
   EMAIL          Email for Let's Encrypt
 EOF
 }
@@ -666,153 +790,82 @@ install_deps() {
 }
 
 # =============================================================================
-# Domain generation & ClouDNS
+# Domain configuration
 # =============================================================================
 generate_domain() {
     if [[ -n "${DOMAIN:-}" ]]; then
-        info "Using pre-configured domain: $DOMAIN"
+        valid_domain "$DOMAIN" || { err "无效域名: $DOMAIN"; exit 1; }
+        info "使用预设域名: $DOMAIN"
         DOMAIN_PRECONFIGURED=1
         mkdir -p "$CONF_DIR"
         echo "$DOMAIN" > "${CONF_DIR}/.domain"
         return
     fi
 
-    # Generate a deterministic 4-char lowercase alphabetic prefix from IP hash
-    # Same IP always produces the same prefix, keeping reinstalls consistent
-    local prefix
-    prefix=$(python3 -c "
-import hashlib
-h = hashlib.md5('${PUBLIC_IP}'.encode()).hexdigest()[:4]
-print(''.join(chr(97 + int(c, 16) % 26) for c in h))
-")
+    local saved_domain=""
+    local selected_domain=""
+    saved_domain=$(cat "${CONF_DIR}/.domain" 2>/dev/null || true)
 
-    local tld=""
-
-    # If TLD is preset via environment variable, use it directly
-    if [[ -n "${CLOUDNS_TLD:-}" ]]; then
-        tld="${CLOUDNS_TLD}"
-        info "Using pre-selected TLD: ${tld}"
-    else
-        # Interactive selection
-        echo ""
-        echo "=================================================="
-        echo "  请选择 ClouDNS 免费域名后缀"
-        echo "=================================================="
-        local i=1
-        for t in "${CLOUDNS_FREE_TLDS[@]}"; do
-            echo "  ${i}) ${prefix}.${t}"
-            i=$((i + 1))
-        done
-        echo "=================================================="
-        echo ""
-
-        local choice=""
-        while true; do
-            tty_read choice "请输入序号 (1-${#CLOUDNS_FREE_TLDS[@]})" ""
-            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#CLOUDNS_FREE_TLDS[@]} ]]; then
-                tld="${CLOUDNS_FREE_TLDS[$((choice - 1))]}"
-                break
-            else
-                warn "无效输入，请重新输入 1-${#CLOUDNS_FREE_TLDS[@]} 之间的数字"
-            fi
-        done
+    if [[ ! -r /dev/tty && ! -t 0 ]]; then
+        err "未提供 DOMAIN，且当前不是交互终端。请设置 DOMAIN=your.domain 后重试。"
+        exit 1
     fi
 
-    DOMAIN="${prefix}.${tld}"
+    echo ""
+    echo "=================================================="
+    echo "  域名设置"
+    echo "=================================================="
+    echo "  请输入你准备用于 DoT 和证书的域名。"
+    echo "  可使用任意 DNS 服务商，只要该域名的 A 记录指向本机公网 IP。"
+    echo "  本机公网 IP: ${PUBLIC_IP}"
+    echo "=================================================="
 
-    info "Generated混淆域名: $DOMAIN"
-    info "Prefix is derived from public IP (same IP = same prefix)"
+    while true; do
+        tty_read selected_domain "请输入域名" "$saved_domain"
+        if valid_domain "$selected_domain"; then
+            DOMAIN="${selected_domain%.}"
+            break
+        fi
+        warn "无效域名，请输入类似 dot.example.com 的完整域名"
+    done
 
-    # Always update domain file so reinstalls pick up the current choice
     mkdir -p "$CONF_DIR"
     echo "$DOMAIN" > "${CONF_DIR}/.domain"
+    info "已保存域名: $DOMAIN"
 }
 
-register_domain_cloudns() {
+verify_domain_dns() {
     if [[ "${DOMAIN_PRECONFIGURED:-0}" == "1" ]]; then
-        info "Skipping ClouDNS registration prompt for pre-configured domain: $DOMAIN"
+        info "预设域名仍会进行 DNS 解析验证: $DOMAIN"
         mkdir -p "$CONF_DIR"
         echo "$DOMAIN" > "${CONF_DIR}/.domain"
-        return
     fi
 
-    if [[ -f "${CONF_DIR}/.domain_registered" ]]; then
-        info "Domain already registered flag found."
-        # Ensure .domain file stays in sync even on reinstalls
-        local saved_domain=""
-        saved_domain=$(cat "${CONF_DIR}/.domain" 2>/dev/null || true)
-        if [[ "$saved_domain" != "$DOMAIN" ]]; then
-            warn "Updating saved domain: $saved_domain -> $DOMAIN"
-            echo "$DOMAIN" > "${CONF_DIR}/.domain"
-        fi
-        return
-    fi
-
-    info "ClouDNS 注册提示"
+    info "域名解析检查"
     info "=================================================="
     info "域名: $DOMAIN"
-    info "A 记录值: $PUBLIC_IP"
+    info "目标 A 记录值: $PUBLIC_IP"
     info "=================================================="
-    info ""
-    info "请按以下步骤完成注册（免费）:"
-    info "1. 访问 https://www.cloudns.net 并登录/注册免费账户"
-    info "2. 进入 Dashboard -> Create zone -> Free zone"
-    info "3. 输入域名前缀: ${DOMAIN%%.*}"
-    info "4. 选择后缀: .${DOMAIN##*.}"
-    info "5. 创建后添加一条 A 记录:"
-    info "   Host: @ (或留空)"
-    info "   Type: A"
-    info "   Points to: $PUBLIC_IP"
-    info "   TTL: 3600"
-    info ""
+    info "请在你的 DNS 服务商里确认 ${DOMAIN} 的 A 记录已经指向 ${PUBLIC_IP}。"
+    info "Cloudflare、阿里云、腾讯云、Namecheap、ClouDNS 或其他 DNS 服务都可以使用。"
 
-    # Try API registration if credentials provided
-    if [[ -n "${CLOUDNS_ID:-}" && -n "${CLOUDNS_PASS:-}" ]]; then
-        info "尝试通过 ClouDNS API 自动注册..."
-        local resp
-        resp=$(curl -s -X POST "https://api.cloudns.net/dns/register.json" \
-            -d "auth-id=${CLOUDNS_ID}" \
-            -d "auth-password=${CLOUDNS_PASS}" \
-            -d "domain-name=${DOMAIN}" \
-            -d "zone-type=domain" 2>/dev/null || echo "")
-        if echo "$resp" | grep -qi "success\|registered"; then
-            ok "API 注册成功 (或域名已存在)"
-            sleep 2
-            # Add A record
-            curl -s -X POST "https://api.cloudns.net/dns/add-record.json" \
-                -d "auth-id=${CLOUDNS_ID}" \
-                -d "auth-password=${CLOUDNS_PASS}" \
-                -d "domain-name=${DOMAIN}" \
-                -d "record-type=A" \
-                -d "host=" \
-                -d "record=${PUBLIC_IP}" \
-                -d "ttl=3600" >/dev/null || true
-            mkdir -p "$CONF_DIR"
-            echo "$DOMAIN" > "${CONF_DIR}/.domain"
-            touch "${CONF_DIR}/.domain_registered"
-            return
-        else
-            warn "API 注册失败或不可用 ($resp)，请手动注册"
-        fi
-    fi
-
-    info ""
-    tty_read confirm "完成注册后按 Enter 继续（或输入 'skip' 跳过验证）" ""
+    local confirm=""
+    tty_read confirm "设置好解析后按 Enter 开始验证（输入 skip 可跳过）" ""
     if [[ "$confirm" == "skip" ]]; then
         warn "跳过域名解析验证，请确保 A 记录已正确配置"
     else
-        info "等待 DNS 解析生效（最多 120 秒）..."
-        local waited=0
+        info "等待 DNS 解析生效（最多 120 秒，每 5 秒检查一次）..."
+        local waited=0 resolved=""
         while [[ $waited -lt 120 ]]; do
-            local resolved
-            resolved=$(dig +short "$DOMAIN" @1.1.1.1 2>/dev/null || echo "")
-            if [[ "$resolved" == "$PUBLIC_IP" ]]; then
+            resolved=$(dig +short A "$DOMAIN" @1.1.1.1 +time=2 +tries=1 2>/dev/null | tr '\n' ' ' || true)
+            if printf '%s\n' "$resolved" | tr ' ' '\n' | grep -Fxq "$PUBLIC_IP"; then
                 ok "DNS 解析验证通过: $DOMAIN -> $PUBLIC_IP"
+                touch "${CONF_DIR}/.domain_verified"
                 break
             fi
             sleep 5
             waited=$((waited + 5))
-            echo -n "."
+            echo "[*] 已等待 ${waited}/120 秒，当前解析结果: ${resolved:-无记录}"
         done
         if [[ $waited -ge 120 ]]; then
             warn "DNS 解析未在 120 秒内生效，将继续安装。如后续证书申请失败，请检查 DNS 配置。"
@@ -821,50 +874,90 @@ register_domain_cloudns() {
 
     mkdir -p "$CONF_DIR"
     echo "$DOMAIN" > "${CONF_DIR}/.domain"
-    touch "${CONF_DIR}/.domain_registered"
 }
 
 # =============================================================================
 # Let's Encrypt Certificate
 # =============================================================================
+cert_covers_domain() {
+    local cert_path="$1"
+    local domain="$2"
+
+    [[ -f "$cert_path" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    openssl x509 -in "$cert_path" -noout -checkhost "$domain" >/dev/null 2>&1 || return 1
+    openssl x509 -in "$cert_path" -noout -checkend 604800 >/dev/null 2>&1 || return 1
+}
+
+find_existing_cert_for_domain() {
+    local domain="$1"
+    local cert_dir
+
+    for cert_dir in "/etc/letsencrypt/live/${domain}" /etc/letsencrypt/live/*; do
+        [[ -d "$cert_dir" ]] || continue
+        [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]] || continue
+        if cert_covers_domain "${cert_dir}/fullchain.pem" "$domain"; then
+            printf '%s\n' "$cert_dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+copy_cert_to_dnsdist() {
+    local cert_live_dir="$1"
+    local cert_basename
+
+    info "Copying certificates to /etc/dnsdist/certs/ ..."
+    mkdir -p /etc/dnsdist/certs "$CONF_DIR"
+    cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
+    cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
+    chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/ 2>/dev/null || true
+    chmod 640 /etc/dnsdist/certs/*.pem
+    cert_basename="$(basename "$cert_live_dir")"
+    echo "$cert_basename" > "${CONF_DIR}/.cert_basename"
+    ok "Certificates copied to /etc/dnsdist/certs/ from ${cert_live_dir}"
+}
+
+deploy_cert_renewal_hook() {
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cp "${SCRIPT_DIR}/renew-hook.sh" /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
+    ok "证书已就绪，自动续期 Hook 已部署"
+}
+
 install_cert() {
-    local certbot_cmd certbot_cmd_force
+    local certbot_cmd existing_cert_dir cert_live_dir
     install_certbot_firewall_hooks
+
+    if existing_cert_dir="$(find_existing_cert_for_domain "$DOMAIN")"; then
+        ok "发现本机已有覆盖 ${DOMAIN} 的有效证书，跳过重新申请: ${existing_cert_dir}"
+        copy_cert_to_dnsdist "$existing_cert_dir"
+        deploy_cert_renewal_hook
+        return
+    fi
 
     # Normal issuance (first time) - no force-renewal to avoid rate limits
     certbot_cmd=(certbot certonly --standalone -d "$DOMAIN" \
         --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
         --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
         --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
-    # Reinstall / explicit renew - force renewal
-    certbot_cmd_force=(certbot certonly --standalone -d "$DOMAIN" --force-renewal \
-        --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
-        --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
-        --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
-
-    local cb_cmd=()
-    if [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
-        info "Let's Encrypt certificate already exists for $DOMAIN, forcing renewal..."
-        cb_cmd=("${certbot_cmd_force[@]}")
-    else
-        info "申请 Let's Encrypt 证书 for $DOMAIN..."
-        cb_cmd=("${certbot_cmd[@]}")
-    fi
+    info "未找到可复用的本机证书，申请 Let's Encrypt 证书 for $DOMAIN..."
 
     run_certbot() {
         open_cert_http_port
         trap restore_reverse_proxy_firewall RETURN
-        if "${cb_cmd[@]}"; then
+        if "${certbot_cmd[@]}"; then
             return 0
         fi
         # Check for known Python compatibility error
-        if "${cb_cmd[@]}" 2>&1 | grep -q "AttributeError" || \
+        if "${certbot_cmd[@]}" 2>&1 | grep -q "AttributeError" || \
            certbot --version 2>&1 | grep -q "AttributeError"; then
             warn "Certbot compatibility error detected. Attempting to fix Python dependencies..."
             pip3 install --upgrade --break-system-packages certbot josepy cryptography 2>/dev/null || \
                 pip3 install --upgrade certbot josepy cryptography 2>/dev/null || true
             info "Retrying certificate request..."
-            "${cb_cmd[@]}"
+            "${certbot_cmd[@]}"
         else
             return 1
         fi
@@ -879,25 +972,16 @@ install_cert() {
         exit 1
     fi
 
-    # Copy certificates to dnsdist-readable location
-    info "Copying certificates to /etc/dnsdist/certs/ ..."
-    local cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
-    if [[ -d "$cert_live_dir" ]]; then
-        mkdir -p /etc/dnsdist/certs
-        cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
-        cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
-        chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
-        chmod 640 /etc/dnsdist/certs/*.pem
-        ok "Certificates copied to /etc/dnsdist/certs/"
-    else
-        warn "Could not find certificate live directory: $cert_live_dir"
+    cert_live_dir="$(find_existing_cert_for_domain "$DOMAIN" || true)"
+    if [[ -z "$cert_live_dir" ]]; then
+        cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
     fi
-
-    # Deploy renewal hook (also handles cert copy on renewal)
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cp "${SCRIPT_DIR}/renew-hook.sh" /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
-    chmod +x /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
-    ok "证书已就绪，自动续期 Hook 已部署"
+    if [[ ! -d "$cert_live_dir" ]]; then
+        err "证书申请成功但未找到 live 目录: $cert_live_dir"
+        exit 1
+    fi
+    copy_cert_to_dnsdist "$cert_live_dir"
+    deploy_cert_renewal_hook
 }
 
 # =============================================================================
@@ -1005,6 +1089,213 @@ EOF
 }
 
 # =============================================================================
+# VPS1 -> VPS2 SNI/QUIC reverse proxy forwarding
+# =============================================================================
+install_reverse_proxy_deps() {
+    detect_os
+    info "Installing SNI/QUIC reverse proxy dependencies..."
+    case "$PKG_MGR" in
+        apt-get)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            local pcre_dev_pkg="libpcre3-dev"
+            if [[ "$(apt-cache policy "$pcre_dev_pkg" | awk '/Candidate:/ {print $2; exit}')" == "(none)" ]]; then
+                pcre_dev_pkg="libpcre2-dev"
+            fi
+            apt-get install -y -qq \
+                build-essential git wget curl ca-certificates \
+                libev-dev "$pcre_dev_pkg" libudns-dev libssl-dev \
+                autoconf automake libtool pkg-config \
+                python3 nftables
+            ;;
+        dnf|yum)
+            $PKG_MGR install -y -q \
+                gcc gcc-c++ make git wget curl ca-certificates \
+                libev-devel pcre-devel openssl-devel \
+                autoconf automake libtool pkgconfig \
+                python3 nftables || true
+            ;;
+    esac
+
+    if ! command -v go >/dev/null 2>&1; then
+        info "Installing Go compiler..."
+        local go_ver="1.22.4" arch go_arch
+        arch=$(uname -m)
+        case "$arch" in
+            x86_64) go_arch="amd64" ;;
+            aarch64|arm64) go_arch="arm64" ;;
+            *) go_arch="amd64" ;;
+        esac
+        wget -q "https://go.dev/dl/go${go_ver}.linux-${go_arch}.tar.gz" -O /tmp/go.tar.gz
+        rm -rf /usr/local/go
+        tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm -f /tmp/go.tar.gz
+        export PATH=$PATH:/usr/local/go/bin
+        echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
+    fi
+}
+
+stop_local_reverse_proxy_services() {
+    info "Stopping local sniproxy/quic-proxy services for forward mode..."
+    systemctl stop sniproxy quic-proxy 2>/dev/null || true
+    systemctl disable sniproxy quic-proxy 2>/dev/null || true
+}
+
+configure_vps1_forward_backend() {
+    check_root
+    local backend_ip="${REVERSE_PROXY_BACKEND_IP:-}" client_cidr="${REVERSE_PROXY_CLIENT_CIDR:-}" firewall_mode="${FIREWALL_MODE:-}"
+
+    if [[ -z "$backend_ip" ]]; then
+        backend_ip="$(get_reverse_proxy_backend_ip)"
+    fi
+    while true; do
+        tty_read backend_ip "VPS2 SNI/QUIC 后端 IP（公网或内网均可）" "$backend_ip"
+        valid_ipv4 "$backend_ip" && break
+        warn "无效 IPv4 地址: $backend_ip"
+    done
+
+    if [[ -z "$client_cidr" ]]; then
+        client_cidr="$(get_reverse_proxy_client_cidr)"
+    fi
+    while true; do
+        tty_read client_cidr "允许访问 VPS1 反代入口的客户端 CIDR" "$client_cidr"
+        valid_ipv4_cidr "$client_cidr" && break
+        warn "无效 IPv4/CIDR: $client_cidr"
+    done
+
+    firewall_mode="${firewall_mode:-$(get_firewall_mode)}"
+    while true; do
+        tty_read firewall_mode "防火墙模式 additive / managed-exclusive / disabled" "$firewall_mode"
+        case "$firewall_mode" in
+            additive|managed-exclusive|disabled) break ;;
+            *) warn "无效防火墙模式，请输入 additive、managed-exclusive 或 disabled" ;;
+        esac
+    done
+
+    mkdir -p "$CONF_DIR"
+    echo "forward" > "${CONF_DIR}/.reverse_proxy_mode"
+    echo "$backend_ip" > "${CONF_DIR}/.reverse_proxy_backend_ip"
+    echo "$client_cidr" > "${CONF_DIR}/.reverse_proxy_client_cidr"
+    echo "$firewall_mode" > "${CONF_DIR}/.firewall_mode"
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.netfilter.nf_conntrack_udp_timeout=30 >/dev/null 2>&1 || true
+    sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=300 >/dev/null 2>&1 || true
+
+    stop_local_reverse_proxy_services
+    setup_firewall
+
+    ok "VPS1 转发模式已启用: ${client_cidr} -> ${backend_ip} (TCP 80/443, UDP 443)"
+    warn "VPS2 必须运行 sniproxy 和 quic-proxy，并且只允许 VPS1 来源访问反代端口。"
+}
+
+setup_vps2_backend_firewall() {
+    local allow_cidr="$1"
+    local mode ssh_ports ssh_ports_nft ssh_ports_csv
+
+    mode="$(get_firewall_mode)"
+    ssh_ports="$(get_ssh_ports)"
+    ssh_ports_nft="$(ports_to_nft_set "$ssh_ports")"
+    ssh_ports_csv="$(ports_to_csv "$ssh_ports")"
+
+    if [[ "$mode" == "disabled" ]]; then
+        warn "防火墙模式为 disabled，未修改规则。需要允许 ${allow_cidr} 访问 TCP 80/443 和 UDP 443。"
+    elif [[ "$mode" == "managed-exclusive" ]]; then
+        if command -v nft >/dev/null 2>&1; then
+            cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        tcp dport ${ssh_ports_nft} accept
+        ip saddr ${allow_cidr} tcp dport { 80, 443 } accept
+        ip saddr ${allow_cidr} udp dport 443 accept
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+    }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+    }
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+EOF
+            chmod +x /etc/nftables.conf
+            nft -f /etc/nftables.conf 2>/dev/null || true
+            systemctl enable nftables 2>/dev/null || true
+        else
+            iptables -F INPUT
+            iptables -P INPUT DROP
+            iptables -A INPUT -i lo -j ACCEPT
+            iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            iptables -A INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
+            iptables -A INPUT -s "$allow_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
+            iptables -A INPUT -s "$allow_cidr" -p udp --dport 443 -j ACCEPT
+            iptables -A INPUT -p icmp -j ACCEPT
+            iptables -P FORWARD ACCEPT
+            iptables -P OUTPUT ACCEPT
+            command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
+        fi
+    elif command -v nft >/dev/null 2>&1; then
+        nft add table inet proxy_gateway_filter 2>/dev/null || true
+        nft add chain inet proxy_gateway_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null || true
+        nft flush chain inet proxy_gateway_filter input 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input ct state established,related accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input tcp dport ${ssh_ports_nft} accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input ip saddr "$allow_cidr" tcp dport { 80, 443 } accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input tcp dport { 80, 443 } drop 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input ip saddr "$allow_cidr" udp dport 443 accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input udp dport 443 drop 2>/dev/null || true
+    else
+        ensure_iptables_jump "" INPUT PROXY_GATEWAY_INPUT
+        iptables -A PROXY_GATEWAY_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -s "$allow_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports 80,443 -j DROP
+        iptables -A PROXY_GATEWAY_INPUT -s "$allow_cidr" -p udp --dport 443 -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -p udp --dport 443 -j DROP
+        iptables -A PROXY_GATEWAY_INPUT -j RETURN
+        command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
+    fi
+    ok "VPS2 SNI/QUIC backend firewall configured (mode: ${mode}, allowed: ${allow_cidr}, SSH ports: ${ssh_ports})"
+}
+
+install_vps2_sni_quic_backend() {
+    check_root
+    local allow_cidr="${REVERSE_PROXY_BACKEND_ALLOWED_CIDR:-}" firewall_mode="${FIREWALL_MODE:-}"
+
+    install_reverse_proxy_deps
+    if [[ -z "$SNIPROXY_DNS" && -t 0 ]]; then
+        tty_read SNIPROXY_DNS "VPS2 sniproxy 后端解析 DNS（留空使用默认海外 DNS）" ""
+    fi
+    [[ -z "${SNIPROXY_DNS:-}" ]] && SNIPROXY_DNS="${DEFAULT_OVERSEAS_DNS[*]}"
+
+    if [[ -z "$allow_cidr" && -t 0 ]]; then
+        tty_read allow_cidr "允许访问 VPS2 反代端口的 VPS1 IP/CIDR" ""
+    fi
+    [[ -z "$allow_cidr" ]] && { err "VPS1 IP/CIDR 不能为空"; return 1; }
+    valid_ipv4_cidr "$allow_cidr" || { err "无效 VPS1 IP/CIDR: $allow_cidr"; return 1; }
+
+    firewall_mode="${firewall_mode:-$(get_firewall_mode)}"
+    mkdir -p "$CONF_DIR"
+    echo "$allow_cidr" > "${CONF_DIR}/.reverse_proxy_backend_allowed_cidr"
+    echo "$firewall_mode" > "${CONF_DIR}/.firewall_mode"
+
+    install_sniproxy
+    install_quic_proxy
+    systemctl restart sniproxy || { err "sniproxy failed to start"; journalctl -u sniproxy --no-pager -n 20; return 1; }
+    systemctl restart quic-proxy || { err "quic-proxy failed to start"; journalctl -u quic-proxy --no-pager -n 20; return 1; }
+    setup_vps2_backend_firewall "$allow_cidr"
+
+    ok "VPS2 SNI/QUIC 后端已安装，只允许 ${allow_cidr} 访问 TCP 80/443 和 UDP 443"
+}
+
+# =============================================================================
 # China DNS race proxy (UDP DNS upstream racing for ChinaList)
 # =============================================================================
 install_china_dns_race_proxy() {
@@ -1060,12 +1351,13 @@ install_dnsdist() {
     echo "$SNIPROXY_DNS" > /etc/dnsdist/.sniproxy_dns
     echo "${OTHER_POLICY:-direct}" > /etc/dnsdist/.other_policy
     echo "${DNS_CACHE_SIZE:-$DEFAULT_DNS_CACHE_SIZE}" > /etc/dnsdist/.cache_size
-    touch /etc/dnsdist/proxy-extra-local.txt \
+    touch /etc/dnsdist/gfwlist-extra-local.txt \
+        /etc/dnsdist/proxy-extra-local.txt \
         /etc/dnsdist/direct-extra-local.txt \
         /etc/dnsdist/custom-proxy-lists.txt \
         /etc/dnsdist/custom-direct-lists.txt
     local policy_file
-    for policy_file in proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
+    for policy_file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
         if [[ -s "${CONF_DIR}/${policy_file}" && ! -s "/etc/dnsdist/${policy_file}" ]]; then
             cp "${CONF_DIR}/${policy_file}" "/etc/dnsdist/${policy_file}"
         fi
@@ -1369,25 +1661,240 @@ EOF
 }
 
 # =============================================================================
-# Firewall (nftables preferred, fallback to iptables)
+# Firewall (additive by default; managed-exclusive is opt-in)
 # =============================================================================
-setup_firewall() {
-    info "Configuring firewall..."
-    local socks_port="" socks_cidr="" wg_port=""
-    local socks_nft_rule="" wg_nft_rule=""
+normalize_port_list() {
+    local raw="$*"
+    local port seen="" out=""
 
-    socks_port=$(cat "${CONF_DIR}/.socks5_port" 2>/dev/null || true)
-    socks_cidr=$(cat "${CONF_DIR}/.socks5_client_cidr" 2>/dev/null || true)
-    wg_port=$(cat "${CONF_DIR}/.wg_port" 2>/dev/null || true)
+    raw="${raw//,/ }"
+    for port in $raw; do
+        [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || continue
+        if [[ " ${seen} " == *" ${port} "* ]]; then
+            continue
+        fi
+        seen="${seen} ${port}"
+        out="${out} ${port}"
+    done
+    echo "${out# }"
+}
+
+detect_ssh_ports() {
+    local ports="" config file
+
+    if command -v sshd >/dev/null 2>&1; then
+        ports+=" $(sshd -T 2>/dev/null | awk 'tolower($1) == "port" {print $2}')"
+    fi
+
+    for config in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+        [[ -f "$config" ]] || continue
+        ports+=" $(awk 'tolower($1) == "port" && $1 !~ /^#/ {print $2}' "$config" 2>/dev/null || true)"
+    done
+
+    if command -v ss >/dev/null 2>&1; then
+        ports+=" $(ss -ltnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}')"
+    fi
+
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        ports+=" $(printf '%s\n' "$SSH_CONNECTION" | awk '{print $4}')"
+    fi
+    if [[ -n "${SSH_CLIENT:-}" ]]; then
+        ports+=" $(printf '%s\n' "$SSH_CLIENT" | awk '{print $3}')"
+    fi
+
+    normalize_port_list "$ports"
+}
+
+get_ssh_ports() {
+    local ports=""
+
+    ports="$(normalize_port_list "${SSH_PORTS:-}")"
+    if [[ -z "$ports" && -f "${CONF_DIR}/.ssh_ports" ]]; then
+        ports="$(normalize_port_list "$(cat "${CONF_DIR}/.ssh_ports" 2>/dev/null || true)")"
+    fi
+    if [[ -z "$ports" ]]; then
+        ports="$(detect_ssh_ports)"
+    fi
+    if [[ -z "$ports" ]]; then
+        ports="22"
+        warn "未检测到实际 SSH 监听端口，默认保留 TCP/22；如使用自定义端口，请设置 SSH_PORTS 后重跑。" >&2
+    fi
+
+    mkdir -p "$CONF_DIR"
+    echo "$ports" > "${CONF_DIR}/.ssh_ports"
+    echo "$ports"
+}
+
+ports_to_csv() {
+    normalize_port_list "$*" | tr ' ' ','
+}
+
+ports_to_nft_set() {
+    local csv
+    csv="$(ports_to_csv "$*")"
+    csv="${csv//,/,\ }"
+    echo "{ ${csv:-22} }"
+}
+
+get_firewall_mode() {
+    local mode="${FIREWALL_MODE:-}"
+    if [[ -z "$mode" && -f "${CONF_DIR}/.firewall_mode" ]]; then
+        mode="$(cat "${CONF_DIR}/.firewall_mode" 2>/dev/null || true)"
+    fi
+    mode="${mode:-$DEFAULT_FIREWALL_MODE}"
+    case "$mode" in
+        additive|managed-exclusive|disabled) ;;
+        *)
+            warn "无效防火墙模式 '$mode'，使用 additive" >&2
+            mode="additive"
+            ;;
+    esac
+    mkdir -p "$CONF_DIR"
+    echo "$mode" > "${CONF_DIR}/.firewall_mode"
+    echo "$mode"
+}
+
+get_reverse_proxy_mode() {
+    local mode="${REVERSE_PROXY_MODE:-}"
+    if [[ -z "$mode" && -f "${CONF_DIR}/.reverse_proxy_mode" ]]; then
+        mode="$(cat "${CONF_DIR}/.reverse_proxy_mode" 2>/dev/null || true)"
+    fi
+    mode="${mode:-$DEFAULT_REVERSE_PROXY_MODE}"
+    [[ "$mode" == "forward" ]] || mode="local"
+    echo "$mode"
+}
+
+get_reverse_proxy_client_cidr() {
+    local cidr="${REVERSE_PROXY_CLIENT_CIDR:-}"
+    if [[ -z "$cidr" && -f "${CONF_DIR}/.reverse_proxy_client_cidr" ]]; then
+        cidr="$(cat "${CONF_DIR}/.reverse_proxy_client_cidr" 2>/dev/null || true)"
+    fi
+    echo "${cidr:-$DEFAULT_CLIENT_CIDR}"
+}
+
+get_reverse_proxy_backend_ip() {
+    local backend="${REVERSE_PROXY_BACKEND_IP:-}"
+    if [[ -z "$backend" && -f "${CONF_DIR}/.reverse_proxy_backend_ip" ]]; then
+        backend="$(cat "${CONF_DIR}/.reverse_proxy_backend_ip" 2>/dev/null || true)"
+    fi
+    echo "$backend"
+}
+
+apply_additive_firewall_nft() {
+    local ssh_ports_nft="$1" client_cidr="$2" reverse_mode="$3" backend_ip="$4" socks_port="$5" socks_cidr="$6" wg_port="$7"
+
+    nft add table inet proxy_gateway_filter 2>/dev/null || true
+    nft add chain inet proxy_gateway_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null || true
+    nft flush chain inet proxy_gateway_filter input 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input ct state established,related accept 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input tcp dport ${ssh_ports_nft} accept 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input tcp dport { 53, 853, 8111 } accept 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input udp dport 53 accept 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input ip saddr "$client_cidr" tcp dport { 80, 443 } accept 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input tcp dport { 80, 443 } drop 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input ip saddr "$client_cidr" udp dport 443 accept 2>/dev/null || true
+    nft add rule inet proxy_gateway_filter input udp dport 443 drop 2>/dev/null || true
+    if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
+        nft add rule inet proxy_gateway_filter input ip saddr "$socks_cidr" tcp dport "$socks_port" accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input tcp dport "$socks_port" drop 2>/dev/null || true
+    fi
+    if [[ "$wg_port" =~ ^[0-9]+$ ]]; then
+        nft add rule inet proxy_gateway_filter input udp dport "$wg_port" accept 2>/dev/null || true
+    fi
+
+    nft add table ip proxy_gateway_nat 2>/dev/null || true
+    nft add chain ip proxy_gateway_nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
+    nft add chain ip proxy_gateway_nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
+    nft add chain inet proxy_gateway_filter forward '{ type filter hook forward priority -100; policy accept; }' 2>/dev/null || true
+    nft flush chain ip proxy_gateway_nat prerouting 2>/dev/null || true
+    nft flush chain ip proxy_gateway_nat postrouting 2>/dev/null || true
+    nft flush chain inet proxy_gateway_filter forward 2>/dev/null || true
+
+    if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
+        nft add rule ip proxy_gateway_nat prerouting ip saddr "$client_cidr" tcp dport { 80, 443 } dnat to "$backend_ip" 2>/dev/null || true
+        nft add rule ip proxy_gateway_nat prerouting ip saddr "$client_cidr" udp dport 443 dnat to "$backend_ip" 2>/dev/null || true
+        nft add rule ip proxy_gateway_nat postrouting ip daddr "$backend_ip" tcp dport { 80, 443 } masquerade 2>/dev/null || true
+        nft add rule ip proxy_gateway_nat postrouting ip daddr "$backend_ip" udp dport 443 masquerade 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter forward ip daddr "$backend_ip" tcp dport { 80, 443 } accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter forward ip daddr "$backend_ip" udp dport 443 accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter forward ip saddr "$backend_ip" ct state established,related accept 2>/dev/null || true
+    fi
+}
+
+ensure_iptables_jump() {
+    local table="$1" parent="$2" child="$3"
+    iptables ${table:+-t "$table"} -N "$child" 2>/dev/null || true
+    iptables ${table:+-t "$table"} -C "$parent" -j "$child" 2>/dev/null || \
+        iptables ${table:+-t "$table"} -I "$parent" 1 -j "$child"
+    iptables ${table:+-t "$table"} -F "$child"
+}
+
+apply_additive_firewall_iptables() {
+    local ssh_ports_csv="$1" client_cidr="$2" reverse_mode="$3" backend_ip="$4" socks_port="$5" socks_cidr="$6" wg_port="$7"
+
+    ensure_iptables_jump "" INPUT PROXY_GATEWAY_INPUT
+    iptables -A PROXY_GATEWAY_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
+    iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports 53,853,8111 -j ACCEPT
+    iptables -A PROXY_GATEWAY_INPUT -p udp --dport 53 -j ACCEPT
+    iptables -A PROXY_GATEWAY_INPUT -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
+    iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports 80,443 -j DROP
+    iptables -A PROXY_GATEWAY_INPUT -s "$client_cidr" -p udp --dport 443 -j ACCEPT
+    iptables -A PROXY_GATEWAY_INPUT -p udp --dport 443 -j DROP
+    if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
+        iptables -A PROXY_GATEWAY_INPUT -s "$socks_cidr" -p tcp --dport "$socks_port" -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -p tcp --dport "$socks_port" -j DROP
+    fi
+    if [[ "$wg_port" =~ ^[0-9]+$ ]]; then
+        iptables -A PROXY_GATEWAY_INPUT -p udp --dport "$wg_port" -j ACCEPT
+    fi
+    iptables -A PROXY_GATEWAY_INPUT -j RETURN
+
+    ensure_iptables_jump nat PREROUTING PROXY_GATEWAY_PREROUTING
+    ensure_iptables_jump nat POSTROUTING PROXY_GATEWAY_POSTROUTING
+    ensure_iptables_jump "" FORWARD PROXY_GATEWAY_FORWARD
+    iptables -A PROXY_GATEWAY_FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+    if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
+        iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j DNAT --to-destination "$backend_ip"
+        iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p udp --dport 443 -j DNAT --to-destination "$backend_ip"
+        iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p tcp -m multiport --dports 80,443 -j MASQUERADE
+        iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p udp --dport 443 -j MASQUERADE
+        iptables -A PROXY_GATEWAY_FORWARD -d "$backend_ip" -p tcp -m multiport --dports 80,443 -j ACCEPT
+        iptables -A PROXY_GATEWAY_FORWARD -d "$backend_ip" -p udp --dport 443 -j ACCEPT
+    fi
+    iptables -A PROXY_GATEWAY_FORWARD -j RETURN
+
+    command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
+}
+
+setup_managed_exclusive_firewall() {
+    local ssh_ports_nft="$1" ssh_ports_csv="$2" client_cidr="$3" reverse_mode="$4" backend_ip="$5" socks_port="$6" socks_cidr="$7" wg_port="$8"
+    local socks_nft_rule="" wg_nft_rule="" nft_nat_block=""
+
     if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
         socks_nft_rule="        ip saddr ${socks_cidr} tcp dport ${socks_port} accept"
     fi
     if [[ "$wg_port" =~ ^[0-9]+$ ]]; then
         wg_nft_rule="        udp dport ${wg_port} accept"
     fi
+    if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
+        nft_nat_block="
+table ip proxy_gateway_nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip saddr ${client_cidr} tcp dport { 80, 443 } dnat to ${backend_ip}
+        ip saddr ${client_cidr} udp dport 443 dnat to ${backend_ip}
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip daddr ${backend_ip} tcp dport { 80, 443 } masquerade
+        ip daddr ${backend_ip} udp dport 443 masquerade
+    }
+}"
+    fi
 
     if command -v nft >/dev/null 2>&1; then
-        # nftables
         cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
 flush ruleset
@@ -1397,13 +1904,13 @@ table inet filter {
         type filter hook input priority 0; policy drop;
         iif "lo" accept
         ct state established,related accept
-        tcp dport { 22, 53, 853, 8111 } accept
+        tcp dport ${ssh_ports_nft} accept
+        tcp dport { 53, 853, 8111 } accept
         udp dport 53 accept
-        ip saddr 172.22.0.0/16 tcp dport { 80, 443 } accept
-        ip saddr 172.22.0.0/16 udp dport 443 accept
+        ip saddr ${client_cidr} tcp dport { 80, 443 } accept
+        ip saddr ${client_cidr} udp dport 443 accept
 ${socks_nft_rule}
 ${wg_nft_rule}
-        # ICMP for basic network health
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
     }
@@ -1414,20 +1921,21 @@ ${wg_nft_rule}
         type filter hook output priority 0; policy accept;
     }
 }
+${nft_nat_block}
 EOF
         chmod +x /etc/nftables.conf
         nft -f /etc/nftables.conf 2>/dev/null || true
         systemctl enable nftables 2>/dev/null || true
     else
-        # iptables fallback
         iptables -F INPUT
         iptables -P INPUT DROP
         iptables -A INPUT -i lo -j ACCEPT
         iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        iptables -A INPUT -p tcp -m multiport --dports 22,53,853,8111 -j ACCEPT
+        iptables -A INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
+        iptables -A INPUT -p tcp -m multiport --dports 53,853,8111 -j ACCEPT
         iptables -A INPUT -p udp --dport 53 -j ACCEPT
-        iptables -A INPUT -s 172.22.0.0/16 -p tcp -m multiport --dports 80,443 -j ACCEPT
-        iptables -A INPUT -s 172.22.0.0/16 -p udp --dport 443 -j ACCEPT
+        iptables -A INPUT -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
+        iptables -A INPUT -s "$client_cidr" -p udp --dport 443 -j ACCEPT
         if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
             iptables -A INPUT -s "$socks_cidr" -p tcp --dport "$socks_port" -j ACCEPT
         fi
@@ -1438,22 +1946,68 @@ EOF
         iptables -P FORWARD ACCEPT
         iptables -P OUTPUT ACCEPT
 
-        # Save rules
-        if command -v iptables-save >/dev/null 2>&1; then
-            iptables-save > /etc/iptables.rules 2>/dev/null || true
+        if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
+            ensure_iptables_jump nat PREROUTING PROXY_GATEWAY_PREROUTING
+            ensure_iptables_jump nat POSTROUTING PROXY_GATEWAY_POSTROUTING
+            iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j DNAT --to-destination "$backend_ip"
+            iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p udp --dport 443 -j DNAT --to-destination "$backend_ip"
+            iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p tcp -m multiport --dports 80,443 -j MASQUERADE
+            iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p udp --dport 443 -j MASQUERADE
         fi
+        command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
     fi
+}
 
-    ok "Firewall configured (reverse proxy whitelist: 172.22.0.0/16)"
+setup_firewall() {
+    info "Configuring firewall..."
+    local mode ssh_ports ssh_ports_nft ssh_ports_csv client_cidr reverse_mode backend_ip socks_port="" socks_cidr="" wg_port=""
+
+    mode="$(get_firewall_mode)"
+    ssh_ports="$(get_ssh_ports)"
+    ssh_ports_nft="$(ports_to_nft_set "$ssh_ports")"
+    ssh_ports_csv="$(ports_to_csv "$ssh_ports")"
+    client_cidr="$(get_reverse_proxy_client_cidr)"
+    reverse_mode="$(get_reverse_proxy_mode)"
+    backend_ip="$(get_reverse_proxy_backend_ip)"
+    socks_port=$(cat "${CONF_DIR}/.socks5_port" 2>/dev/null || true)
+    socks_cidr=$(cat "${CONF_DIR}/.socks5_client_cidr" 2>/dev/null || true)
+    wg_port=$(cat "${CONF_DIR}/.wg_port" 2>/dev/null || true)
+
+    case "$mode" in
+        disabled)
+            warn "防火墙模式为 disabled，未修改规则。需要放行 SSH(${ssh_ports})、DNS/DoT、${client_cidr} 到 80/443/TCP 和 443/UDP。"
+            ;;
+        managed-exclusive)
+            setup_managed_exclusive_firewall "$ssh_ports_nft" "$ssh_ports_csv" "$client_cidr" "$reverse_mode" "$backend_ip" "$socks_port" "$socks_cidr" "$wg_port"
+            ;;
+        additive)
+            if command -v nft >/dev/null 2>&1; then
+                apply_additive_firewall_nft "$ssh_ports_nft" "$client_cidr" "$reverse_mode" "$backend_ip" "$socks_port" "$socks_cidr" "$wg_port"
+            else
+                apply_additive_firewall_iptables "$ssh_ports_csv" "$client_cidr" "$reverse_mode" "$backend_ip" "$socks_port" "$socks_cidr" "$wg_port"
+            fi
+            ;;
+    esac
+
+    ok "Firewall configured (mode: ${mode}, SSH ports: ${ssh_ports}, reverse proxy whitelist: ${client_cidr})"
 }
 
 setup_socks_only_firewall() {
     local socks_port="$1"
     local allow_cidr="$2"
+    local mode ssh_ports ssh_ports_nft ssh_ports_csv
     info "Configuring SOCKS5-only firewall..."
 
-    if command -v nft >/dev/null 2>&1; then
-        cat > /etc/nftables.conf <<EOF
+    mode="$(get_firewall_mode)"
+    ssh_ports="$(get_ssh_ports)"
+    ssh_ports_nft="$(ports_to_nft_set "$ssh_ports")"
+    ssh_ports_csv="$(ports_to_csv "$ssh_ports")"
+
+    if [[ "$mode" == "disabled" ]]; then
+        warn "防火墙模式为 disabled，未修改规则。需要允许 ${allow_cidr} 访问 TCP/${socks_port}。"
+    elif [[ "$mode" == "managed-exclusive" ]]; then
+        if command -v nft >/dev/null 2>&1; then
+            cat > /etc/nftables.conf <<EOF
 #!/usr/sbin/nft -f
 flush ruleset
 
@@ -1462,7 +2016,7 @@ table inet filter {
         type filter hook input priority 0; policy drop;
         iif "lo" accept
         ct state established,related accept
-        tcp dport 22 accept
+        tcp dport ${ssh_ports_nft} accept
         ip saddr ${allow_cidr} tcp dport ${socks_port} accept
         ip protocol icmp accept
         ip6 nexthdr icmpv6 accept
@@ -1475,31 +2029,54 @@ table inet filter {
     }
 }
 EOF
-        chmod +x /etc/nftables.conf
-        nft -f /etc/nftables.conf 2>/dev/null || true
-        systemctl enable nftables 2>/dev/null || true
+            chmod +x /etc/nftables.conf
+            nft -f /etc/nftables.conf 2>/dev/null || true
+            systemctl enable nftables 2>/dev/null || true
+        else
+            iptables -F INPUT
+            iptables -P INPUT DROP
+            iptables -A INPUT -i lo -j ACCEPT
+            iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            iptables -A INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
+            iptables -A INPUT -s "$allow_cidr" -p tcp --dport "$socks_port" -j ACCEPT
+            iptables -A INPUT -p icmp -j ACCEPT
+            iptables -P FORWARD ACCEPT
+            iptables -P OUTPUT ACCEPT
+            command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
+        fi
+    elif command -v nft >/dev/null 2>&1; then
+        nft add table inet proxy_gateway_filter 2>/dev/null || true
+        nft add chain inet proxy_gateway_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null || true
+        nft flush chain inet proxy_gateway_filter input 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input ct state established,related accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input tcp dport ${ssh_ports_nft} accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input ip saddr "$allow_cidr" tcp dport "$socks_port" accept 2>/dev/null || true
+        nft add rule inet proxy_gateway_filter input tcp dport "$socks_port" drop 2>/dev/null || true
     else
-        iptables -F INPUT
-        iptables -P INPUT DROP
-        iptables -A INPUT -i lo -j ACCEPT
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-        iptables -A INPUT -s "$allow_cidr" -p tcp --dport "$socks_port" -j ACCEPT
-        iptables -A INPUT -p icmp -j ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
+        ensure_iptables_jump "" INPUT PROXY_GATEWAY_INPUT
+        iptables -A PROXY_GATEWAY_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -s "$allow_cidr" -p tcp --dport "$socks_port" -j ACCEPT
+        iptables -A PROXY_GATEWAY_INPUT -p tcp --dport "$socks_port" -j DROP
+        iptables -A PROXY_GATEWAY_INPUT -j RETURN
         command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
     fi
-    ok "SOCKS5-only firewall configured"
+    ok "SOCKS5-only firewall configured (mode: ${mode}, SSH ports: ${ssh_ports})"
 }
 
 open_cert_http_port() {
     info "Temporarily opening TCP/80 for Let's Encrypt HTTP-01..."
 
-    if command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then
+    if command -v nft >/dev/null 2>&1 && nft list chain inet proxy_gateway_filter input >/dev/null 2>&1; then
+        nft insert rule inet proxy_gateway_filter input tcp dport 80 accept comment "proxy-gateway-cert-http" 2>/dev/null || true
+    elif command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then
         nft insert rule inet filter input tcp dport 80 accept 2>/dev/null || true
     elif command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
+        if iptables -L PROXY_GATEWAY_INPUT >/dev/null 2>&1; then
+            iptables -I PROXY_GATEWAY_INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
+        else
+            iptables -I INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
+        fi
     fi
 }
 
@@ -1514,18 +2091,29 @@ install_certbot_firewall_hooks() {
     cat > /usr/local/bin/proxy-gateway-open-cert-http.sh <<'EOF'
 #!/bin/bash
 set -e
-if command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then
+if command -v nft >/dev/null 2>&1 && nft list chain inet proxy_gateway_filter input >/dev/null 2>&1; then
+    nft insert rule inet proxy_gateway_filter input tcp dport 80 accept comment "proxy-gateway-cert-http" 2>/dev/null || true
+elif command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then
     nft insert rule inet filter input tcp dport 80 accept 2>/dev/null || true
 elif command -v iptables >/dev/null 2>&1; then
-    iptables -I INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
+    if iptables -L PROXY_GATEWAY_INPUT >/dev/null 2>&1; then
+        iptables -I PROXY_GATEWAY_INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
+    else
+        iptables -I INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
+    fi
 fi
 EOF
     cat > /usr/local/bin/proxy-gateway-restore-firewall.sh <<'EOF'
 #!/bin/bash
 set -e
-if command -v nft >/dev/null 2>&1 && [[ -f /etc/nftables.conf ]]; then
+if command -v nft >/dev/null 2>&1 && nft list chain inet proxy_gateway_filter input >/dev/null 2>&1; then
+    for handle in $(nft -a list chain inet proxy_gateway_filter input | awk '/proxy-gateway-cert-http/ {print $NF}'); do
+        nft delete rule inet proxy_gateway_filter input handle "$handle" 2>/dev/null || true
+    done
+elif command -v nft >/dev/null 2>&1 && [[ -f /etc/nftables.conf ]]; then
     nft -f /etc/nftables.conf 2>/dev/null || true
 elif command -v iptables >/dev/null 2>&1; then
+    while iptables -D PROXY_GATEWAY_INPUT -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null; do :; done
     while iptables -D INPUT -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null; do :; done
 fi
 EOF
@@ -1909,8 +2497,12 @@ start_services() {
     info "Starting services..."
     systemctl restart china-dns-race-proxy || { err "china-dns-race-proxy failed to start"; journalctl -u china-dns-race-proxy --no-pager -n 20; exit 1; }
     systemctl restart dnsdist || { err "dnsdist failed to start"; journalctl -u dnsdist --no-pager -n 20; exit 1; }
-    systemctl restart sniproxy || { err "sniproxy failed to start"; journalctl -u sniproxy --no-pager -n 20; exit 1; }
-    systemctl restart quic-proxy || { err "quic-proxy failed to start"; journalctl -u quic-proxy --no-pager -n 20; exit 1; }
+    if [[ "$(get_reverse_proxy_mode)" == "forward" ]]; then
+        stop_local_reverse_proxy_services
+    else
+        systemctl restart sniproxy || { err "sniproxy failed to start"; journalctl -u sniproxy --no-pager -n 20; exit 1; }
+        systemctl restart quic-proxy || { err "quic-proxy failed to start"; journalctl -u quic-proxy --no-pager -n 20; exit 1; }
+    fi
     ok "All services started"
 }
 
@@ -1978,6 +2570,21 @@ show_status() {
     if [[ -f "${CONF_DIR}/.cache_size" ]]; then
         echo "DNS cache size: $(cat "${CONF_DIR}/.cache_size")"
     fi
+    if [[ -f "${CONF_DIR}/.firewall_mode" ]]; then
+        echo "Firewall mode: $(cat "${CONF_DIR}/.firewall_mode")"
+    fi
+    if [[ -f "${CONF_DIR}/.ssh_ports" ]]; then
+        echo "SSH ports preserved: $(cat "${CONF_DIR}/.ssh_ports")"
+    fi
+    if [[ -f "${CONF_DIR}/.reverse_proxy_mode" ]]; then
+        echo "Reverse proxy mode: $(cat "${CONF_DIR}/.reverse_proxy_mode")"
+    fi
+    if [[ -f "${CONF_DIR}/.reverse_proxy_backend_ip" ]]; then
+        echo "Reverse proxy backend: $(cat "${CONF_DIR}/.reverse_proxy_backend_ip")"
+    fi
+    if [[ -f "${CONF_DIR}/.reverse_proxy_client_cidr" ]]; then
+        echo "Reverse proxy client CIDR: $(cat "${CONF_DIR}/.reverse_proxy_client_cidr")"
+    fi
     if [[ -f "${CONF_DIR}/.socks5_port" ]]; then
         echo "SOCKS5 port: $(cat "${CONF_DIR}/.socks5_port")"
     fi
@@ -1989,9 +2596,9 @@ show_status() {
 }
 
 do_uninstall() {
-    warn "This will remove proxy-gateway services, dnsdist configs, optional SOCKS5/WireGuard units, and rules."
-    tty_read confirm "Are you sure? [y/N]" ""
-    [[ "$confirm" =~ ^[Yy]$ ]] || { info "Uninstall cancelled"; exit 0; }
+    warn "这会删除 proxy-gateway 服务、dnsdist 配置、可选 SOCKS5/WireGuard 单元和规则。"
+    tty_read confirm "确认卸载？[y/N]" ""
+    [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消卸载"; exit 0; }
 
     systemctl stop dnsdist sniproxy quic-proxy china-dns-race-proxy proxy-gateway-ios-profile proxy-gateway-socks proxy-gateway-upstream-socks wg-quick@pgw-rdns 2>/dev/null || true
     systemctl disable dnsdist sniproxy quic-proxy china-dns-race-proxy proxy-gateway-ios-profile proxy-gateway-socks proxy-gateway-upstream-socks wg-quick@pgw-rdns 2>/dev/null || true
@@ -2099,12 +2706,16 @@ main_install() {
 
     install_deps
     generate_domain
-    register_domain_cloudns
+    verify_domain_dns
     install_cert
     configure_overseas_dns
     configure_dns_policy
-    install_sniproxy
-    install_quic_proxy
+    if [[ "$(get_reverse_proxy_mode)" == "forward" ]]; then
+        stop_local_reverse_proxy_services
+    else
+        install_sniproxy
+        install_quic_proxy
+    fi
     install_china_dns_race_proxy
     install_dnsdist
     init_rules
@@ -2120,8 +2731,13 @@ main_install() {
     echo "=========================================="
     echo ""
     echo "DoT 地址:  tls://${DOMAIN}:853"
-    echo "TCP 代理:  ${PUBLIC_IP}:80, ${PUBLIC_IP}:443 (sniproxy)"
-    echo "UDP 代理:  ${PUBLIC_IP}:443 (quic-proxy)"
+    if [[ "$(get_reverse_proxy_mode)" == "forward" ]]; then
+        echo "TCP 代理:  ${PUBLIC_IP}:80, ${PUBLIC_IP}:443 -> $(get_reverse_proxy_backend_ip)"
+        echo "UDP 代理:  ${PUBLIC_IP}:443 -> $(get_reverse_proxy_backend_ip)"
+    else
+        echo "TCP 代理:  ${PUBLIC_IP}:80, ${PUBLIC_IP}:443 (sniproxy)"
+        echo "UDP 代理:  ${PUBLIC_IP}:443 (quic-proxy)"
+    fi
     echo "DNS 查询:  ${PUBLIC_IP}:53"
     echo "iOS 描述文件: http://${DOMAIN}:${IOS_PROFILE_PORT}/ios-dot.mobileconfig"
     echo ""
@@ -2136,6 +2752,9 @@ main_install() {
     echo "  $0 --status"
     echo "  $0 --update-rules"
     echo "  $0 --renew-cert"
+    echo "  $0 --clear-settings"
+    echo "  $0 --vps1-forward"
+    echo "  $0 --vps2-backend"
     echo "  $0 -ios"
     echo "  $0 --uninstall"
     echo "=========================================="
@@ -2154,15 +2773,18 @@ main_menu() {
         echo "  3) 管理自定义分流列表"
         echo "  4) 添加 RethinkDNS WireGuard 兜底入口"
         echo "  5) 添加 RethinkDNS SOCKS5 兜底入口"
-        echo "  6) 安装可选 VPS2 SOCKS5 出口"
-        echo "  7) 立即更新 DNS 规则"
-        echo "  8) 查看状态"
-        echo "  9) 续期证书"
-        echo " 10) 重新生成 iOS 描述文件"
-        echo " 11) 卸载"
+        echo "  6) 配置 VPS1 转发到 VPS2 SNI/QUIC 后端"
+        echo "  7) 安装 VPS2 SNI/QUIC 后端"
+        echo "  8) 安装可选 VPS2 SOCKS5 出口"
+        echo "  9) 立即更新 DNS 规则"
+        echo " 10) 查看状态"
+        echo " 11) 续期证书"
+        echo " 12) 重新生成 iOS 描述文件"
+        echo " 13) 清空 DNS 设置"
+        echo " 14) 卸载"
         echo "  0) 退出"
         echo "=========================================="
-        tty_read choice "请输入序号 (0-11)" ""
+        tty_read choice "请输入序号 (0-14)" ""
         case "$choice" in
             1)
                 main_install
@@ -2183,39 +2805,50 @@ main_menu() {
                 install_socks5_fallback
                 ;;
             6)
-                install_vps2_socks_exit
+                configure_vps1_forward_backend
+                pause_return
                 ;;
             7)
-                if [[ -x /usr/local/bin/update-dnsdist-rules.sh ]]; then
-                    /usr/local/bin/update-dnsdist-rules.sh
-                else
-                    warn "update-dnsdist-rules.sh not installed yet; run core installation first."
-                fi
+                install_vps2_sni_quic_backend
                 pause_return
                 ;;
             8)
+                install_vps2_socks_exit
+                ;;
+            9)
+                if [[ -x /usr/local/bin/update-dnsdist-rules.sh ]]; then
+                    /usr/local/bin/update-dnsdist-rules.sh
+                else
+                    warn "update-dnsdist-rules.sh 尚未安装，请先安装核心网关。"
+                fi
+                pause_return
+                ;;
+            10)
                 get_public_ip 2>/dev/null || true
                 show_status
                 pause_return
                 ;;
-            9)
+            11)
                 force_renew_cert
                 pause_return
                 ;;
-            10)
+            12)
                 regenerate_ios_profile
                 pause_return
                 ;;
-            11)
+            13)
+                clear_settings_menu
+                ;;
+            14)
                 do_uninstall
                 pause_return
                 ;;
             0)
-                echo "Bye."
+                echo "已退出。"
                 return 0
                 ;;
             *)
-                warn "无效输入，请重新输入 0-11 之间的数字"
+                warn "无效输入，请重新输入 0-14 之间的数字"
                 ;;
         esac
     done
@@ -2234,6 +2867,15 @@ case "${1:-}" in
         ;;
     --renew-cert)
         force_renew_cert
+        ;;
+    --clear-settings)
+        clear_settings_menu
+        ;;
+    --vps1-forward)
+        configure_vps1_forward_backend
+        ;;
+    --vps2-backend)
+        install_vps2_sni_quic_backend
         ;;
     --uninstall)
         do_uninstall

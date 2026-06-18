@@ -25,4 +25,9 @@ if [[ "${rules}" != *'loadfile(chunk)'* ]]; then
     exit 1
 fi
 
+if [[ "${rules}" != *'ChinaList 已解析 ${count} 个域名'* ]]; then
+    echo "ChinaList parsing should print periodic progress so long parses do not look stuck." >&2
+    exit 1
+fi
+
 echo "ChinaList is not truncated"
