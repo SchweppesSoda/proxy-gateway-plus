@@ -171,13 +171,13 @@ chmod +x install.sh
 
 ```text
   VPS1 主网关
-  1) 安装/更新 VPS1 核心 DNS 网关（dnsdist + DoT 证书 + 规则）
+  1) 安装/更新 VPS1 本机网关（dnsdist + 本机 sniproxy/quic-proxy）
   2) 配置 VPS1 DNS 分流策略
   3) 管理 VPS1 自定义分流列表
-  4) 启用 VPS1 -> VPS2 SNI/QUIC 转发（需先完成 1）
+  4) 切换 VPS1 为入口转发模式（停本机 sniproxy/quic-proxy，转发到 VPS2）
 
   VPS2 后端/出口
-  5) 在 VPS2 安装 SNI/QUIC 后端（sniproxy + quic-proxy）
+  5) 在 VPS2 安装 SNI/QUIC 后端（配合 4 使用）
   6) 在 VPS2 安装 SOCKS5 出口
 
   RethinkDNS 兜底入口（装在 VPS1）
@@ -192,6 +192,14 @@ chmod +x install.sh
  13) 清空 DNS 设置
  14) 卸载
   0) 退出
+```
+
+怎么选：
+
+```text
+只想让 VPS1 本机执行 SNI/QUIC：只执行 1。
+想让 VPS1 做入口、VPS2 执行 SNI/QUIC：VPS2 执行 5，VPS1 先执行 1 再执行 4。
+不要把 4 当成核心安装；4 只切换转发模式，不安装 dnsdist、不申请 DoT 证书。
 ```
 
 脚本交互输入优先从 `/dev/tty` 读取，适配 `curl` 下载后本地执行的场景。需要 root 的安装建议先下载脚本再运行，不建议直接在线管道执行。
