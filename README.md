@@ -170,14 +170,21 @@ chmod +x install.sh
 主菜单：
 
 ```text
-  1) 安装核心 DNS + SNI/QUIC 网关
-  2) 配置 DNS 分流策略
-  3) 管理自定义分流列表
-  4) 添加 RethinkDNS WireGuard 兜底入口
-  5) 添加 RethinkDNS SOCKS5 兜底入口
-  6) 配置 VPS1 转发到 VPS2 SNI/QUIC 后端
-  7) 安装 VPS2 SNI/QUIC 后端
-  8) 安装可选 VPS2 SOCKS5 出口
+  VPS1 主网关
+  1) 安装/更新 VPS1 核心 DNS 网关（dnsdist + DoT 证书 + 规则）
+  2) 配置 VPS1 DNS 分流策略
+  3) 管理 VPS1 自定义分流列表
+  4) 启用 VPS1 -> VPS2 SNI/QUIC 转发（需先完成 1）
+
+  VPS2 后端/出口
+  5) 在 VPS2 安装 SNI/QUIC 后端（sniproxy + quic-proxy）
+  6) 在 VPS2 安装 SOCKS5 出口
+
+  RethinkDNS 兜底入口（装在 VPS1）
+  7) 添加 WireGuard 兜底入口
+  8) 添加 SOCKS5 兜底入口
+
+  维护
   9) 立即更新 DNS 规则
  10) 查看状态
  11) 续期证书
@@ -235,10 +242,13 @@ VPS2 sniproxy/quic-proxy -> 真实网站
 
 ```bash
 ./install.sh --vps2-backend   # 在 VPS2 上执行，安装 sniproxy/quic-proxy
-./install.sh --vps1-forward   # 在 VPS1 上执行，输入 VPS2 IP 和客户端 CIDR
+./install.sh                  # 在 VPS1 上执行菜单 1，安装核心 DNS 网关
+./install.sh --vps1-forward   # 在已安装核心网关的 VPS1 上执行，输入 VPS2 IP 和客户端 CIDR
 ```
 
 VPS1 forward 模式会停止并禁用本机 `sniproxy` / `quic-proxy`，避免和 DNAT 入口抢占 80/443/TCP、443/UDP。DNS 仍然返回 VPS1，客户端不会拿到 VPS2 IP。
+
+注意：`--vps1-forward` / 菜单 4 只启用转发，不安装 dnsdist、不申请 DoT 证书、不初始化规则。新 VPS1 必须先完成菜单 1。New VPS1: run menu 1 before `--vps1-forward`.
 
 UDP/QUIC 使用内核 NAT + conntrack，不使用 `socat`。VPS1 会对转发到 VPS2 的 TCP/UDP 流量做 MASQUERADE，因此 VPS2 看到的来源是 VPS1，回包会稳定回到 VPS1，再由 VPS1 返回客户端。
 

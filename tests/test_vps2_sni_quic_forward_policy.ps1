@@ -18,6 +18,9 @@ function Assert-Contains {
 
 Assert-Contains $install 'configure_vps1_forward_backend()' 'VPS1 forward configuration entrypoint'
 Assert-Contains $install 'install_vps2_sni_quic_backend()' 'VPS2 SNI/QUIC backend entrypoint'
+Assert-Contains $install '/etc/dnsdist/dnsdist.conf' 'VPS1 forward checks core gateway install'
+Assert-Contains $install '/usr/local/bin/update-dnsdist-rules.sh' 'VPS1 forward checks rule updater install'
+Assert-Contains $readme 'New VPS1' 'README explains new VPS1 must install core gateway first'
 Assert-Contains $install 'stop_local_reverse_proxy_services()' 'VPS1 forward disables local reverse proxy services'
 Assert-Contains $install 'systemctl disable sniproxy quic-proxy' 'VPS1 forward prevents local port conflicts'
 Assert-Contains $install '.reverse_proxy_backend_ip' 'VPS2 backend IP is persisted'

@@ -1145,6 +1145,17 @@ configure_vps1_forward_backend() {
     check_root
     local backend_ip="${REVERSE_PROXY_BACKEND_IP:-}" client_cidr="${REVERSE_PROXY_CLIENT_CIDR:-}" firewall_mode="${FIREWALL_MODE:-}"
 
+    if [[ ! -f /etc/dnsdist/dnsdist.conf || ! -x /usr/local/bin/update-dnsdist-rules.sh ]]; then
+        warn "当前机器还没有检测到 VPS1 核心 DNS 网关安装结果。"
+        warn "此项只启用 VPS1 -> VPS2 的 80/443/TCP 和 443/UDP 转发，不会安装 dnsdist 或申请 DoT 证书。"
+        warn "新 VPS1 请先执行菜单 1：安装/更新 VPS1 核心 DNS 网关。"
+        if [[ -r /dev/tty || -t 0 ]]; then
+            local continue_answer=""
+            tty_yes_no continue_answer "仍然继续只配置转发？" "N"
+            [[ "$continue_answer" == "y" ]] || return 0
+        fi
+    fi
+
     if [[ -z "$backend_ip" ]]; then
         backend_ip="$(get_reverse_proxy_backend_ip)"
     fi
@@ -2768,14 +2779,21 @@ main_menu() {
         echo "=========================================="
         echo "  Proxy Gateway Plus"
         echo "=========================================="
-        echo "  1) 安装核心 DNS + SNI/QUIC 网关"
-        echo "  2) 配置 DNS 分流策略"
-        echo "  3) 管理自定义分流列表"
-        echo "  4) 添加 RethinkDNS WireGuard 兜底入口"
-        echo "  5) 添加 RethinkDNS SOCKS5 兜底入口"
-        echo "  6) 配置 VPS1 转发到 VPS2 SNI/QUIC 后端"
-        echo "  7) 安装 VPS2 SNI/QUIC 后端"
-        echo "  8) 安装可选 VPS2 SOCKS5 出口"
+        echo "  VPS1 主网关"
+        echo "  1) 安装/更新 VPS1 核心 DNS 网关（dnsdist + DoT 证书 + 规则）"
+        echo "  2) 配置 VPS1 DNS 分流策略"
+        echo "  3) 管理 VPS1 自定义分流列表"
+        echo "  4) 启用 VPS1 -> VPS2 SNI/QUIC 转发（需先完成 1）"
+        echo ""
+        echo "  VPS2 后端/出口"
+        echo "  5) 在 VPS2 安装 SNI/QUIC 后端（sniproxy + quic-proxy）"
+        echo "  6) 在 VPS2 安装 SOCKS5 出口"
+        echo ""
+        echo "  RethinkDNS 兜底入口（装在 VPS1）"
+        echo "  7) 添加 WireGuard 兜底入口"
+        echo "  8) 添加 SOCKS5 兜底入口"
+        echo ""
+        echo "  维护"
         echo "  9) 立即更新 DNS 规则"
         echo " 10) 查看状态"
         echo " 11) 续期证书"
@@ -2798,22 +2816,22 @@ main_menu() {
                 configure_custom_lists_menu
                 ;;
             4)
-                install_wireguard_fallback
-                pause_return
-                ;;
-            5)
-                install_socks5_fallback
-                ;;
-            6)
                 configure_vps1_forward_backend
                 pause_return
                 ;;
-            7)
+            5)
                 install_vps2_sni_quic_backend
                 pause_return
                 ;;
-            8)
+            6)
                 install_vps2_socks_exit
+                ;;
+            7)
+                install_wireguard_fallback
+                pause_return
+                ;;
+            8)
+                install_socks5_fallback
                 ;;
             9)
                 if [[ -x /usr/local/bin/update-dnsdist-rules.sh ]]; then
