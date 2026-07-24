@@ -20,6 +20,23 @@ c_g(){ echo -e "\033[1;32m[*]\033[0m $*"; }
 c_y(){ echo -e "\033[1;33m[!]\033[0m $*"; }
 die(){ echo -e "\033[1;31m[x]\033[0m $*" >&2; exit 1; }
 
+# 交互读取一行到指定变量, 撞 EOF / 无可用终端时回落到默认值 —— 绝不触发 errexit。
+# 用法: ask <变量名> <提示语> [默认值]
+# 为什么每次新开 /dev/tty: 自举把 fd 0 绑成某一个 /dev/tty 打开描述(见下方 exec ... < /dev/tty),
+# 长时间抓包(detect-internal-range.sh ~90s)后该描述在某些云主机/终端上会进入异常态, 后续 read
+# 立即返回 EOF。旧写法 `read ... VAR` 的非零返回会被 set -e 判成致命错误 → 整场安装回滚, 且不留
+# 任何错误行(见 issue: "内网卡来源段 CIDR [...]: [!] 安装失败")。这里每次都新开 /dev/tty 取一个
+# 干净的终端描述, 并把 EOF/无终端当"用默认值"处理, 让一次 read 失手不再拖垮整场安装。
+ask(){
+  local __var="$1" __prompt="$2" __def="${3:-}" __ans=""
+  # 探针与重跑处同款: 把重定向挂在普通命令上, 打不开只让该命令返回非零(不会让 shell 退出);
+  # 能打开才 read, 且 read 的 EOF 用 `|| __ans=""` 吃掉 —— 两条路都回落到默认值, 均不触发 errexit。
+  if { true < /dev/tty; } 2>/dev/null; then
+    read -rp "$__prompt" __ans < /dev/tty || __ans=""
+  fi
+  printf -v "$__var" '%s' "${__ans:-$__def}"
+}
+
 pdg_checkout_latest_tag(){
   local dir="$1" tag cur target
   git -C "$dir" fetch -q --tags origin main
@@ -327,14 +344,14 @@ echo
 SERVER_IP="${PDG_SERVER_IP:-}"
 if [[ -z "$SERVER_IP" ]]; then
   DET_IP=$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
-  if [[ -n "$NONINT" ]]; then SERVER_IP="$DET_IP"; else read -rp "本机公网 IP [${DET_IP}]: " SERVER_IP; SERVER_IP="${SERVER_IP:-$DET_IP}"; fi
+  if [[ -n "$NONINT" ]]; then SERVER_IP="$DET_IP"; else ask SERVER_IP "本机公网 IP [${DET_IP}]: " "$DET_IP"; fi
 fi
 [[ -n "$SERVER_IP" ]] || die "公网 IP 不能为空"
 
 SSH_PORT="${PDG_SSH_PORT:-}"
 if [[ -z "$SSH_PORT" ]]; then
   DET_SSH=$(ss -lntpH 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}'); DET_SSH="${DET_SSH:-22}"
-  if [[ -n "$NONINT" ]]; then SSH_PORT="$DET_SSH"; else read -rp "SSH 端口 [${DET_SSH}]: " SSH_PORT; SSH_PORT="${SSH_PORT:-$DET_SSH}"; fi
+  if [[ -n "$NONINT" ]]; then SSH_PORT="$DET_SSH"; else ask SSH_PORT "SSH 端口 [${DET_SSH}]: " "$DET_SSH"; fi
 fi
 
 INTERNAL_CIDR="${PDG_INTERNAL_CIDR:-}"
@@ -347,9 +364,8 @@ if [[ -z "$INTERNAL_CIDR" ]]; then
     if [[ -n "$DET_CIDR" ]]; then c_g "抓到内网卡段: $DET_CIDR"
     else c_y "没抓到(手机没走内网卡? 云安全组挡了 80/ICMP?)。可先手填(如 172.22.0.0/16),"
          c_y "装完再从容跑 \`sudo pdg detect-cidr\` 重新识别并一键应用。"; fi
-    read -rp "内网卡来源段 CIDR [${DET_CIDR:-请手填如 172.22.0.0/16}]: " INTERNAL_CIDR
-    INTERNAL_CIDR="${INTERNAL_CIDR:-${DET_CIDR:-}}"
-    [[ -n "$INTERNAL_CIDR" ]] || die "必须填内网卡来源段 (形如 172.22.0.0/16)"
+    ask INTERNAL_CIDR "内网卡来源段 CIDR [${DET_CIDR:-请手填如 172.22.0.0/16}]: " "${DET_CIDR:-}"
+    [[ -n "$INTERNAL_CIDR" ]] || die "必须填内网卡来源段 (形如 172.22.0.0/16; 非交互/无终端请用 PDG_INTERNAL_CIDR)"
   fi
 fi
 
@@ -358,14 +374,16 @@ fi
 PLATFORM="${PDG_PLATFORM:-}"
 # 覆盖重装(PDG_FORCE_REINSTALL)未显式传 PDG_PLATFORM 时: 优先沿用已有平台标记 —— 不能默认把 iOS 改成 Android。
 if [[ -z "$PLATFORM" ]]; then
-  _ep="$(cat /etc/privdns-gateway/platform 2>/dev/null)"
+  # 全新装时该文件尚不存在, cat 返 1 —— 在 set -e 下"赋值里命令替换失败"是致命错误, 会当场
+  # 中止并回滚(屏幕上只剩"安装失败", 真原因被埋掉; 正是交互全新装偏偏挂在这里的根因)。故 || true。
+  _ep="$(cat /etc/privdns-gateway/platform 2>/dev/null || true)"
   [[ "$_ep" == ios || "$_ep" == android ]] && { PLATFORM="$_ep"; c_g "沿用已有平台标记: $PLATFORM"; }
 fi
 if [[ -z "$PLATFORM" ]]; then
   if [[ -n "$NONINT" ]]; then PLATFORM="android"
   else
     echo; c_y "你的手机平台?(决定客户端下发 + iOS 专属功能;一台网关对一个手机)"
-    read -rp "平台 [1=iOS / 2=Android, 默认 2]: " _p
+    _p=""; ask _p "平台 [1=iOS / 2=Android, 默认 2]: " ""
     case "$_p" in 1 | ios | iOS | IOS) PLATFORM=ios;; *) PLATFORM=android;; esac
   fi
 fi
@@ -377,10 +395,10 @@ if [[ -z "$NONINT" ]]; then
   if [[ -z "$BOT_TOKEN" ]]; then
     c_y "提示: 出口(落地节点)和分流规则都在 Telegram bot 里设置。不填 token 也能装完,"
     c_y "      但要等之后 sudo pdg-set-token 设好 token、给 bot 发 /start 才能配代理。"
-    read -rp "Telegram bot token (可留空): " BOT_TOKEN
+    ask BOT_TOKEN "Telegram bot token (可留空): " ""
   fi
-  if [[ -n "$BOT_TOKEN" && -z "$ALLOWED_IDS" ]]; then read -rp "你的 Telegram user id (只允许它管理): " ALLOWED_IDS; fi
-  [[ -n "$DOT_DOMAIN" ]] || read -rp "DoT 域名 (如 dot.example.com): " DOT_DOMAIN
+  if [[ -n "$BOT_TOKEN" && -z "$ALLOWED_IDS" ]]; then ask ALLOWED_IDS "你的 Telegram user id (只允许它管理): " ""; fi
+  [[ -n "$DOT_DOMAIN" ]] || ask DOT_DOMAIN "DoT 域名 (如 dot.example.com): " ""
 fi
 [[ -n "$DOT_DOMAIN" ]] || die "DoT 域名不能为空 (非交互请用 PDG_DOT_DOMAIN)"
 # token / user id 可留空 → 装完先不启 bot, 之后 sudo pdg-set-token 补
@@ -543,7 +561,10 @@ else
   echo
   c_y "现在签 DoT 证书。请先确认: $DOT_DOMAIN 的 A 记录已指向 $SERVER_IP"
   c_y "(Cloudflare 等用『灰云 / DNS only』, 不要开代理; 等生效后再继续)"
-  [[ -n "$NONINT" ]] || read -rp "A 记录已指好? 回车继续签发 / Ctrl-C 退出去配 DNS: " _
+  # 交互暂停确认 A 记录: 撞 EOF/无终端不该触发 errexit → 直接继续(等同回车); Ctrl-C 仍能中止。
+  if [[ -z "$NONINT" ]] && { true < /dev/tty; } 2>/dev/null; then
+    read -rp "A 记录已指好? 回车继续签发 / Ctrl-C 退出去配 DNS: " _ < /dev/tty || true
+  fi
   certbot certonly --standalone -d "$DOT_DOMAIN" --non-interactive --agree-tos \
     --register-unsafely-without-email --keep-until-expiring \
     --pre-hook  /usr/local/bin/proxy-gateway-open-cert-http.sh \

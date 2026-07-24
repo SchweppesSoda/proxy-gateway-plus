@@ -70,6 +70,13 @@ exit 0
 S
 chmod 755 /usr/local/bin/sing-box
 fi
+# tcpdump 桩: 让 detect-internal-range.sh 解析出一个确定的内网卡段(交互用例的 CIDR 探测)
+cat > /usr/local/bin/tcpdump <<'S'
+#!/bin/sh
+printf 'IP 172.22.0.5.55000 > 10.0.0.1.853: tcp\n172.22.0.5\n172.22.0.5\n'
+exit 0
+S
+chmod 755 /usr/local/bin/tcpdump
 
 run_install(){   # $1=额外 env
   # shellcheck disable=SC2086
@@ -78,6 +85,14 @@ run_install(){   # $1=额外 env
       PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaaBBbbCCccDDddEEeeFFffGGgg \
       PDG_ALLOWED=1 PDG_PLATFORM=android $1 \
       bash "$E2E_ROOT/install.sh" 2>&1
+}
+# 交互模式装机: 不预置 PDG_NONINTERACTIVE, 也不预置 CIDR/PLATFORM/TOKEN → 全走交互 read;
+# stdin=/dev/null 且无控制终端 → 每个 read 都撞 EOF/无 tty(等价用户报的现场)。只预置无默认值
+# 的 DOT 域名。这条路专治 issue #2: 平台探测 `cat` 在 set -e 下的致命赋值 + 交互 read 的 EOF 韧性。
+run_install_interactive(){
+  env -u PDG_NONINTERACTIVE PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_DOT_DOMAIN=dot.e2e.test \
+      bash "$E2E_ROOT/install.sh" </dev/null 2>&1
 }
 reset_box(){
   rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot \
@@ -110,6 +125,29 @@ python3 -c "import json,sys; json.load(open('/etc/sing-box/config.json'))" \
   && ok "渲染出的 sing-box 配置是合法 JSON" || bad "config.json 不合法"
 grep -q '__[A-Z_]*__' /etc/mosdns/config.yaml /etc/nftables.conf \
   && bad "渲染后仍残留占位符" || ok "模板占位符全部渲染完毕"
+
+# ══ 1b. 交互全新装: 无输入(EOF/无 tty)也要装完, 不因 set -e 挂在半路(issue #2)═════════
+# 回归点: ① 平台探测 `_ep="$(cat …platform)"` 在全新装(文件不存在)时 cat 返 1 → set -e 致命赋值
+#         → 回滚; ② 任一交互 read 撞 EOF → set -e → 回滚。两者都该被容错掉, 回落到探测值/默认值。
+echo; echo "── 1b. 交互全新装 + 无输入(EOF/无 tty) ──"
+reset_box; e2e_stub_system
+out=$(run_install_interactive); rc=$?
+[[ "$rc" == 0 ]] && ok "交互式安装无输入(EOF)仍成功(exit 0, 未回滚)" \
+                 || bad "交互安装挂了 rc=$rc: $(tail -6 <<<"$out")"
+grep -q '安装失败 → 回滚' <<<"$out" && bad "触发回滚(issue #2 症状: 平台 cat / read EOF 被 set -e 判死)" \
+                                    || ok "未触发回滚"
+grep -q 'unbound variable' <<<"$out" && bad "出现 unbound variable" || ok "无 unbound variable"
+for f in /usr/local/bin/pdg /opt/pdg-bot/bot.py /etc/mosdns/config.yaml \
+         /etc/sing-box/config.json /etc/privdns-gateway/backend /etc/nftables.conf; do
+  [[ -e "$f" ]] || bad "交互装完却缺 $f"
+done
+ok "关键文件全部落地"
+[[ "$(cat /etc/privdns-gateway/platform 2>/dev/null)" == android ]] \
+  && ok "平台探测无输入 → 回落 android(平台 cat 不再致命)" \
+  || bad "平台标记=$(cat /etc/privdns-gateway/platform 2>/dev/null)(平台探测把安装挂了?)"
+grep -rq '172\.22\.0\.0/16' /etc/nftables.conf /etc/privdns-gateway 2>/dev/null \
+  && ok "CIDR 无输入 → 回落到 tcpdump 探测值 172.22.0.0/16" \
+  || bad "CIDR 未回落到探测值(装出来的配置里找不到 172.22.0.0/16)"
 
 # ══ 2. 已有部署 → 默认拒绝重装(引导走 pdg update) ════════════════════════════
 echo; echo "── 2. 已有部署上再跑 install.sh ──"
