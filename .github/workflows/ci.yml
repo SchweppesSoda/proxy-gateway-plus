@@ -251,6 +251,10 @@ jobs:
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-drop-singbox.sh
 
+      - name: E2E 自定义防火墙保护 (额外 table/VPN/NAT/转发/开放端口: 迁移后逐字节不变)
+        env: { PDG_E2E_ISOLATED: "1" }
+        run: bash tests/e2e-custom-nft.sh
+
       - name: E2E 跨版本回滚 (v1.5.12 更新器 + 当前代码, 迁移后注入 doctor 失败: unit 不得被清空)
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-cross-version-rollback.sh

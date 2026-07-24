@@ -35,7 +35,21 @@ chmod 755 /usr/local/bin/mihomo
 # 现场是"仍在跑 sing-box 的老机器"(backend=singbox + 二进制/unit 都在): 这次 update 应当
 # 由 migrate_drop_singbox 自动迁到 mihomo 并把 sing-box 运行时清掉。
 printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/sing-box; chmod 755 /usr/local/bin/sing-box
-printf '[Unit]\nDescription=sing-box\n' > /etc/systemd/system/sing-box.service
+# 老版装机真正生成的 unit 形态 —— 归属判定据此认出"这是本项目装的"才会去清理它
+# (随手写的 `[Unit]` 桩不具备该特征, 会被当成第三方 sing-box 保留, 那是另一条分支)
+cat > /etc/systemd/system/sing-box.service <<'SBU'
+[Unit]
+Description=sing-box
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+SBU
 
 # ── 造发布源: 真 git 仓库, 两个 tag(v9.9.8 当前 / v9.9.9 新版) ────────────────
 # 连 origin 都是真的(本地裸仓库): pdg update 里的 `git fetch --tags origin main` 照跑不误,

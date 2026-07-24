@@ -1514,6 +1514,74 @@ run_all_migrations(){
 
 # 迁移到 mihomo 时渲染并应用 mihomo 的 nft 入站模型(REDIRECT→7893)。出口/分流/证书/DoT/mosdns
 # 全不动(model 共用)。$1 目前恒为 mihomo(唯一内核), 保留形参以兼容 _activate_mihomo_core 调用。
+# 把渲染好的 pdg 表块**合并**进现网 nftables.conf: 只替换本项目管理区(table inet pdg 的
+# 声明/delete/表体), 其余内容逐字节保留。$1=渲染好的块文件 $2=目标 conf $3=输出文件。
+# 无法证明能安全合并(pdg 块括号不配平 / 文件里有 flush ruleset 又还有别的表)→ 返回非 0,
+# 调用方必须在改动运行环境**之前**中止 —— 整文件覆盖会把用户的 VPN/NAT/转发/开放端口抹掉。
+_pdg_nft_splice(){
+  python3 - "$1" "$2" "$3" <<'PY'
+import re, sys
+block_f, target_f, out_f = sys.argv[1:4]
+block = open(block_f, encoding="utf-8").read()
+# 只取模板里的规则部分(从第一处 `table inet pdg` 起) —— 整个模板带 shebang 与大段头注释,
+# 原样插进现网文件中段会多出一个 `#!/usr/sbin/nft -f`, 既难看也容易误导读者。
+_m = re.search(r"^\s*table\s+inet\s+pdg\b", block, re.M)
+if _m:
+    block = ("# ==== PrivDNS Gateway 管理区(table inet pdg): 由 pdg 自动维护, 勿手改 ====\n"
+             + block[_m.start():])
+block = block.rstrip("\n")
+try:
+    lines = open(target_f, encoding="utf-8").read().split("\n")
+except OSError:
+    lines = []
+
+decl = re.compile(r"^\s*table\s+inet\s+pdg\s*$")
+dele = re.compile(r"^\s*delete\s+table\s+inet\s+pdg\s*$")
+open_ = re.compile(r"^\s*table\s+inet\s+pdg\s*\{")
+other_table = re.compile(r"^\s*(table)\s+\S+\s+(\S+)")
+
+keep, i, first_hit, n = [], 0, None, len(lines)
+while i < n:
+    ln = lines[i]
+    if decl.match(ln) or dele.match(ln):
+        first_hit = len(keep) if first_hit is None else first_hit
+        i += 1; continue
+    if open_.match(ln):                      # 整个 table inet pdg { ... } 块
+        first_hit = len(keep) if first_hit is None else first_hit
+        depth = 0
+        while i < n:
+            depth += lines[i].count("{") - lines[i].count("}")
+            i += 1
+            if depth <= 0:
+                break
+        else:
+            print("pdg 表块括号不配平, 无法安全合并", file=sys.stderr); sys.exit(2)
+        if depth > 0:
+            print("pdg 表块括号不配平, 无法安全合并", file=sys.stderr); sys.exit(2)
+        continue
+    keep.append(ln); i += 1
+
+# 剩下的内容里若还有 flush ruleset + 别的表 → 应用时会连别人的表一起冲掉, 不能算安全合并
+rest = "\n".join(keep)
+if re.search(r"^\s*flush\s+ruleset\s*$", rest, re.M):
+    others = [m.group(0).strip() for m in other_table.finditer(rest)]
+    if others:
+        print("现网 nftables.conf 含 `flush ruleset` 且另有表(%s) —— 合并后应用会冲掉它们, 拒绝自动处理"
+              % ", ".join(others[:3]), file=sys.stderr)
+        sys.exit(3)
+
+if first_hit is None:                         # 现网没有 pdg 区 → 追加到末尾
+    while keep and not keep[-1].strip():
+        keep.pop()
+    merged = "\n".join(keep) + ("\n\n" if keep else "") + block
+else:
+    merged = "\n".join(keep[:first_hit] + block.split("\n") + keep[first_hit:])
+if not merged.endswith("\n"):
+    merged += "\n"
+open(out_f, "w", encoding="utf-8").write(merged)
+PY
+}
+
 _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 SSH端口/内网段)
   local target="$1" sshp icidr
   [[ "$target" == mihomo ]] || { echo "内部错误: _switchcore_nft 只支持 mihomo(收到 $target)"; return 1; }
@@ -1528,9 +1596,43 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   icidr=$(python3 -c "import sys;sys.path.insert(0,'/opt/pdg-bot');import checks;print(checks._internal_cidr())" 2>/dev/null)
   [[ -n "$sshp" && -n "$icidr" ]] || { echo "提取 SSH端口/内网段失败(ssh=$sshp cidr=$icidr)"; return 1; }
   [[ -f "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" ]] || { echo "缺 nftables-mihomo.conf(先 pdg update)"; return 1; }
-  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
-  _pdg_nft_strip_gms /etc/nftables.conf   # iOS: 渲染后剥掉 GMS 5228-5230
-  nft -f /etc/nftables.conf
+  local wd rendered merged bak rc
+  wd="$(mktemp -d)" || { echo "无法创建临时目录"; return 1; }
+  rendered="$wd/pdg.nft"; merged="$wd/merged.conf"; bak="$wd/nftables.conf.bak"
+  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \
+      "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$rendered"
+  _pdg_nft_strip_gms "$rendered"          # iOS: 渲染后剥掉 GMS 5228-5230
+  # 备份必须先成立(逐字节校验): 后面任何一步失败都要靠它把现网原样放回去
+  if [[ -e /etc/nftables.conf ]]; then
+    if ! cp -a /etc/nftables.conf "$bak" 2>/dev/null || ! cmp -s /etc/nftables.conf "$bak"; then
+      rm -rf "$wd"; echo "备份 /etc/nftables.conf 失败(磁盘满?), 未改动防火墙"; return 1
+    fi
+  fi
+  # 只替换本项目管理区(table inet pdg), 用户的额外表/VPN/NAT/转发/开放端口原样保留。
+  # 合并不了(块不配平 / flush ruleset 与别的表共存)→ 在改动运行环境之前就中止。
+  if ! _pdg_nft_splice "$rendered" /etc/nftables.conf "$merged"; then
+    rm -rf "$wd"
+    echo "无法安全合并防火墙配置 → 未改动 /etc/nftables.conf(见上方冲突位置)"
+    echo "  请把本项目所需规则手工并入 table inet pdg 后重试, 或先备份并清理冲突配置。"
+    return 1
+  fi
+  if ! nft -c -f "$merged" >/dev/null 2>&1; then
+    rm -rf "$wd"; echo "合并后的 nftables 配置校验(nft -c)未过, 未改动防火墙"; return 1
+  fi
+  if ! cp -f "$merged" /etc/nftables.conf 2>/dev/null || ! cmp -s "$merged" /etc/nftables.conf; then
+    [[ -e "$bak" ]] && cp -a "$bak" /etc/nftables.conf 2>/dev/null
+    rm -rf "$wd"; echo "写入 /etc/nftables.conf 失败(磁盘满?), 已还原"; return 1
+  fi
+  if ! nft -f /etc/nftables.conf; then
+    rc=1
+    if [[ -e "$bak" ]]; then
+      cp -a "$bak" /etc/nftables.conf 2>/dev/null
+      nft -f /etc/nftables.conf 2>/dev/null || true
+      echo "应用新防火墙失败 → 已还原并重新应用原配置"
+    fi
+    rm -rf "$wd"; return "$rc"
+  fi
+  rm -rf "$wd"
 }
 
 # 内核切换的 enable/disable 收尾 + 状态核验(单一职责, 便于打桩测试)。
