@@ -93,6 +93,8 @@ source "$REPO_DIR/lib/versions.sh"
 source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 pdg 迁移共用, 免漂移)
 # shellcheck source=lib/mosdns.sh
 source "$REPO_DIR/lib/mosdns.sh" # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
+# shellcheck source=lib/cidr.sh
+source "$REPO_DIR/lib/cidr.sh"   # 内网卡段校验 + 抓包/手输并行(与 pdg detect-cidr 共用)
 
 # ── 事务性安装: 失败自动回滚(只撤本次新装的, 不误伤既有可用部署)──
 INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
@@ -343,13 +345,29 @@ if [[ -z "$INTERNAL_CIDR" ]]; then
   if [[ -n "$NONINT" ]]; then
     INTERNAL_CIDR="172.16.0.0/12"
   else
-    echo; c_y "识别【内网卡来源段】(抓包 ~90s, 期间用手机走【内网卡/蜂窝, 关 WiFi】访问本机一次)"
-    DET_CIDR=$(bash "$REPO_DIR/lib/detect-internal-range.sh" 90 "$SERVER_IP" || true)
-    if [[ -n "$DET_CIDR" ]]; then c_g "抓到内网卡段: $DET_CIDR"
-    else c_y "没抓到(手机没走内网卡? 云安全组挡了 80/ICMP?)。可先手填(如 172.22.0.0/16),"
-         c_y "装完再从容跑 \`sudo pdg detect-cidr\` 重新识别并一键应用。"; fi
-    ask INTERNAL_CIDR "内网卡来源段 CIDR [${DET_CIDR:-请手填如 172.22.0.0/16}]: " "${DET_CIDR:-}"
-    [[ -n "$INTERNAL_CIDR" ]] || die "必须填内网卡来源段 (形如 172.22.0.0/16; 非交互/无终端请用 PDG_INTERNAL_CIDR)"
+    echo; c_y "识别【内网卡来源段】(抓包 ~90s; 期间可随时直接手输网段, 谁先给出结果就用谁)"
+    # 抓包与手输并行: 知道网段的人不必干等 90 秒, 抓到了也不用再确认一遍。
+    INTERNAL_CIDR="$(pdg_detect_cidr_race 90 "$SERVER_IP" || true)"
+    if [[ -n "$INTERNAL_CIDR" ]]; then
+      c_g "内网卡来源段: $INTERNAL_CIDR"
+    else
+      c_y "没抓到(手机没走内网卡? 云安全组挡了 80/ICMP?)。"
+      c_y "先手填一个即可; 装完再从容跑 \`sudo pdg detect-cidr\` 重新识别并一键应用。"
+    fi
+    # 取不到/填错都再给机会 —— 等满 90 秒后因一个空回车就回滚整场安装, 那是白等。
+    _cidr_try=0
+    while ! pdg_cidr_valid "$INTERNAL_CIDR"; do
+      [[ -n "$INTERNAL_CIDR" ]] && c_y "「$INTERNAL_CIDR」不是合法网段(形如 172.22.0.0/16)。"
+      _cidr_try=$((_cidr_try + 1))
+      if [[ "$_cidr_try" -gt 3 ]]; then
+        die "未取得内网卡来源段 (形如 172.22.0.0/16; 非交互/无终端请用 PDG_INTERNAL_CIDR)"
+      fi
+      # 无终端时再问也白问(ask 会立刻回空), 直接给出可操作的出路, 不空转三次
+      if ! { true < /dev/tty; } 2>/dev/null; then
+        die "无可用终端且未取得内网卡来源段 (请用 PDG_INTERNAL_CIDR=172.22.0.0/16 重跑)"
+      fi
+      ask INTERNAL_CIDR "内网卡来源段 CIDR (如 172.22.0.0/16): " ""
+    done
   fi
 fi
 

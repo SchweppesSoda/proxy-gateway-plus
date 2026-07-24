@@ -983,10 +983,16 @@ cmd_report(){ need_root report; python3 /opt/pdg-bot/report.py "$@"; }
 cmd_detect_cidr(){
   need_root detect-cidr
   local dur="${1:-30}" sip det cur
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/cidr.sh" 2>/dev/null || { echo "❌ 读不到 lib/cidr.sh"; return 1; }
   sip=$(grep -oE '"[0-9.]+/32"' /etc/sing-box/config.json 2>/dev/null | tr -d '"' | grep -v '^127' | head -1 | cut -d/ -f1)
-  det=$(bash "$REPO_DIR/lib/detect-internal-range.sh" "$dur" "${sip:-本机IP}" || true)
+  # 抓包与手输并行(与装机同款): 知道网段就直接输, 不必干等抓包
+  det=$(pdg_detect_cidr_race "$dur" "${sip:-本机IP}" || true)
   if [[ -z "$det" ]]; then
     c_y "没抓到。确认手机走内网卡(关 WiFi), 或云安全组放行入站 80/ICMP, 再重试。"; return 1
+  fi
+  if ! pdg_cidr_valid "$det"; then
+    c_y "「$det」不是合法网段(形如 172.22.0.0/16), 未改动。"; return 1
   fi
   cur=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
   echo "  检测到内网卡段: $det"

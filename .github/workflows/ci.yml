@@ -100,6 +100,9 @@ jobs:
       - name: "parse_link 多协议回归 (各协议链接 + Surge ss 行字段映射)"
         run: python3 tests/test-parse-links.py
 
+      - name: "内网卡段取值回归 (真 pty: 抓包/手输并行谁先用谁 + 形态校验 + 半截输入不漏)"
+        run: python3 tests/test-cidr-input.py
+
       - name: "发布链路回归 (tag-only 安装/更新 + 文档版本)"
         run: bash tests/test-release-flow.sh
 
