@@ -19,13 +19,18 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-sed -n '/^_activate_mihomo_core(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"  > "$WORK/fn.sh"
-sed -n '/^migrate_drop_singbox(){/,/^}/p'  "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
+sed -n '/^_pdg_singbox_is_ours(){/,/^}/p'   "$ROOT/deploy/bot/pdg.sh"  > "$WORK/fn.sh"
+sed -n '/^_pdg_drop_singbox_files(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
+sed -n '/^_activate_mihomo_core(){/,/^}/p'   "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
+sed -n '/^migrate_drop_singbox(){/,/^}/p'    "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
 grep -q '^_activate_mihomo_core(){' "$WORK/fn.sh" || { echo "抽取 _activate_mihomo_core 失败"; exit 1; }
 grep -q '^migrate_drop_singbox(){'  "$WORK/fn.sh" || { echo "抽取 migrate_drop_singbox 失败"; exit 1; }
+grep -q '^_pdg_singbox_is_ours(){' "$WORK/fn.sh" || { echo "抽取归属助手失败"; exit 1; }
 # 绝对路径 → 沙箱(控制流与变量引用一字未改)
 sed -i -e 's#/etc/#$SB/etc/#g' -e 's#/opt/pdg-bot#$SB/opt/pdg-bot#g' \
        -e 's#/usr/local/bin/#$SB/usr/local/bin/#g' "$WORK/fn.sh"
+# 归属判据里的 ExecStart 特征行是**目标机上的真实路径**, 不能被上面的沙箱重写改掉
+sed -i -e 's#\$SB/usr/local/bin/sing-box run -c \$SB/etc/sing-box/config#/usr/local/bin/sing-box run -c /etc/sing-box/config#' "$WORK/fn.sh"
 
 mk(){   # $1=当前 backend 标记; 造出"仍是 sing-box 的老机器"现场
   SB="$WORK/root"; rm -rf "$SB"
@@ -37,7 +42,21 @@ mk(){   # $1=当前 backend 标记; 造出"仍是 sing-box 的老机器"现场
   printf 'y\n'  > "$SB/etc/mihomo/config.yaml"
   printf '{}\n' > "$SB/etc/sing-box/config.json"
   printf '#!/bin/sh\nexit 0\n' > "$SB/usr/local/bin/sing-box"; chmod 755 "$SB/usr/local/bin/sing-box"
-  printf '[Unit]\n' > "$SB/etc/systemd/system/sing-box.service"
+  # 用**老版装机真正生成的** unit 形态(lib/units.sh 历史模板 pdg_unit_singbox), 否则归属
+  # 判定认不出它是本项目的东西 —— 那正是第三方 sing-box 该走的分支, 不能拿它冒充自家的。
+  cat > "$SB/etc/systemd/system/sing-box.service" <<'U'
+[Unit]
+Description=sing-box
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+U
   export SB
 }
 
@@ -139,6 +158,35 @@ rm -f "$SB/usr/local/bin/sing-box" "$SB/etc/systemd/system/sing-box.service"
 out=$(run "RENDER_MODE=raise" migrate_drop_singbox)   # 渲染故意会炸: 短路了就压根不会调到
 { grep -q 'RC=0' <<<"$out" && ! grep -q 'ValueError' <<<"$out"; } \
   && ok "幂等: 已是纯 mihomo → 短路返回0(不重复迁移)" || bad "7: out=$out"
+
+# ── 8. 归属保护: 机器上是**第三方**的 sing-box(不是本项目装的)→ 一律不删 ──
+# 用户完全可能自己在跑一个 sing-box 干别的; 删掉别人的东西不可逆。
+tp_unit(){ cat > "$SB/etc/systemd/system/sing-box.service" <<'U'
+[Unit]
+Description=sing-box service (third party, hand rolled)
+[Service]
+ExecStart=/opt/mysingbox/sing-box run -c /opt/mysingbox/my.json
+U
+}
+mk singbox; tp_unit
+out=$(run "RENDER_MODE=ok" migrate_drop_singbox)
+{ [[ -e "$SB/etc/systemd/system/sing-box.service" ]] && [[ -e "$SB/usr/local/bin/sing-box" ]]; } \
+  && ok "第三方 sing-box: 迁移完成后文件原样保留(不删别人的东西)" || bad "8: 第三方 sing-box 被删了"
+grep -q '无法确认是本项目安装的' <<<"$out" \
+  && ok "第三方 sing-box: 明确告知已保留 + 给出手工清理指引" || bad "8b: 没有保留提示: $out"
+
+# backend 已是 mihomo 且只剩第三方 sing-box → 不该每次更新都去动它(也不重复迁移)
+mk mihomo; tp_unit
+out=$(run "RENDER_MODE=raise" migrate_drop_singbox)   # 渲染会炸: 真去迁移就会暴露
+{ grep -q 'RC=0' <<<"$out" && ! grep -q 'ValueError' <<<"$out" \
+  && [[ -e "$SB/etc/systemd/system/sing-box.service" ]]; } \
+  && ok "已是 mihomo + 第三方 sing-box: 不重复迁移也不删它" || bad "8c: out=$out"
+
+# 带归属标记的(本项目装的)→ 即便 unit 形态不匹配也认得出来, 该删就删
+mk singbox; tp_unit; : > "$SB/etc/privdns-gateway/singbox.pdg-owned"
+out=$(run "RENDER_MODE=ok" migrate_drop_singbox)
+[[ ! -e "$SB/etc/systemd/system/sing-box.service" ]] \
+  && ok "带归属标记: 认定为本项目安装 → 正常清理" || bad "8d: 归属标记未生效"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
