@@ -2,6 +2,19 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-25 — v1.6.0(彻底移除 sing-box 运行时,mihomo 成唯一内核)
+
+**破坏性变更**。sing-box 被钉死在 1.12.x 是个死胡同:1.13 移除了本网关赖以工作的 `sniff_override_destination`,而它的新写法(`action: sniff`)**不覆盖目标地址**、会导致流量回环 —— 也就是说 sing-box 这条路只会越走越窄。mihomo(clash.meta)的 `sniffer.override-destination` 没有版本天花板、活跃维护,且 iOS 位置改写(WLOC)本就只有 mihomo 有路由层。故本版把 mihomo 从"可选内核(原型)"提为**唯一内核**。
+
+- **旧的 sing-box 机器 `sudo pdg update` 时自动迁移**,无需任何手工操作:下 mihomo → 从现有配置渲染 → `mihomo -t` 校验 → 换 nft 入站模型(REDIRECT→7893)→ 起 mihomo 停 sing-box → 删掉 sing-box 的 unit 与二进制。**出口、分流规则、故障组、证书、DoT、mosdns 全程不动**(数据模型共用,见下)。
+- **迁移是事务性的,且绝不静默丢出口**。遇到 mihomo 无法无损转换的出站(如 wireguard/shadowtls),迁移**逐个点名**该出口并返回失败 → `pdg update` 回滚到更新前快照,用户仍留在旧 sing-box 版本、数据无损;在 bot 里删/换掉该出口后重跑 update 即可。渲染异常、`mihomo -t` 不过、nft 应用失败、内核起不来同样各自带出**真实原因**并回滚,不留半迁移态。
+- **`pdg switch-core` 命令与 Bot 的换核菜单项一并移除**(只剩一个内核,切换已无意义)。`lib/units.sh` 的 `pdg_unit_singbox`、`lib/versions.sh` 的 `SINGBOX_VER`/哈希、`deploy/firewall/nftables.conf`(sing-box 变体)一并删除。
+- **`PDG_CORE` 环境变量取消**,装机恒装 mihomo;README 一键安装命令**形态不变**。
+- **`/etc/sing-box/config.json` 仍是 bot 的唯一数据模型**(mihomo 配置由 `sb2mihomo` 从它渲染),`/etc/sing-box/{config.json,rs,ui}` 路径保持不变 —— 因此备份/恢复、快照回滚、面板全部照旧可用,跨版本快照也仍能回滚(回滚一律按 mihomo 起核,并清掉快照可能带回的 sing-box 残留)。
+- **自动迁移的健壮性**:现网 nft 认不出 SSH 端口时(自定义/异形防火墙)不再直接判死 —— 那会把用户永久挡在旧版上;改为退回问 sshd 实际在听哪个口,再退回 22。
+
+**测试**:`tests/test-switch-core*.sh` / `e2e-switch-core.sh` 重定位为迁移测试 —— 新增 `test-migrate-drop-singbox.sh`(14 项:各类失败都要点名原因+返回非0+回滚标记+不误删 sing-box;成功要清干净;幂等)与 `e2e-drop-singbox.sh`(**真** mihomo 二进制 + 3 个真实协议出口:迁移后一个不丢、`mihomo -t` 通过、防火墙已换模型;注入 wireguard 出口必须点名拒绝且不留半迁移态);`e2e-update.sh` 现在整条 `pdg update` 都跑在"老 sing-box 机器"上,断言更新后已迁为 mihomo;`test-outbound-schema.sh` 改为验证**真实生产链路**(parse_link → sb2mihomo → 真 `mihomo -t`),11 个协议全过。
+
 ## 2026-07-24 — v1.5.13(交互全新装挂在平台探测的 `cat`,issue #2)
 
 **用户报告修复(issue #2)**:新装机交互式安装,在识别到内网卡网段后立刻失败并回滚,屏幕上只有"安装失败 → 回滚",没有任何真原因;而**非交互式安装一切正常**。日志停在这一句:

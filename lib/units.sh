@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# systemd unit 单一事实源。install.sh(装机)与 pdg switch-core(切内核)都从这里
-# 生成内核 / pdg-mitm 的 unit, 杜绝两处手写漂移 —— 历史坑: switch-core 生成的
+# systemd unit 单一事实源。install.sh(装机)与 pdg 的 sing-box→mihomo 迁移都从这里
+# 生成内核 / pdg-mitm 的 unit, 杜绝两处手写漂移 —— 历史坑: 换核时生成的
 # mihomo.service 漏了 Environment=SAFE_PATHS, 与装机版不一致。
 #
 # 各函数把 unit 内容打到 stdout, 由调用方重定向落盘, 例:
@@ -25,21 +25,6 @@ WantedBy=multi-user.target
 EOF
 }
 
-pdg_unit_singbox(){ cat <<'EOF'
-[Unit]
-Description=sing-box
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
 pdg_unit_pdg_mitm(){ cat <<'EOF'
 [Unit]
 Description=pdg-mitm (PrivDNS Gateway MITM plugins)
@@ -54,11 +39,10 @@ WantedBy=multi-user.target
 EOF
 }
 
-# 内核 svc 名 → 对应 unit 生成函数(供切核统一取用)。
+# 内核 svc 名 → 对应 unit 生成函数(mihomo 为唯一内核; 保留此壳以便将来扩展/调用方不改)。
 pdg_unit_for_core_svc(){
   case "$1" in
     mihomo)   pdg_unit_mihomo ;;
-    sing-box) pdg_unit_singbox ;;
     *) return 1 ;;
   esac
 }

@@ -16,17 +16,11 @@ REPO_DIR = "/opt/privdns-gateway"   # 已装仓库(比对部署文件是否与�
 os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
 
 def _core():
-    """活动内核: mihomo / singbox(读不到标记默认 singbox)。"""
-    try:
-        b = open(BACKEND_MARKER, encoding="utf-8").read().strip()
-        if b in ("mihomo", "singbox"):
-            return b
-    except OSError:
-        pass
-    return "singbox"
+    """活动内核: v1.6.0 起恒 mihomo(彻底移除 sing-box 运行时)。"""
+    return "mihomo"
 
 def _core_svc():
-    return "mihomo" if _core() == "mihomo" else "sing-box"
+    return "mihomo"
 
 def _platform():
     """手机平台: ios / android(读不到默认 android)。用于跳过平台不相关的检查。"""
@@ -170,22 +164,11 @@ def check_services():
     return ("fail", "服务", "未运行: " + ", ".join(bad)) if bad \
         else ("ok", "服务", "/".join(names) + " 都在")
 
-def check_singbox_version():
-    if _core() == "mihomo":
-        _, out, _ = _run(["mihomo", "-v"])
-        m = re.search(r"v?(\d+\.\d+\.\d+)", out or "")
-        return ("ok", "mihomo 版本", "v" + m.group(1) + " ✓(版本随项目发布更新)") if m \
-            else ("warn", "mihomo 版本", "读不到版本")
-    _, out, _ = _run(["sing-box", "version"])
-    m = re.search(r"version\s+(\d+)\.(\d+)", out)
-    if not m:
-        return ("warn", "sing-box 版本", "读不到版本")
-    major, minor = int(m.group(1)), int(m.group(2)); v = f"{major}.{minor}"
-    if (major, minor) == (1, 12):
-        return ("ok", "sing-box 版本", v + ".x ✓")
-    if (major, minor) >= (1, 13):
-        return ("fail", "sing-box 版本", v + " 太新! 1.13+ 移除了 sniff_override_destination, 网关失效, 须降回 1.12.x")
-    return ("warn", "sing-box 版本", v + " 偏旧, 建议 1.12.x")
+def check_core_version():
+    _, out, _ = _run(["mihomo", "-v"])
+    m = re.search(r"v?(\d+\.\d+\.\d+)", out or "")
+    return ("ok", "mihomo 版本", "v" + m.group(1) + " ✓(版本随项目发布更新)") if m \
+        else ("warn", "mihomo 版本", "读不到版本")
 
 def check_dot_arecord():
     d = _dot_domain(); sip = _server_ip()
@@ -294,10 +277,7 @@ def check_redirect():
     """mihomo 模式: 内网卡来源的 80/443 必须 REDIRECT 到 mihomo 的 redir 口, 否则代理链路是断的。
 
     专门补的一项: 这条规则曾被 iOS GMS 清理迁移整行删掉, 而 doctor 一路全绿 —— 防火墙那项
-    只查"敏感端口有没有对全网开放", 规则整条消失反而更"干净", 于是线上代理断了好几天没人发现。
-    sing-box 模式没有这条 REDIRECT(走各自入站)→ 返回 None 跳过, 不误报。"""
-    if _core() != "mihomo":
-        return None
+    只查"敏感端口有没有对全网开放", 规则整条消失反而更"干净", 于是线上代理断了好几天没人发现。"""
     port = _mihomo_redir_port()
 
     def _sources():
@@ -361,36 +341,16 @@ def check_gms():
             return ("warn", "GMS 残留", "iOS 不应有 GMS 5228-5230, 检出于 " + "、".join(residue)
                     + "; 运行 sudo pdg __migrate 清理(自定义防火墙形态需手动移除)。")
         return None
-    if _core() == "mihomo":
-        # mihomo: 5228-5230 由 nft prerouting REDIRECT 到 redir 端口 + sniffer 处理, 不在 input accept
-        _, pre, _ = _run(["nft", "list", "chain", "inet", "pdg", "prerouting"])
-        if not pre:
-            try:
-                pre = open("/etc/nftables.conf").read()
-            except OSError:
-                pre = ""
-        ok_mh = any("saddr" in ln and "5228" in ln and "redirect" in ln for ln in pre.splitlines())
-        return ("ok", "GMS 推送", "GMS/FCM 5228-5230 已启用(nft REDIRECT→mihomo 嗅探)") if ok_mh \
-            else ("warn", "GMS 推送", "mihomo 模式 5228-5230 未在 nft prerouting REDIRECT, 检查防火墙模板是否生效。")
-    try:
-        have = {i.get("listen_port") for i in json.load(open(SB)).get("inbounds", [])}
-    except Exception:  # noqa: BLE001
-        have = set()
-    sb_ok = {5228, 5229, 5230} <= have
-    _, out, _ = _run(["nft", "list", "chain", "inet", "pdg", "input"])
-    if not out:
-        _, out, _ = _run(["nft", "list", "chain", "inet", "filter", "input"])
-    if not out:                                  # 没 nft 权限/没装时退回看 on-disk 配置
+    # mihomo(唯一内核): 5228-5230 由 nft prerouting REDIRECT 到 redir 端口 + sniffer 处理, 不在 input accept
+    _, pre, _ = _run(["nft", "list", "chain", "inet", "pdg", "prerouting"])
+    if not pre:
         try:
-            out = open("/etc/nftables.conf").read()
+            pre = open("/etc/nftables.conf").read()
         except OSError:
-            out = ""
-    fw_ok = any("saddr" in ln and "5228" in ln and "tcp" in ln and "accept" in ln
-                for ln in out.splitlines())      # 覆盖原装形态(内网来源 + 5228-5230 区间)即可
-    if sb_ok and fw_ok:
-        return ("ok", "GMS 推送", "GMS/FCM 5228-5230 已启用")
-    return ("warn", "GMS 推送", "GMS/FCM 推送端口未完整启用; 运行 sudo pdg restart 或 sudo pdg 触发迁移。"
-                                "若使用自定义防火墙, 请手动放行内网卡段 → 5228-5230/tcp。")
+            pre = ""
+    ok_mh = any("saddr" in ln and "5228" in ln and "redirect" in ln for ln in pre.splitlines())
+    return ("ok", "GMS 推送", "GMS/FCM 5228-5230 已启用(nft REDIRECT→mihomo 嗅探)") if ok_mh \
+        else ("warn", "GMS 推送", "5228-5230 未在 nft prerouting REDIRECT, 检查防火墙模板是否生效。")
 
 def _internal_seq_block(conf):
     """截取 mosdns config 里 internal_sequence 一段文本 (到下一个顶层 '  - tag:' 为止)。"""
@@ -474,14 +434,10 @@ def check_dns():
     return ("ok", "本机DNS", "mosdns 应答正常") if out.strip() \
         else ("fail", "本机DNS", "127.0.0.1:53 不应答(mosdns?)")
 
-def check_singbox_config():
-    if _core() == "mihomo":
-        rc, out, err = _run(["mihomo", "-t", "-d", "/etc/mihomo", "-f", MIHOMO_CFG], t=20)
-        return ("ok", "mihomo 配置", "check 通过") if rc == 0 \
-            else ("fail", "mihomo 配置", "check 失败: " + (out + err)[-200:])
-    rc, out, err = _run(["sing-box", "check", "-c", SB], t=20)
-    return ("ok", "sing-box 配置", "check 通过") if rc == 0 \
-        else ("fail", "sing-box 配置", "check 失败: " + (out + err)[-200:])
+def check_core_config():
+    rc, out, err = _run(["mihomo", "-t", "-d", "/etc/mihomo", "-f", MIHOMO_CFG], t=20)
+    return ("ok", "mihomo 配置", "check 通过") if rc == 0 \
+        else ("fail", "mihomo 配置", "check 失败: " + (out + err)[-200:])
 
 # ── 深度(慢速)端到端检查: `pdg doctor --deep` 用, 仍只读 ──
 def check_deep_dot_handshake():
@@ -710,23 +666,20 @@ def check_mitm():
         hij = ""
     if not all(d in hij for d in GS_LOC):
         return ("fail", "MITM 插件", "mitm_hijack.txt 未含 gs-loc 接管域名(mosdns 未强制劫持, 重开一次 WLOC)")
-    # 当前内核的 MITM 路由: mihomo 需 MITM-OUT 出站 + gs-loc → MITM-OUT 规则; sing-box 无路由层
-    if _core() == "mihomo":
-        try:
-            mc = json.load(open(MIHOMO_CFG))
-            has_out = any(p.get("name") == "MITM-OUT" for p in mc.get("proxies", []))
-            has_rule = any(("MITM-OUT" in r) and ("gs-loc" in r) for r in mc.get("rules", []))
-        except Exception:  # noqa: BLE001
-            has_out = has_rule = False
-        if not (has_out and has_rule):
-            return ("fail", "MITM 插件", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
-    else:
-        return ("fail", "MITM 插件", "WLOC 开启但内核为 sing-box(无 MITM 路由层), 请 pdg switch-core mihomo")
+    # MITM 路由(mihomo): 需 MITM-OUT 出站 + gs-loc → MITM-OUT 规则。
+    try:
+        mc = json.load(open(MIHOMO_CFG))
+        has_out = any(p.get("name") == "MITM-OUT" for p in mc.get("proxies", []))
+        has_rule = any(("MITM-OUT" in r) and ("gs-loc" in r) for r in mc.get("rules", []))
+    except Exception:  # noqa: BLE001
+        has_out = has_rule = False
+    if not (has_out and has_rule):
+        return ("fail", "MITM 插件", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
     return ("ok", "MITM 插件", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
 
-ALL = [check_platform, check_services, check_singbox_version, check_dot_arecord, check_dot_domain_sync,
+ALL = [check_platform, check_services, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_nft, check_redirect, check_gms, check_mosdns_ratelimit, check_mem,
-       check_cert, check_dns, check_singbox_config, check_mitm_structure, check_mitm]
+       check_cert, check_dns, check_core_config, check_mitm_structure, check_mitm]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加

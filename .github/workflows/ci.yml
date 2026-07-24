@@ -82,11 +82,11 @@ jobs:
       - name: "低内存模式回归 (fixture meminfo 解析/渲染/迁移幂等)"
         run: bash tests/test-lowmem.sh
 
-      - name: "switch-core 内核切换纪律回归 (假 systemctl+重启模拟: 只起一个内核/跨核回滚/unit 无漂移)"
-        run: bash tests/test-switch-core.sh
+      - name: "内核激活纪律回归 (假 systemctl+重启模拟: 只起一个内核/失败回滚/unit 无漂移)"
+        run: bash tests/test-core-activate.sh
 
-      - name: "switch-core 失败诊断回归 (转不了的出口逐个列名/内核真实报错/日志线索, 不再一句话糊过去)"
-        run: bash tests/test-switch-core-diag.sh
+      - name: "sing-box→mihomo 迁移回归 (转不了的出口逐个列名/失败非0且回滚标记/成功清干净/幂等)"
+        run: bash tests/test-migrate-drop-singbox.sh
 
       - name: "平台隔离安装/迁移矩阵 (marker 证据回退/GMS 仅安卓/iOS GMS 清理/服务集按平台)"
         run: bash tests/test-platform-install.sh
@@ -231,9 +231,9 @@ jobs:
       - name: E2E 加落地+分流 (真 parse_link/apply_sb → 真 mihomo -t → 真 mosdns 解析)
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-exit-rule.sh
-      - name: E2E 内核切换 (两内核真二进制真切换 + 不可转换出口必须点名拒绝)
+      - name: E2E sing-box→mihomo 迁移 (真 mihomo 二进制 + 真协议出口一个不丢 + 不可转换出口必须点名拒绝)
         env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-switch-core.sh
+        run: bash tests/e2e-drop-singbox.sh
       - name: "E2E 全新安装 (真跑 install.sh: 落地全套 / 拒绝重装 / 失败回滚干净)"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-install.sh

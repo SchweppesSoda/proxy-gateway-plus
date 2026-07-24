@@ -95,15 +95,12 @@ def main():
         if checks._platform() == "ios":
             _svcs.append("pdg-mitm")
     else:
-        _svcs = ["mosdns", "sing-box", "pdg-bot"]
+        _svcs = ["mosdns", "mihomo", "pdg-bot"]
     _svcs += ["pdg-rules-update.timer", "pdg-health.timer", "vnstat"]
     parts.append(section("服务状态", "\n".join(
         f"  {s:<14}{run(['systemctl', 'is-active', s])}" for s in _svcs)))
-    # 内核版本/日志一律跟着当前后端走: mihomo 机上再固定打印 sing-box, 只会得到一段
-    # "command not found" 而真正的内核版本与日志全缺席(诊断报告最该有的两项)。
-    kernel = "mihomo" if (checks is not None and checks._core() == "mihomo") else "sing-box"
-    kver = ["mihomo", "-v"] if kernel == "mihomo" else ["sing-box", "version"]
-    parts.append(section(f"{kernel} 版本", run(kver)))
+    # 内核版本: v1.6.0 起恒 mihomo(已彻底移除 sing-box 运行时)。
+    parts.append(section("mihomo 版本", run(["mihomo", "-v"])))
     parts.append(section("监听端口 (ss -lntu)", run(["ss", "-lntu"])))
     parts.append(section("证书 (CN / 有效期)",
                          run(["openssl", "x509", "-in", cert, "-noout", "-subject", "-enddate"])))
@@ -113,8 +110,8 @@ def main():
     if fw_rc != 0:
         fw = run(["nft", "list", "chain", "inet", "filter", "input"])
     parts.append(section("防火墙 input 链", fw))
-    parts.append(section(f"最近日志 (pdg-bot / mosdns / {kernel}, 80 行)",
-                         run(["journalctl", "-u", "pdg-bot", "-u", "mosdns", "-u", kernel,
+    parts.append(section("最近日志 (pdg-bot / mosdns / mihomo, 80 行)",
+                         run(["journalctl", "-u", "pdg-bot", "-u", "mosdns", "-u", "mihomo",
                               "-n", "80", "--no-pager", "-o", "short-iso"], t=20)))
 
     text = "".join(parts)

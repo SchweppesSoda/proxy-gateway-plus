@@ -62,13 +62,13 @@ exit 0
 S
 chmod 755 /usr/local/bin/mosdns
 fi
-if ! command -v sing-box >/dev/null 2>&1; then
-cat > /usr/local/bin/sing-box <<S
+if ! command -v mihomo >/dev/null 2>&1; then
+cat > /usr/local/bin/mihomo <<S
 #!/bin/sh
-case "\$1" in version) echo "sing-box version $SINGBOX_VER";; check) exit 0;; esac
+case "\$1" in -v|version) echo "Mihomo Meta $MIHOMO_VER linux amd64";; -t) exit 0;; esac
 exit 0
 S
-chmod 755 /usr/local/bin/sing-box
+chmod 755 /usr/local/bin/mihomo
 fi
 # tcpdump 桩: 让 detect-internal-range.sh 解析出一个确定的内网卡段(交互用例的 CIDR 探测)
 cat > /usr/local/bin/tcpdump <<'S'

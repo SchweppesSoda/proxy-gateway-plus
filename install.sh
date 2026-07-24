@@ -5,7 +5,7 @@
 # 非交互/自动化: 预置 PDG_* 环境变量 + PDG_NONINTERACTIVE=1 (见 docs/INSTALL.md)。
 #   PDG_SERVER_IP PDG_SSH_PORT PDG_INTERNAL_CIDR PDG_BOT_TOKEN PDG_ALLOWED PDG_DOT_DOMAIN
 #   PDG_SKIP_CERT=1  跳过 certbot, 生成自签占位证书 (之后用 bot 补正式证书)
-# 做什么: 装 mosdns + sing-box(1.12) + 管理 bot + 防火墙 + DoT 证书。
+# 做什么: 装 mosdns + mihomo + 管理 bot + 防火墙 + DoT 证书。
 #   自动识别公网IP / 内网卡段; DNS(域名 A 记录) 那步留给你自己做; 落地出口装好后用 bot 加。
 # 也支持 curl|bash 直接跑: curl -fsSL <raw>/install.sh | sudo bash  (脚本会自动拉取仓库)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_URL="https://github.com/misaka-cpu/privdns-gateway.git"
 CERT_DIR="/etc/mosdns/certs"
 NONINT="${PDG_NONINTERACTIVE:-}"
-# 二进制版本(MOSDNS_VER/SINGBOX_VER)+ 钉死 SHA256 来自 lib/versions.sh, 自举进仓库后 source(见下)
+# 二进制版本(MOSDNS_VER/MIHOMO_VER)+ 钉死 SHA256 来自 lib/versions.sh, 自举进仓库后 source(见下)
 
 c_g(){ echo -e "\033[1;32m[*]\033[0m $*"; }
 c_y(){ echo -e "\033[1;33m[!]\033[0m $*"; }
@@ -90,7 +90,7 @@ fi
 # shellcheck source=lib/versions.sh
 source "$REPO_DIR/lib/versions.sh"
 # shellcheck source=lib/units.sh
-source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 switch-core 共用, 免漂移)
+source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 pdg 迁移共用, 免漂移)
 # shellcheck source=lib/mosdns.sh
 source "$REPO_DIR/lib/mosdns.sh" # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
 
@@ -98,7 +98,7 @@ source "$REPO_DIR/lib/mosdns.sh" # mosdns 劫持形态单一事实源(与 hijack
 INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
 # 安装状态: 全部在注册 EXIT trap 前初始化 —— rollback 在 set -u 下读到未赋值的变量会
 # 二次崩溃, 把最初的安装错误盖掉, 还会漏掉它后面的 nftables/resolved/resolv.conf 还原。
-PRIOR_INSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0
+PRIOR_INSTALL=0; MOSDNS_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0
 # 二进制安装事务台账: 每项 "目标路径|装前是否存在(0/1)|备份路径|装前SHA"。
 # 只要"即将改动目标"就先记一笔 —— *_INSTALLED 表示的是"装成功了吗", 不能拿来表示
 # "这次碰过目标没有": install 写了一半才失败时它还是 0, 回滚就会漏掉那个半成品。
@@ -302,41 +302,25 @@ if ! command -v mosdns >/dev/null; then
   rm -rf "$t"
 fi
 
-# ── 3. 内核: sing-box 1.12.x(默认)或 mihomo(PDG_CORE=mihomo, 原型)──
-CORE="${PDG_CORE:-singbox}"
-[[ "$CORE" == singbox || "$CORE" == mihomo ]] || die "PDG_CORE 只能是 singbox 或 mihomo"
-if [[ "$CORE" == mihomo ]]; then
-  CORE_SVC=mihomo
-  if ! mihomo -v 2>/dev/null | grep -q "$MIHOMO_VER"; then
-    c_g "下载 mihomo $MIHOMO_VER ($MARCH)…"
-    t=$(mktemp -d)
-    curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${MARCH}-${MIHOMO_VER}.gz" -o "$t/mihomo.gz"
-    pdg_verify_sha256 "$t/mihomo.gz" "${PDG_SHA256[mihomo-$MARCH]:-}" "mihomo $MIHOMO_VER ($MARCH)" \
-      || { rm -rf "$t"; die "mihomo 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
-    gunzip -c "$t/mihomo.gz" > "$t/mihomo"
-    _stash_bin /usr/local/bin/mihomo || die "备份既有 mihomo 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
-    install -m755 "$t/mihomo" /usr/local/bin/mihomo
-    # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;
+# ── 3. 内核: mihomo(clash.meta)—— 唯一流量内核 ──
+# 历史上支持 sing-box(1.12.x)/mihomo 二选一; 但 sing-box 1.13 移除了本网关依赖的
+# sniff_override_destination、被钉死在死胡同, 故 v1.6.0 起彻底移除 sing-box 运行时,
+# mihomo 成唯一内核。旧的 sing-box 机器 `pdg update` 时由 migrate_drop_singbox 自动迁移。
+CORE=mihomo
+CORE_SVC=mihomo
+if ! mihomo -v 2>/dev/null | grep -q "$MIHOMO_VER"; then
+  c_g "下载 mihomo $MIHOMO_VER ($MARCH)…"
+  t=$(mktemp -d)
+  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${MARCH}-${MIHOMO_VER}.gz" -o "$t/mihomo.gz"
+  pdg_verify_sha256 "$t/mihomo.gz" "${PDG_SHA256[mihomo-$MARCH]:-}" "mihomo $MIHOMO_VER ($MARCH)" \
+    || { rm -rf "$t"; die "mihomo 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
+  gunzip -c "$t/mihomo.gz" > "$t/mihomo"
+  _stash_bin /usr/local/bin/mihomo || die "备份既有 mihomo 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
+  install -m755 "$t/mihomo" /usr/local/bin/mihomo
+  # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;
   # 回滚已改看 BIN_TXN 事务台账(它才代表"这次碰过目标没有")。
   MIHOMO_INSTALLED=1
-    rm -rf "$t"
-  fi
-else
-  CORE_SVC=sing-box
-  if ! sing-box version 2>/dev/null | grep -q "version 1.12"; then
-    c_g "下载 sing-box $SINGBOX_VER ($MARCH)…"
-    t=$(mktemp -d)
-    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${MARCH}.tar.gz" -o "$t/sb.tgz"
-    pdg_verify_sha256 "$t/sb.tgz" "${PDG_SHA256[singbox-$MARCH]:-}" "sing-box $SINGBOX_VER ($MARCH)" \
-      || { rm -rf "$t"; die "sing-box 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
-    tar --no-same-owner -xzf "$t/sb.tgz" -C "$t"
-    _stash_bin /usr/local/bin/sing-box || die "备份既有 sing-box 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
-    install -m755 "$t"/sing-box-*/sing-box /usr/local/bin/sing-box
-    # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;
-  # 回滚已改看 BIN_TXN 事务台账(它才代表"这次碰过目标没有")。
-  SINGBOX_INSTALLED=1
-    rm -rf "$t"
-  fi
+  rm -rf "$t"
 fi
 
 # ── 4. 收集参数 (env 预置优先; PDG_NONINTERACTIVE=1 则不交互) ──
@@ -489,25 +473,21 @@ PY
 fi
 chmod 700 /etc/sing-box; chmod 600 /etc/sing-box/config.json   # config 含出口密码/uuid
 [[ -e /etc/nftables.conf.pdg-orig ]] || cp -a /etc/nftables.conf /etc/nftables.conf.pdg-orig 2>/dev/null || true  # 供 uninstall 还原
-# 内核后端: 标记 + 防火墙模板(mihomo 用 REDIRECT 入站变体)+ 初始渲染 mihomo 配置
+# 内核后端: 标记(恒 mihomo)+ 防火墙(mihomo REDIRECT 入站变体)+ 初始渲染 mihomo 配置
 printf '%s\n' "$CORE" > /etc/privdns-gateway/backend
-if [[ "$CORE" == mihomo ]]; then
-  render "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
-  install -d -m700 /etc/mihomo
-  python3 - <<PY
+render "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
+install -d -m700 /etc/mihomo
+python3 - <<PY
 import json, os, sys
 sys.path.insert(0, "$REPO_DIR/deploy/bot")
 import sb2mihomo
-model = json.load(open("/etc/sing-box/config.json"))
+model = json.load(open("/etc/sing-box/config.json"))   # config.json 仍是核无关的数据模型
 cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893)
 with open("/etc/mihomo/config.yaml", "w") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)   # JSON 即合法 YAML
 os.chmod("/etc/mihomo/config.yaml", 0o600)
 PY
-else
-  render "$REPO_DIR/deploy/firewall/nftables.conf"      > /etc/nftables.conf
-fi
-# iOS: 防火墙模板对两平台通用, 但 iOS 走 APNs 不需要 GMS 5228-5230 → 渲染后剥掉(sing-box 端口集 + mihomo REDIRECT)。
+# iOS: 走 APNs 不需要 GMS 5228-5230 → 渲染后从 nft 剥掉(accept 端口集 + mihomo REDIRECT 集)。
 if [[ "$PLATFORM" == ios ]]; then
   sed -E -i 's#(tcp dport [{] 53, 80, 81, 443, 853), 5228-5230, 8445 [}] accept#\1, 8445 } accept#' /etc/nftables.conf
   sed -E -i 's#(tcp dport [{] 80, 443), 5228-5230 [}] redirect#\1 } redirect#' /etc/nftables.conf
@@ -539,11 +519,7 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-if [[ "$CORE" == mihomo ]]; then
-  pdg_write_unit pdg_unit_mihomo  /etc/systemd/system/mihomo.service
-else
-  pdg_write_unit pdg_unit_singbox /etc/systemd/system/sing-box.service
-fi
+pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
 
 # pdg-mitm: MITM 插件服务(Feature B, 仅 iOS)。按 /etc/privdns-gateway/mitm.json 加载启用的插件。
 if [[ "$PLATFORM" == ios ]]; then

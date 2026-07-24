@@ -14,9 +14,10 @@ export SAFE_PATHS="${SAFE_PATHS:-/etc/sing-box/ui/dist}"
 c_g(){ echo -e "\033[1;32m$*\033[0m"; }
 c_y(){ echo -e "\033[1;33m$*\033[0m"; }
 need_root(){ [[ $EUID -eq 0 ]] || { echo "请用 root: sudo pdg $*"; exit 1; }; }
-# 活动内核后端(mihomo / singbox; 读不到标记默认 singbox)
-_pdg_core(){ local b; b=$(cat /etc/privdns-gateway/backend 2>/dev/null); [[ "$b" == mihomo || "$b" == singbox ]] && echo "$b" || echo singbox; }
-_pdg_core_svc(){ [[ "$(_pdg_core)" == mihomo ]] && echo mihomo || echo sing-box; }
+# 活动内核后端: v1.6.0 起恒 mihomo(彻底移除 sing-box 运行时)。旧机器的 backend 标记里可能还
+# 写着 singbox, 但由 migrate_drop_singbox 在 update 时迁移 —— 判定一律按 mihomo。
+_pdg_core(){ echo mihomo; }
+_pdg_core_svc(){ echo mihomo; }
 # 手机平台(ios / android; 读不到默认 android)
 _pdg_platform(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[ "$p" == ios || "$p" == android ]] && echo "$p" || echo android; }
 # 平台标记是否明确(status/doctor 据此提示"缺失回退")
@@ -309,14 +310,14 @@ migrate_firewall_to_pdg(){
   if ! _fw_is_stock "$f" "$port" "$cidr"; then
     c_y "检测到旧防火墙含自定义规则/额外端口/额外表 → 不自动迁移(避免静默丢失你的规则)。"
     c_y "  迁移会用标准模板重建(只保留 SSH=$port + 内网段=$cidr)。请任选其一:"
-    c_y "   • 把自定义规则并进 deploy/firewall/nftables.conf 同风格后手动 nft -f; 或"
+    c_y "   • 把自定义规则并进 deploy/firewall/nftables-mihomo.conf 同风格后手动 nft -f; 或"
     c_y "   • sudo pdg migrate-fw 先迁标准部分, 再把自定义规则补到 inet pdg。"
     c_y "  现状: 旧 inet filter 不动(证书 hook/doctor 已兼容它, 不迁也能正常用)。"
     rm -f "$tmp"; return 0
   fi
   c_g "检测到旧版(原装)防火墙 → 迁移到独立表 inet pdg (SSH=$port, 内网段=$cidr)…"
   sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \
-      "$REPO_DIR/deploy/firewall/nftables.conf" > "$tmp"
+      "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$tmp"
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
     c_y "  新规则 nft -c 校验未过, 保留旧防火墙不动。"; rm -f "$tmp"; return 0
   fi
@@ -664,7 +665,6 @@ cmd_snapshot(){
 
 cmd_rollback(){
   need_root rollback; _lock
-  local pre_core; pre_core="$(_pdg_core)"   # 回滚前正在运行的内核(跨内核回滚要据此停旧核)
   # 参数: <序号>(默认0) | --dir <快照目录>(精确指定, 供 update 用) | --git <ref>(回滚后把 REPO_DIR 复位到该提交)
   local idx="" dir="" git_ref="" target
   while [[ $# -gt 0 ]]; do
@@ -707,28 +707,14 @@ cmd_rollback(){
     fi
     panel_sanitized=1
   fi
-  # 内核配置校验: 按**快照记录的** backend(而非当前) 校验快照里对应内核配置
-  local snap_core; snap_core="$(cat "$tree/etc/privdns-gateway/backend" 2>/dev/null)"
-  [[ "$snap_core" == mihomo || "$snap_core" == singbox ]] || snap_core="$(_pdg_core)"
-  # 校验快照里的旧配置要用**快照自带的那个内核**。拿当前(可能刚升上来的新版)内核去校验旧
-  # 配置, 新核不认旧配置时会把回滚自己挡住 —— 而旧核和旧配置本来就该一起回去。
-  # 只有旧快照确实不含内核二进制时, 才退回用当前内核校验, 并明确提示。
-  local snap_svc snap_kbin=""
-  snap_svc="$([[ "$snap_core" == mihomo ]] && echo mihomo || echo sing-box)"
-  [[ -x "$tree/usr/local/bin/$snap_svc" ]] && snap_kbin="$tree/usr/local/bin/$snap_svc"
-  if [[ -z "$snap_kbin" ]] \
-     && { [[ -f "$tree/etc/mihomo/config.yaml" ]] || [[ -f "$tree/etc/sing-box/config.json" ]]; }; then
-    c_y "  快照不含 $snap_svc 二进制(v1.5.8 及更早的快照)→ 只能用当前内核校验旧配置。"
-    c_y "  若下面报\"快照配置 check 失败\", 很可能是新内核不认旧配置(而非快照本身坏), 需手工降内核后再回滚。"
-  fi
-  if [[ "$snap_core" == mihomo ]]; then
-    [[ -f "$tree/etc/mihomo/config.yaml" ]] && { "${snap_kbin:-mihomo}" -t -d "$tree/etc/mihomo" -f "$tree/etc/mihomo/config.yaml" >/dev/null 2>&1 || { echo "❌ 快照的 mihomo 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }; }
-  elif [[ -f "$tree/etc/sing-box/config.json" ]]; then
-    if ! sed "s#/etc/sing-box/rs/#$tree/etc/sing-box/rs/#g" "$tree/etc/sing-box/config.json" > "$tmp/sb.chk"; then
-      echo "❌ 快照的 sing-box 校验副本生成失败, 中止"; rm -rf "$tmp"; return 1
-    fi
-    "${snap_kbin:-sing-box}" check -c "$tmp/sb.chk" >/dev/null 2>&1 || { echo "❌ 快照的 sing-box 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }
-    rm -f "$tmp/sb.chk"
+  # 内核配置校验(v1.6.0 只剩 mihomo)。快照带 mihomo 配置就用 mihomo 校验(优先用快照自带的
+  # mihomo 二进制 —— 拿刚升上来的新核校验旧配置可能误挡回滚)。迁移前(singbox)快照没有 mihomo
+  # 配置, 此处不拦, 留待落盘后从还原出的 config.json 现渲染再核验(见下方内核收尾)。
+  local snap_mbin=""
+  [[ -x "$tree/usr/local/bin/mihomo" ]] && snap_mbin="$tree/usr/local/bin/mihomo"
+  if [[ -f "$tree/etc/mihomo/config.yaml" ]]; then
+    "${snap_mbin:-mihomo}" -t -d "$tree/etc/mihomo" -f "$tree/etc/mihomo/config.yaml" >/dev/null 2>&1 \
+      || { echo "❌ 快照的 mihomo 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }
   fi
   [[ -f "$tree/etc/nftables.conf" ]] && { nft -c -f "$tree/etc/nftables.conf" >/dev/null 2>&1 || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }; }
   echo "回滚到 $(basename "$target") …"
@@ -739,25 +725,27 @@ cmd_rollback(){
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   systemctl daemon-reload
   nft -f /etc/nftables.conf 2>/dev/null || true
-  local new_svc; new_svc="$(_pdg_core_svc)"   # 已是快照恢复后的 backend 对应内核
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
-  if [[ "$(_pdg_core)" != "$pre_core" ]]; then
-    # 跨内核回滚: 旧核 disable+stop, 快照核 enable+start(重生 unit 保正确), 免重启双起
-    local old_svc; old_svc="$([[ "$pre_core" == mihomo ]] && echo mihomo || echo sing-box)"
-    # shellcheck source=/dev/null
-    source "$REPO_DIR/lib/units.sh" 2>/dev/null || true
-    if [[ "$new_svc" == mihomo ]]; then pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
-    else pdg_write_unit pdg_unit_singbox /etc/systemd/system/sing-box.service; fi
-    systemctl daemon-reload
-    # 激活失败必须计入 unrestored: 快照核没起来就不是"已回滚", 不能只 warn 后照报成功。
-    if ! _core_kernel_activate "$new_svc" "$old_svc"; then
-      c_y "  跨内核回滚未完全达标(目标 $new_svc / 旧核 $old_svc), 请 pdg doctor 复查"
-      unrestored+=("内核激活($new_svc)")
-    fi
-    systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
-  else
-    systemctl restart mosdns "$new_svc" pdg-bot pdg-probe81 2>/dev/null || true
+  # v1.6.0: mihomo 是唯一内核。无论快照记录的是 mihomo 还是迁移前的 singbox, 一律起 mihomo ——
+  # config.json 是核无关数据模型, mihomo 总能从它渲染。并清掉快照可能带回来的 sing-box 残留。
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/units.sh" 2>/dev/null || true
+  if [[ ! -f /etc/mihomo/config.yaml ]] && [[ -f /etc/sing-box/config.json ]]; then
+    install -d -m700 /etc/mihomo                # 迁移前快照只有 config.json → 现渲染 mihomo 配置
+    (cd /opt/pdg-bot && python3 -c 'import sys;sys.path.insert(0,"/opt/pdg-bot");import bot;bot._render_mihomo_file()') 2>/dev/null \
+      || unrestored+=("mihomo配置渲染")
   fi
+  printf 'mihomo\n' > /etc/privdns-gateway/backend
+  pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
+  systemctl disable --now sing-box >/dev/null 2>&1 || true   # 快照可能把 sing-box 带回来了 → 清掉
+  rm -f /etc/systemd/system/sing-box.service /usr/local/bin/sing-box
+  systemctl daemon-reload
+  # 激活失败必须计入 unrestored: 内核没起来就不是"已回滚", 不能只 warn 后照报成功。
+  if ! _core_kernel_activate mihomo sing-box; then
+    c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
+    unrestored+=("内核激活(mihomo)")
+  fi
+  systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
   systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   # 仓库 Git 复位(update 回滚: 让 REPO_DIR 与还原出的旧脚本版本一致); 记录未能恢复项, 不谎报"完全回滚"
@@ -781,12 +769,8 @@ _core_bindir(){ echo "${PDG_CORE_BINDIR:-/usr/local/bin}"; }
 
 # 用**刚装上的**新内核二进制对现网配置跑 check(显式走路径, 不依赖 PATH)。
 _core_config_check(){
-  local svc="$1" bindir="$2"
-  if [[ "$svc" == mihomo ]]; then
-    "$bindir/mihomo" -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1
-  else
-    "$bindir/sing-box" check -c /etc/sing-box/config.json >/dev/null 2>&1
-  fi
+  local svc="$1" bindir="$2"   # svc 恒为 mihomo(v1.6.0 唯一内核); 保留形参以兼容调用方
+  "$bindir/mihomo" -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1
 }
 
 # 内核活性 + 稳定判定: 起得来, 且持续观察若干次仍在跑。
@@ -873,40 +857,24 @@ _core_swap_verify(){
 # 关键安全: 先备份旧二进制, 用新二进制对现有配置跑 check + 重启稳定判定, 全过才切换; 失败还原旧版, 不留坏内核。
 # 返回: 0=已是钉死版/下载或校验失败(保留现版本, 非致命); 1=换核失败(已还原) → 调用方须回滚整次更新。
 _update_core_binary(){
-  local core march ver tmp bindir
+  local march ver tmp bindir   # v1.6.0: mihomo 是唯一内核
   bindir="$(_core_bindir)"
-  core="$(_pdg_core)"
   # shellcheck source=/dev/null
   # 读不到 versions.sh 就无从知道该装哪个版本 —— 以前"跳过"后照报成功, 实际内核可能没升上去。
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
     || { c_y "读不到 versions.sh, 无法确认内核目标版本"; return 1; }
   march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
   tmp=$(mktemp -d)
-  if [[ "$core" == mihomo ]]; then
-    ver="$MIHOMO_VER"
-    mihomo -v 2>/dev/null | grep -q "$ver" && { rm -rf "$tmp"; return 0; }   # 已是钉死版本
-    c_g "更新 mihomo 内核 → $ver …"
-    curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz" \
-      || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
-    pdg_verify_sha256 "$tmp/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $ver ($march)" \
-      || { c_y "  SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
-    gunzip -c "$tmp/m.gz" > "$tmp/mihomo" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
-    [[ -s "$tmp/mihomo" ]] || { c_y "  解压产物为空"; rm -rf "$tmp"; return 1; }
-    if ! _core_swap_verify mihomo "$tmp/mihomo" "$bindir" "$ver"; then rm -rf "$tmp"; return 1; fi
-  else
-    ver="$SINGBOX_VER"
-    sing-box version 2>/dev/null | grep -q "version $ver" && { rm -rf "$tmp"; return 0; }
-    c_g "更新 sing-box 内核 → $ver …"
-    curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${march}.tar.gz" -o "$tmp/sb.tgz" \
-      || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
-    pdg_verify_sha256 "$tmp/sb.tgz" "${PDG_SHA256[singbox-$march]:-}" "sing-box $ver ($march)" \
-      || { c_y "  SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
-    tar --no-same-owner -xzf "$tmp/sb.tgz" -C "$tmp" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
-    cp -f "$tmp"/sing-box-*/sing-box "$tmp/sing-box" 2>/dev/null \
-      || { c_y "  解压产物缺失"; rm -rf "$tmp"; return 1; }
-    [[ -s "$tmp/sing-box" ]] || { c_y "  解压产物为空"; rm -rf "$tmp"; return 1; }
-    if ! _core_swap_verify sing-box "$tmp/sing-box" "$bindir" "$ver"; then rm -rf "$tmp"; return 1; fi
-  fi
+  ver="$MIHOMO_VER"
+  mihomo -v 2>/dev/null | grep -q "$ver" && { rm -rf "$tmp"; return 0; }   # 已是钉死版本
+  c_g "更新 mihomo 内核 → $ver …"
+  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz" \
+    || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
+  pdg_verify_sha256 "$tmp/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $ver ($march)" \
+    || { c_y "  SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
+  gunzip -c "$tmp/m.gz" > "$tmp/mihomo" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
+  [[ -s "$tmp/mihomo" ]] || { c_y "  解压产物为空"; rm -rf "$tmp"; return 1; }
+  if ! _core_swap_verify mihomo "$tmp/mihomo" "$bindir" "$ver"; then rm -rf "$tmp"; return 1; fi
   rm -rf "$tmp"
 }
 
@@ -977,7 +945,7 @@ cmd_update(){
   if ! bash /usr/local/bin/pdg __migrate; then
     c_y "迁移(__migrate)失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
-  # 内核二进制: 按 versions.sh 钉死版本更新(mihomo 可持续升版; sing-box 仍钉 1.12.x)。
+  # 内核二进制: mihomo 按 versions.sh 钉死版本更新。
   if ! _update_core_binary; then
     c_y "内核二进制更新失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
@@ -987,12 +955,8 @@ cmd_update(){
   if ! python3 -m py_compile /opt/pdg-bot/*.py 2>/dev/null; then
     c_y "Python 语法错误, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
-  if [[ "$(_pdg_core)" == mihomo ]]; then
-    if ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
-      c_y "mihomo 配置 check 失败, 回滚…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
-    fi
-  elif ! sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
-    c_y "sing-box 配置 check 失败, 回滚…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+  if ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
+    c_y "mihomo 配置 check 失败, 回滚…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
   if ! nft -c -f /etc/nftables.conf >/dev/null 2>&1; then
     c_y "nftables 配置 check 失败, 回滚…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
@@ -1214,7 +1178,7 @@ migrate_mihomo_safepaths(){
 }
 
 # 老装升级: 确保所有 bot 模块(.py)都部署到 /opt/pdg-bot。修「旧版 cmd_update 安装列表缺新模块
-# (如 sb2mihomo/mitm_*)、首次升级时序滞后漏装」→ switch-core/WLOC 渲染报 ModuleNotFoundError。
+# (如 sb2mihomo/mitm_*)、首次升级时序滞后漏装」→ 迁移/WLOC 渲染报 ModuleNotFoundError。
 # pdg-bot.py 由主安装装成 bot.py, 此处跳过。幂等。
 migrate_deploy_botfiles(){
   [[ -d "$REPO_DIR/deploy/bot" ]] || return 0
@@ -1545,6 +1509,7 @@ migrate_backend_marker(){
 }
 
 run_all_migrations(){
+  local rc=0
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
@@ -1555,19 +1520,32 @@ run_all_migrations(){
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
   migrate_android_cleanup || true; migrate_ios_gms_cleanup || true   # 平台隔离清理(各自平台内幂等)
+  # 内核迁移放最后: 上面的 config.json / mosdns / 防火墙 迁移都在 sing-box 仍在时按老路子跑完
+  # (migrate_singbox_gms 等仍能操作模型 + 重启 sing-box), 这里再把**最终形态的** config.json
+  # 转 mihomo 并移除 sing-box 运行时。唯一"失败必须传出"的迁移 —— 失败即让 __migrate 返回非0,
+  # cmd_update 据此回滚到更新前快照(其余迁移都是幂等自愈, 失败 best-effort 吞掉不挡后续)。
+  migrate_drop_singbox || rc=1
+  return $rc
 }
 
-# 内核切换: sing-box <-> mihomo。出口/分流/证书/DoT/mosdns 全不动(model 共用), 只换内核二进制 +
-# 服务 + nft 入站模型(sing-box 裸 accept ↔ mihomo REDIRECT→7893)。失败自动回滚。
-_switchcore_nft(){   # $1=target 渲染并应用对应内核的 nft(用当前 SSH端口/内网段)
-  local target="$1" tmpl sshp icidr
+# 迁移到 mihomo 时渲染并应用 mihomo 的 nft 入站模型(REDIRECT→7893)。出口/分流/证书/DoT/mosdns
+# 全不动(model 共用)。$1 目前恒为 mihomo(唯一内核), 保留形参以兼容 _activate_mihomo_core 调用。
+_switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 SSH端口/内网段)
+  local target="$1" sshp icidr
+  [[ "$target" == mihomo ]] || { echo "内部错误: _switchcore_nft 只支持 mihomo(收到 $target)"; return 1; }
   sshp=$(grep -oP '^\s*tcp dport \{ \K[0-9]+(?= \} accept)' /etc/nftables.conf | head -1)
+  # 现网 nft 认不出 SSH 端口时(自定义/异形防火墙)不能直接判死 —— 这条路现在跑在**自动迁移**里,
+  # 硬失败会把用户永久挡在旧版上。退回问 sshd 实际在听哪个口, 再退回 22(与装机探测同口径)。
+  if [[ -z "$sshp" ]]; then
+    sshp=$(ss -lntpH 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}')
+    sshp="${sshp:-22}"
+    c_y "  未能从 /etc/nftables.conf 认出 SSH 端口 → 按实际监听/默认值取 $sshp(新防火墙会放行它)。"
+  fi
   icidr=$(python3 -c "import sys;sys.path.insert(0,'/opt/pdg-bot');import checks;print(checks._internal_cidr())" 2>/dev/null)
   [[ -n "$sshp" && -n "$icidr" ]] || { echo "提取 SSH端口/内网段失败(ssh=$sshp cidr=$icidr)"; return 1; }
-  [[ "$target" == mihomo ]] && tmpl=nftables-mihomo.conf || tmpl=nftables.conf
-  [[ -f "$REPO_DIR/deploy/firewall/$tmpl" ]] || { echo "缺 $tmpl(先 pdg update)"; return 1; }
-  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" "$REPO_DIR/deploy/firewall/$tmpl" > /etc/nftables.conf
-  _pdg_nft_strip_gms /etc/nftables.conf   # iOS: 切核渲染后剥掉 GMS 5228-5230(不让 iOS 切核复活 GMS)
+  [[ -f "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" ]] || { echo "缺 nftables-mihomo.conf(先 pdg update)"; return 1; }
+  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
+  _pdg_nft_strip_gms /etc/nftables.conf   # iOS: 渲染后剥掉 GMS 5228-5230
   nft -f /etc/nftables.conf
 }
 
@@ -1597,21 +1575,12 @@ _core_kernel_restore(){
   systemctl enable --now "$old" >/dev/null 2>&1 || true
 }
 
-cmd_switch_core(){
-  need_root switch-core; _lock
-  local target="${1:-}" cur march plat
-  [[ "$target" == mihomo || "$target" == singbox ]] || { echo "用法: pdg switch-core <mihomo|singbox>"; return 1; }
-  cur="$(_pdg_core)"
-  [[ "$cur" == "$target" ]] && { echo "已经是 $target 内核。"; return 0; }
-  [[ -f /etc/mihomo/config.yaml || -f "$REPO_DIR/deploy/bot/sb2mihomo.py" ]] || { echo "❌ 缺 mihomo 支持文件, 先 sudo pdg update。"; return 1; }
-  # 硬门控: WLOC(MITM 位置改写)只有 mihomo 有路由层。WLOC 开着时切回 sing-box 会静默失去
-  # 位置改写 → 拒绝, 要求先关 WLOC(不假成功)。
-  if [[ "$target" == singbox ]] \
-     && [[ "$(python3 -c 'import json;print(bool(json.load(open("/etc/privdns-gateway/mitm.json")).get("wloc",{}).get("enabled")))' 2>/dev/null)" == True ]]; then
-    echo "❌ WLOC(位置改写)正开启 —— 切回 sing-box 会失去 MITM 路由。请先在 TG bot 关闭 WLOC 再切。"; return 1
-  fi
-  c_g "切换内核 $cur → $target(出口/分流/证书/DoT 均不动)…"
-  cmd_snapshot >/dev/null 2>&1 || true
+# 把当前机器激活成 mihomo 内核: 下核 → 渲染(拒 unknown_proxies) → mihomo -t 校验 → 写 unit →
+# nft REDIRECT 入站 → 起 mihomo 并停旧 sing-box(_core_kernel_activate)。带失败回滚。成功 0 / 失败非 0。
+# 由 migrate_drop_singbox 调用(旧 sing-box 机器 update 时迁移)。出口/分流/证书/DoT/mosdns 均不动(model 共用)。
+_activate_mihomo_core(){
+  local march plat prev_backend why t
+  prev_backend="$(cat /etc/privdns-gateway/backend 2>/dev/null)"
   march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
   plat="$(_pdg_platform)"
   # shellcheck source=/dev/null
@@ -1620,21 +1589,18 @@ cmd_switch_core(){
   source "$REPO_DIR/lib/units.sh"   2>/dev/null || { echo "❌ 读不到 units.sh"; return 1; }
   cp /etc/nftables.conf /etc/nftables.conf.scbak 2>/dev/null
 
-  if [[ "$target" == mihomo ]]; then
-    if ! mihomo -v 2>/dev/null | grep -q "$MIHOMO_VER"; then
-      c_g "下载 mihomo $MIHOMO_VER…"; local t; t=$(mktemp -d)
-      if ! curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${march}-${MIHOMO_VER}.gz" -o "$t/m.gz" \
-         || ! pdg_verify_sha256 "$t/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $MIHOMO_VER" \
-         || ! gunzip -c "$t/m.gz" > "$t/mihomo"; then rm -rf "$t"; echo "❌ mihomo 下载/校验失败, 未切换"; return 1; fi
-      install -m755 "$t/mihomo" /usr/local/bin/mihomo; rm -rf "$t"
-    fi
-    install -d -m700 /etc/mihomo
-    printf 'mihomo\n' > /etc/privdns-gateway/backend      # 先切标记, 让渲染/迁移按 mihomo 走
-    # 渲染前先拦: 有出口 mihomo 无法无损转换(unknown_proxies)→ 拒绝切换, 免得切过去出口凭空少一个。
-    # 必须把**真实原因**带出来: 旧实现 python 的 stderr 直接 2>/dev/null 丢掉, 三种完全不同的失败
-    # (渲染抛异常 / 有出口转不了 / mihomo -t 不过)挤在同一句话里, 用户只看到"渲染/校验失败"而无从下手。
-    local why
-    if ! why=$(cd /opt/pdg-bot && python3 - <<'SCPY' 2>&1
+  if ! mihomo -v 2>/dev/null | grep -q "$MIHOMO_VER"; then
+    c_g "下载 mihomo $MIHOMO_VER…"; t=$(mktemp -d)
+    if ! curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${march}-${MIHOMO_VER}.gz" -o "$t/m.gz" \
+       || ! pdg_verify_sha256 "$t/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $MIHOMO_VER" \
+       || ! gunzip -c "$t/m.gz" > "$t/mihomo"; then rm -rf "$t"; echo "❌ mihomo 下载/校验失败, 未迁移"; return 1; fi
+    install -m755 "$t/mihomo" /usr/local/bin/mihomo; rm -rf "$t"
+  fi
+  install -d -m700 /etc/mihomo
+  printf 'mihomo\n' > /etc/privdns-gateway/backend      # 先切标记, 让渲染/迁移按 mihomo 走
+  # 渲染前先拦: 有出口 mihomo 无法无损转换(unknown_proxies)→ 拒绝迁移, 免得凭空丢一个出口。
+  # 把**真实原因**带出来(渲染抛异常 / 有出口转不了 分开报), 用户据此在 bot 里删/换该出口再重试。
+  if ! why=$(cd /opt/pdg-bot && python3 - <<'SCPY' 2>&1
 import sys
 sys.path.insert(0, "/opt/pdg-bot")
 import bot
@@ -1644,64 +1610,53 @@ except Exception as e:
     print("渲染 mihomo 配置失败: %s: %s" % (type(e).__name__, e)); sys.exit(1)
 bad = (meta or {}).get("unknown_proxies") or []
 if bad:
-    print("这些出口 mihomo 无法转换(切过去会凭空丢失): " + ", ".join(str(x) for x in bad)); sys.exit(1)
+    print("这些出口 mihomo 无法转换(迁移会凭空丢失): " + ", ".join(str(x) for x in bad)); sys.exit(1)
 SCPY
-    ); then
-      printf 'singbox\n' > /etc/privdns-gateway/backend
-      echo "❌ 未切换(已回滚标记): ${why:-渲染 mihomo 配置失败(无输出)}"; return 1
-    fi
-    if ! why=$(mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml 2>&1); then
-      printf 'singbox\n' > /etc/privdns-gateway/backend
-      echo "❌ 未切换(已回滚标记): mihomo 配置校验失败:"
-      printf '%s\n' "$why" | tail -c 400 | sed 's/^/    /'; return 1
-    fi
-    pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service   # 与装机同源(含 SAFE_PATHS)
-    [[ "$plat" == ios ]] && pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
-    systemctl daemon-reload
-    _switchcore_nft mihomo || { printf 'singbox\n' > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
-    if ! _core_kernel_activate mihomo sing-box; then
-      c_y "mihomo 启动/自启核验失败 → 回滚到 sing-box"
-      printf 'singbox\n' > /etc/privdns-gateway/backend
-      [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
-      _core_kernel_restore mihomo sing-box; rm -f /etc/nftables.conf.scbak
-      echo "❌ 切换失败, 已回滚到 sing-box 内核。mihomo 最近日志:"
-      journalctl -u mihomo -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
-      return 1
-    fi
-    [[ "$plat" == ios ]] && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
-  else
-    if ! sing-box version 2>/dev/null | grep -q "version $SINGBOX_VER"; then
-      c_g "下载 sing-box $SINGBOX_VER…"; local t; t=$(mktemp -d)
-      if ! curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${march}.tar.gz" -o "$t/sb.tgz" \
-         || ! pdg_verify_sha256 "$t/sb.tgz" "${PDG_SHA256[singbox-$march]:-}" "sing-box $SINGBOX_VER" \
-         || ! tar --no-same-owner -xzf "$t/sb.tgz" -C "$t"; then rm -rf "$t"; echo "❌ sing-box 下载/校验失败, 未切换"; return 1; fi
-      install -m755 "$t"/sing-box-*/sing-box /usr/local/bin/sing-box; rm -rf "$t"
-    fi
-    printf 'singbox\n' > /etc/privdns-gateway/backend
-    local why
-    if ! why=$(sing-box check -c /etc/sing-box/config.json 2>&1); then
-      printf 'mihomo\n' > /etc/privdns-gateway/backend
-      echo "❌ 未切换(已回滚标记): sing-box 配置校验失败:"
-      printf '%s\n' "$why" | tail -c 400 | sed 's/^/    /'; return 1
-    fi
-    pdg_write_unit pdg_unit_singbox /etc/systemd/system/sing-box.service
-    systemctl daemon-reload
-    _switchcore_nft singbox || { printf 'mihomo\n' > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
-    if ! _core_kernel_activate sing-box mihomo; then
-      c_y "sing-box 启动/自启核验失败 → 回滚到 mihomo"
-      printf 'mihomo\n' > /etc/privdns-gateway/backend
-      [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
-      _core_kernel_restore sing-box mihomo; rm -f /etc/nftables.conf.scbak
-      echo "❌ 切换失败, 已回滚到 mihomo 内核。sing-box 最近日志:"
-      journalctl -u sing-box -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
-      return 1
-    fi
-    systemctl stop pdg-mitm 2>/dev/null   # sing-box 暂无 MITM 路由(Item 6 将改为 WLOC 感知)
+  ); then
+    printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
+    echo "❌ 未迁移(已回滚标记): ${why:-渲染 mihomo 配置失败(无输出)}"; return 1
   fi
-
-  # 走到这里 = 目标核已 active+enabled 且旧核已 inactive+disabled(activate 已核验)。
+  if ! why=$(mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml 2>&1); then
+    printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
+    echo "❌ 未迁移(已回滚标记): mihomo 配置校验失败:"
+    printf '%s\n' "$why" | tail -c 400 | sed 's/^/    /'; return 1
+  fi
+  pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service   # 与装机同源(含 SAFE_PATHS)
+  [[ "$plat" == ios ]] && pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
+  systemctl daemon-reload
+  _switchcore_nft mihomo || { printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
+  if ! _core_kernel_activate mihomo sing-box; then
+    c_y "mihomo 启动/自启核验失败 → 回滚"
+    printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
+    [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
+    _core_kernel_restore mihomo sing-box; rm -f /etc/nftables.conf.scbak
+    echo "❌ 迁移失败, 已回滚。mihomo 最近日志:"
+    journalctl -u mihomo -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  [[ "$plat" == ios ]] && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
   rm -f /etc/nftables.conf.scbak
-  echo "✅ 已切换到 $target 内核(出口/分流/证书/DoT 未动)。"
+  return 0
+}
+
+# 旧 sing-box 机器迁到 mihomo(v1.6.0 彻底移除 sing-box 运行时)。加入 run_all_migrations, 故 `pdg update`
+# 走 __migrate 时自动执行。幂等: 已是纯 mihomo(无 sing-box 服务/二进制)直接返回 0。
+# 失败(unknown_proxies / 渲染 / 校验 / 起核)返回非 0 → run_all_migrations 传出 → cmd_update 回滚到
+# 更新前快照(用户仍留在旧 sing-box 版, 数据无损), 而不是把机器留在半迁移态。
+migrate_drop_singbox(){
+  local cur; cur="$(cat /etc/privdns-gateway/backend 2>/dev/null)"
+  if [[ "$cur" == mihomo ]] && [[ ! -e /etc/systemd/system/sing-box.service ]] && [[ ! -e /usr/local/bin/sing-box ]]; then
+    return 0                                    # 已是纯 mihomo → 幂等短路
+  fi
+  c_y "检测到 sing-box 运行时(v1.6.0 已移除)→ 迁移到 mihomo 唯一内核(出口/分流/证书/DoT 不动)…"
+  _activate_mihomo_core || { echo "❌ 迁移到 mihomo 失败(见上)。请在 TG bot 处理无法转换的出口后, 重试 sudo pdg update。"; return 1; }
+  # 收尾: _core_kernel_activate 已 stop+disable sing-box; 再删掉它的 unit + 二进制。
+  systemctl disable --now sing-box >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/sing-box.service
+  systemctl daemon-reload 2>/dev/null || true
+  rm -f /usr/local/bin/sing-box
+  printf 'mihomo\n' > /etc/privdns-gateway/backend
+  c_g "  已迁移到 mihomo 内核, sing-box 运行时已移除。"
   return 0
 }
 
@@ -1800,7 +1755,6 @@ case "${1:-menu}" in
   detect-cidr|cidr) shift || true; cmd_detect_cidr "${1:-}";;
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
-  switch-core)   shift || true; cmd_switch_core "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|switch-core <mihomo|singbox>|migrate-fw|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate-fw|uninstall [--purge]]";;
 esac

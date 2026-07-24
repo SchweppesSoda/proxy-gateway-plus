@@ -174,18 +174,21 @@ print("[OK]   任务异常后 BUSY 释放")
 # ── apply_sb 事务性: check/restart 超时也还原备份, 不留未验证配置 ────────────
 import json as _json
 sbf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-_json.dump({"outbounds": [{"tag": "orig"}]}, sbf); sbf.close()
+# 出站要能被 sb2mihomo 转换(否则渲染阶段就先拒了, 到不了下面模拟的"校验超时")
+_json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, sbf); sbf.close()
 bot.SB = sbf.name
 lf = tempfile.NamedTemporaryFile(delete=False); lf.close(); bot.LOCKFILE = lf.name
+# 渲染出的 mihomo 配置落临时目录(别写真 /etc/mihomo), 好让下面的"校验超时"如期发生在 check 那步
+_mhd = tempfile.mkdtemp(); bot.MIHOMO_DIR = _mhd; bot.MIHOMO_CFG = os.path.join(_mhd, "config.yaml")
 bot.apply_sb = _REAL_APPLY_SB
 def boom_sh(cmd, *a, **k):
-    if "check" in cmd:
-        raise subprocess.TimeoutExpired(cmd, 180)   # 模拟 sing-box check 超时
+    if "check" in cmd or "-t" in cmd:
+        raise subprocess.TimeoutExpired(cmd, 180)   # 模拟内核配置校验超时
     class R:
         returncode = 0; stdout = ""; stderr = ""
     return R()
 bot.sh = boom_sh
-ok, msg = bot.apply_sb(lambda c: c["outbounds"].append({"tag": "new"}))
+ok, msg = bot.apply_sb(lambda c: c["outbounds"].append({"tag": "new", "type": "direct"}))
 assert ok is False and "还原" in msg, ("异常应还原并返回失败", ok, msg)
 assert SECRET not in msg
 restored = _json.load(open(bot.SB))

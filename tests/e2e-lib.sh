@@ -131,16 +131,6 @@ e2e_fetch_mosdns(){
   (cd /tmp && unzip -qo mos.zip mosdns) 2>/dev/null || return 1
   install -m755 /tmp/mosdns /usr/local/bin/mosdns 2>/dev/null || return 1
 }
-e2e_fetch_singbox(){
-  command -v sing-box >/dev/null 2>&1 && return 0
-  # shellcheck source=/dev/null
-  . "$E2E_ROOT/lib/versions.sh"
-  curl -fsSL --retry 2 -m 120 \
-    "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz" \
-    -o /tmp/sb.tgz 2>/dev/null || return 1
-  tar --no-same-owner -xzf /tmp/sb.tgz -C /tmp 2>/dev/null || return 1
-  install -m755 /tmp/sing-box-*/sing-box /usr/local/bin/sing-box 2>/dev/null || return 1
-}
 
 # ── 造现场 ──────────────────────────────────────────────────────────────────
 E2E_SIP=203.0.113.1
@@ -175,10 +165,10 @@ e2e_seed_mosdns(){
 }
 
 # 渲染真实防火墙配置(switch-core 要从中提取 SSH 端口)。$1=内核(singbox|mihomo)
+# v1.6.0: 只剩 mihomo 一套模板($1 保留但已无意义, 调用方不必改)。
 e2e_seed_nft(){
-  local tmpl; [[ "${1:-singbox}" == mihomo ]] && tmpl=nftables-mihomo.conf || tmpl=nftables.conf
   sed -e "s|__SSH_PORT__|22|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e "s|__SERVER_IP__|$E2E_SIP|g" \
-      "$E2E_ROOT/deploy/firewall/$tmpl" > /etc/nftables.conf
+      "$E2E_ROOT/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
 }
 
 e2e_seed_singbox_model(){

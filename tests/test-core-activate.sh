@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# switch-core 内核切换的 enable/disable 纪律回归(Item 7)。
+# 内核激活(_core_kernel_activate/restore)的 enable/disable 纪律回归(Item 7)。
+# v1.6.0 起换核命令已移除, 但这套纪律仍是 sing-box→mihomo **迁移**的核心(起 mihomo / 停旧核)。
 # 不起真核心/真 systemd: 用**假 systemctl 状态机**(记录每个 unit 的 active/enabled)
 # + 重启模拟, 验证:
-#   A. 切换后: 目标核 active+enabled, 旧核 inactive+**disabled**(不再只 stop 不 disable)。
+#   A. 激活后: 目标核 active+enabled, 旧核 inactive+**disabled**(不再只 stop 不 disable)。
 #   B. 重启只起一个内核(enabled 集里内核唯一)—— 旧坑: 旧核仍 enabled → reboot 双起冲突。
 #   C. 目标核起不来 → activate 返回失败, restore 把旧核 enable+start 回来。
 #   D. "旧核 disable 没生效(仍 enabled)"必须被 activate 判失败(不放过潜在双起)。
-#   E. unit 模板单一事实源: mihomo unit 含 SAFE_PATHS, 且切核与装机用同一函数(无漂移)。
+#   E. unit 模板单一事实源: mihomo unit 含 SAFE_PATHS, 且迁移与装机用同一函数(无漂移)。
+#   F. switch-core 命令与 sing-box unit 模板确已移除。
 # 退出码 0=全过。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
@@ -19,8 +21,11 @@ ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 # ── 抽取被测函数 + 单一事实源 unit 库 ────────────────────────────────────────
-sed -n '/^_core_kernel_activate(){/,/^cmd_switch_core(){/p' "$ROOT/deploy/bot/pdg.sh" | sed '$d' > "$WORK/helpers.sh"
-grep -q '_core_kernel_restore' "$WORK/helpers.sh" && ok "抽出 activate/restore 两个收尾函数" || bad "抽取失败"
+# 逐个函数抽(不靠"下一个函数名"当结束标记 —— 那个标记一旦改名/删除就会把整份文件拖进来)
+sed -n '/^_core_kernel_activate(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"  > "$WORK/helpers.sh"
+sed -n '/^_core_kernel_restore(){/,/^}/p'  "$ROOT/deploy/bot/pdg.sh" >> "$WORK/helpers.sh"
+{ grep -q '^_core_kernel_activate(){' "$WORK/helpers.sh" && grep -q '^_core_kernel_restore(){' "$WORK/helpers.sh"; } \
+  && ok "抽出 activate/restore 两个收尾函数" || bad "抽取失败"
 
 # ── 假 systemctl 状态机(active/enabled 双状态) + 故障注入 ────────────────────
 cat > "$WORK/harness.sh" <<'EOF'
@@ -105,11 +110,14 @@ pdg_unit_mihomo | grep -q 'Environment=SAFE_PATHS=/etc/sing-box/ui/dist' && ok "
 [[ "$(pdg_unit_mihomo)" == "$(pdg_unit_for_core_svc mihomo)" ]] && ok "pdg_unit_for_core_svc(mihomo) 与 pdg_unit_mihomo 同源" || bad "unit 生成不一致"
 # install.sh 与 switch-core 都调 pdg_write_unit pdg_unit_mihomo → 内容必然一致(同函数)
 grep -q 'pdg_write_unit pdg_unit_mihomo' "$ROOT/install.sh" && grep -q 'pdg_write_unit pdg_unit_mihomo' "$ROOT/deploy/bot/pdg.sh" \
-  && ok "install.sh 与 switch-core 均用 pdg_write_unit pdg_unit_mihomo(无手写漂移)" || bad "两处未统一到 units.sh"
+  && ok "install.sh 与 迁移均用 pdg_write_unit pdg_unit_mihomo(无手写漂移)" || bad "两处未统一到 units.sh"
 
-# ── F. WLOC 硬门控: 切回 sing-box 前拦 WLOC 开启态(Item 6) ────────────────────
-grep -q 'WLOC.*正开启.*sing-box' "$ROOT/deploy/bot/pdg.sh" && grep -q 'wloc.*enabled' "$ROOT/deploy/bot/pdg.sh" \
-  && ok "switch-core: WLOC 开着时拒绝切回 sing-box(不失去 MITM 路由)" || bad "缺 WLOC 切核硬门控"
+# ── F. v1.6.0: 换核命令已移除 —— 不该再有 switch-core 入口/双核分支残留 ─────────
+{ ! grep -q 'cmd_switch_core' "$ROOT/deploy/bot/pdg.sh" && ! grep -q 'switch-core)' "$ROOT/deploy/bot/pdg.sh"; } \
+  && ok "pdg.sh 无 switch-core 命令残留(mihomo 为唯一内核)" || bad "pdg.sh 仍有 switch-core 残留"
+grep -q 'pdg_unit_singbox' "$ROOT/lib/units.sh" \
+  && bad "units.sh 仍有 pdg_unit_singbox(应随 sing-box 运行时一并移除)" \
+  || ok "units.sh 已无 sing-box unit 模板"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

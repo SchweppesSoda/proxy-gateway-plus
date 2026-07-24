@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 出站 schema 校验: 用**项目锁定版** sing-box(lib/versions.sh 的 SINGBOX_VER, 钉死 SHA256)
-# 对 parse_link 生成的各协议出站跑 `sing-box check`。
-# 为什么单独做: test-parse-links.py 只验"解析出的 dict 字段对不对", 但字段名/结构跟 sing-box
-# schema 对不对得上是另一回事, 且常随版本小变 —— 必须拿锁定版真 check 才算数。CI 可跑。
+# 出站 schema 校验: 走**真实生产链路** —— parse_link 生成的各协议出站(sing-box JSON 数据模型)
+# → sb2mihomo 渲染 → 用**项目锁定版** mihomo(lib/versions.sh 的 MIHOMO_VER, 钉死 SHA256)跑 `mihomo -t`。
+# 为什么单独做: test-parse-links.py 只验"解析出的 dict 字段对不对", 但这些字段能不能真的渲染成
+# 内核认的配置是另一回事, 且常随版本小变 —— 必须拿锁定版内核真校验才算数。CI 可跑。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,15 +18,16 @@ case "$(uname -m)" in
   *) fail "不支持的架构: $(uname -m)" ;;
 esac
 
-# 必须用锁定版(不是 PATH 上可能漂移的版本)→ 下载 SINGBOX_VER 并校验 SHA256
-echo "[*] 下载锁定版 sing-box $SINGBOX_VER ($ARCH)…"
-curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${ARCH}.tar.gz" \
-     -o "$WORK/sb.tgz" || fail "sing-box 下载失败"
-pdg_verify_sha256 "$WORK/sb.tgz" "${PDG_SHA256[singbox-$ARCH]:-}" "sing-box $SINGBOX_VER ($ARCH)" \
-  || fail "sing-box SHA256 校验失败"
-tar -xzf "$WORK/sb.tgz" -C "$WORK"
-SB="$(echo "$WORK"/sing-box-*/sing-box)"
-echo "[*] $("$SB" version | head -1)"
+# 必须用锁定版(不是 PATH 上可能漂移的版本)→ 下载 MIHOMO_VER 并校验 SHA256
+echo "[*] 下载锁定版 mihomo $MIHOMO_VER ($ARCH)…"
+curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${ARCH}-${MIHOMO_VER}.gz" \
+     -o "$WORK/m.gz" || fail "mihomo 下载失败"
+pdg_verify_sha256 "$WORK/m.gz" "${PDG_SHA256[mihomo-$ARCH]:-}" "mihomo $MIHOMO_VER ($ARCH)" \
+  || fail "mihomo SHA256 校验失败"
+gunzip -c "$WORK/m.gz" > "$WORK/mihomo" || fail "mihomo 解压失败"
+chmod 755 "$WORK/mihomo"
+MH="$WORK/mihomo"
+echo "[*] $("$MH" -v | head -1)"
 
 # 用 parse_link 拼各协议出站 → 写最小 config(占位但字段合法的值)
 python3 - "$ROOT" "$WORK/cfg.json" "$ZASHBOARD_VER" <<'PY'
@@ -59,19 +60,27 @@ links = [
 ]
 obs = [b.parse_link(x) for x in links]
 print("[*] 出站类型:", [o["type"] for o in obs])
-cfg = {"log": {"level": "error"},
-       "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 12345}],
-       "outbounds": obs + [{"type": "direct", "tag": "direct"}],
-       "route": {"final": "direct"},
-       "experimental": {"clash_api": {
-           "external_controller": "0.0.0.0:9090", "secret": "schema-test",
-           "external_ui": "/etc/sing-box/ui/dist",
-           "external_ui_download_url": f"https://github.com/Zephyruso/zashboard/releases/download/{zash_ver}/dist-no-fonts.zip"}}}
-json.dump(cfg, open(out, "w"), ensure_ascii=False)
+# 数据模型仍是 sing-box JSON(bot 的唯一数据源), 再经 sb2mihomo 渲染成内核吃的配置
+model = {"log": {"level": "error"},
+         "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 12345}],
+         "outbounds": obs + [{"type": "direct", "tag": "direct"}],
+         "route": {"final": "direct"},
+         "experimental": {"clash_api": {
+             "external_controller": "0.0.0.0:9090", "secret": "schema-test",
+             "external_ui": "/etc/sing-box/ui/dist",
+             "external_ui_download_url": f"https://github.com/Zephyruso/zashboard/releases/download/{zash_ver}/dist-no-fonts.zip"}}}
+sys.path.insert(0, os.path.join(root, "deploy/bot"))
+import sb2mihomo
+cfg, meta = sb2mihomo.singbox_to_mihomo(model, redir_port=7893)
+bad = (meta or {}).get("unknown_proxies") or []
+if bad:                                    # 每个协议都必须能转换, 不能静默丢
+    print("[FAIL] 这些出站 sb2mihomo 转换不了:", ", ".join(map(str, bad)), file=sys.stderr)
+    sys.exit(1)
+json.dump(cfg, open(out, "w"), ensure_ascii=False)   # JSON 即合法 YAML
 PY
-[ -f "$WORK/cfg.json" ] || fail "拼 config 失败(parse_link 出错?)"
+[ -f "$WORK/cfg.json" ] || fail "拼 config 失败(parse_link / sb2mihomo 出错?)"
 
-echo "[*] sing-box check(锁定版 $SINGBOX_VER)…"
-"$SB" check -c "$WORK/cfg.json" \
-  || fail "sing-box check 不过: parse_link 生成的出站与锁定版 $SINGBOX_VER 的 schema 不符"
-echo "✅ 各协议出站 + 面板 clash_api 在锁定版 sing-box $SINGBOX_VER 下 schema 校验通过"
+echo "[*] mihomo -t(锁定版 $MIHOMO_VER)…"
+"$MH" -t -d "$WORK" -f "$WORK/cfg.json" \
+  || fail "mihomo -t 不过: parse_link→sb2mihomo 产出的配置与锁定版 $MIHOMO_VER 不符"
+echo "✅ 各协议出站 + 面板 clash_api 经 sb2mihomo 在锁定版 mihomo $MIHOMO_VER 下校验通过"

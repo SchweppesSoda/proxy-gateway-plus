@@ -26,12 +26,16 @@ e2e_seed_cert || e2e_skip "无 openssl, 造不出占位证书"
 
 # 内核二进制打桩: update 里的 _update_core_binary 会比对版本, 让它认为"已是钉死版本"
 . "$E2E_ROOT/lib/versions.sh"
-cat > /usr/local/bin/sing-box <<S
+cat > /usr/local/bin/mihomo <<S
 #!/bin/sh
-case "\$1" in version) echo "sing-box version $SINGBOX_VER";; check) exit 0;; esac
+case "\$1" in -v|version) echo "Mihomo Meta $MIHOMO_VER linux amd64";; -t) exit 0;; esac
 exit 0
 S
-chmod 755 /usr/local/bin/sing-box
+chmod 755 /usr/local/bin/mihomo
+# 现场是"仍在跑 sing-box 的老机器"(backend=singbox + 二进制/unit 都在): 这次 update 应当
+# 由 migrate_drop_singbox 自动迁到 mihomo 并把 sing-box 运行时清掉。
+printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/sing-box; chmod 755 /usr/local/bin/sing-box
+printf '[Unit]\nDescription=sing-box\n' > /etc/systemd/system/sing-box.service
 
 # ── 造发布源: 真 git 仓库, 两个 tag(v9.9.8 当前 / v9.9.9 新版) ────────────────
 # 连 origin 都是真的(本地裸仓库): pdg update 里的 `git fetch --tags origin main` 照跑不误,
@@ -70,6 +74,14 @@ grep -q 'NEWVERSION-MARKER' /opt/pdg-bot/checks.py \
   && ok "仓库已切到最新发布 tag v9.9.9" || bad "仓库 tag=$(git -C "$REPO" describe --tags 2>/dev/null)"
 snaps=$(find /var/lib/privdns-gateway/backups -name snap.tar.gz 2>/dev/null | wc -l)
 [[ "$snaps" -ge 1 ]] && ok "更新前留下了快照($snaps 份)" || bad "没有快照"
+# v1.6.0: 这台老机器原本跑 sing-box, update 应顺带把它迁到 mihomo 并清掉 sing-box 运行时
+[[ "$(cat /etc/privdns-gateway/backend 2>/dev/null)" == mihomo ]] \
+  && ok "旧 sing-box 机器: update 后 backend 已迁为 mihomo" \
+  || bad "backend=$(cat /etc/privdns-gateway/backend 2>/dev/null)"
+{ [[ ! -e /usr/local/bin/sing-box ]] && [[ ! -e /etc/systemd/system/sing-box.service ]]; } \
+  && ok "旧 sing-box 机器: update 后 sing-box 二进制/unit 已移除" || bad "sing-box 运行时仍残留"
+grep -q '出口/分流/证书/DoT 不动' <<<"$out" \
+  && ok "迁移明确声明不动出口/分流/证书/DoT" || bad "迁移未声明数据保全"
 
 # ── 2. doctor 判失败 → 必须回滚且不显示成功 ═════════════════════════════════
 echo; echo "── 2. doctor 报 fail → 回滚 ──"
@@ -77,8 +89,8 @@ git -C "$REPO" checkout -q v9.9.8                     # 退回旧版, 好再更�
 rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
 for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
 install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
-# 让 doctor 报一条 fail(内核服务不在) —— 用有状态 systemd 桩把 sing-box 置为 inactive
-e2e_svc_fail sing-box
+# 让 doctor 报一条 fail(内核服务不在) —— 用有状态 systemd 桩把 mihomo 置为 inactive
+e2e_svc_fail mihomo
 before=$(sha256sum /opt/pdg-bot/checks.py | cut -d' ' -f1)
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && ! grep -q '✅ 已更新' <<<"$out"; } \
@@ -88,7 +100,7 @@ grep -qE '自检发现|回滚' <<<"$out" && ok "明确说明是自检失败并�
   && ok "回滚把部署文件真的换回了更新前那份(按 sha 比对)" || bad "回滚后文件不是更新前的"
 grep -q 'NEWVERSION-MARKER' /opt/pdg-bot/checks.py \
   && bad "回滚后仍残留新版标记(说明没换回去)" || ok "回滚后无新版残留"
-rm -f /tmp/e2e-svc/sing-box.ac
+rm -f /tmp/e2e-svc/mihomo.ac
 
 # ── 3. --dry-run 只看不动 ════════════════════════════════════════════════════
 echo; echo "── 3. --dry-run ──"

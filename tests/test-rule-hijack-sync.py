@@ -134,7 +134,7 @@ def main():
     # 净化必须发生在校验/落盘之前
     src = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
     body = src[src.index("def restore_from("):]
-    assert body.index("_platform_sanitize_model") < body.index("sing-box\", \"check"), "净化晚于校验"
+    assert body.index("_platform_sanitize_model") < body.index("MIHOMO_BIN"), "净化晚于校验"
     ok("恢复净化: 排在配置校验之前")
 
     print(f"\n通过 {pass_n} 项断言")

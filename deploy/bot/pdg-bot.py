@@ -237,8 +237,6 @@ def _nav(key):
     }
     if _platform() == "ios":                          # iOS 专属: 位置改写(WLOC)
         subs["ops"][1].append([{"text": "🍏 位置改写(WLOC)", "callback_data": "wloc"}])
-    _lbl = "🔀 换到 mihomo 内核" if _core_backend() == "singbox" else "🔀 换回 sing-box 内核"
-    subs["ops"][1].append([{"text": _lbl, "callback_data": "switchcore"}])
     title, rows = subs[key]
     return title, {"inline_keyboard": rows + [[{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]}
 
@@ -352,18 +350,13 @@ def _svc_active(unit, need=3, delay=0.6, max_polls=15):
     return False
 
 def _core_backend():
-    """当前活动内核: mihomo / singbox(读不到标记默认 singbox, 向后兼容既有装置)。"""
-    try:
-        b = open(BACKEND_MARKER, encoding="utf-8").read().strip()
-        if b in ("mihomo", "singbox"):
-            return b
-    except OSError:
-        pass
-    return "singbox"
+    """当前活动内核: v1.6.0 起恒 mihomo(彻底移除 sing-box 运行时; 旧 backend 标记里的 singbox
+    由 pdg 的 migrate_drop_singbox 在 update 时迁移)。"""
+    return "mihomo"
 
 def _core_svc():
-    """活动内核的 systemd 服务名(mihomo / sing-box)。"""
-    return "mihomo" if _core_backend() == "mihomo" else "sing-box"
+    """活动内核的 systemd 服务名(恒 mihomo)。"""
+    return "mihomo"
 
 def _platform():
     """手机平台标记: ios / android(读不到默认 android —— 不启用 iOS 专属的 MITM 等)。"""
@@ -654,9 +647,6 @@ def wloc_enable(on):
     """开/关 WLOC(开启需已有激活地点)。"""
     if _platform() != "ios":
         return False, "位置改写(WLOC)仅 iOS 平台可用。"
-    # WLOC 的 MITM 路由只有 mihomo 内核渲染; sing-box 不能直接开(菜单入口也会提示切 mihomo)。
-    if on and _core_backend() != "mihomo":
-        return False, "WLOC 需要 mihomo 内核。请先返回运维菜单，切换到 mihomo。"
     w = _wloc_state()
     if on and not _wloc_active(w):
         return False, "请先「➕ 添加地点」设一个坐标再开启。"
@@ -694,43 +684,32 @@ def _render_mihomo_file():
     return meta
 
 def _core_apply():
-    """按当前后端校验 model 渲染出的核心配置并重启核心。不改 model 文件本身。
+    """校验 model 渲染出的 mihomo 配置并重启 mihomo。不改 model 文件本身。
     返回 (ok, errtext, restarted): restarted 标明核心是否已被重启(决定回滚要不要再重启)。"""
-    if _core_backend() == "mihomo":
-        try:
-            meta = _render_mihomo_file()
-        except Exception as e:  # noqa: BLE001  渲染失败(未知协议/写盘): 视为校验失败, 核心未动
-            return False, "渲染 mihomo 配置失败(%s)" % type(e).__name__, False
-        # 有出口 mihomo 无法无损转换 → 拒绝(否则会被静默丢弃, mihomo -t 仍会通过而出口凭空消失)
-        bad = (meta or {}).get("unknown_proxies")
-        if bad:
-            return False, "有出口 mihomo 无法转换(会被静默丢弃): %s" % ", ".join(str(x) for x in bad), False
-        chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", MIHOMO_CFG])
-        if chk.returncode != 0:
-            return False, "mihomo 配置校验失败:\n" + (chk.stdout + chk.stderr)[-400:], False
-        sh(["systemctl", "reset-failed", "mihomo"])
-        r = sh(["systemctl", "restart", "mihomo"])
-        if r.returncode != 0 or not _svc_active("mihomo"):
-            return False, "重启 mihomo 失败:\n" + (r.stdout + r.stderr)[-300:], True
-        return True, "", True
-    # sing-box
-    chk = sh(["sing-box", "check", "-c", SB])
+    try:
+        meta = _render_mihomo_file()
+    except Exception as e:  # noqa: BLE001  渲染失败(未知协议/写盘): 视为校验失败, 核心未动
+        return False, "渲染 mihomo 配置失败(%s)" % type(e).__name__, False
+    # 有出口 mihomo 无法无损转换 → 拒绝(否则会被静默丢弃, mihomo -t 仍会通过而出口凭空消失)
+    bad = (meta or {}).get("unknown_proxies")
+    if bad:
+        return False, "有出口 mihomo 无法转换(会被静默丢弃): %s" % ", ".join(str(x) for x in bad), False
+    chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", MIHOMO_CFG])
     if chk.returncode != 0:
-        return False, "配置校验失败,已回滚:\n" + (chk.stdout + chk.stderr)[-400:], False
-    sh(["systemctl", "reset-failed", "sing-box"])   # 清 start-limit: 连改多条快速重启不触发限速锁死
-    r = sh(["systemctl", "restart", "sing-box"])
-    if r.returncode != 0 or not _svc_active("sing-box"):
-        return False, "重启 sing-box 失败, 已还原上一份配置:\n" + (r.stdout + r.stderr)[-300:], True
+        return False, "mihomo 配置校验失败:\n" + (chk.stdout + chk.stderr)[-400:], False
+    sh(["systemctl", "reset-failed", "mihomo"])
+    r = sh(["systemctl", "restart", "mihomo"])
+    if r.returncode != 0 or not _svc_active("mihomo"):
+        return False, "重启 mihomo 失败:\n" + (r.stdout + r.stderr)[-300:], True
     return True, "", True
 
 def _core_sync_file():
-    """校验失败回滚后: 把渲染文件同步回(已还原的)good model, 但不重启(运行中的核心未受影响)。
-    sing-box 直接读 SB, 无需额外文件; mihomo 需把 good model 重新渲染落盘, 免得磁盘上留着坏配置。"""
-    if _core_backend() == "mihomo":
-        try:
-            _render_mihomo_file()
-        except Exception:  # noqa: BLE001
-            pass
+    """校验失败回滚后: 把 good model 重新渲染落盘(免得磁盘上留着坏 mihomo 配置), 但不重启
+    (运行中的 mihomo 未受影响)。"""
+    try:
+        _render_mihomo_file()
+    except Exception:  # noqa: BLE001
+        pass
 
 def apply_sb(modify):
     # 串行化配置写 + 与 pdg update/rollback 用同一把 flock 协调(拿不到锁友好返回, 不卡死)。
@@ -2509,23 +2488,18 @@ def restore_from(data):
                 json.dump(cfg, open(checksb, "w"), ensure_ascii=False)
         except Exception:  # noqa: BLE001
             pass
-        # 校验备份的 model(core-aware): sing-box=check checksb; mihomo=渲染临时 mihomo 配置 + `mihomo -t`
-        if _core_backend() == "mihomo":
-            try:
-                import sb2mihomo
-                mcfg, _ = sb2mihomo.singbox_to_mihomo(json.load(open(checksb)),
-                                                      redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets())
-                mtmp = checksb + ".mihomo"
-                json.dump(mcfg, open(mtmp, "w"), ensure_ascii=False)
-                chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", mtmp])
-            except Exception as e:  # noqa: BLE001
-                return False, "备份配置渲染 mihomo 失败(%s)" % type(e).__name__
-            if chk.returncode != 0:
-                return False, "备份的配置(mihomo)校验失败:\n" + (chk.stdout + chk.stderr)[-300:]
-        else:
-            chk = sh(["sing-box", "check", "-c", checksb])
-            if chk.returncode != 0:
-                return False, "备份的 sing-box 配置校验失败:\n" + (chk.stdout + chk.stderr)[-300:]
+        # 校验备份的 model: 从 SB(sing-box JSON)数据模型渲染临时 mihomo 配置 + `mihomo -t`
+        try:
+            import sb2mihomo
+            mcfg, _ = sb2mihomo.singbox_to_mihomo(json.load(open(checksb)),
+                                                  redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets())
+            mtmp = checksb + ".mihomo"
+            json.dump(mcfg, open(mtmp, "w"), ensure_ascii=False)
+            chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", mtmp])
+        except Exception as e:  # noqa: BLE001
+            return False, "备份配置渲染 mihomo 失败(%s)" % type(e).__name__
+        if chk.returncode != 0:
+            return False, "备份的配置(mihomo)校验失败:\n" + (chk.stdout + chk.stderr)[-300:]
         ts = time.strftime("%Y%m%d-%H%M%S")
         shutil.copy(SB, SB + ".pre-restore-" + ts)
         restored = []
@@ -2864,8 +2838,6 @@ def handle_cb(chat, mid, data):
     if data in ("wloc", "wloc:menu"):
         if _platform() != "ios":
             edit(chat, mid, "位置改写(WLOC)仅 iOS 平台可用。", OPS_BACK); return
-        if _core_backend() != "mihomo":
-            edit(chat, mid, "WLOC 需要 mihomo 内核。\n请先返回运维菜单，切换到 mihomo。", OPS_BACK); return
         w = _wloc_state(); on = bool(w.get("enabled")); loc = _wloc_active(w)
         cur = f"<b>{w['active']}</b>({loc['lat']}, {loc['lon']})" if loc else "未设"
         edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n状态: <b>{'🟢 开启' if on else '关闭'}</b>　当前: {cur}　地点: {len(w['locations'])} 个\n\n"
@@ -2922,30 +2894,6 @@ def handle_cb(chat, mid, data):
         return
     if data in ("wloc:on", "wloc:off"):
         ok, msg = wloc_enable(data == "wloc:on"); edit(chat, mid, msg if ok else ("❌ " + msg), WLOC_BACK); return
-    if data == "switchcore":
-        cur = _core_backend(); tgt = "mihomo" if cur == "singbox" else "singbox"
-        # 切回 sing-box 前: WLOC 开启则阻止, 避免留下"WLOC 显示开启但 pdg-mitm 已停"的状态。
-        if tgt == "singbox" and bool((_mitm_config().get("wloc") or {}).get("enabled")):
-            edit(chat, mid, "WLOC 当前处于开启状态。请先关闭 WLOC，再切换到 sing-box。", OPS_BACK); return
-        if tgt == "mihomo":
-            body = ("🔀 <b>切换内核：sing-box → mihomo</b>\n\n"
-                    "出口、分流、证书、DoT 和规则配置会保留。\n"
-                    "mihomo 版本随 PrivDNS Gateway 发布更新。\n\n"
-                    "切换期间连接可能中断几秒；失败时自动回滚。")
-        else:
-            body = ("🔀 <b>切换内核：mihomo → sing-box</b>\n\n"
-                    "出口、分流、证书、DoT 和规则配置会保留。\n"
-                    "sing-box 固定使用 1.12.x。\n\n"
-                    "WLOC 仅支持 mihomo，切换期间连接可能中断几秒；失败时自动回滚。")
-        edit(chat, mid, body,
-             {"inline_keyboard": [[{"text": f"✅ 确认换到 {tgt}", "callback_data": "switchcore:" + tgt}],
-                                  [{"text": "取消", "callback_data": "nav:ops"}]]}); return
-    if data in ("switchcore:mihomo", "switchcore:singbox"):
-        tgt = data.split(":", 1)[1]
-        edit(chat, mid, f"⏳ 正在切换到 <b>{tgt}</b> 内核(下载/校验/切服务, 约 10-30 秒, 期间代理短暂中断)…", OPS_BACK)
-        r = sh(["pdg", "switch-core", tgt])
-        lines = (r.stdout + r.stderr).strip().splitlines()
-        send(chat, (lines[-1] if lines else ("✅ 完成" if r.returncode == 0 else "❌ 失败")), OPS_BACK); return
     if data == "panel":
         on = _panel_on()
         edit(chat, mid, "📊 <b>临时观测/控制面板 (zashboard)</b>\n"

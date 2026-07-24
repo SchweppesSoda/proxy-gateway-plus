@@ -79,18 +79,15 @@ def setup(tmp, backend="mihomo", svc_active=True):
 
 
 def main():
-    # ── _core_backend ──
+    # ── _core_backend: v1.6.0 起恒 mihomo(唯一内核), 与 backend 标记内容无关 ──
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp, backend="mihomo")
-        assert bot._core_backend() == "mihomo"; ok("_core_backend 识别 mihomo")
+        assert bot._core_backend() == "mihomo"; ok("_core_backend 恒 mihomo")
         with open(bot.BACKEND_MARKER, "w") as f:
-            f.write("singbox")
-        assert bot._core_backend() == "singbox"; ok("_core_backend 识别 singbox")
+            f.write("singbox")                          # 旧机器标记里可能还写着 singbox
+        assert bot._core_backend() == "mihomo"; ok("_core_backend 忽略旧 singbox 标记, 仍 mihomo")
         os.remove(bot.BACKEND_MARKER)
-        assert bot._core_backend() == "singbox"; ok("_core_backend 缺标记默认 singbox")
-        with open(bot.BACKEND_MARKER, "w") as f:
-            f.write("garbage")
-        assert bot._core_backend() == "singbox"; ok("_core_backend 非法值默认 singbox")
+        assert bot._core_backend() == "mihomo"; ok("_core_backend 缺标记也 mihomo")
 
     # ── _panel_render_args ──
     args = bot._panel_render_args({"experimental": {"clash_api": {
@@ -195,23 +192,16 @@ def main():
         assert "RULE-SET,rs_a,ss1" in cfg["rules"]
         ok("_render_mihomo_file 从 RS_META 产出 rule-providers + RULE-SET")
 
-    # ── 向后兼容: sing-box 分支不受重构影响 ──
+    # ── _core_apply: v1.6.0 唯一路径就是 mihomo(渲染 + mihomo -t + restart mihomo) ──
     with tempfile.TemporaryDirectory() as tmp:
-        fake = setup(tmp, backend="singbox", svc_active=True)
+        fake = setup(tmp, backend="mihomo", svc_active=True)
         ret = bot._core_apply()
         assert ret == (True, "", True), ret
-        assert fake.has(["sing-box", "check", "-c", bot.SB])
-        assert fake.has(["systemctl", "restart", "sing-box"])
-        assert not fake.has(["mihomo", "-t"]), "singbox 模式不该碰 mihomo"
-        assert not os.path.exists(bot.MIHOMO_CFG), "singbox 模式不该渲染 mihomo 配置"
-        ok("_core_apply singbox 成功 → 校验+重启 sing-box, 不渲染 mihomo")
-    with tempfile.TemporaryDirectory() as tmp:
-        fake = setup(tmp, backend="singbox", svc_active=True)
-        fake.sbcheck_rc = 1
-        okr, err, restarted = bot._core_apply()
-        assert okr is False and restarted is False and "校验失败" in err
-        assert not fake.has(["systemctl", "restart", "sing-box"]), "校验失败不该重启"
-        ok("_core_apply singbox 校验失败 → 未重启")
+        assert fake.has(["mihomo", "-t", "-d", bot.MIHOMO_DIR, "-f", bot.MIHOMO_CFG])
+        assert fake.has(["systemctl", "restart", "mihomo"])
+        assert os.path.exists(bot.MIHOMO_CFG), "应渲染出 mihomo 配置"
+        assert not fake.has(["sing-box", "check", "-c", bot.SB]), "不该再碰 sing-box"
+        ok("_core_apply → 渲染 + mihomo -t + restart mihomo(不碰 sing-box)")
 
     print(f"\n通过 {pass_n} 项断言")
 

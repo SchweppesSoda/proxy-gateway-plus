@@ -386,6 +386,8 @@ with tempfile.TemporaryDirectory() as td:
         tar.addfile(info, io.BytesIO(data))
     bot.SB = sb; bot.MOSDNS_CONF = mos; bot.RS_DIR = os.path.join(td, "rs")
     bot.RESTORE_MAP = {"etc/sing-box/config.json": sb}
+    # restore 走 _core_apply → 渲染 mihomo 配置, 落在临时目录(别写真 /etc/mihomo)
+    bot.MIHOMO_DIR = os.path.join(td, "mihomo"); bot.MIHOMO_CFG = os.path.join(bot.MIHOMO_DIR, "config.yaml")
     bot.sh = lambda cmd: _R()
     bot._svc_active = lambda *a, **k: True   # restore 现走 core-aware _core_apply(会验服务 active)
     ok, err = bot.restore_from(raw.getvalue())
@@ -410,14 +412,10 @@ bot.clash_up = lambda: True
 bot.clash_get = lambda path: (_qpaths.append(path) or {"delay": 9})
 bot.load = lambda: {"outbounds": [{"tag": "jp", "type": "direct"},
                                   {"tag": "hk", "type": "shadowsocks", "server": "1.1.1.1", "server_port": 8388}]}
-bot._core_backend = lambda: "mihomo"
 out = bot.test_exits()
 assert "/proxies/DIRECT/delay" in " ".join(_qpaths), "mihomo 下 direct 出口(jp)应查内建 DIRECT"
 assert "/proxies/hk/delay" in " ".join(_qpaths), "代理出口名不变"
 assert "<b>jp</b>" in out and "<b>hk</b>" in out, "显示仍用原出口名"
-_qpaths.clear(); bot._core_backend = lambda: "singbox"
-bot.test_exits()
-assert "/proxies/jp/delay" in " ".join(_qpaths), "singbox 后端 jp 用原名(不映射)"
-print("[OK]   测出口: mihomo direct→DIRECT 映射, singbox 用原名")
+print("[OK]   测出口: mihomo direct→DIRECT 映射")
 
 print("panel regression OK")

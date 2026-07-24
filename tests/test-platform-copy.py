@@ -84,39 +84,28 @@ def main():
     assert "（iOS 描述文件）" in bot.status_text()
     ok("iOS 状态: DoT 显示 iOS 描述文件")
 
-    # 6 iOS + sing-box 不能开启 WLOC
-    bot._platform = lambda: "ios"; bot._core_backend = lambda: "singbox"
-    r_ok, msg = bot.wloc_enable(True)
-    assert r_ok is False and "mihomo" in msg
-    ok("iOS+sing-box: wloc_enable 被拒并提示切 mihomo")
-    # 进入 WLOC 菜单也提示切 mihomo
-    CAP.clear(); bot.handle_cb(1, 2, "wloc")
-    assert CAP and "mihomo" in CAP[-1]
-    ok("iOS+sing-box: 点 WLOC 入口提示需要 mihomo(不进菜单)")
-    # 7 iOS + mihomo 可进入 WLOC 菜单
-    bot._core_backend = lambda: "mihomo"; CAP.clear(); bot.handle_cb(1, 2, "wloc")
+    # 6 iOS 可进入 WLOC 菜单(v1.6.0: mihomo 唯一内核, 不再有"需切 mihomo"的门控)
+    bot._platform = lambda: "ios"; CAP.clear(); bot.handle_cb(1, 2, "wloc")
     assert CAP and "位置改写" in CAP[-1] and "需要 mihomo" not in CAP[-1]
-    ok("iOS+mihomo: 正常进入 WLOC 菜单")
-
-    # 8 WLOC 开启时不能切回 sing-box
-    bot._mitm_config = lambda: {"wloc": {"enabled": True, "locations": [{"name": "x", "lat": 1, "lon": 2}], "active": "x"}}
-    bot._core_backend = lambda: "mihomo"   # 当前 mihomo → 目标 singbox
-    CAP.clear(); bot.handle_cb(1, 2, "switchcore")
-    assert CAP and "请先关闭 WLOC" in CAP[-1]
-    ok("WLOC 开启时切回 sing-box 被阻止(提示先关闭 WLOC)")
+    ok("iOS: 正常进入 WLOC 菜单(无内核门控)")
+    # 7 换核入口已随 switch-core 一起移除: 运维菜单不该再有它
+    CAP.clear(); bot.handle_cb(1, 2, "nav:ops")
+    assert CAP and "换到 mihomo" not in CAP[-1] and "换回 sing-box" not in CAP[-1]
+    ok("运维菜单不再有换核入口(switch-core 已移除)")
 
     # 9 文案与 README 一致
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     src = (ROOT / "deploy" / "bot" / "pdg-bot.py").read_text(encoding="utf-8")
     for phrase in ("按探测延迟选择出口，并在出口不可用时切换",   # 故障组
-                   "mihomo 版本随 PrivDNS Gateway 发布更新",      # 内核切换(→mihomo)
-                   "sing-box 固定使用 1.12.x",                    # 内核切换(→singbox)
                    "指定并校验过的内核版本"):                     # 更新页
         assert phrase in src, f"pdg-bot.py 缺文案: {phrase}"
     # README 与 Bot 语义一致: 共享关键短语都在两处出现
-    for phrase in ("按探测延迟选择出口", "固定使用 1.12.x", "指定并校验过的"):
+    for phrase in ("按探测延迟选择出口", "指定并校验过的"):
         assert phrase in readme, f"README 缺一致文案: {phrase}"
-    ok("故障组/内核切换/更新文案在 Bot 与 README 中一致")
+    ok("故障组/更新文案在 Bot 与 README 中一致")
+    # v1.6.0: 换核 UI 已移除 —— Bot 源码里不该再有 switch-core 调用
+    assert "switch-core" not in src, "pdg-bot.py 仍残留 switch-core 调用"
+    ok("Bot 源码无 switch-core 残留")
 
     # 10 README 相对链接存在
     import re

@@ -100,14 +100,12 @@ st, _, msg = redir_case("mihomo",
     "chain prerouting {\n ip saddr 172.22.0.0/16 tcp dport { 80 } redirect to :7893\n}")
 assert st == "fail", (st, msg)
 
-# sing-box 后端没有这条 REDIRECT(走入站/tproxy) → 返回 None 跳过, 不得误报
-assert redir_case("singbox", PRE_EMPTY) is None
-
-# ── check_gms: sing-box 三入站 + 防火墙内网放行 → ok; 任一缺失 → warn(不 fail) ──
+# ── check_gms(Android): 5228-5230 靠 nft prerouting REDIRECT 进 mihomo 嗅探; 缺 → warn(不 fail) ──
 import json, tempfile
 
-NFT_OK = ("chain input {\n ip saddr 172.22.0.0/16 tcp dport { 53, 80-81, 443, 853, 5228-5230, 8445 } accept\n}")
-NFT_NO_GMS = ("chain input {\n ip saddr 172.22.0.0/16 tcp dport { 53, 80-81, 443, 853, 8445 } accept\n}")
+# v1.6.0: mihomo 是唯一内核, GMS 判据从"sing-box 入站 + input accept"改为 prerouting REDIRECT。
+PRE_GMS_OK = ("chain prerouting {\n ip saddr 172.22.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n}")
+PRE_GMS_NO = ("chain prerouting {\n ip saddr 172.22.0.0/16 tcp dport { 80, 443 } redirect to :7893\n}")
 
 def gms_case(ports, nft_out):
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
@@ -117,16 +115,16 @@ def gms_case(ports, nft_out):
     checks._run = lambda cmd: (0, nft_out, "")
     return checks.check_gms()
 
-st, _, msg = gms_case([443, 80, 5228, 5229, 5230], NFT_OK)
+st, _, msg = gms_case([443, 80, 5228, 5229, 5230], PRE_GMS_OK)
 assert st == "ok" and "5228-5230" in msg, (st, msg)
 
-st, _, msg = gms_case([443, 80, 5229, 5230], NFT_OK)          # sing-box 缺 5228
-assert st == "warn" and "pdg" in msg, (st, msg)
+st, _, msg = gms_case([443, 80], PRE_GMS_OK)      # 模型入站已不参与判据, 仍按防火墙判 ok
+assert st == "ok", (st, msg)
 
-st, _, msg = gms_case([443, 80, 5228, 5229, 5230], NFT_NO_GMS)  # 防火墙缺 5228-5230
+st, _, msg = gms_case([443, 80, 5228, 5229, 5230], PRE_GMS_NO)  # 防火墙缺 5228-5230 → warn
 assert st == "warn", (st, msg)
 
-st, _, msg = gms_case([443, 80], NFT_NO_GMS)                    # 双缺也只 warn, 不 fail
+st, _, msg = gms_case([443, 80], PRE_GMS_NO)                    # 双缺也只 warn, 不 fail
 assert st == "warn", (st, msg)
 
 # ── check_gms iOS: 正常无残留 → None(不显示); sing-box/nft 端口集残留 5228 → warn ──

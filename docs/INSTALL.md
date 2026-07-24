@@ -57,11 +57,11 @@ sudo ./install.sh
 |---|---|
 | 证书签发失败 | A 记录没生效?80 口被云厂商安全组挡了?`dig +short 域名` 对不对 |
 | 手机没 DNS | 私密 DNS 主机名填对了吗?手机确实走内网卡?`systemctl status mosdns` |
-| 代理域名打不开 | `systemctl status sing-box`;出口加了吗、密码对不对(bot「🚦 测出口」)|
+| 代理域名打不开 | `systemctl status mihomo`;出口加了吗、密码对不对(bot「🚦 测出口」)|
 | 内网卡段填错 | 改 `/etc/mosdns/config.yaml` 的 `npn_clients` 和 `/etc/nftables.conf`,`systemctl restart mosdns && nft -f /etc/nftables.conf` |
 | bot 不理你 | `systemctl status pdg-bot`;token / user id 对不对(`/etc/privdns-gateway/bot.env`)|
 
-日志:`journalctl -u mosdns -u sing-box -u pdg-bot -n 50`。
+日志:`journalctl -u mosdns -u mihomo -u pdg-bot -n 50`。
 
 ## 非交互 / 自动化安装
 
@@ -82,7 +82,7 @@ sudo PDG_NONINTERACTIVE=1 \
 - `PDG_SKIP_CERT=1`:跳过 certbot,生成**自签占位证书**(先把服务跑起来,之后用 bot「🌐 DoT 自定义域名」补正式证书)。
 - 安装会**自动关闭 systemd-resolved**(它占 `127.0.0.53:53`,与 mosdns 的 `0.0.0.0:53` 冲突)。
 
-> 本仓库的 install.sh 已在全新 Debian 12 上实跑验证(mosdns/sing-box/bot/防火墙全部起来、DNS 劫持分流正确)。
+> 本仓库的 install.sh 已在全新 Debian 12 上实跑验证(mosdns/mihomo/bot/防火墙全部起来、DNS 劫持分流正确)。
 
 ## 需要开放的端口
 
@@ -92,35 +92,27 @@ sudo PDG_NONINTERACTIVE=1 \
 |---|---|---|---|
 | 22 | tcp | 全网 | SSH 管理 |
 | 853 | tcp | 仅内网卡段 | **DoT — 手机私密 DNS 入口(核心)** |
-| 443 | tcp+udp | 仅内网卡段 | **sing-box 数据入口(嗅 SNI / QUIC)** |
-| 80 | tcp | 仅内网卡段 | sing-box HTTP 入口(嗅 Host) |
+| 443 | tcp+udp | 仅内网卡段 | **mihomo 数据入口(nft REDIRECT → redir 监听,嗅 SNI / QUIC)** |
+| 80 | tcp | 仅内网卡段 | mihomo HTTP 入口(嗅 Host) |
 | 53 | tcp+udp | 仅内网卡段 | 明文 DNS |
 | 81 | tcp | 仅内网卡段 | iOS OnDemand 探测端点 |
-| 5228-5230 | tcp | 仅内网卡段 | GMS/FCM 推送(mtalk.google.com 原生端口,经 sing-box 嗅探分流) |
-| 9090 | tcp | 仅 127.0.0.1 | sing-box clash_api(bot 用,不对外) |
+| 5228-5230 | tcp | 仅内网卡段 | GMS/FCM 推送(mtalk.google.com 原生端口,经 mihomo 嗅探分流) |
+| 9090 | tcp | 仅 127.0.0.1 | mihomo clash_api(bot 用,不对外) |
 | 8443 | tcp | 临时·仅内网卡 | `pdg ios` 下发描述文件时短开,用完自动关 |
 
 Bot 的“临时观测/控制面板”开启期间，9090 会临时监听 `0.0.0.0`，但 nftables 只允许安装时识别的内网卡段访问；面板可查看流量/连接并断开连接，持久规则和出口配置仍通过 Bot/CLI 修改。关闭、到时或 Bot 重启后会收回到 `127.0.0.1`。
 
-⚠️ **证书签发/续期需要从公网访问 80 端口**(Let's Encrypt HTTP-01 校验):签发时 pre-hook 会把 80 临时对全网开放(并停 sing-box),完后还原。
+⚠️ **证书签发/续期需要从公网访问 80 端口**(Let's Encrypt HTTP-01 校验):签发时 pre-hook 会把 80 临时对全网开放(并停内核),完后还原。
 所以**云安全组必须允许入站 80**,否则证书续期会失败。
 
 出站:`output` 链 policy accept(全放行);网关需能访问 Telegram API、DNS 上游(1.1.1.1/8.8.8.8/223.5.5.5)、各落地节点、GitHub。
 
 ## 版本注意
 
-- **sing-box 固定 1.12.x**。1.13 移除了 `sniff_override_destination`,升级即失效。
+- **流量内核 mihomo(clash.meta)**,版本由 `lib/versions.sh` 钉死、`pdg update` 随发布版安装并逐字节 SHA256 校验。
 - mosdns v5.x。
 
-### 看到 "入站字段已废弃 / 将在 1.12.0 中被移除" 怎么办
-
-**说明你的 sing-box 版本不对(太旧),不是我们锁的 1.12.x。**
-本仓库 install.sh 装的是项目锁定的 **1.12.x**(当前 **1.12.25**),实测 `sing-box check` 零告警——这条 "将在 1.12.0 中移除" 是 **1.11.x** 才会打的旧提示。
-
-`sing-box version` 确认一下;如果不是 1.12.x,重跑 install.sh(会自动下项目锁定版)或手动换成 1.12.x。
-
-> 本项目**锁 1.12.x** 的原因:1.13 移除了 `sniff_override_destination`,而它的新写法(`action: sniff`)**不覆盖目标地址**、会导致流量回环。
-> 所以**别升 1.13+,也别用比 1.12 旧的版本**。
+> **为什么不用 sing-box**:sing-box 1.13 移除了本网关依赖的 `sniff_override_destination`(其新写法 `action: sniff` 不覆盖目标地址、会流量回环),只能钉死在 1.12.x 死胡同。因此 v1.6.0 起彻底改用 mihomo(`sniffer.override-destination` 无版本天花板)。旧的 sing-box 机器 `sudo pdg update` 时会自动迁移到 mihomo。
 
 ## 升级
 

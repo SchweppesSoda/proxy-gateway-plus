@@ -120,8 +120,8 @@ out=$(sh_run "" "_stash_bin '$SB/usr/local/bin/absent'; echo rc=\$?")
 { grep -q 'rc=0' <<<"$out" && [[ ! -e "$SB/usr/local/bin/absent.pdg-preinstall" ]]; } \
   && ok "1e: 目标不存在 → 返回0 且不生成备份" || bad "1e: out=$out"
 
-# 1f. 静态守卫: 三个安装点都必须 `_stash_bin ... ||` 中止(不能忽略返回值)
-for b in mosdns sing-box mihomo; do
+# 1f. 静态守卫: 各安装点都必须 `_stash_bin ... ||` 中止(不能忽略返回值)
+for b in mosdns mihomo; do
   if grep -qE "_stash_bin /usr/local/bin/$b( |\$).*\|\|" "$ROOT/install.sh" \
      || grep -A0 -E "_stash_bin /usr/local/bin/$b\b" "$ROOT/install.sh" | grep -q '||'; then
     ok "1f: $b 安装点检查了 _stash_bin 返回值"

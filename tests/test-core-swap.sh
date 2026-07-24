@@ -4,7 +4,7 @@
 #   A. 配置 check 失败      → 还原旧核(内容/sha 一致)、无 .prev 残留、return 1、不报"已装并重启"
 #   B. check 过但重启不稳定 → 同上(旧实现此时 .prev 已删 → 无核可退, 正是本 issue)
 #   C. 全过                 → 新核就位、.prev 已删、return 0、报"已装并重启"
-#   mihomo 与 sing-box 两内核对称覆盖。
+#   v1.6.0 起 mihomo 是唯一内核(sing-box 运行时已移除), 故只覆盖 mihomo。
 #   D. 快照含内核二进制 + 回滚能按内容还原(不依赖联网重下)。
 # 沙箱化: PDG_CORE_BINDIR 指到临时目录; systemctl is-active 依"当前装的是新核还是旧核"作答。
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,7 +47,8 @@ setup(){ # $1=svc $2=新核 check 退出码
 }
 cursha(){ sha256sum "$BIN/$1" | cut -d' ' -f1; }
 
-for svc in mihomo sing-box; do
+# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
+for svc in mihomo; do
   # ── A. 配置 check 失败 → 还原旧核 ──
   setup "$svc" 3; NEW_ACTIVE=active
   rc=0; out=$(_core_swap_verify "$svc" "$WORK/new-$svc" "$BIN" vTEST 2>&1) || rc=$?
@@ -75,7 +76,8 @@ done
 
 # ── E. 备份失败必须在装新内核之前中止(问题四) ────────────────────────────
 # 旧实现 `cp -a "$bin" "$prev"` 不看结果, 备份没成也照装新核 → 出事时无核可退。
-for svc in mihomo sing-box; do
+# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
+for svc in mihomo; do
   setup "$svc" 0; NEW_ACTIVE=active
   rc=0
   out=$(cp(){ return 1; }                       # 注入: 备份拷不动
@@ -89,7 +91,8 @@ done
 # ── F. 历史遗留的 <svc>.prev 不得被当成"本次备份"还原回去 ──────────────────
 # 真正的危险: 备份 cp 失败时旧实现原地留下上次的 .prev, 还原那步会把这个**来源不明的
 # 历史文件** mv 成当前内核 —— 等于用一个谁也不知道是什么的二进制顶替了正在跑的内核。
-for svc in mihomo sing-box; do
+# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
+for svc in mihomo; do
   setup "$svc" 3; NEW_ACTIVE=active
   printf '#!/bin/sh\n# STALE-HISTORICAL-PREV\nexit 0\n' > "$BIN/$svc.prev"
   rc=0
@@ -102,7 +105,8 @@ for svc in mihomo sing-box; do
 done
 
 # ── G. 还原时 mv 失败 → _core_restore_prev 必须返回非0(不能只凭服务 active 判成功) ──
-for svc in mihomo sing-box; do
+# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
+for svc in mihomo; do
   setup "$svc" 0; NEW_ACTIVE=active
   cp -a "$BIN/$svc" "$BIN/$svc.prev"           # 备份路径同时喂给新旧两种签名
   rc=0
@@ -114,7 +118,8 @@ for svc in mihomo sing-box; do
 done
 
 # ── H. 起来即崩: is-active 每次都答 active, 但观察窗口内 NRestarts 在涨 → 必须判不稳定 ──
-for svc in mihomo sing-box; do
+# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
+for svc in mihomo; do
   setup "$svc" 0; NEW_ACTIVE=active; RESTART_LOOP=1; : > "$WORK/nrestarts"
   rc=0; out=$(_core_swap_verify "$svc" "$WORK/new-$svc" "$BIN" vTEST 2>&1) || rc=$?
   unset RESTART_LOOP; rm -f "$WORK/nrestarts"

@@ -78,14 +78,13 @@ def main():
     assert "mihomo" in svcs and "sing-box" not in svcs, svcs; ok("mihomo: journalctl 取 mihomo 日志(不取 sing-box)")
     assert "/ mihomo, 80 行)" in text, text[:400]; ok("mihomo: 日志小节标题与内核一致")
 
-    # ── sing-box 后端(不回归) ──
+    # ── 旧机器 backend 标记里仍写着 singbox: 报告也只认 mihomo(v1.6.0 唯一内核) ──
     text, cmds = collect("singbox")
-    assert "===== sing-box 版本 =====" in text; ok("sing-box: 版本小节标题为 'sing-box 版本'")
-    assert has_cmd(cmds, "sing-box", "version"); ok("sing-box: 取版本用 `sing-box version`")
-    assert not has_cmd(cmds, "mihomo", "-v"); ok("sing-box: 不去问 mihomo 版本")
+    assert "===== mihomo 版本 =====" in text; ok("旧 singbox 标记: 版本小节仍为 'mihomo 版本'")
+    assert has_cmd(cmds, "mihomo", "-v"); ok("旧 singbox 标记: 取版本仍用 `mihomo -v`")
+    assert not has_cmd(cmds, "sing-box", "version"); ok("旧 singbox 标记: 不去问 sing-box 版本")
     svcs = journal_svcs(cmds)
-    assert "sing-box" in svcs and "mihomo" not in svcs, svcs; ok("sing-box: journalctl 取 sing-box 日志")
-    assert "/ sing-box, 80 行)" in text; ok("sing-box: 日志小节标题与内核一致")
+    assert "mihomo" in svcs and "sing-box" not in svcs, svcs; ok("旧 singbox 标记: journalctl 仍取 mihomo 日志")
 
     print(f"\n通过 {pass_n} 项断言")
 

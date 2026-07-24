@@ -70,9 +70,13 @@ rc=$?
   && ok "推测态: iOS 组件一个没删(万一这台其实服务 iPhone)" || bad "推测态下 iOS 组件被删了"
 grep -q '跳过 iOS 组件清理' /tmp/mig1.log && ok "推测态: 明确说明跳过了清理" || bad "未提示跳过清理"
 
-# 内核标记必须落地(否则永远靠默认值兜底, 默认值一改就静默换核)
-[[ "$(cat /etc/privdns-gateway/backend 2>/dev/null)" == singbox ]] \
-  && ok "内核标记落地 singbox(据现场证据, 不再靠默认值)" || bad "backend=$(cat /etc/privdns-gateway/backend 2>/dev/null)"
+# v1.6.0: 老装(sing-box)迁移后内核标记必须落定 mihomo, 且 sing-box 运行时被清干净
+[[ "$(cat /etc/privdns-gateway/backend 2>/dev/null)" == mihomo ]] \
+  && ok "老装迁移: 内核标记落定 mihomo" || bad "backend=$(cat /etc/privdns-gateway/backend 2>/dev/null)"
+{ [[ ! -e /etc/systemd/system/sing-box.service ]] && [[ ! -e /usr/local/bin/sing-box ]]; } \
+  && ok "老装迁移: sing-box unit 与二进制已移除" || bad "sing-box 运行时仍有残留"
+grep -q 'sing-box 运行时已移除' /tmp/mig1.log \
+  && ok "老装迁移: 迁移过程有明确告知" || bad "迁移日志未提到移除 sing-box"
 
 # mosdns: 补 hijack_set 插件, all 模式不装劫持门
 { [[ "$(plug)" == 1 ]] && [[ "$(gate)" == 0 ]]; } \
