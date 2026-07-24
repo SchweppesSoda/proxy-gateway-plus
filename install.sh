@@ -310,7 +310,7 @@ fi
 # mihomo 成唯一内核。旧的 sing-box 机器 `pdg update` 时由 migrate_drop_singbox 自动迁移。
 CORE=mihomo
 CORE_SVC=mihomo
-if ! mihomo -v 2>/dev/null | grep -q "$MIHOMO_VER"; then
+if ! pdg_mihomo_is_version "$MIHOMO_VER"; then
   c_g "下载 mihomo $MIHOMO_VER ($MARCH)…"
   t=$(mktemp -d)
   curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${MARCH}-${MIHOMO_VER}.gz" -o "$t/mihomo.gz"

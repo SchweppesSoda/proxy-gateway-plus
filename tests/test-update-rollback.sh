@@ -48,6 +48,11 @@ _pdg_core_svc(){ echo sing-box; }
 _pdg_mktemp_dir(){ mktemp -d; }
 _sb_panel_managed_on(){ return 1; }
 _core_kernel_activate(){ return 0; }
+# cmd_rollback 会用到的 units.sh / 归属助手: 沙箱里没有真 /etc, 一并打桩(与 systemctl/nft 同理)
+pdg_write_unit(){ return 0; }
+pdg_unit_mihomo(){ echo "[Unit]"; }
+_pdg_drop_singbox_files(){ :; }
+_pdg_singbox_is_ours(){ return 1; }
 systemctl(){ return 0; }
 nft(){ return 0; }
 # 覆写落盘: 不碰真 /, 把被应用快照的判别标记抄到沙箱, 供断言"回滚到了哪份"

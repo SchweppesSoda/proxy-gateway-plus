@@ -845,7 +845,7 @@ _update_core_binary(){
   march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
   tmp=$(mktemp -d)
   ver="$MIHOMO_VER"
-  mihomo -v 2>/dev/null | grep -q "$ver" && { rm -rf "$tmp"; return 0; }   # 已是钉死版本
+  pdg_mihomo_is_version "$ver" && { rm -rf "$tmp"; return 0; }   # 已是钉死版本(精确比较, 非子串)
   c_g "更新 mihomo 内核 → $ver …"
   curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz" \
     || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
@@ -1675,7 +1675,7 @@ _activate_mihomo_core(){
   source "$REPO_DIR/lib/units.sh"   2>/dev/null || { echo "❌ 读不到 units.sh"; return 1; }
   cp /etc/nftables.conf /etc/nftables.conf.scbak 2>/dev/null
 
-  if ! mihomo -v 2>/dev/null | grep -q "$MIHOMO_VER"; then
+  if ! pdg_mihomo_is_version "$MIHOMO_VER"; then
     c_g "下载 mihomo $MIHOMO_VER…"; t=$(mktemp -d)
     if ! curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${march}-${MIHOMO_VER}.gz" -o "$t/m.gz" \
        || ! pdg_verify_sha256 "$t/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $MIHOMO_VER" \

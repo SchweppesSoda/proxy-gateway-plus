@@ -23,6 +23,26 @@ declare -A PDG_SHA256=(
   [zashboard]="403b351d3663f5fe65db053cb2f3dc980108d8f86e8c6968d56164d3452592e1"
 )
 
+# ── 内核版本判定: 必须精确匹配, 不能用子串 ──────────────────────────────────
+# `mihomo -v | grep -q "$MIHOMO_VER"` 是子串判断: 期望 v1.19.1 时, 机器上跑 v1.19.10 也会被
+# 判成"已是钉死版本" → 装机/更新都跳过下载, 内核实际没升上去。这类错判只在版本号进位到两位
+# 数时才出现, 极难发现。故统一解析出完整版本字段后做等值比较。
+
+# 从 `mihomo -v` 输出解析版本(如 v1.19.29); 解析不出则输出空。
+pdg_mihomo_version(){
+  local out
+  out="$(mihomo -v 2>/dev/null | head -1)" || return 0
+  [[ "$out" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]] && printf 'v%s\n' "${BASH_REMATCH[1]}"
+}
+
+# 当前 mihomo 是否**恰好**是 $1 指定的版本(带不带 v 前缀都行)。
+# 读不到版本(没装/输出异常)一律返回非 0 —— 宁可多装一次, 也不能跳过该做的安装。
+pdg_mihomo_is_version(){
+  local want="${1#v}" got
+  got="$(pdg_mihomo_version)"; got="${got#v}"
+  [[ -n "$got" && "$got" == "$want" ]]
+}
+
 # pdg_verify_sha256 <文件> <期望hash> [名称]  → 不符返回非 0 并打印期望/实际
 pdg_verify_sha256(){
   local file="$1" exp="$2" name="${3:-$1}" got
