@@ -133,6 +133,9 @@ jobs:
       - name: "bot 凭据保护/后台执行器/BUSY 锁回归"
         run: python3 tests/test-bot-credential.py
 
+      - name: "备份恢复解包安全 (绝对路径/../symlink/hardlink/设备/FIFO/压缩炸弹均不得越界)"
+        run: python3 tests/test-restore-tar-safety.py
+
       - name: "观测面板回归 (zashboard 开关 + clash_api secret)"
         run: python3 tests/test-panel.py
 

@@ -2379,6 +2379,65 @@ RESTORE_MAP = {
     "etc/mosdns/rules/custom_hijack.txt": MOSDNS_HIJACK,
     "opt/pdg-bot/rulesets.json": RS_META,
 }
+# 备份包是**外部输入**(bot 从 Telegram 收文件, 谁都能发一个) → 解包必须按白名单来。
+RESTORE_RS_PREFIX = RS_DIR.lstrip("/") + "/"          # etc/sing-box/rs/ 下的规则集
+RESTORE_MAX_MEMBERS = 512                             # 成员数量上限
+RESTORE_MAX_FILE_BYTES = 8 * 1024 * 1024              # 单文件上限
+RESTORE_MAX_TOTAL_BYTES = 64 * 1024 * 1024            # 解出总量上限(压缩炸弹)
+
+
+def _restore_member_allowed(name):
+    """成员是否在恢复白名单内: RESTORE_MAP 的键, 或 rs/ 下的规则集文件。"""
+    if name in RESTORE_MAP:
+        return True
+    if name.startswith(RESTORE_RS_PREFIX):
+        rest = name[len(RESTORE_RS_PREFIX):]
+        return bool(rest) and "/" not in rest        # 只收 rs/ 下一层, 不收子目录
+    return False
+
+
+def _safe_extract(tar, dest):
+    """安全解包: 只落地白名单内的**普通文件**, 逐个 resolve 确认落在 dest 之内。
+
+    不用 tar.extract() 的不受限形态 —— 它会照单全收符号链接/硬链接/设备/FIFO, 而符号链接
+    足以让后续成员写穿到解压目录之外(两段式), 解出来的 rs/ 又会被 copytree 搬进现网。
+    这里一律自己写文件: 目录按需 mkdir, 其余类型直接跳过, 从根上不产生链接。
+    体积/数量上限用于挡压缩炸弹。任一硬性上限被突破即抛错, 由调用方判恢复失败。
+    """
+    root = os.path.realpath(dest)
+    total = 0
+    seen = 0
+    for m in tar.getmembers():
+        seen += 1
+        if seen > RESTORE_MAX_MEMBERS:
+            raise ValueError("备份成员过多(>%d), 拒绝解包" % RESTORE_MAX_MEMBERS)
+        name = m.name.lstrip("./")
+        # 只要普通文件; 目录/链接/设备/FIFO 一律不按成员落地(需要的目录下面自己建)
+        if not m.isreg():
+            continue
+        if name.startswith("/") or ".." in name.split("/"):
+            continue
+        if not _restore_member_allowed(name):
+            continue
+        if m.size > RESTORE_MAX_FILE_BYTES:
+            raise ValueError("备份内文件过大(%s, >%d 字节), 拒绝解包" % (name, RESTORE_MAX_FILE_BYTES))
+        total += m.size
+        if total > RESTORE_MAX_TOTAL_BYTES:
+            raise ValueError("备份解出总量过大(>%d 字节), 拒绝解包" % RESTORE_MAX_TOTAL_BYTES)
+        target = os.path.realpath(os.path.join(root, name))
+        # resolve 之后必须仍在解压根内(挡住经既存符号链接的写穿)
+        if target != root and not target.startswith(root + os.sep):
+            raise ValueError("备份成员越界: %s" % name)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        src = tar.extractfile(m)
+        if src is None:
+            continue
+        # 落地前再确认一次父目录没被换成链接(TOCTOU 兜底), 并且不跟随既有链接写入
+        if os.path.islink(target):
+            raise ValueError("备份成员目标是符号链接: %s" % name)
+        with open(target, "wb") as out:
+            shutil.copyfileobj(src, out, 64 * 1024)
+        os.chmod(target, 0o600)
 
 def backup_blob():
     buf = io.BytesIO()
@@ -2441,13 +2500,12 @@ def restore_from(data):
         return False, "不是有效的 .tar.gz 备份文件"
     tmp = tempfile.mkdtemp(prefix="pdgrs")
     try:
-        for m in tar.getmembers():
-            if m.name.startswith("/") or ".." in m.name.split("/"):
-                continue
-            try:
-                tar.extract(m, tmp)
-            except Exception:  # noqa: BLE001
-                pass
+        # 安全解包: 白名单内的普通文件才落地, 链接/设备/FIFO 一律不产生, 逐个 resolve 限定在
+        # tmp 内, 并有体积/数量上限。备份包来自 Telegram(外部输入), 不能用不受限的 extract。
+        try:
+            _safe_extract(tar, tmp)
+        except Exception as e:  # noqa: BLE001
+            return False, "备份包不安全或已损坏, 拒绝恢复: %s" % e
         newsb = os.path.join(tmp, "etc/sing-box/config.json")
         newmos = os.path.join(tmp, "etc/mosdns/config.yaml")
         if not os.path.exists(newsb):
