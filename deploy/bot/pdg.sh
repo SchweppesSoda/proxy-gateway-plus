@@ -1697,6 +1697,15 @@ except Exception as e:
 bad = (meta or {}).get("unknown_proxies") or []
 if bad:
     print("这些出口 mihomo 无法转换(迁移会凭空丢失): " + ", ".join(str(x) for x in bad)); sys.exit(1)
+# 规则/规则集同理: 进不了 mihomo 运行配置就不能迁 —— 迁过去 `mihomo -t` 照样会过, 但那条
+# 分流实际已经不存在了。典型是老机器上遗留的 sing-box 二进制 .srs 规则集(mihomo 读不了)。
+drop = (meta or {}).get("dropped") or []
+if drop:
+    names = [str(d.get("rule_set") or d) for d in drop] if isinstance(drop[0], dict) else [str(x) for x in drop]
+    print("这些规则/规则集无法进入 mihomo 运行配置(迁移会凭空丢失): " + ", ".join(names[:8]))
+    print("  .srs 是 sing-box 二进制规则集, mihomo 读不了 —— 请先在 bot 里删掉并换成 "
+          ".list/.txt/.yaml/.mrs, 再重试 sudo pdg update。")
+    sys.exit(1)
 SCPY
   ); then
     printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend

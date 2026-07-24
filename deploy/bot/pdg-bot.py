@@ -413,7 +413,8 @@ def _write_mihomo(cfg):
 
 def _mihomo_rulesets():
     """从 RS_META 构造 mihomo rule-providers 入参: rule-provider 指向原始 url, mihomo 原生抓取解析。
-    仅收文本/yaml/mrs 类; sing-box 二进制 .srs 无法被 mihomo 消费, 跳过(渲染器 meta.dropped 会报告)。"""
+    收文本/yaml/mrs 类。历史遗留的 sing-box 二进制 .srs mihomo 读不了 → 跳过, 于是渲染器会把
+    它记进 meta['dropped'], 由 _core_apply/迁移据此判失败并点名(不再静默丢弃)。"""
     out = {}
     try:
         meta = _rs_meta()
@@ -421,7 +422,7 @@ def _mihomo_rulesets():
         return out
     for name, info in meta.items():
         low = str(info.get("url", "")).lower().split("?", 1)[0]
-        if low.endswith(".srs"):
+        if low.endswith(".srs") or str(info.get("format", "")) == "binary":
             continue
         if low.endswith((".yaml", ".yml")):
             behavior, fmt = "classical", "yaml"
@@ -683,6 +684,19 @@ def _render_mihomo_file():
     _write_mihomo(cfg)
     return meta
 
+def _fmt_dropped(dropped):
+    """把渲染器丢弃的规则说人话: 规则集报名字, 其余报它长什么样(供用户定位)。"""
+    out = []
+    for d in dropped or []:
+        if isinstance(d, dict) and d.get("rule_set"):
+            out.append(str(d["rule_set"]))
+        elif isinstance(d, dict):
+            out.append(",".join(f"{k}={v}" for k, v in list(d.items())[:2]) or "未知规则")
+        else:
+            out.append(str(d))
+    return ", ".join(out[:8]) + ("…" if len(out) > 8 else "")
+
+
 def _core_apply():
     """校验 model 渲染出的 mihomo 配置并重启 mihomo。不改 model 文件本身。
     返回 (ok, errtext, restarted): restarted 标明核心是否已被重启(决定回滚要不要再重启)。"""
@@ -694,6 +708,11 @@ def _core_apply():
     bad = (meta or {}).get("unknown_proxies")
     if bad:
         return False, "有出口 mihomo 无法转换(会被静默丢弃): %s" % ", ".join(str(x) for x in bad), False
+    # 同理: 没能翻译进运行配置的规则/规则集也必须拒。mihomo -t 照样会过 —— 它只看渲染出来的
+    # 那份, 根本不知道有东西被丢了; 用户则以为分流已生效, 实际那条规则压根不存在。
+    dropped = (meta or {}).get("dropped")
+    if dropped:
+        return False, "有规则/规则集无法进入 mihomo 运行配置(会被静默丢弃): %s" % _fmt_dropped(dropped), False
     chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", MIHOMO_CFG])
     if chk.returncode != 0:
         return False, "mihomo 配置校验失败:\n" + (chk.stdout + chk.stderr)[-400:], False
@@ -1718,13 +1737,17 @@ def add_ruleset(url, target, label=""):
     if target not in exit_tags(c):
         return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))}"
     low = url.lower().split("?", 1)[0]
-    if low.endswith(".mrs"):
-        return False, ".mrs 是 mihomo 二进制格式, sing-box 不支持。请用 .list/.txt 文本规则, 或 sing-box .srs。"
+    # .srs 是 sing-box 的二进制规则集, mihomo 消费不了 —— 收下它只会在渲染时被丢弃, 而用户
+    # 以为分流已生效。入口就拒, 并指出可用的替代格式(不再"接受成功, 背地丢弃")。
+    if low.endswith(".srs"):
+        return False, (".srs 是 sing-box 二进制规则集, mihomo 无法读取(收下也不会进运行配置)。\n"
+                       "请改用 .list / .txt 文本规则、.yaml provider, 或 mihomo 原生 .mrs。")
     name = "rs_" + hashlib.sha1(url.encode()).hexdigest()[:8]
     os.makedirs(RS_DIR, exist_ok=True)
     try:
-        if low.endswith(".srs"):
-            path = os.path.join(RS_DIR, name + ".srs"); fmt = "binary"
+        if low.endswith(".mrs"):
+            # mihomo 原生二进制规则集: 直接存盘, 由 rule-provider 按 mrs 格式加载
+            path = os.path.join(RS_DIR, name + ".mrs"); fmt = "mrs"
             open(path, "wb").write(_fetch_bytes(url)); count = None; warn = ""
         else:
             path = os.path.join(RS_DIR, name + ".json"); fmt = "source"
@@ -1741,15 +1764,26 @@ def add_ruleset(url, target, label=""):
         cc["route"]["rules"] = [r for r in cc["route"]["rules"] if r.get("rule_set") != name]
         idx = 1 if cc["route"]["rules"] and cc["route"]["rules"][0].get("action") == "reject" else 0
         cc["route"]["rules"].insert(idx, {"rule_set": name, "outbound": target})
+
+    # 元数据必须**先**落地: mihomo 的 rule-providers 是从 RS_META 生成的, 后写就意味着本次
+    # 渲染看不到这个规则集 —— 规则会被当成"翻译不了"丢掉, 而用户已经收到"已添加"。
+    # 失败则把元数据与下载的文件一并回退, 不留半截。
+    prev = _rs_meta()
+    m = dict(prev)
+    m[name] = {"url": url, "outbound": target, "format": fmt, "path": path, "count": count}
+    if label.strip():
+        m[name]["label"] = label.strip()[:40]
+    _save_rs_meta(m)
     ok, msg = apply_sb(mod)
     if ok:
-        m = _rs_meta(); m[name] = {"url": url, "outbound": target, "format": fmt,
-                                   "path": path, "count": count}
-        if label.strip():
-            m[name]["label"] = label.strip()[:40]
-        _save_rs_meta(m)
-        cntdesc = f"{count} 条" if count is not None else "sing-box .srs"
+        cntdesc = f"{count} 条" if count is not None else "mihomo .mrs"
         return True, f"规则集已添加 → {target}（{cntdesc}，{label.strip() or name}）" + warn
+    _save_rs_meta(prev)                     # 回退元数据
+    if name not in prev:
+        try:
+            os.remove(path)                 # 回退这次下载的规则集文件
+        except OSError:
+            pass
     return False, msg
 
 def set_ruleset_label(name, label):
@@ -2784,7 +2818,7 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "发个域名, 查它走哪个出口/规则(还是国内直连)。\n例: <code>netflix.com</code>\n/cancel 取消。", RULE_BACK); return
     if data == "add_rs":
         state[chat] = "add_rs"
-        edit(chat, mid, "发「<b>规则集URL 出口 [名称]</b>」(后缀 .list / .txt / .srs)。\n"
+        edit(chat, mid, "发「<b>规则集URL 出口 [名称]</b>」(后缀 .list / .txt / .yaml / .mrs)。\n"
              f"出口: {', '.join(exit_tags(load()))}\n名称可留空(之后用「✏️ 改规则集名」改)。\n"
              "例: <code>https://.../Binance.list tw 币安</code>\n/cancel 取消。", RULE_BACK); return
     if data == "del_rs":
@@ -3045,7 +3079,7 @@ def handle_text(chat, text, mid=None):
         if cmd == "/delrule":
             state[chat] = "del_rule"; send(chat, "发要删除的域名。/cancel 取消。", BACK); return
         if cmd == "/addrs":
-            state[chat] = "add_rs"; send(chat, "发「<b>规则集URL 出口</b>」（支持 .list / .srs）。/cancel 取消。", BACK); return
+            state[chat] = "add_rs"; send(chat, "发「<b>规则集URL 出口</b>」（支持 .list / .txt / .yaml / .mrs）。/cancel 取消。", BACK); return
         if cmd == "/delexit":
             tags = deletable_tags(load())
             send(chat, "选择删除的出口/组：" if tags else "无可删出口", kb_pick("delx", tags) if tags else BACK); return
