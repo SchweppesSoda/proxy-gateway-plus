@@ -48,7 +48,19 @@ pdg_unit_for_core_svc(){
 }
 
 # 写入 unit 并置 644(幂等)。$1=生成函数名 $2=目标路径。
+#
+# 必须原子: 先渲染到同目录临时文件, 确认生成函数成功**且产出非空**, 再 mv 落位。
+# 旧写法 `"$fn" > "$path"` 会让 shell **先把目标截断**再去解析命令 —— 生成函数不存在
+# (跨版本回滚: 旧 updater 调新版 units.sh 里已删除的 pdg_unit_singbox)时, 目标就成了
+# 0 字节, 而调用方还可能照报成功。宁可不写, 也不能把现成的 unit 毁掉。
 pdg_write_unit(){
-  local fn="$1" path="$2"
-  "$fn" > "$path" && chmod 644 "$path"
+  local fn="$1" path="$2" tmp
+  command -v "$fn" >/dev/null 2>&1 || {
+    echo "pdg_write_unit: 生成函数 $fn 不存在, 拒绝写 $path(保留原文件)" >&2; return 1; }
+  tmp="$(mktemp "$(dirname "$path")/.pdg-unit.XXXXXX")" || return 1
+  if ! "$fn" > "$tmp" 2>/dev/null || [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo "pdg_write_unit: $fn 生成失败或产出为空, 拒绝写 $path(保留原文件)" >&2; return 1
+  fi
+  chmod 644 "$tmp" && mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
 }

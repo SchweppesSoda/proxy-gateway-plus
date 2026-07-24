@@ -24,6 +24,38 @@ _pdg_platform(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[
 _pdg_platform_present(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[ "$p" == ios || "$p" == android ]]; }
 # 按平台的必需服务集(pdg-probe81 iOS 专属; 与 checks.expected_services 同语义)
 _pdg_svcs(){ local s; s="mosdns $(_pdg_core_svc) pdg-bot"; [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"; echo "$s"; }
+
+# ── sing-box 文件归属 ────────────────────────────────────────────────────────
+# 迁移/卸载要删 sing-box 的 unit 与二进制, 但机器上那份未必是本项目装的 —— 用户完全
+# 可能自己在跑一个 sing-box 干别的。删掉别人的东西是不可逆的, 故只删**能证明是我们装的**。
+# 判据(任一成立):
+#   ① 归属标记文件(本项目装 sing-box 时留下; v1.6 起已不装 sing-box, 故仅老机器可能有);
+#   ② unit 与 lib/units.sh 历史模板 pdg_unit_singbox 的特征行一致 —— ExecStart 指向本项目
+#      的配置路径 /etc/sing-box/config.json, 这是老版装机生成的形态。
+# 都不成立 = 来源不明 → 一律保留, 只提示, 绝不代用户决定。
+PDG_SINGBOX_OWNED_MARK=/etc/privdns-gateway/singbox.pdg-owned
+_pdg_singbox_is_ours(){
+  local unit="${1:-/etc/systemd/system/sing-box.service}"
+  [[ -e "${PDG_SINGBOX_OWNED_MARK:-/etc/privdns-gateway/singbox.pdg-owned}" ]] && return 0
+  [[ -f "$unit" ]] || return 1
+  grep -qE '^ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config\.json[[:space:]]*$' "$unit" \
+    && grep -qE '^Description=sing-box[[:space:]]*$' "$unit"
+}
+
+# 停用并删除**本项目装的** sing-box unit 与二进制; 来源不明则原样保留并给出手工清理指引。
+# $1 = 场景描述(仅用于文案)。恒返回 0: 保留第三方文件不是错误, 不该让调用方判失败。
+_pdg_drop_singbox_files(){
+  local why="${1:-}" unit=/etc/systemd/system/sing-box.service bin=/usr/local/bin/sing-box
+  [[ -e "$unit" || -e "$bin" ]] || return 0
+  if ! _pdg_singbox_is_ours "$unit"; then
+    c_y "  检测到 sing-box${why:+($why)}, 但无法确认是本项目安装的 → 原样保留, 不删。"
+    c_y "  (确认它无用可自行清理: systemctl disable --now sing-box; rm -f $unit $bin)"
+    return 0
+  fi
+  systemctl disable --now sing-box >/dev/null 2>&1 || true
+  rm -f "$unit" "$bin" "${PDG_SINGBOX_OWNED_MARK:-/etc/privdns-gateway/singbox.pdg-owned}"
+  return 0
+}
 # iOS: 从已渲染的 nft 移除 GMS 5228-5230(iOS 走 APNs, 不需要)。nft 模板对两平台通用 —— 装机/切核
 # 渲染后在 iOS 上剥掉, 免得 iOS 带上 GMS(或切核后 GMS 复活)。$1=nft 文件; 非 iOS 或文件不存在=空操作。
 _pdg_nft_strip_gms(){
@@ -664,9 +696,10 @@ cmd_rollback(){
   fi
   rm -rf "$tmp"
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
-  systemctl daemon-reload
-  nft -f /etc/nftables.conf 2>/dev/null || true
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
+  # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
+  systemctl daemon-reload || unrestored+=("daemon-reload")
+  nft -f /etc/nftables.conf 2>/dev/null || true
   # v1.6.0: mihomo 是唯一内核。无论快照记录的是 mihomo 还是迁移前的 singbox, 一律起 mihomo ——
   # config.json 是核无关数据模型, mihomo 总能从它渲染。并清掉快照可能带回来的 sing-box 残留。
   # shellcheck source=/dev/null
@@ -677,10 +710,15 @@ cmd_rollback(){
       || unrestored+=("mihomo配置渲染")
   fi
   printf 'mihomo\n' > /etc/privdns-gateway/backend
-  pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
-  systemctl disable --now sing-box >/dev/null 2>&1 || true   # 快照可能把 sing-box 带回来了 → 清掉
-  rm -f /etc/systemd/system/sing-box.service /usr/local/bin/sing-box
-  systemctl daemon-reload
+  # 快照里已经带回 unit 的就别再重生成 —— 快照那份才是"回滚目标状态"的权威。
+  # 只有快照没有(或空文件)时才用模板补一份, 免得回滚顺手把状态又改成了当前版本的样子。
+  if [[ ! -s /etc/systemd/system/mihomo.service ]]; then
+    pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service \
+      || unrestored+=("mihomo.service 生成")
+  fi
+  # sing-box 残留只清"项目自己装的"(见 _pdg_singbox_is_ours), 第三方的原样保留
+  _pdg_drop_singbox_files "快照带回的"
+  systemctl daemon-reload || unrestored+=("daemon-reload(清理后)")
   # 激活失败必须计入 unrestored: 内核没起来就不是"已回滚", 不能只 warn 后照报成功。
   if ! _core_kernel_activate mihomo sing-box; then
     c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
@@ -1594,13 +1632,17 @@ migrate_drop_singbox(){
   if [[ "$cur" == mihomo ]] && [[ ! -e /etc/systemd/system/sing-box.service ]] && [[ ! -e /usr/local/bin/sing-box ]]; then
     return 0                                    # 已是纯 mihomo → 幂等短路
   fi
+  # backend 已是 mihomo, 只剩来源不明的 sing-box 文件 → 那不是本项目的东西, 不该每次更新都去动它
+  if [[ "$cur" == mihomo ]] && ! _pdg_singbox_is_ours; then
+    _pdg_drop_singbox_files "非本项目安装"      # 只打印保留提示, 不删
+    return 0
+  fi
   c_y "检测到 sing-box 运行时(v1.6.0 已移除)→ 迁移到 mihomo 唯一内核(出口/分流/证书/DoT 不动)…"
   _activate_mihomo_core || { echo "❌ 迁移到 mihomo 失败(见上)。请在 TG bot 处理无法转换的出口后, 重试 sudo pdg update。"; return 1; }
-  # 收尾: _core_kernel_activate 已 stop+disable sing-box; 再删掉它的 unit + 二进制。
-  systemctl disable --now sing-box >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/sing-box.service
+  # 收尾: _core_kernel_activate 已 stop+disable sing-box; 再删掉**本项目装的** unit + 二进制
+  # (来源不明的一律保留 —— 删别人的东西不可逆)。
+  _pdg_drop_singbox_files
   systemctl daemon-reload 2>/dev/null || true
-  rm -f /usr/local/bin/sing-box
   printf 'mihomo\n' > /etc/privdns-gateway/backend
   c_g "  已迁移到 mihomo 内核, sing-box 运行时已移除。"
   return 0

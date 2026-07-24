@@ -85,8 +85,14 @@ jobs:
       - name: "内核激活纪律回归 (假 systemctl+重启模拟: 只起一个内核/失败回滚/unit 无漂移)"
         run: bash tests/test-core-activate.sh
 
-      - name: "sing-box→mihomo 迁移回归 (转不了的出口逐个列名/失败非0且回滚标记/成功清干净/幂等)"
+      - name: "sing-box→mihomo 迁移回归 (转不了的出口逐个列名/失败非0且回滚标记/成功清干净/幂等/第三方不删)"
         run: bash tests/test-migrate-drop-singbox.sh
+
+      - name: "unit 写入原子性 (生成函数缺失/失败/空产出都不许截断既有 unit —— 跨版本回滚)"
+        run: bash tests/test-write-unit-atomic.sh
+
+      - name: "sing-box 归属保护 (uninstall/--purge 只删本项目装的, 第三方原样保留)"
+        run: bash tests/test-singbox-ownership.sh
 
       - name: "平台隔离安装/迁移矩阵 (marker 证据回退/GMS 仅安卓/iOS GMS 清理/服务集按平台)"
         run: bash tests/test-platform-install.sh
@@ -222,7 +228,11 @@ jobs:
     container:
       image: debian:12
     steps:
+      # fetch-depth: 0 —— 跨版本回滚用例要取**真的** v1.5.12 代码当更新器; 默认浅克隆没有
+      # tag, 那条用例会静默 skip(CI 绿但零覆盖), 正是本项目最怕的假绿。
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: 装依赖
         run: |
           apt-get update -qq
@@ -237,6 +247,10 @@ jobs:
       - name: E2E sing-box→mihomo 迁移 (真 mihomo 二进制 + 真协议出口一个不丢 + 不可转换出口必须点名拒绝)
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-drop-singbox.sh
+
+      - name: E2E 跨版本回滚 (v1.5.12 更新器 + 当前代码, 迁移后注入 doctor 失败: unit 不得被清空)
+        env: { PDG_E2E_ISOLATED: "1" }
+        run: bash tests/e2e-cross-version-rollback.sh
       - name: "E2E 全新安装 (真跑 install.sh: 落地全套 / 拒绝重装 / 失败回滚干净)"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-install.sh
