@@ -1788,7 +1788,7 @@ def del_ruleset(name):
     return False, msg
 
 def refresh_rulesets():
-    """重下并原子替换所有规则集; sing-box check 通过才重启, 坏档自动回滚、不断网(供 bot 与每日定时调用)。"""
+    """重下并原子替换所有规则集; 内核校验通过才重启, 坏档自动回滚、不断网(供 bot 与每日定时调用)。"""
     m = _rs_meta(); n = 0; swapped = []   # (path, bak)
     for name, info in m.items():
         # 兼容早期缺 format/path 的旧条目 (按 name 回填, 否则刷新会 KeyError)。

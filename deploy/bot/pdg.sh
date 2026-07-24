@@ -466,68 +466,9 @@ PY
   fi
 }
 
-# 老装迁移: sing-box 补 5228-5230 direct 嗅探入站(GMS/FCM 推送端口 mtalk.google.com)。幂等。
-# 不补则被 DNS 劫持的 mtalk 只能靠客户端回落 443, 回落慢的手机表现为"Google 服务连不上"。
-# check 不过/起不来自动还原。$1 可指定文件(供测试), 默认 /etc/sing-box/config.json。
-# shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
-migrate_singbox_gms(){
-  local f="${1:-/etc/sing-box/config.json}"
-  [[ "$(_pdg_platform 2>/dev/null)" == ios ]] && return 0     # GMS/FCM 仅 Android; iOS 走 APNs, 不补
-  [[ -f "$f" ]] || return 0
-  # 幂等/形态判定走 JSON 解析, 不靠文本格式 —— 用 grep 认 `"listen_port": 5228` 会被紧凑
-  # JSON(冒号后无空格)骗过, 于是重复插入三条同端口入站; 虽有 check/重启兜底能还原, 但那是
-  # 事后补救, 判据本身不该依赖别人怎么格式化这份 JSON。
-  local _gmsst
-  _gmsst=$(python3 - "$f" <<'GMSPY'
-import json, sys
-try:
-    c = json.load(open(sys.argv[1], encoding="utf-8"))
-except Exception:
-    print("skip"); raise SystemExit(0)
-ins = c.get("inbounds") or []
-if not any(i.get("sniff_override_destination") for i in ins):
-    print("skip")                                            # 不是本项目形态的配置 → 不动
-elif any(i.get("listen_port") in (5228, 5229, 5230) for i in ins):
-    print("have")                                            # 已有 → 幂等退出
-else:
-    print("need")
-GMSPY
-  ) || _gmsst=skip
-  [[ "$_gmsst" == need ]] || return 0
-  command -v sing-box >/dev/null || return 0
-  c_g "检测到 sing-box 缺 GMS 推送入站 → 补 5228-5230 嗅探入站…"
-  local bak; bak="$f.pregms.$(date +%s)"
-  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
-    c_y "  备份失败(磁盘满?), 中止、不动现网。"; rm -f "$bak" 2>/dev/null; return 0
-  fi
-  if ! python3 - "$f" <<'PY'
-import json, sys
-p = sys.argv[1]
-c = json.load(open(p))
-ins = c.get("inbounds", [])
-idx = next((n + 1 for n, i in enumerate(ins) if i.get("listen_port") == 80),
-           next((n + 1 for n, i in enumerate(ins) if i.get("listen_port") == 443), len(ins)))
-for off, port in enumerate((5228, 5229, 5230)):
-    ins.insert(idx + off, {"type": "direct", "tag": "in-gms-%d" % port, "network": "tcp",
-                           "listen": "0.0.0.0", "listen_port": port,
-                           "sniff": True, "sniff_override_destination": True, "sniff_timeout": "300ms"})
-c["inbounds"] = ins
-json.dump(c, open(p, "w"), ensure_ascii=False, indent=2)
-PY
-  then c_y "  生成失败 → 还原。"; cp -a "$bak" "$f"; return 0; fi
-  if ! sing-box check -c "$f" >/dev/null 2>&1; then
-    c_y "  sing-box check 未过 → 还原、不重启。"; cp -a "$bak" "$f"; return 0
-  fi
-  systemctl reset-failed sing-box 2>/dev/null; systemctl restart sing-box 2>/dev/null; sleep 2
-  if [[ "$(systemctl is-active sing-box 2>/dev/null)" == active ]]; then
-    c_g "  ✅ 已补 GMS 入站(5228-5230)。"
-  else
-    c_y "  ⚠️ sing-box 重启失败 → 还原。"; cp -a "$bak" "$f"
-    systemctl reset-failed sing-box 2>/dev/null; systemctl restart sing-box 2>/dev/null
-  fi
-}
 
-# 老装迁移: 防火墙内网放行集补 5228-5230(配合上面的 sing-box 入站)。幂等。
+# 老装迁移: 防火墙内网放行集补 5228-5230(GMS/FCM 推送 mtalk.google.com 的原生端口;
+# mihomo 靠 nft 把它们 REDIRECT 进 redir 端口再嗅 SNI 分流)。幂等。
 # 只动"原装形态"的那一行(严格匹配现行端口集); 自定义端口集不碰, 提示手动加。
 # $1 可指定文件(供测试), 默认 /etc/nftables.conf; 测试时 nft 可用函数打桩。
 # shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
@@ -1375,14 +1316,12 @@ c["inbounds"] = [i for i in c.get("inbounds", []) if i.get("tag") not in ("in-gm
 json.dump(c, open(f, "w"), ensure_ascii=False, indent=2)
 PY
       then
-        # 用当前内核校验: mihomo 机上 canonical model 是渲染源, 得重渲染再 -t;
-        # 两个内核都不可用时, JSON 解析通过即接受(model 本身不被直接执行)。
+        # 用内核校验: canonical model 是渲染源, 得重渲染再 `mihomo -t`;
+        # 内核不可用时(装到一半/沙盒), JSON 解析通过即接受(model 本身不被直接执行)。
         local _vok=0
-        if [[ "$(_pdg_core)" == mihomo ]] && command -v mihomo >/dev/null 2>&1; then
+        if command -v mihomo >/dev/null 2>&1; then
           if ( cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1 \
              && mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then _vok=1; fi
-        elif command -v sing-box >/dev/null 2>&1; then
-          sing-box check -c "$sb" >/dev/null 2>&1 && _vok=1
         else
           _vok=1
         fi
@@ -1488,10 +1427,11 @@ migrate_mosdns_hijack_shape(){
   fi
 }
 
-# 老装(v1.4.x)从来没有 backend 标记 —— 内核判定一直靠 _pdg_core 的默认值 singbox 兜底。
-# 这是隐式状态: 默认值将来一改(比如默认转 mihomo), 这些机器会在某次更新后**静默换核**,
-# 而它们上面可能根本没装那个内核, 随后 doctor 判失败、更新回滚, 直接卡死升不上去。
-# 据现场证据把标记落地(unit 文件存在才算数, 免得 is-active 的异常输出误导)。
+# 老装(v1.4.x)从来没有 backend 标记。据现场证据把它落地(unit 文件存在才算数, 免得 is-active
+# 的异常输出误导), 让"这台机器此刻跑的是哪个核"成为显式状态而非默认值。
+# v1.6.0 起唯一内核是 mihomo, 本函数仍有用: 它跑在 migrate_drop_singbox **之前**, 于是万一
+# 迁移失败, 标记如实停在 singbox(而不是谎称已是 mihomo) —— 下次 update 会据此重试迁移。
+# 这里的 sing-box 探测只是**读现场**, 不是运行时依赖。
 migrate_backend_marker(){
   local bm=/etc/privdns-gateway/backend cur core=""
   cur="$(cat "$bm" 2>/dev/null)"
@@ -1513,16 +1453,16 @@ run_all_migrations(){
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
-  migrate_mosdns_unlock || true; migrate_singbox_gms || true; migrate_fw_gms || true
+  migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true
   migrate_mosdns_hijack_shape || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
   migrate_android_cleanup || true; migrate_ios_gms_cleanup || true   # 平台隔离清理(各自平台内幂等)
-  # 内核迁移放最后: 上面的 config.json / mosdns / 防火墙 迁移都在 sing-box 仍在时按老路子跑完
-  # (migrate_singbox_gms 等仍能操作模型 + 重启 sing-box), 这里再把**最终形态的** config.json
-  # 转 mihomo 并移除 sing-box 运行时。唯一"失败必须传出"的迁移 —— 失败即让 __migrate 返回非0,
+  # 内核迁移放最后: 上面的 config.json / mosdns / 防火墙 迁移都先按老路子跑完(它们只动数据模型
+  # 与 nft, 与内核无关), 这里再把**最终形态的** config.json 转 mihomo 并移除 sing-box 运行时。
+  # 唯一"失败必须传出"的迁移 —— 失败即让 __migrate 返回非0,
   # cmd_update 据此回滚到更新前快照(其余迁移都是幂等自愈, 失败 best-effort 吞掉不挡后续)。
   migrate_drop_singbox || rc=1
   return $rc
