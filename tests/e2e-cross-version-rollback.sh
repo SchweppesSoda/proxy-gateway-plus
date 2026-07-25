@@ -28,8 +28,10 @@ E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 source "$(dirname "${BASH_SOURCE[0]}")/e2e-lib.sh"
 e2e_enter "$@"
 
-# 受影响版本(既调 pdg_unit_singbox, 自检门又真会回滚): v1.5.10~v1.5.12; 取最旧+最新
-OLD_TAGS="${PDG_XVER_TAGS:-v1.5.10 v1.5.12}"
+# 受影响版本(既调 pdg_unit_singbox, 自检门又真会回滚): v1.5.10~v1.5.12 —— 全跑, 不抽样。
+# 只跑首尾是拿"中间那版大概一样"当假设: 这三个 tag 之间 cmd_update / cmd_rollback 的实现
+# 各有改动, 中间版本恰好走了另一条分支的话就永远测不到。三个版本各一遍, 用例本身不长。
+OLD_TAGS="${PDG_XVER_TAGS:-v1.5.10 v1.5.11 v1.5.12}"
 AVAIL=""
 for _t in $OLD_TAGS; do
   git -C "$E2E_ROOT" rev-parse "$_t" >/dev/null 2>&1 && AVAIL="$AVAIL $_t"
