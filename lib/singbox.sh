@@ -22,6 +22,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 PDG_SINGBOX_OWNED_TOKEN="PDG-SINGBOX-OWNED v1"
+# 数据模型归属标记(与"运行时归属"分开): /etc/sing-box 目录归本项目所有。
+# v1.6 起本项目根本不装 sing-box 运行时, 于是"运行时归属"恒为否 —— 但 /etc/sing-box/config.json
+# 仍是本项目的数据模型, 里面是出口密码、UUID、节点地址。拿运行时归属去决定 --purge 删不删它,
+# 结果就是纯 mihomo 的新装机器 purge 后把这些凭据原样留在盘上。
+PDG_SBMODEL_OWNED_TOKEN="PDG-SBMODEL-OWNED v1"
 
 pdg_singbox_paths(){   # 回显本函数族用到的路径(带测试前缀)
   local p="${PDG_ROOT_PREFIX:-}"
@@ -118,6 +123,58 @@ pdg_singbox_kept_paths(){
   done
   [[ "${1:-}" == with-config && -e "$pfx/etc/sing-box" ]] && echo "$pfx/etc/sing-box"
   return 0
+}
+
+# ── /etc/sing-box 数据模型的归属(与上面的运行时归属分开判) ──────────────────
+_pdg_sbmodel_marker(){ echo "${PDG_ROOT_PREFIX:-}/etc/privdns-gateway/sbmodel.pdg-owned"; }
+
+pdg_sbmodel_marker_ok(){
+  local m; m="$(_pdg_sbmodel_marker)"
+  [[ -f "$m" ]] || return 1
+  [[ "$(head -1 "$m" 2>/dev/null)" == "$PDG_SBMODEL_OWNED_TOKEN" ]]
+}
+
+# 装机时落标记(可回滚: 调用方失败时删掉它即可, 见 install.sh 的目录事务)。
+pdg_sbmodel_mark_owned(){
+  local d="${PDG_ROOT_PREFIX:-}/etc/privdns-gateway"
+  [[ -d "$d" ]] || install -d -m700 "$d" 2>/dev/null || return 1
+  printf '%s\ncreated=%s\n' "$PDG_SBMODEL_OWNED_TOKEN" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$(_pdg_sbmodel_marker)" 2>/dev/null
+}
+
+# /etc/sing-box 是不是**本项目的数据模型目录**。
+#   ① 有可信标记 → 是(新装都会落);
+#   ② 老机器没标记 → 用多个项目特征保守推断: config.json 确实是我们的数据模型(特征入站齐全),
+#      **并且**现场另有本项目的安装痕迹(backend 标记 + bot 目录/仓库副本至少两样)。
+#      单看 config.json 不够 —— 那是"第三方恰好也这么配"时最容易误判的一条。
+pdg_sbmodel_is_ours(){
+  local pfx="${PDG_ROOT_PREFIX:-}"
+  pdg_sbmodel_marker_ok && return 0
+  [[ -d "$pfx/etc/sing-box" ]] || return 1
+  pdg_singbox_config_is_ours || return 1
+  [[ -f "$pfx/etc/privdns-gateway/backend" ]] || return 1
+  local hits=0
+  [[ -e "$pfx/opt/pdg-bot/bot.py" ]] && hits=$((hits + 1))
+  [[ -e "$pfx/opt/privdns-gateway/install.sh" ]] && hits=$((hits + 1))
+  [[ -e "$pfx/etc/privdns-gateway/bot.env" ]] && hits=$((hits + 1))
+  [[ -e "$pfx/etc/mosdns/config.yaml" ]] && hits=$((hits + 1))
+  [[ "$hits" -ge 2 ]]
+}
+
+# 说清为什么判不出数据模型归属(卸载时要如实告诉用户为何保留)。
+pdg_sbmodel_why_not_ours(){
+  local pfx="${PDG_ROOT_PREFIX:-}"
+  pdg_sbmodel_marker_ok && { echo "(实为本项目所有)"; return 0; }
+  [[ -d "$pfx/etc/sing-box" ]] || { echo "$pfx/etc/sing-box 不存在"; return 0; }
+  if ! pdg_singbox_config_is_ours; then
+    echo "没有模型归属标记, 且 $pfx/etc/sing-box/config.json 不是本项目的数据模型(缺特征入站 in-https/in-http/tg-proxy)"
+    return 0
+  fi
+  if [[ ! -f "$pfx/etc/privdns-gateway/backend" ]]; then
+    echo "没有模型归属标记, 且缺 $pfx/etc/privdns-gateway/backend —— 这台机器没有本项目的安装痕迹"
+    return 0
+  fi
+  echo "没有模型归属标记, 且本项目的其它安装痕迹不足两处(无法保守认定 /etc/sing-box 归本项目)"
 }
 
 # 确认归属后**落一份可信标记**再动手: 中途崩了下次也还认得出是自家的, 不至于退化成"证明不了"。

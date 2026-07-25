@@ -1,5 +1,5 @@
 [Unit]
-Description=PrivDNS Gateway iOS OnDemand 探测端点 (:81 -> 204)
+Description=PrivDNS Gateway iOS OnDemand 探测端点 (:81 -> HTTP 200)
 After=network-online.target
 Wants=network-online.target
 

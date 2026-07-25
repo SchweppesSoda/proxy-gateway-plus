@@ -156,7 +156,8 @@ def load_from_config(path=None):
     loc = _wloc_active(w)
     if w.get("enabled") and loc:
         import mitm_wloc
-        # 坐标不在这里定死: 交给 WlocConfig 按 mtime 热加载 —— 切地点只改 mitm.json, 本进程
+        # 坐标不在这里定死: 交给 WlocConfig 在下一次 WLOC 请求开始时读当前 mitm.json ——
+        # 切地点只原子更新那个文件, 本进程
         # 不必重启(接管域名只由 enabled 决定, 那才需要走完整事务)。
         register(mitm_wloc.WLOCPlugin(accuracy=int(w.get("accuracy", 50)),
                                       config=mitm_wloc.WlocConfig(path or MITM_CONFIG)))

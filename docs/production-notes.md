@@ -110,7 +110,7 @@ gvt2.com / gvt3.com / android.com`，`systemctl restart dnsdist` 生效。
 - **故障切换组管理**：`add_group(名 成员…)` 建 urltest 组；`exit_tags` 纳入组(可作默认出口/规则目标)；
   删除出口时从各组成员清理、空组自动删、悬挂引用回落 final。
 - **iOS 描述文件下发**：由 `/opt/pdg-bot/pdg-dot.mobileconfig.tmpl` 填 DoT host/IP/UUID → `sendDocument` 发到 DM。
-  ⚠️ 模板 OnDemand 蜂窝规则探测 `http://<IP>:81/probe`，需另配一个**只对内网卡(172.22)放行的 :81→204** 端点才会在蜂窝下激活。
+  ⚠️ 模板 OnDemand 蜂窝规则探测 `http://<IP>:81/probe`，需另配一个**只对内网卡(172.22)放行的 :81→200** 端点才会在蜂窝下激活。
 - **配置备份/恢复**：备份 = 打包 sing-box+mosdns+规则集 → `sendDocument`（含出口密码，注意保管）；
   恢复 = 收 `.tar.gz` → `sing-box check` 通过才应用 → 重启，失败回滚。main 循环新增 `document` 分支(仅 restore 态接收)。
 - 修 `refresh_rulesets`：回填早期缺 `format/path` 的旧条目(否则刷新 KeyError)，顺带补齐 `count`。
@@ -140,10 +140,11 @@ gvt2.com / gvt3.com / android.com`，`systemctl restart dnsdist` 生效。
 - 脚本：`deploy/cert/{proxy-gateway-open-cert-http.sh, proxy-gateway-restore-firewall.sh, 99-reload-cert.deploy-hook.sh}`。
 
 ### iOS OnDemand :81 探测端点（双卡区分）
-- `deploy/ios/probe81.py`（:81 任意 GET→204，systemd `pdg-probe81.service`，DynamicUser+CAP_NET_BIND_SERVICE）。
+- `deploy/ios/probe81.py`（:81 任意 GET→**200**，systemd `pdg-probe81.service`，DynamicUser+CAP_NET_BIND_SERVICE）。
+  （本文早期几处写成 204，是记录笔误：iOS 的 `URLStringProbe` 只认 **200**，实现从来返回 200。）
 - nftables 把 81 加进内网卡放行集：`ip saddr 172.22.0.0/16 tcp dport { 80, 81, 443 }`；81 **不在**无差别集 `{22,53,853,8111}` 里，
   policy drop 兜底 → **普通卡探不通、内网卡探得通**，iOS OnDemand 据此只在内网卡(蜂窝)激活 DoT。
-  (从本机测「公网IP:81」会因自身 IP 走 lo 被 `iif lo accept` 而返 204，非破绽；外部非 172.22 源走 policy drop。)
+  (从本机测「公网IP:81」会因自身 IP 走 lo 被 `iif lo accept` 而返 200，非破绽；外部非 172.22 源走 policy drop。)
 
 ### bot 内联菜单改二级
 - 一级只留：状态 / 测出口 / 流量 + 四分类（📤出口管理 / 📑分流管理 / 📱客户端 / 🛠运维）；点分类展开二级子菜单，

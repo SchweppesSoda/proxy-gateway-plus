@@ -52,7 +52,9 @@ def _notify(text):
                                  "disable_web_page_preview": True})
 
 def main():
-    if not os.environ.get("PDG_BOT_TOKEN") or not ALLOWED:
+    # 凭据判据与 status / doctor / CLI / update 校验门同一份(checks.bot_credentials):
+    # 没配齐就没人可通知, 直接安静退出 —— 这不是故障。
+    if checks.bot_credentials() != "ready" or not ALLOWED:
         return
     problems = _problems()
     try:

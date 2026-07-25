@@ -153,11 +153,44 @@ def check_platform():
         return ("ok", "平台", p)
     return ("warn", "平台", "平台标记缺失/非法 → 当前按 Android 安全回退(非已确认); 运行 sudo pdg 触发迁移落定")
 
+BOT_ENV = "/etc/privdns-gateway/bot.env"
+
+
+def bot_credentials():
+    """Bot 凭据状态: "ready" | "unset" | "partial"。CLI / status / doctor / healthcheck /
+    update 校验门统一取这里, 别处不许再各写一份判断。
+
+    token 与 allowed **都空**是合法的"没配 bot" —— 这台机器就是不用 Telegram 管理, pdg-bot
+    不运行属于正常禁用态, 不是故障。都配了才要求它必须在跑。只配一半是配置错误(bot 起来了
+    也不会响应任何人), 得明确点出来, 而不是含糊地报"服务未运行"。"""
+    vals = {}
+    try:
+        with open(BOT_ENV, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln.startswith("PDG_BOT_TOKEN=") or ln.startswith("PDG_BOT_ALLOWED="):
+                    k, _, v = ln.partition("=")
+                    vals[k] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    tok = bool(vals.get("PDG_BOT_TOKEN"))
+    allowed = bool(vals.get("PDG_BOT_ALLOWED"))
+    if tok and allowed:
+        return "ready"
+    if not tok and not allowed:
+        return "unset"
+    return "partial"
+
+
 def expected_services():
     """按平台的必需服务集。pdg-probe81 是 iOS 专属(:81 探测), Android 不含。
-    pdg-mitm 由 check_mitm 单独按启用态判定, 不列入必需集。CLI/status/report/healthcheck 统一取此。"""
+    pdg-mitm 由 check_mitm 单独按启用态判定, 不列入必需集。
+    未配 bot 凭据时 pdg-bot 不在必需集里 —— 它本来就不该启动。
+    CLI/status/report/healthcheck 统一取此。"""
     svc = _core_svc()
-    names = ["mosdns", svc, "pdg-bot"]
+    names = ["mosdns", svc]
+    if bot_credentials() == "ready":
+        names.append("pdg-bot")
     if _platform() == "ios":
         names.append("pdg-probe81")
     return names
@@ -167,6 +200,22 @@ def check_services():
     bad = [s for s in names if _run(["systemctl", "is-active", s])[1].strip() != "active"]
     return ("fail", "服务", "未运行: " + ", ".join(bad)) if bad \
         else ("ok", "服务", "/".join(names) + " 都在")
+
+
+def check_bot_credentials():
+    """Bot 凭据本身的状态。没配是正常禁用态(info), 配了一半是明确的配置错误(fail)。"""
+    st = bot_credentials()
+    if st == "ready":
+        act = _run(["systemctl", "is-active", "pdg-bot"])[1].strip()
+        if act == "active":
+            return ("ok", "Bot 凭据", "token + 允许 id 均已配置, pdg-bot 运行中")
+        return ("fail", "Bot 凭据", "token + 允许 id 已配置, 但 pdg-bot 未运行(" + (act or "unknown") + ")")
+    if st == "partial":
+        return ("fail", "Bot 凭据",
+                "只配了一项(token 与允许 id 必须成对): pdg-bot 起来了也不会响应任何人。"
+                "请用 <code>pdg-set-token</code> 补齐, 或把两项都留空以彻底禁用 bot。")
+    return ("info", "Bot 凭据", "未配置(token 与允许 id 都为空)→ pdg-bot 不启动, 属正常禁用态。"
+                               "需要用 Telegram 管理时运行 pdg-set-token 配置。")
 
 def check_core_version():
     _, out, _ = _run(["mihomo", "-v"])
@@ -213,6 +262,21 @@ def check_internal_cidr():
         return ("warn", "内网卡段", f"{c} 偏宽(/{net.prefixlen}), 建议收到内网卡精确 /16")
     return ("ok", "内网卡段", c)
 
+def platform_ports_text():
+    """按当前平台列出应放行的端口。写死一串"53/80/81/443/853/5228-5230/7893/8445"会在 iOS 上
+    声称 GMS 5228-5230 已就位(iOS 走 APNs, 装机就把它剥掉了), 在 Android 上又提 :81
+    (那是 iOS 专属的 OnDemand 探测端点, Android 根本不装 pdg-probe81)。"""
+    ios = _platform() == "ios"
+    ports = ["53", "80"]
+    if ios:
+        ports.append("81(仅 iOS)")
+    ports += ["443", "853"]
+    if not ios:
+        ports.append("5228-5230(仅 Android)")
+    ports += ["7893", "8445"]          # 8445 = Telegram SOCKS5, 两平台共用
+    return "/".join(ports)
+
+
 def check_nft():
     # 兼容两种表名: 新版独立表 inet pdg; 旧装(尚未迁移)仍是 inet filter。
     _, out, _ = _run(["nft", "list", "chain", "inet", "pdg", "input"])
@@ -239,7 +303,7 @@ def check_nft():
                     leaked |= {p for p in sens if a <= int(p) <= b}
     if leaked:
         return ("fail", "防火墙", "这些口对全网开放(应只限内网卡): " + ", ".join(sorted(leaked)))
-    return ("ok", "防火墙", "53/80/81/443/853/5228-5230/7893/8445 仅限内网卡来源")
+    return ("ok", "防火墙", platform_ports_text() + " 仅限内网卡来源")
 
 def _filesha(path):
     """文件 SHA256(读不到返回空串)。用于比对部署文件与仓库文件是否同一版本。"""
@@ -731,7 +795,7 @@ def check_nft_input_chains():
     return ("ok", "input 链冲突", "只有 table inet pdg 挂在 hook input 上")
 
 
-ALL = [check_platform, check_services, check_core_version, check_dot_arecord, check_dot_domain_sync,
+ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm]

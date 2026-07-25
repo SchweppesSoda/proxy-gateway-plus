@@ -24,9 +24,11 @@ WLOC 改的是 **Apple 网络定位查询**(`gs-loc.apple.com` / 国区 `gs-loc-
 
 - bot 在配置锁内**原子改写** `mitm.json` 的 `active`,并把 `generation` 整数 +1;
 - 不预热 CA、不写 `mitm_hijack.txt`、不重渲内核、不重启 mihomo / mosdns / pdg-mitm;
-- `pdg-mitm` 侧由 `mitm_wloc.WlocConfig` 按 `mtime_ns` 缓存配置:每个 WLOC 请求开始时取**一次**
+- `pdg-mitm` 侧由 `mitm_wloc.WlocConfig` **在下一次 WLOC 请求开始时读取当前 mitm.json**(整份读,
+  不做 mtime 缓存 —— mtime 分辨率有限, 连着两次原子替换可能落在同一时间戳上而漏读), 取一次
   不可变快照 `(active, lat, lon, generation)`,整个请求都用它 —— 切换正好落在转发中途也不会
   半新半旧。配置临时不可读或坏档时保留 last-known-good,并把错误类型记进状态文件,绝不用半读取的内容。
+  因此切换地点无需重启服务;网关只能保证**下一次请求**使用新坐标,不能主动清除 iOS locationd 缓存。
 - 开 / 关 WLOC(接管域名真的变了)仍走原来的完整事务:CA → hijack → 内核 → pdg-mitm → mosdns,
   任一步失败全量回滚。
 

@@ -22,8 +22,29 @@ _pdg_core_svc(){ echo mihomo; }
 _pdg_platform(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[ "$p" == ios || "$p" == android ]] && echo "$p" || echo android; }
 # 平台标记是否明确(status/doctor 据此提示"缺失回退")
 _pdg_platform_present(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[ "$p" == ios || "$p" == android ]]; }
-# 按平台的必需服务集(pdg-probe81 iOS 专属; 与 checks.expected_services 同语义)
+# 展示用的服务集(status 逐个列状态): 恒含 pdg-bot —— 用户想看到它在不在跑, 哪怕没配凭据。
+# pdg-probe81 仍是 iOS 专属。
 _pdg_svcs(){ local s; s="mosdns $(_pdg_core_svc) pdg-bot"; [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"; echo "$s"; }
+
+# **必需**服务集(校验门用): 与 checks.expected_services() 同语义 —— bot.env 两项都空是合法的
+# "这台机器不用 Telegram 管理", pdg-bot 不运行属正常禁用态, 不该把它算成必须在跑的服务。
+# 以前平台切换直接用 _pdg_svcs 校验, 于是没配 bot 的机器 `pdg platform ios` 必然卡在
+# "pdg-bot 未稳定运行"并整体回滚 —— 而那台机器本来就没打算起 bot。
+_pdg_required_svcs(){
+  local s; s="mosdns $(_pdg_core_svc)"
+  [[ "$(_pdg_bot_cred)" == ready ]] && s="$s pdg-bot"
+  [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"
+  echo "$s"
+}
+
+# nft 可执行文件位置: 判据集中在 lib/nftbin.sh(pdg / uninstall / certbot 钩子共用), 详见
+# 该文件注释 —— 只看 PATH 会把"nft 在 /usr/sbin 但 PATH 没导出"当成没装。找不到回显空串。
+_pdg_nft_bin(){
+  # shellcheck source=lib/nftbin.sh
+  source "${REPO_DIR:-/opt/privdns-gateway}/lib/nftbin.sh" 2>/dev/null \
+    || { command -v nft 2>/dev/null || true; return 0; }   # 连判据文件都没有: 至少别比以前差
+  pdg_nft_bin || true
+}
 
 # ── sing-box 文件归属 ────────────────────────────────────────────────────────
 # 判据集中在 lib/singbox.sh(install/uninstall/pdg 共用), 详见该文件注释:
@@ -241,8 +262,17 @@ cmd_status(){
   local core; core="$(_pdg_core)"
   local s
   # shellcheck disable=SC2046  # _pdg_svcs 输出有意按空白分词
+  local _cred; _cred="$(_pdg_bot_cred)"
   for s in $(_pdg_svcs); do   # 按平台: pdg-probe81 仅 iOS
-    printf "  %-12s %s\n" "$s" "$(systemctl is-active "$s" 2>/dev/null)"
+    local _st; _st="$(systemctl is-active "$s" 2>/dev/null)"
+    if [[ "$s" == pdg-bot && "$_cred" != ready ]]; then
+      # 合法禁用态不是故障: 两项都空 = 这台机器不用 Telegram 管理; 只配一半才是配置错误
+      [[ "$_cred" == partial ]] \
+        && printf "  %-12s %s (⚠️ 凭据只配了一项, 需成对配置)\n" "$s" "$_st" \
+        || printf "  %-12s %s (未配置凭据, 正常禁用态; 需要时 pdg-set-token)\n" "$s" "$_st"
+    else
+      printf "  %-12s %s\n" "$s" "$_st"
+    fi
   done
   [[ "$(_pdg_platform)" == ios ]] && printf "  %-12s %s\n" "pdg-mitm" "$(systemctl is-active pdg-mitm 2>/dev/null)"
   echo "  timer        $(systemctl is-active pdg-rules-update.timer 2>/dev/null)"
@@ -257,7 +287,18 @@ cmd_status(){
   # mihomo 模式 443/80 由 nft 转到 7893(redir), 故把 7893 一并纳入端口展示
   ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|7893|8445|9090)\b' | sed 's/^://' | sort -u | sed "s|^9090$|$p9090|" | tr '\n' ' ')
   echo "  监听端口     $ports"
-  if [[ -d "$REPO_DIR/.git" ]]; then echo "  代码版本     $(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)"; fi
+  # 读不到就说读不到 —— 以前 describe 失败(仓库损坏 / dubious ownership)时这里输出一个空值,
+  # 看起来像"版本号是空的", 排错方向全歪。
+  if [[ -d "$REPO_DIR/.git" ]]; then
+    local ver
+    if ver="$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)" && [[ -n "$ver" ]]; then
+      echo "  代码版本     $ver"
+    else
+      echo "  代码版本     未知(仓库不可读: 试 git -C $REPO_DIR describe --tags --always 看具体原因)"
+    fi
+  else
+    echo "  代码版本     未知($REPO_DIR 不是 git 仓库 → pdg update 不可用)"
+  fi
   local lm cache; lm="$(pdg_lowmem_current)"; cache="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' /etc/mosdns/config.yaml 2>/dev/null)"
   echo "  内存模式     $([[ "$lm" == 1 ]] && echo 低内存 || echo 标准)(mosdns cache=${cache:-?})"
 }
@@ -860,14 +901,27 @@ _update_core_binary(){
 
 cmd_update(){
   need_root update
-  command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
+  # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
+  # 以前 fetch/describe/tag 全用 `2>/dev/null` 吞掉, 拿不到就打印"最新发布: (无 tag)"再 return 0,
+  # 用户会当成"已经是最新版", 实际是网络不通或仓库读不了。
   if [[ "${1:-}" == "--dry-run" ]]; then
-    [[ -d "$REPO_DIR/.git" ]] && pdg_fetch_release_tags "$REPO_DIR" 2>/dev/null
-    local tgt; tgt=$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)
-    echo "当前: $(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)   最新发布: ${tgt:-(无 tag)}"
-    [[ -n "$tgt" ]] && { echo "待更新提交(HEAD..$tgt):"; git -C "$REPO_DIR" log --oneline "HEAD..$tgt" 2>/dev/null || echo "  (已是最新或无法比较)"; }
+    command -v git >/dev/null 2>&1 || { c_y "❌ 没有 git, 无法查看更新(dry-run 不安装任何东西)"; return 1; }
+    [[ -d "$REPO_DIR/.git" ]] || { c_y "❌ $REPO_DIR 不是 git 仓库, 无法查看更新"; return 1; }
+    local cur_desc tgt
+    if ! pdg_fetch_release_tags "$REPO_DIR"; then
+      c_y "❌ 拉取远端 tag 失败(网络不通 / 仓库地址无效 / 属主异常)→ 无法判断是否有新版"; return 1
+    fi
+    if ! cur_desc="$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)" || [[ -z "$cur_desc" ]]; then
+      c_y "❌ 读不到当前版本(git describe 失败: 仓库损坏 / 无提交 / 属主异常)"; return 1
+    fi
+    tgt="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
+    [[ -n "$tgt" ]] || { c_y "❌ 仓库里没有任何发布 tag(v*)→ 无法确定目标版本"; return 1; }
+    echo "当前: $cur_desc   最新发布: $tgt"
+    echo "待更新提交(HEAD..$tgt):"
+    git -C "$REPO_DIR" log --oneline "HEAD..$tgt" 2>/dev/null || echo "  (已是最新或无法比较)"
     return 0
   fi
+  command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
   _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
   c_g "更新前留快照…"
   if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
@@ -950,8 +1004,11 @@ cmd_update(){
   sleep 2
 
   # token 是否已配置(未配则 pdg-bot 不在跑属正常, 不据此回滚)
-  local token_set=0
-  [[ -f "$ENVF" ]] && grep -qE '^PDG_BOT_TOKEN=.+' "$ENVF" && grep -qE '^PDG_BOT_ALLOWED=.+' "$ENVF" && token_set=1
+  # 凭据状态取 checks.bot_credentials(与 status/doctor/healthcheck 同一份判断), 不再本地
+  # 各写一遍 grep。ready=两项都配 / unset=两项都空(正常禁用态) / partial=只配一半(配置错)。
+  local cred token_set=0
+  cred="$(_pdg_bot_cred)"
+  [[ "$cred" == ready ]] && token_set=1
   if [[ "$token_set" == 1 && "$(systemctl is-active pdg-bot 2>/dev/null)" != "active" ]]; then
     c_y "pdg-bot 更新后起不来, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
@@ -960,7 +1017,9 @@ cmd_update(){
   # 以前 doctor 用 `|| true` 吞掉退出码, 且没有 jq 就整段跳过 —— 自检崩了/输出坏了/机器没装
   # jq, 都会直接跳到"✅ 已更新"。改用 python3 解析(本项目本来就硬依赖 python3, 不再依赖 jq),
   # 并要求输出是**非空的 JSON 数组**; 任何一环不成立都按"无法确认更新结果"回滚。
-  # (未配 token 时把"服务: 未运行: pdg-bot"这单一项排除, 避免误判)
+  # 不再按文案豁免任何检查项: 未配凭据时 pdg-bot 压根不在 expected_services() 里, doctor
+  # 自己就不会报它 —— 靠比对 doctor 的 detail 字符串做豁免, 那句话多一个服务名
+  # 或改个措辞就会失效, 属于最脆的一类耦合。
   local j rcd=0 summary nfail
   if ! command -v python3 >/dev/null 2>&1; then   # 与"自检输出坏"区分开, 免得排错走偏
     c_y "python3 不可用, 无法运行/判读自检 → 回滚到更新前快照…"
@@ -980,15 +1039,13 @@ import json, sys
 d = json.load(sys.stdin)
 if not isinstance(d, list) or not d:
     raise SystemExit("doctor 输出不是非空 JSON 数组")
-tok = sys.argv[1] == "1"
-fails = [x for x in d if x.get("level") == "fail"
-         and (tok or x.get("check") != "服务" or x.get("detail") != "未运行: pdg-bot")]
+fails = [x for x in d if x.get("level") == "fail"]
 warns = [x for x in d if x.get("level") == "warn"]
 print(len(fails))
 for x in fails: print("  ❌ %s: %s" % (x.get("check"), x.get("detail")))
 print("@@WARN@@")
 for x in warns: print("  ⚠️ %s: %s" % (x.get("check"), x.get("detail")))
-' "$token_set" 2>/dev/null); then
+' 2>/dev/null); then
     c_y "自检输出不可解析(应为非空 JSON 数组), 无法确认更新结果, 回滚到更新前快照…"
     cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
@@ -1009,7 +1066,60 @@ for x in warns: print("  ⚠️ %s: %s" % (x.get("check"), x.get("detail")))
 cmd_token(){ need_root token; pdg-set-token; }   # 不 exec, 设完/取消都回菜单
 
 # shellcheck disable=SC2086  # $svcs 是有意按空白分词的服务名列表
-cmd_restart(){ need_root restart; local svcs; svcs="$(_pdg_svcs)"; systemctl restart $svcs 2>/dev/null; echo "已重启: $svcs"; }
+# Bot 凭据状态: ready | unset | partial。判据在 checks.bot_credentials(单一来源),
+# 读不到 checks 时按最保守的 unset 处理(不因为拿不到判断就去要求 pdg-bot 必须在跑)。
+_pdg_bot_cred(){
+  python3 -c 'import sys; sys.path.insert(0, "/opt/pdg-bot"); import checks; print(checks.bot_credentials())' \
+    2>/dev/null || echo unset
+}
+
+# 重启并**确认真的起来了**。旧实现 `systemctl restart $svcs 2>/dev/null; echo 已重启` ——
+# 返回值直接丢掉: mihomo 配置是空的、服务一直 activating/failed, 它照样返回 0 说"已重启",
+# 用户以为好了, 实际整条链是断的。
+cmd_restart(){
+  need_root restart
+  local core; core="$(_pdg_core_svc)"
+  local cred; cred="$(_pdg_bot_cred)"
+  # 1) 先校验内核配置: 配置本身不合法的话重启只会换来一个起不来的服务, 不如当场说清楚
+  if command -v mihomo >/dev/null 2>&1 && [[ -f /etc/mihomo/config.yaml ]]; then
+    if ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
+      c_y "❌ mihomo 配置校验(mihomo -t)未过 → 没有重启任何服务。"
+      mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml 2>&1 | tail -5 | sed 's/^/    /'
+      return 1
+    fi
+  fi
+  # 2) 要重启哪些: 平台必需服务 + 已启用的 pdg-mitm; 未配凭据的 pdg-bot 明确跳过
+  local want=() s
+  for s in mosdns "$core"; do want+=("$s"); done
+  [[ "$(_pdg_platform)" == ios ]] && want+=(pdg-probe81)
+  if [[ "$cred" == ready ]]; then
+    want+=(pdg-bot)
+  elif [[ "$cred" == partial ]]; then
+    c_y "⚠️ Bot 凭据只配了一项(token 与允许 id 必须成对)→ 跳过 pdg-bot; 用 pdg-set-token 补齐。"
+  else
+    c_y "ℹ️ Bot 凭据未配置 → pdg-bot 未启动(正常禁用态; 需要时运行 pdg-set-token)。"
+  fi
+  [[ -f /etc/systemd/system/pdg-mitm.service ]] \
+    && systemctl is-enabled pdg-mitm >/dev/null 2>&1 && want+=(pdg-mitm)
+  # 3) 重启并逐个确认"持续 active"(_core_kernel_stable 连采多次 + 比对 NRestarts)
+  local bad=()
+  for s in "${want[@]}"; do
+    systemctl reset-failed "$s" >/dev/null 2>&1 || true
+    systemctl restart "$s" >/dev/null 2>&1 || { bad+=("$s"); continue; }
+  done
+  for s in "${want[@]}"; do
+    _core_kernel_stable "$s" || { [[ " ${bad[*]} " == *" $s "* ]] || bad+=("$s"); }
+  done
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    c_y "❌ 以下服务未能稳定运行: ${bad[*]}"
+    for s in "${bad[@]}"; do
+      echo "  ── $s 最近日志 ──"
+      journalctl -u "$s" -n 12 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+    done
+    return 1
+  fi
+  c_g "✅ 已重启并确认运行: ${want[*]}"
+}
 
 # 内核日志跟当前后端走(mihomo 机上取 sing-box 只会得到空日志), 与 report.py 同口径。
 cmd_log(){ journalctl -u pdg-bot -u mosdns -u "$(_pdg_core_svc)" -n "${1:-40}" --no-pager -o cat; }
@@ -1039,14 +1149,65 @@ cmd_detect_cidr(){
   [[ "$det" == "$cur" ]] && { c_g "✅ 与当前一致, 无需改动。"; return 0; }
   read -rp "把内网卡段 ${cur:-?} → $det 并应用(写 mosdns+nftables 并重启)? [y/N]: " yn
   [[ "$yn" == [yY] ]] || { echo "已取消, 未改动。"; return 0; }
-  _lock; c_g "先留快照…"; cmd_snapshot >/dev/null 2>&1 || true
-  [[ -n "$cur" ]] && sed -i "s#${cur//./\\.}#$det#g" /etc/nftables.conf
-  sed -i -E "s#(ips:[[:space:]]*\[[[:space:]]*\")[0-9./]+(\")#\1$det\2#" /etc/mosdns/config.yaml
-  if ! nft -c -f /etc/nftables.conf >/dev/null 2>&1; then c_y "nft 校验失败, 回滚…"; cmd_rollback 0; return 1; fi
-  nft -f /etc/nftables.conf
-  systemctl restart mosdns; sleep 2
-  [[ "$(systemctl is-active mosdns)" == active ]] || { c_y "mosdns 重启异常, 回滚…"; cmd_rollback 0; return 1; }
-  c_g "✅ 内网卡段已更新为 $det 并重启 mosdns。"
+  _lock
+  # 快照必须成立, 且要记住**这一次**的目录 —— 旧写法 `cmd_snapshot || true` 把失败吞掉,
+  # 后面出事再 `cmd_rollback 0` 按序号回滚, 回到的可能是上周某次无关快照(index 0 是"最新一份",
+  # 而这次根本没留下快照)。宁可一个字节都不改。
+  c_g "先留快照…"
+  # 与 cmd_update 同口径: 用 cmd_snapshot 自己回报的 _PDG_SNAP_CREATED 记住**本次**那一份,
+  # 不按 index 猜(index 0 是"最新一份", 这次没留成时它指向的是上一次的无关快照)。
+  local snap_dir
+  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
+    c_y "❌ 快照失败 → 未改动任何文件(拒绝在没有回退手段的前提下改内网卡段)。"; return 1
+  fi
+  snap_dir="$_PDG_SNAP_CREATED"
+  # 本次事务的精确备份(回滚只用它, 不用模糊的 index)
+  local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
+  cp -a /etc/nftables.conf "$wd/nftables.conf" 2>/dev/null
+  cp -a /etc/mosdns/config.yaml "$wd/config.yaml" 2>/dev/null
+  local newnft="$wd/nftables.new" newmos="$wd/mosdns.new"
+  cp -a /etc/nftables.conf "$newnft" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 /etc/nftables.conf"; return 1; }
+  cp -a /etc/mosdns/config.yaml "$newmos" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 mosdns 配置"; return 1; }
+  _dc_restore(){   # 只用本次备份还原, 不碰别的快照
+    [[ -e "$wd/nftables.conf" ]] && cp -a "$wd/nftables.conf" /etc/nftables.conf
+    [[ -e "$wd/config.yaml" ]] && cp -a "$wd/config.yaml" /etc/mosdns/config.yaml
+    nft -f /etc/nftables.conf 2>/dev/null || true
+    systemctl restart mosdns >/dev/null 2>&1 || true
+    c_y "已用本次事务的备份还原(快照留在 $snap_dir, 必要时 sudo pdg rollback --dir $snap_dir)。"
+  }
+  # 改**临时文件**, 并复核新网段真的写进去了 —— sed 没命中时旧写法一声不吭继续往下走,
+  # 最后还打印"✅ 已更新", 而两份配置一个字都没变。
+  [[ -n "$cur" ]] && sed -i "s#${cur//./\\.}#$det#g" "$newnft"
+  sed -i -E "s#(ips:[[:space:]]*\[[[:space:]]*\")[0-9./]+(\")#\1$det\2#" "$newmos"
+  if ! grep -qF "$det" "$newnft"; then
+    rm -rf "$wd"; c_y "❌ nftables 配置里没找到可替换的内网卡段(自定义形态?) → 未改动任何文件。"; return 1
+  fi
+  if ! grep -qE "ips:[[:space:]]*\[[[:space:]]*\"${det//./\\.}\"" "$newmos"; then
+    rm -rf "$wd"; c_y "❌ mosdns 配置里的 ips 段未能替换(自定义形态?) → 未改动任何文件。"; return 1
+  fi
+  if ! nft -c -f "$newnft" >/dev/null 2>&1; then
+    rm -rf "$wd"; c_y "❌ 新防火墙配置校验(nft -c)未过 → 未改动任何文件。"; return 1
+  fi
+  # 校验都过了才落盘
+  cp -a "$newnft" /etc/nftables.conf && cp -a "$newmos" /etc/mosdns/config.yaml || {
+    _dc_restore; rm -rf "$wd"; c_y "❌ 落盘失败, 已还原。"; return 1; }
+  if ! nft -f /etc/nftables.conf; then _dc_restore; rm -rf "$wd"; c_y "❌ 应用防火墙失败, 已还原。"; return 1; fi
+  systemctl reset-failed mosdns >/dev/null 2>&1 || true
+  if ! systemctl restart mosdns || ! _core_kernel_stable mosdns; then
+    _dc_restore; rm -rf "$wd"
+    c_y "❌ mosdns 未能稳定运行, 已还原。近期日志:"
+    journalctl -u mosdns -n 12 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  # 成功后三处复核一致: 防火墙文件 / mosdns 配置 / doctor 读到的内网段
+  local dc_ok=1 seen
+  grep -qF "$det" /etc/nftables.conf || { c_y "⚠️ 复核: nftables 里没有 $det"; dc_ok=0; }
+  grep -qF "$det" /etc/mosdns/config.yaml || { c_y "⚠️ 复核: mosdns 配置里没有 $det"; dc_ok=0; }
+  seen="$(python3 -c 'import sys; sys.path.insert(0,"/opt/pdg-bot"); import checks; print(checks._internal_cidr())' 2>/dev/null)"
+  [[ "$seen" == "$det" ]] || { c_y "⚠️ 复核: 自检读到的内网段是「${seen:-空}」, 与 $det 不一致"; dc_ok=0; }
+  rm -rf "$wd"
+  [[ "$dc_ok" == 1 ]] || { c_y "❌ 改动已应用但复核不一致 → 请运行 sudo pdg doctor 检查。"; return 1; }
+  c_g "✅ 内网卡段已更新为 $det, mosdns 已重启, 防火墙/mosdns/自检三处一致。"
 }
 
 cmd_ios(){
@@ -1577,73 +1738,14 @@ _pdg_nft_foreign_input_chains(){
 # 无法证明能安全合并(pdg 块括号不配平 / 文件里有 flush ruleset 又还有别的表)→ 返回非 0,
 # 调用方必须在改动运行环境**之前**中止 —— 整文件覆盖会把用户的 VPN/NAT/转发/开放端口抹掉。
 _pdg_nft_splice(){
-  python3 - "$1" "$2" "$3" <<'PY'
-import re, sys
-block_f, target_f, out_f = sys.argv[1:4]
-block = open(block_f, encoding="utf-8").read()
-# 只取模板里的规则部分(从第一处 `table inet pdg` 起) —— 整个模板带 shebang 与大段头注释,
-# 原样插进现网文件中段会多出一个 `#!/usr/sbin/nft -f`, 既难看也容易误导读者。
-_m = re.search(r"^\s*table\s+inet\s+pdg\b", block, re.M)
-if _m:
-    block = ("# ==== PrivDNS Gateway 管理区(table inet pdg): 由 pdg 自动维护, 勿手改 ====\n"
-             + block[_m.start():])
-block = block.rstrip("\n")
-try:
-    lines = open(target_f, encoding="utf-8").read().split("\n")
-except OSError:
-    lines = []
-
-decl = re.compile(r"^\s*table\s+inet\s+pdg\s*$")
-dele = re.compile(r"^\s*delete\s+table\s+inet\s+pdg\s*$")
-open_ = re.compile(r"^\s*table\s+inet\s+pdg\s*\{")
-other_table = re.compile(r"^\s*(table)\s+\S+\s+(\S+)")
-
-keep, i, first_hit, n = [], 0, None, len(lines)
-while i < n:
-    ln = lines[i]
-    if decl.match(ln) or dele.match(ln):
-        first_hit = len(keep) if first_hit is None else first_hit
-        i += 1; continue
-    if open_.match(ln):                      # 整个 table inet pdg { ... } 块
-        first_hit = len(keep) if first_hit is None else first_hit
-        start_line = i + 1                   # 1-indexed, 报给用户看
-        depth = 0
-        while i < n:
-            depth += lines[i].count("{") - lines[i].count("}")
-            i += 1
-            if depth <= 0:
-                break
-        if depth > 0:
-            print("冲突位置: %s 第 %d 行起的 `table inet pdg {` 块括号不配平(到文件末尾仍未闭合)"
-                  % (target_f, start_line), file=sys.stderr)
-            print("  该行: %s" % lines[start_line - 1].strip(), file=sys.stderr)
-            sys.exit(2)
-        continue
-    keep.append(ln); i += 1
-
-# 剩下的内容里若还有 flush ruleset + 别的表 → 应用时会连别人的表一起冲掉, 不能算安全合并
-rest_lines = keep
-flush_ln = next((k + 1 for k, ln in enumerate(rest_lines)
-                 if re.match(r"^\s*flush\s+ruleset\s*$", ln)), None)
-if flush_ln:
-    others = [(k + 1, ln.strip()) for k, ln in enumerate(rest_lines) if other_table.match(ln)]
-    if others:
-        print("冲突位置: %s 第 %d 行 `flush ruleset`, 且文件里另有表 —— 合并后一应用会连它们一起冲掉:"
-              % (target_f, flush_ln), file=sys.stderr)
-        for lno, txt in others[:5]:
-            print("    第 %d 行: %s" % (lno, txt), file=sys.stderr)
-        sys.exit(3)
-
-if first_hit is None:                         # 现网没有 pdg 区 → 追加到末尾
-    while keep and not keep[-1].strip():
-        keep.pop()
-    merged = "\n".join(keep) + ("\n\n" if keep else "") + block
-else:
-    merged = "\n".join(keep[:first_hit] + block.split("\n") + keep[first_hit:])
-if not merged.endswith("\n"):
-    merged += "\n"
-open(out_f, "w", encoding="utf-8").write(merged)
-PY
+  local m
+  for m in "${REPO_DIR:-/opt/privdns-gateway}/deploy/bot/nftmerge.py" /opt/pdg-bot/nftmerge.py; do
+    [[ -f "$m" ]] || continue
+    python3 "$m" "$1" "$2" "$3"
+    return $?
+  done
+  echo "找不到 nftmerge.py(合并脚本缺失), 拒绝合并防火墙配置" >&2
+  return 1
 }
 
 _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 SSH端口/内网段)
@@ -1862,20 +1964,245 @@ migrate_drop_singbox(){
 
 # 切换劫持模式: all(非CN全劫持) | gfw(只劫持 GFWList 真被墙域名, 非墙海外直连)。换 hijack_set 加载的域名文件。
 # 人工确认手机平台。装机时会写标记; 只有老装(v1.4.x 无平台概念)推断不出来才需要手工定。
+# profile.env 的 PDG_PLATFORM 与 platform 文件必须同步 —— 后者丢了(备份恢复/手工清理)时
+# _pdg_platform 会回退去读 profile.env, 两处不一致就会在下一次迁移里把平台判反。
+_plat_write_profile(){
+  _profile_set PDG_PLATFORM "$1"
+}
+
+# 部署 iOS 专属组件(幂等)。probe81 / 描述文件模板 / MITM 模块 —— 缺一样 doctor 就会报
+# "pdg-probe81 未运行 / :81 无响应", 而以前 `pdg platform ios` 只写个标记就说"已确认"。
+# iOS 平台必须存在的文件(源 → 目标)。切平台是**事务**, 这里一个都不能少。
+_PLAT_IOS_REQUIRED=(
+  "deploy/ios/probe81.py|/opt/pdg-bot/probe81.py|755"
+  "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl|/opt/pdg-bot/pdg-dot.mobileconfig.tmpl|644"
+  "deploy/bot/mitm_ca.py|/opt/pdg-bot/mitm_ca.py|755"
+  "deploy/bot/mitm_server.py|/opt/pdg-bot/mitm_server.py|755"
+  "deploy/bot/mitm_wloc.py|/opt/pdg-bot/mitm_wloc.py|755"
+  "deploy/ios/pdg-probe81.service|/etc/systemd/system/pdg-probe81.service|644"
+)
+
+_plat_deploy_ios(){
+  # 严格模式: 每个必需文件自己装、自己查, 不走 migrate_deploy_botfiles ——
+  # 那是**幂等迁移**的语义(`install … || true`, 装不上就当没这回事, 下轮再补), 放在平台切换
+  # 这种一次性事务里就成了洞: 注入 mitm_server.py 安装失败后命令照样 RC=0、platform=ios,
+  # 而机器上既没有 mitm_server.py 也没有 pdg-mitm.service —— 一个半残的 iOS 现场。
+  local ent src dst mode
+  install -d -m755 /opt/pdg-bot || { echo "  创建 /opt/pdg-bot 失败"; return 1; }
+  for ent in "${_PLAT_IOS_REQUIRED[@]}"; do
+    IFS='|' read -r src dst mode <<< "$ent"
+    if ! install -m"$mode" "$REPO_DIR/$src" "$dst" 2>/dev/null; then
+      echo "  部署失败: $src → $dst"; return 1
+    fi
+    [[ -s "$dst" ]] || { echo "  部署后文件为空/不存在: $dst"; return 1; }
+  done
+  systemctl daemon-reload >/dev/null 2>&1 || { echo "  systemctl daemon-reload 失败"; return 1; }
+  systemctl reset-failed pdg-probe81 >/dev/null 2>&1 || true
+  systemctl enable --now pdg-probe81 >/dev/null 2>&1 || { echo "  启用 pdg-probe81 失败"; return 1; }
+  # pdg-mitm unit 也照严格口径写(migrate_pdg_mitm_service 是幂等迁移, 失败同样是吞掉的)
+  # shellcheck source=lib/units.sh
+  source "$REPO_DIR/lib/units.sh" 2>/dev/null || { echo "  读不到 lib/units.sh"; return 1; }
+  pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service \
+    || { echo "  写 pdg-mitm.service 失败"; return 1; }
+  systemctl daemon-reload >/dev/null 2>&1 || { echo "  systemctl daemon-reload 失败"; return 1; }
+  systemctl reset-failed pdg-mitm >/dev/null 2>&1 || true
+  systemctl enable --now pdg-mitm >/dev/null 2>&1 || { echo "  启用 pdg-mitm 失败"; return 1; }
+  return 0
+}
+
+# 切换成功前的复核: 目标平台**该有的**在、**该没有的**不在。
+# 部署那步逐个查过返回值了, 这里再看一遍最终现场 —— 中间任何一步把文件又弄没了(比如某条
+# 幂等迁移顺手清理), 也能在返回 0 之前发现。
+_plat_verify(){
+  local p="$1" f miss=() extra=()
+  if [[ "$p" == ios ]]; then
+    local ent dst
+    for ent in "${_PLAT_IOS_REQUIRED[@]}"; do
+      dst="$(cut -d'|' -f2 <<< "$ent")"
+      [[ -s "$dst" ]] || miss+=("$dst")
+    done
+    [[ -s /etc/systemd/system/pdg-mitm.service ]] || miss+=("/etc/systemd/system/pdg-mitm.service")
+    [[ "$(systemctl is-active pdg-probe81 2>/dev/null)" == active ]] || miss+=("pdg-probe81(未运行)")
+    [[ "$(systemctl is-active pdg-mitm 2>/dev/null)" == active ]] || miss+=("pdg-mitm(未运行)")
+  else
+    for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
+             /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
+             /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
+      [[ -e "$f" ]] && extra+=("$f")
+    done
+    [[ "$(systemctl is-active pdg-probe81 2>/dev/null)" == active ]] && extra+=("pdg-probe81(仍在运行)")
+    [[ "$(systemctl is-active pdg-mitm 2>/dev/null)" == active ]] && extra+=("pdg-mitm(仍在运行)")
+  fi
+  if [[ ${#miss[@]} -gt 0 ]]; then
+    echo "❌ 切到 $p 后这些必需项缺失: ${miss[*]}"; return 1
+  fi
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    echo "❌ 切到 $p 后这些 iOS 专属残留没清掉: ${extra[*]}"; return 1
+  fi
+  return 0
+}
+
+# 切平台: 全局锁 + 快照 + 就地备份, 任一步失败恢复原平台与原配置并返回非 0。
+# 以前这里只写个标记就 run_all_migrations 并恒返回 0: Android→iOS 缺 probe81/描述文件模板,
+# iOS→Android 的 nft 里 GMS 5228-5230 回不来、mihomo 配置里 MITM-OUT 还留着, 而命令还说"已确认"。
 cmd_platform(){
   need_root platform
   local p="${1:-}" cur; cur="$(_pdg_platform)"
   if [[ "$p" != ios && "$p" != android ]]; then
     echo "用法: pdg platform <ios|android>"
     echo "  当前: $cur$( [[ -e /etc/privdns-gateway/platform.guessed ]] && echo "  ⚠️ 推测值, 未确认" )"
-    echo "  确认后才会执行该平台的组件清理(推测状态下一律不做破坏性清理)。"
+    echo "  确认后才会执行该平台的组件部署/清理(推测状态下一律不做破坏性清理)。"
     return 1
   fi
+  _lock
+  c_g "切换平台: $cur → $p"
+  # 1) 先留快照。拿不到就别开始 —— 后面要改 nft、删/装 unit、重渲内核, 没有回退手段不能动手。
+  cmd_snapshot >/dev/null 2>&1 || { echo "❌ 快照失败 → 中止切换(未改动任何东西)"; return 1; }
+  # 2) 就地备份直接会被改写的几样(快照是整体回退, 这些用于精确还原)
+  local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
+  local f
+  for f in /etc/privdns-gateway/platform /etc/privdns-gateway/profile.env \
+           /etc/privdns-gateway/mitm.json /etc/nftables.conf /etc/mihomo/config.yaml \
+           /etc/mosdns/rules/mitm_hijack.txt; do
+    [[ -e "$f" ]] && cp -a "$f" "$wd/$(basename "$f")" 2>/dev/null
+  done
+  # 2b) 平台专属文件也要能原样回去: 装上去的要删掉, 清掉的要放回来。
+  # 只还原配置不管这些文件的话, 一次失败的 Android→iOS 会在盘上留下 probe81/描述文件模板/
+  # MITM 模块和两个 unit —— 平台明明已经回滚成 android, 现场却是半个 iOS。
+  # 备份**内容**而不只是记在不在: 文件本来就有(版本旧一点)时, install 会把它改写掉。
+  local _PLAT_FILES=(
+    /opt/pdg-bot/probe81.py
+    /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
+    /opt/pdg-bot/mitm_ca.py
+    /opt/pdg-bot/mitm_server.py
+    /opt/pdg-bot/mitm_wloc.py
+    /etc/systemd/system/pdg-probe81.service
+    /etc/systemd/system/pdg-mitm.service
+  )
+  mkdir -p "$wd/plat"
+  local _pf _key
+  for _pf in "${_PLAT_FILES[@]}"; do
+    _key="${_pf//\//_}"
+    [[ -e "$_pf" ]] && cp -a "$_pf" "$wd/plat/$_key" 2>/dev/null
+  done
+  # 服务的启用/运行状态同样记下来(回滚后不能留下一个"unit 已删但还标着 enabled"的现场)
+  # 只取第一行并在空值时兜底: systemctl 这些子命令是"既打印状态又用退出码表态", 拿
+  # `cmd || echo disabled` 兜底会打印两遍, 多出来的那行会被下面的 read 当成新记录读走。
+  local _psvc _pstate _pen _pac; _pstate=""
+  for _psvc in pdg-probe81 pdg-mitm; do
+    _pen="$(systemctl is-enabled "$_psvc" 2>/dev/null | head -1)"
+    _pac="$(systemctl is-active  "$_psvc" 2>/dev/null | head -1)"
+    _pstate="$_pstate$_psvc|${_pen:-disabled}|${_pac:-inactive}"$'\n'
+  done
+  _plat_rollback(){
+    local g
+    for g in platform profile.env mitm.json nftables.conf config.yaml mitm_hijack.txt; do
+      case "$g" in
+        platform|profile.env|mitm.json) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" "/etc/privdns-gateway/$g";;
+        nftables.conf) [[ -e "$wd/$g" ]] && { cp -a "$wd/$g" /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null || true; };;
+        config.yaml)   [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mihomo/config.yaml;;
+        mitm_hijack.txt) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mosdns/rules/mitm_hijack.txt;;
+      esac
+    done
+    # 平台专属文件: 有备份的放回去, 本来不存在的删掉(这次新装的)
+    local pf key
+    for pf in "${_PLAT_FILES[@]}"; do
+      key="${pf//\//_}"
+      if [[ -e "$wd/plat/$key" ]]; then
+        install -d "$(dirname "$pf")" 2>/dev/null || true
+        cp -a "$wd/plat/$key" "$pf" 2>/dev/null || true
+      else
+        rm -f "$pf" 2>/dev/null || true
+      fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    # 服务状态回到切换前: unit 已经不在了就只停不启
+    local svc en ac
+    while IFS='|' read -r svc en ac; do
+      [[ -n "$svc" ]] || continue
+      if [[ -e "/etc/systemd/system/$svc.service" ]] && [[ "$en" == enabled || "$ac" == active ]]; then
+        systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+        if [[ "$ac" == active ]]; then
+          systemctl enable --now "$svc" >/dev/null 2>&1 || true
+        else
+          systemctl enable "$svc" >/dev/null 2>&1 || true      # 切换前就是"开机启动但没在跑"
+        fi
+      else
+        systemctl disable --now "$svc" >/dev/null 2>&1 || true
+      fi
+    done <<< "$_pstate"
+    _plat_write_profile "$cur" >/dev/null 2>&1 || true
+    systemctl restart "$(_pdg_core_svc)" mosdns >/dev/null 2>&1 || true
+    c_y "已恢复到原平台 $cur 与原配置(含平台专属文件与服务状态; 快照仍在, 必要时可 sudo pdg rollback)。"
+  }
+  # 3) 落平台标记(platform 文件 + profile.env 同步)
   install -d -m700 /etc/privdns-gateway
-  printf '%s\n' "$p" > /etc/privdns-gateway/platform
+  printf '%s\n' "$p" > /etc/privdns-gateway/platform || { _plat_rollback; rm -rf "$wd"; return 1; }
   rm -f /etc/privdns-gateway/platform.guessed
+  _plat_write_profile "$p" || { c_y "profile.env 写入失败"; _plat_rollback; rm -rf "$wd"; return 1; }
+
+  # 4) 按目标平台部署 / 清理组件
+  if [[ "$p" == ios ]]; then
+    if ! _plat_deploy_ios; then
+      echo "❌ iOS 组件部署失败(probe81 / 描述文件模板 / pdg-probe81 服务)"
+      _plat_rollback; rm -rf "$wd"; return 1
+    fi
+  else
+    migrate_android_cleanup                     # 安全休眠 WLOC + 移除 iOS unit/模块/模板(保留地点与 CA)
+  fi
+
+  # 5) 防火墙按目标平台重建(Android 有 GMS 5228-5230, iOS 没有)。与迁移同一实现: 渲染 → 合并
+  #    (用户其它表逐字节保留)→ nft -c → 应用, 任一步失败它自己会把现网还原。
+  if ! _switchcore_nft mihomo; then
+    echo "❌ 防火墙按新平台重建失败"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
+
+  # 6) 重渲内核配置: iOS→Android 要把 MITM-OUT 出站/路由去掉(接管域名已空), 反向则补上
+  if ! ( cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1; then
+    echo "❌ 重新渲染 mihomo 配置失败"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
+  if command -v mihomo >/dev/null 2>&1 && ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
+    echo "❌ 新平台的 mihomo 配置校验(mihomo -t)未过"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
+  systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 || true
+  systemctl restart mosdns >/dev/null 2>&1 || true
+
+  # 7) 校验: nft 配置、核心服务、平台必需服务
+  # nft 的位置与扫描器同一份判据(_pdg_nft_bin): `command -v nft` 只看 PATH, 而 nft 装在
+  # /usr/sbin —— PATH 里没有 sbin 时这条校验会被整条跳过, 等于不校验就放行。
+  local _nftexe; _nftexe="$(_pdg_nft_bin)"
+  if [[ -n "$_nftexe" ]] && ! "$_nftexe" -c -f /etc/nftables.conf >/dev/null 2>&1; then
+    echo "❌ 切换后的 nftables 配置校验未过"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
+  if [[ "$(_pdg_bot_cred)" == partial ]]; then
+    echo "❌ Bot 凭据只配了一项(token 与允许 id 必须成对)—— 这是配置错误, 先用 pdg-set-token"
+    echo "   补齐或把两项都留空(彻底禁用 bot), 再切平台。"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
+  local svc bad=()
+  # 必需服务集按凭据状态算: 没配 bot 的机器不该因为 pdg-bot 没跑而切不了平台
+  for svc in $(_pdg_required_svcs); do
+    _core_kernel_stable "$svc" || bad+=("$svc")
+  done
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    echo "❌ 切换后这些服务未稳定运行: ${bad[*]}"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
+  # 8) 返回 0 之前复核现场: 目标平台该有的都在、该没有的都清干净了
+  if ! _plat_verify "$p"; then
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
+  rm -rf "$wd"
+  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑
   c_g "平台已确认: $cur → $p"
-  run_all_migrations        # 让平台相关的部署/清理按确认后的平台立刻落地
+  if [[ -x /opt/pdg-bot/doctor.py ]] || [[ -f /opt/pdg-bot/doctor.py ]]; then
+    python3 /opt/pdg-bot/doctor.py || c_y "自检有未通过项(见上), 平台切换本身已完成。"
+  fi
+  return 0
 }
 
 cmd_hijack_mode(){
@@ -1933,6 +2260,10 @@ cmd_hijack_mode(){
 if [[ $EUID -eq 0 ]]; then
   case "${1:-menu}" in
     status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm|__migrate) : ;;   # 只读/卸载/内部迁移: 不重复迁移
+    update|up)
+      # `update --dry-run` 是**查看**命令: 不该在"只是看看有没有新版"时就把迁移跑了
+      # (迁移会改 unit / nft / mosdns 配置)。真正的 update 仍照旧先迁移。
+      [[ "${2:-}" == "--dry-run" ]] || run_all_migrations ;;
     *) run_all_migrations ;;   # 管理类命令才迁移(idempotent)
   esac
 fi

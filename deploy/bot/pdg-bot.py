@@ -662,7 +662,7 @@ def _wloc_edit_locked(mutate):
     mutate 返回 False 表示"什么都不用改", 不写盘。
 
     切地点走这里而不是 _mitm_transact: 接管域名只由 enabled 决定, 换坐标既不影响 CA、也不
-    影响 hijack 表和内核路由, 而 pdg-mitm 现在会自己按 mtime 热加载坐标 —— 那一整套
+    影响 hijack 表和内核路由, 而 pdg-mitm 会在下一次 WLOC 请求开始时读取当前 mitm.json —— 那一整套
     (预热证书/重渲内核/重启 pdg-mitm/重启 mosdns)对"只换经纬度"是纯粹的浪费, 还会断一次
     DNS。返回改后的 w; 锁忙返回 None。"""
     with _cfg_guard() as got:
@@ -772,7 +772,8 @@ def wloc_switch_gen(name):
 
     快路径: 只在配置锁内原子改 mitm.json 的 active + generation。不预热 CA、不写 hijack、
     不重渲内核、不重启 mihomo/mosdns/pdg-mitm —— 那些只有"接管域名变了"(开/关 WLOC)才需要,
-    而 pdg-mitm 会按 mtime 自己热加载新坐标。目标是这条路径 1 秒内完成。"""
+    而 pdg-mitm 会在下一次 WLOC 请求开始时读取当前 mitm.json(无需重启服务)。
+    目标是这条路径 1 秒内完成。"""
     if _platform() != "ios":
         return False, "位置改写(WLOC)仅 iOS 平台可用。", 0
     st = {}
@@ -3684,8 +3685,17 @@ def handle_cb(chat, mid, data):
         ok, msg = _panel_close(chat)
         edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
     if data == "restart":
-        ok, msg = apply_sb(lambda c: None); sh(["systemctl", "restart", "mosdns"])
-        edit(chat, mid, f"✅ 已重启 {_core_svc()} + mosdns" if ok else msg, OPS_BACK); return
+        # apply_sb 只管到内核那一半; mosdns 重启的结果以前直接丢掉 —— mosdns 起不来时
+        # 用户照样收到"✅ 已重启", 而这台机器的 DNS 已经断了。两边都要核实。
+        ok, msg = apply_sb(lambda c: None)
+        if not ok:
+            edit(chat, mid, msg, OPS_BACK); return
+        sh(["systemctl", "reset-failed", "mosdns"])
+        r = sh(["systemctl", "restart", "mosdns"])
+        if r.returncode != 0 or not _svc_active("mosdns"):
+            edit(chat, mid, f"⚠️ {_core_svc()} 已重启, 但 <b>mosdns 未能起来</b>(DNS 现在是断的)。\n"
+                            "请到服务器上看: <code>journalctl -u mosdns -n 30</code>", OPS_BACK); return
+        edit(chat, mid, f"✅ 已重启并确认运行: {_core_svc()} + mosdns", OPS_BACK); return
     if data == "updgeo":
         edit(chat, mid, "正在更新 geosite + 规则集…", OPS_BACK)
         r = sh(["/bin/bash", UPDATE_SCRIPT]); n, rs_failed = refresh_rulesets()
