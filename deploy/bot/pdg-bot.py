@@ -2420,6 +2420,57 @@ RESTORE_MAX_FILE_BYTES = 8 * 1024 * 1024              # 单文件上限
 RESTORE_MAX_TOTAL_BYTES = 64 * 1024 * 1024            # 解出总量上限(压缩炸弹)
 
 
+class _RestoreAbort(Exception):
+    """恢复过程中止 → 触发整体回滚(不是给用户看的堆栈, 消息就是给用户的说明)。"""
+
+
+def _restore_targets():
+    """恢复会覆盖的**全部**目标: 模型/mosdns 配置/自定义直连·劫持/规则集元数据/rs 目录/
+    渲染出的 mihomo 配置。回滚必须覆盖同一组, 少一个就会留下互相错位的半恢复状态。"""
+    t = list(RESTORE_MAP.values()) + [RS_DIR, MIHOMO_CFG]
+    seen, out = set(), []
+    for p in t:
+        if p and p not in seen:
+            seen.add(p); out.append(p)
+    return out
+
+
+def _stage_restore_targets(bakdir):
+    """把每个目标暂存到 bakdir。返回 [(目标, 暂存路径或 None)] —— None 表示"原本不存在",
+    回滚时要把它删掉而不是还原。"""
+    staged = []
+    for i, p in enumerate(_restore_targets()):
+        slot = os.path.join(bakdir, str(i))
+        if os.path.isdir(p):
+            shutil.copytree(p, slot)
+            staged.append((p, slot))
+        elif os.path.exists(p):
+            shutil.copy2(p, slot)
+            staged.append((p, slot))
+        else:
+            staged.append((p, None))
+    return staged
+
+
+def _rollback_restore_targets(bakdir, staged):
+    """把所有目标还原回暂存时的样子; 逐项独立处理, 单项失败不挡住其余还原。"""
+    for p, slot in staged:
+        try:
+            if slot is None:                      # 原本不存在 → 删掉恢复过程创建的
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                elif os.path.exists(p):
+                    os.remove(p)
+            elif os.path.isdir(slot):
+                shutil.rmtree(p, ignore_errors=True)
+                shutil.copytree(slot, p)
+            else:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                shutil.copy2(slot, p)
+        except Exception:  # noqa: BLE001  单项失败不该中断其余还原
+            pass
+
+
 def _restore_member_allowed(name):
     """成员是否在恢复白名单内: RESTORE_MAP 的键, 或 rs/ 下的规则集文件。"""
     if name in RESTORE_MAP:
@@ -2593,26 +2644,45 @@ def restore_from(data):
         if chk.returncode != 0:
             return False, "备份的配置(mihomo)校验失败:\n" + (chk.stdout + chk.stderr)[-300:]
         ts = time.strftime("%Y%m%d-%H%M%S")
-        shutil.copy(SB, SB + ".pre-restore-" + ts)
-        restored = []
-        for arc, dst in RESTORE_MAP.items():
-            src = os.path.join(tmp, arc)
-            if os.path.exists(src):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy(src, dst); restored.append(os.path.basename(dst))
-        src_rs = os.path.join(tmp, RS_DIR.lstrip("/"))
-        if os.path.isdir(src_rs):
-            shutil.rmtree(RS_DIR, ignore_errors=True); shutil.copytree(src_rs, RS_DIR); restored.append("rs/")
-        # 从恢复后的 model 校验+重启活动核(core-aware): sing-box=check+restart; mihomo=渲染+mihomo -t+restart
-        ok, err, _ = _core_apply()
-        if not ok:
-            shutil.copy(SB + ".pre-restore-" + ts, SB); _core_apply()   # 回滚 model + 重启回已知good
-            return False, "恢复后 %s 启动失败, 已回滚:\n%s" % (_core_svc(), (err or "")[-200:])
-        sh(["systemctl", "restart", "mosdns"])
-        msg = "已恢复: " + ", ".join(restored) + "\n已重启 " + _core_svc() + " + mosdns"
-        if subs:
-            msg += "\n(跨机导入: 已保留本机身份 " + "、".join(kept) + ", 只搬了出口+分流+规则集)"
-        return True, msg
+        shutil.copy(SB, SB + ".pre-restore-" + ts)      # 给用户留一份看得见的旧 model
+        # ── 事务化落盘 ──────────────────────────────────────────────────────
+        # 恢复会覆盖一整组目标(model / mosdns 配置 / direct·hijack / 规则集元数据 / rs 目录 /
+        # 渲染出的 mihomo 配置)。旧实现只备份了 model, 校验一失败就只把 model 换回去, 其余全部
+        # 停在"半恢复"状态: model 与 mosdns、规则集互相错位, 而界面只说一句"已回滚"。
+        # 这里先把**全部目标**暂存, 任一步失败就整体还原。
+        bak = tempfile.mkdtemp(prefix="pdgrsbak")
+        staged = _stage_restore_targets(bak)
+        try:
+            restored = []
+            for arc, dst in RESTORE_MAP.items():
+                src = os.path.join(tmp, arc)
+                if os.path.exists(src):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy(src, dst); restored.append(os.path.basename(dst))
+            src_rs = os.path.join(tmp, RESTORE_RS_PREFIX.rstrip("/"))   # 归档内路径, 非本机路径
+            if os.path.isdir(src_rs):
+                shutil.rmtree(RS_DIR, ignore_errors=True); shutil.copytree(src_rs, RS_DIR)
+                restored.append("rs/")
+            # 内核: 渲染 + 校验(含 dropped 检查) + 重启 + 确认 active, 全在 _core_apply 里
+            ok, err, _ = _core_apply()
+            if not ok:
+                raise _RestoreAbort("恢复后内核配置校验/启动失败:\n%s" % (err or "")[-300:])
+            # mosdns: 重启结果必须确认 —— 旧实现 restart 完就报成功, 起不来也照说"已恢复"
+            sh(["systemctl", "reset-failed", "mosdns"])
+            r = sh(["systemctl", "restart", "mosdns"])
+            if r.returncode != 0 or not _svc_active("mosdns"):
+                raise _RestoreAbort("恢复后 mosdns 启动失败:\n%s" % (r.stdout + r.stderr)[-300:])
+            msg = "已恢复: " + ", ".join(restored) + "\n已重启 " + _core_svc() + " + mosdns"
+            if subs:
+                msg += "\n(跨机导入: 已保留本机身份 " + "、".join(kept) + ", 只搬了出口+分流+规则集)"
+            return True, msg
+        except _RestoreAbort as e:
+            _rollback_restore_targets(bak, staged)
+            _core_apply()                       # 用还原回来的 model 重回已知 good
+            sh(["systemctl", "restart", "mosdns"])
+            return False, "%s\n已回滚(model / mosdns / 规则集 / rs 目录 全部还原)。" % e
+        finally:
+            shutil.rmtree(bak, ignore_errors=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -142,6 +142,9 @@ jobs:
       - name: "备份恢复解包安全 (绝对路径/../symlink/hardlink/设备/FIFO/压缩炸弹均不得越界)"
         run: python3 tests/test-restore-tar-safety.py
 
+      - name: "恢复备份事务化 (内核校验/dropped/mosdns/内核起不来: 全部目标逐字节还原)"
+        run: python3 tests/test-restore-transaction.py
+
       - name: "观测面板回归 (zashboard 开关 + clash_api secret)"
         run: python3 tests/test-panel.py
 
