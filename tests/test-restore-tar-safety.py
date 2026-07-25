@@ -68,8 +68,9 @@ def extract(data, dest):
         return True, str(e)
 
 
-def run_case(label, build):
-    """解包到隔离目录, 断言解压根之外没有任何写入, 根内不留链接/特殊文件。"""
+def run_case(label, build, must_raise=True):
+    """解包到隔离目录; 断言**整个备份被拒**(而不是跳过坏成员), 解压根之外无写入, 根内不留
+    链接/特殊文件。跳过坏成员会让用户以为"恢复成功了", 实际那份包本就不可信。"""
     base = tempfile.mkdtemp(prefix="pdgsafe")
     dest = os.path.join(base, "root")
     os.makedirs(dest)
@@ -79,7 +80,9 @@ def run_case(label, build):
     with open(victim, "w") as f:
         f.write("ORIGINAL")
     try:
-        extract(mktar(build), dest)
+        raised, err = extract(mktar(build), dest)
+        if must_raise and not raised:
+            bad(f"{label}: 可疑成员只被跳过, 没有拒绝整个备份")
         if open(victim).read() != "ORIGINAL":
             bad(f"{label}: 解压根之外的文件被改写了!")
         stray = [n for n in os.listdir(outside) if n != "victim.txt"]
@@ -152,13 +155,43 @@ def main():
             addfile(t, "etc/sing-box/config.json", b"{}")
             addfile(t, "root/.ssh/authorized_keys", b"ssh-rsa AAA")
             addfile(t, "etc/cron.d/pwn", b"* * * * * root sh")
-        extract(mktar(mixed), dest)
+        raised, _ = extract(mktar(mixed), dest)
+        if not raised:
+            bad("合法配置里混入白名单外成员, 却没有拒绝整个备份")
         if os.path.exists(os.path.join(dest, "root/.ssh/authorized_keys")) \
            or os.path.exists(os.path.join(dest, "etc/cron.d/pwn")):
             bad("白名单之外的成员被解出来了")
-        if not os.path.exists(os.path.join(dest, "etc/sing-box/config.json")):
-            bad("白名单内的成员没解出来")
-        ok("只解白名单内成员(白名单外的 authorized_keys / cron.d 一概不落地)")
+        ok("合法配置中混入一个非法成员 → 拒绝整个备份(不是只跳过它)")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+    # ── 白名单形式的**绝对路径**: 不许被 lstrip 洗白成合法相对路径 ──
+    run_case("白名单形式绝对路径", lambda t: addfile(t, "/etc/sing-box/config.json", b"{}"))
+    ok("白名单形式的绝对路径(/etc/sing-box/config.json)被拒整包")
+
+    # ── `../../` 逃逸到白名单路径 ──
+    run_case("..逃逸到白名单路径",
+             lambda t: addfile(t, "../../etc/sing-box/config.json", b"{}"))
+    ok("`../../etc/sing-box/config.json` 被拒整包(未被规范化洗白)")
+
+    # ── 硬链接两段式: 先放正常配置, 再放一个指向根外的硬链接 ──
+    def hardlink_two_stage(t):
+        addfile(t, "etc/sing-box/config.json", b"{}")
+        addfile(t, "etc/mosdns/config.yaml", b"log: {}\n")
+        i = tarfile.TarInfo("etc/sing-box/rs/evil.list")
+        i.type = tarfile.LNKTYPE
+        i.linkname = "../../../../../../etc/passwd"
+        t.addfile(i)
+    base = tempfile.mkdtemp(prefix="pdgsafe")
+    dest = os.path.join(base, "root")
+    os.makedirs(dest)
+    try:
+        raised, _ = extract(mktar(hardlink_two_stage), dest)
+        if not raised:
+            bad("硬链接两段式攻击未被拒整包")
+        if os.path.exists(os.path.join(dest, "etc/sing-box/config.json")):
+            bad("拒整包后仍留下了先落地的合法成员(应当整包不生效)")
+        ok("硬链接两段式(正常配置 + 越界硬链接)→ 拒整包, 先落地的成员也不留")
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -183,6 +216,25 @@ def main():
         if not raised:
             bad("成员数量上限未生效")
         ok(f"成员数量上限生效({bot.RESTORE_MAX_MEMBERS} 个)")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+    # ── 声明值撒谎: tar 头里的 size 是攻击者写的, 只卡声明值挡不住"声明小、实则源源不断" ──
+    base = tempfile.mkdtemp(prefix="pdgsafe")
+    dest = os.path.join(base, "root")
+    os.makedirs(dest)
+    try:
+        # 造一份成员表: 每个成员声明很小, 但累计实际内容远超总量上限
+        chunk = b"B" * (1024 * 1024)
+        n_needed = bot.RESTORE_MAX_TOTAL_BYTES // len(chunk) + 4
+
+        def liar(t):
+            for i in range(min(n_needed, bot.RESTORE_MAX_MEMBERS - 1)):
+                addfile(t, f"etc/sing-box/rs/big{i}.list", chunk)
+        raised, _ = extract(mktar(liar), dest)
+        if not raised:
+            bad("累计解出量超限却没被拒(只卡声明值挡不住解压炸弹)")
+        ok(f"累计解出量上限生效({bot.RESTORE_MAX_TOTAL_BYTES} 字节, 按**实际读取**计)")
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

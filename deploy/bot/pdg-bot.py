@@ -2527,47 +2527,97 @@ def _restore_member_allowed(name):
 
 
 def _safe_extract(tar, dest):
-    """安全解包: 只落地白名单内的**普通文件**, 逐个 resolve 确认落在 dest 之内。
+    """安全解包: 只落地白名单内的**普通文件**, 任何可疑成员一律**拒绝整个备份**。
 
-    不用 tar.extract() 的不受限形态 —— 它会照单全收符号链接/硬链接/设备/FIFO, 而符号链接
-    足以让后续成员写穿到解压目录之外(两段式), 解出来的 rs/ 又会被 copytree 搬进现网。
-    这里一律自己写文件: 目录按需 mkdir, 其余类型直接跳过, 从根上不产生链接。
-    体积/数量上限用于挡压缩炸弹。任一硬性上限被突破即抛错, 由调用方判恢复失败。
+    设计要点(备份包是外部输入, bot 从 Telegram 收文件, 谁都能发一个):
+      · **流式遍历**(逐个 next()), 不用 getmembers() —— 后者会先把整份成员表读进内存,
+        一个成员表巨大的包在检查开始前就已经把内存吃掉了。
+      · 先看**原始成员名**再做任何规范化: 绝不用 lstrip("./") 之类去"洗白" —— 那会把
+        `/etc/...` 洗成 `etc/...`、把 `../../etc/x` 洗成看似合法的相对路径, 等于自己把
+        逃逸路径改成合法路径再放行。
+      · 可疑成员**拒整包**而不是跳过: 一个包里既有正常配置又混着符号链接/越界路径, 说明它
+        本就不可信; 跳过坏成员、留下好成员会让用户以为"恢复成功了"。
+      · 数量、单文件声明大小、累计声明大小、**实际读取字节数**四道限额都要卡 —— tar 头里的
+        size 是攻击者写的, 只信它挡不住"声明 1KB 实则源源不断"的解压炸弹。
     """
     root = os.path.realpath(dest)
-    total = 0
+    declared_total = 0
+    written_total = 0
     seen = 0
-    for m in tar.getmembers():
+    written = []          # 本次已落地的文件: 一旦判拒整包, 连它们也要清掉
+    try:
+        _safe_extract_loop(tar, root, written)
+    except Exception:
+        # "拒绝整个备份"要名副其实: 已经写下去的成员也不能留(调用方虽然会删临时目录,
+        # 但契约本身不该依赖调用方善后)。
+        for p_ in reversed(written):
+            try:
+                os.remove(p_)
+            except OSError:
+                pass
+        raise
+
+
+def _safe_extract_loop(tar, root, written):
+    """_safe_extract 的主体; 单独一层好让上面在判拒时统一清理已落地的成员。"""
+    declared_total = 0
+    written_total = 0
+    seen = 0
+    while True:
+        m = tar.next()
+        if m is None:
+            break
         seen += 1
         if seen > RESTORE_MAX_MEMBERS:
-            raise ValueError("备份成员过多(>%d), 拒绝解包" % RESTORE_MAX_MEMBERS)
-        name = m.name.lstrip("./")
-        # 只要普通文件; 目录/链接/设备/FIFO 一律不按成员落地(需要的目录下面自己建)
+            raise ValueError("备份成员过多(>%d), 拒绝整个备份" % RESTORE_MAX_MEMBERS)
+        raw = m.name                       # **原始**成员名, 未经任何规范化
+        # 1) 先按原始名判危险形态 —— 绝对路径 / 含 .. / 盘符式绝对路径
+        if raw.startswith("/") or raw.startswith("\\"):
+            raise ValueError("备份含绝对路径成员, 拒绝整个备份: %s" % raw)
+        if any(seg == ".." for seg in raw.replace("\\", "/").split("/")):
+            raise ValueError("备份含 `..` 路径成员, 拒绝整个备份: %s" % raw)
+        # 2) 类型: 只收普通文件与目录; 链接/设备/FIFO 一律拒整包
+        if m.issym() or m.islnk():
+            raise ValueError("备份含链接成员(可用于写穿解压目录), 拒绝整个备份: %s" % raw)
+        if m.ischr() or m.isblk() or m.isfifo() or m.isdev():
+            raise ValueError("备份含设备/FIFO 成员, 拒绝整个备份: %s" % raw)
+        if m.isdir():
+            continue                       # 需要的目录在写文件时自建, 不按成员落地
         if not m.isreg():
-            continue
-        if name.startswith("/") or ".." in name.split("/"):
-            continue
+            raise ValueError("备份含非普通文件成员, 拒绝整个备份: %s" % raw)
+        # 3) 到这里 raw 已确认是"不以 / 开头、不含 .." 的相对路径, 只去掉无害的 ./ 前缀
+        name = raw[2:] if raw.startswith("./") else raw
         if not _restore_member_allowed(name):
-            continue
+            raise ValueError("备份含白名单之外的成员, 拒绝整个备份: %s" % raw)
+        # 4) 限额: 声明值先卡一道(便宜), 实际读取再卡一道(声明值是攻击者写的, 不可信)
         if m.size > RESTORE_MAX_FILE_BYTES:
-            raise ValueError("备份内文件过大(%s, >%d 字节), 拒绝解包" % (name, RESTORE_MAX_FILE_BYTES))
-        total += m.size
-        if total > RESTORE_MAX_TOTAL_BYTES:
-            raise ValueError("备份解出总量过大(>%d 字节), 拒绝解包" % RESTORE_MAX_TOTAL_BYTES)
+            raise ValueError("备份内文件过大(%s, >%d 字节), 拒绝整个备份" % (raw, RESTORE_MAX_FILE_BYTES))
+        declared_total += m.size
+        if declared_total > RESTORE_MAX_TOTAL_BYTES:
+            raise ValueError("备份声明总量过大(>%d 字节), 拒绝整个备份" % RESTORE_MAX_TOTAL_BYTES)
         target = os.path.realpath(os.path.join(root, name))
         # resolve 之后必须仍在解压根内(挡住经既存符号链接的写穿)
         if target != root and not target.startswith(root + os.sep):
-            raise ValueError("备份成员越界: %s" % name)
+            raise ValueError("备份成员越界, 拒绝整个备份: %s" % raw)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         src = tar.extractfile(m)
         if src is None:
-            continue
-        # 落地前再确认一次父目录没被换成链接(TOCTOU 兜底), 并且不跟随既有链接写入
+            raise ValueError("备份成员无法读取, 拒绝整个备份: %s" % raw)
+        # 落地前再确认目标不是符号链接(TOCTOU 兜底), 并且不跟随既有链接写入
         if os.path.islink(target):
-            raise ValueError("备份成员目标是符号链接: %s" % name)
+            raise ValueError("备份成员目标是符号链接, 拒绝整个备份: %s" % raw)
         with open(target, "wb") as out:
-            shutil.copyfileobj(src, out, 64 * 1024)
+            while True:
+                chunk = src.read(64 * 1024)
+                if not chunk:
+                    break
+                written_total += len(chunk)
+                if written_total > RESTORE_MAX_TOTAL_BYTES:
+                    raise ValueError("备份实际解出量超限(>%d 字节), 拒绝整个备份"
+                                     % RESTORE_MAX_TOTAL_BYTES)
+                out.write(chunk)
         os.chmod(target, 0o600)
+        written.append(target)
 
 def backup_blob():
     buf = io.BytesIO()
