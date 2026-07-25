@@ -105,7 +105,31 @@ PRIOR_INSTALL=0; MOSDNS_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0
 # 只要"即将改动目标"就先记一笔 —— *_INSTALLED 表示的是"装成功了吗", 不能拿来表示
 # "这次碰过目标没有": install 写了一半才失败时它还是 0, 回滚就会漏掉那个半成品。
 BIN_TXN=()
+# 目录事务台账: 每项 "目录|装前是否存在(0/1)|装前内容备份路径"。
+# 回滚只该撤销**本次**造成的改动: 本次新建的目录才删, 装前就存在的要按备份还原 ——
+# 直接 rm -rf 那几个目录会把装前就在那儿的东西(可能是别人的)一并抹掉。
+DIR_TXN=()
 [[ -f /opt/pdg-bot/bot.py || -x /usr/local/bin/pdg ]] && PRIOR_INSTALL=1
+
+# ── 第三方路径冲突: 在改动任何东西之前中止 ──────────────────────────────────
+# 本项目把 /etc/sing-box/config.json 当数据模型, 而手工装的 sing-box 也常用这个路径。
+# 若机器上已有一份**证明不了归属**的 sing-box(unit / 二进制 / 配置), 继续装就会覆盖别人的
+# 配置且不可逆 —— 直接中止, 把处置权交回用户。
+# shellcheck source=lib/singbox.sh
+source "$REPO_DIR/lib/singbox.sh"
+if [[ "$PRIOR_INSTALL" == 0 ]]; then
+  _sb_conflict=()
+  [[ -e /etc/systemd/system/sing-box.service ]] && _sb_conflict+=("/etc/systemd/system/sing-box.service")
+  [[ -e /usr/local/bin/sing-box ]] && _sb_conflict+=("/usr/local/bin/sing-box")
+  [[ -e /etc/sing-box/config.json ]] && _sb_conflict+=("/etc/sing-box/config.json")
+  if [[ ${#_sb_conflict[@]} -gt 0 ]] && ! pdg_singbox_is_ours; then
+    die "检测到已存在的 sing-box, 且无法确认是本项目安装的 → 中止安装(未改动任何文件)。
+  冲突路径: ${_sb_conflict[*]}
+  本项目会把 /etc/sing-box/config.json 用作数据模型, 继续装会覆盖上面这些内容, 且不可逆。
+  请先确认它们的归属: 确实不再需要就自行备份并移除, 再重跑本脚本;
+  若那是你自己在跑的 sing-box, 请换一台机器部署本项目。"
+  fi
+fi
 
 # 已有部署: install.sh 会重写配置, 半途失败难以无损还原 → 默认拒绝, 引导走 pdg update(带快照+回滚)。
 # 确需原机覆盖重装的显式 PDG_FORCE_REINSTALL=1; 此时先打快照, 失败用 pdg rollback 恢复。
@@ -233,10 +257,33 @@ rollback(){
   if nft list table inet pdg >/dev/null 2>&1; then         # 表不存在不算失败
     nft delete table inet pdg 2>/dev/null || failed+=("删除 nft 表 inet pdg")
   fi
-  for d in /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway; do
-    [[ -e "$d" ]] || continue
-    rm -rf "$d" || failed+=("删除 $d")
-  done
+  # 按目录事务台账还原: 本次新建的删掉; 装前就存在的按备份原样还原 —— 无差别 rm -rf 会把
+  # 装前就在那儿的东西(可能是第三方 sing-box 的配置)一并抹掉, 那不是"回滚"而是破坏。
+  # 台账可能还没建(极早期失败) —— 在 set -u 下必须先安全取用, 直接 ${#DIR_TXN[@]} 会 unbound,
+  # 那会让回滚自己崩掉并盖住最初的安装错误(正是本项目专门防的那类事故)。
+  local dirtxn=(); dirtxn=(${DIR_TXN[@]+"${DIR_TXN[@]}"})
+  if [[ ${#dirtxn[@]} -gt 0 ]]; then
+    local entry d pre bak
+    for entry in "${dirtxn[@]}"; do
+      IFS='|' read -r d pre bak <<<"$entry"
+      if [[ "$pre" == 1 ]]; then
+        rm -rf "$d" 2>/dev/null
+        if [[ -n "$bak" && -d "$bak" ]]; then
+          mkdir -p "$d" && cp -a "$bak/." "$d/" 2>/dev/null || failed+=("还原 $d")
+          rm -rf "$bak"
+        else
+          failed+=("还原 $d(备份丢失)")
+        fi
+      else
+        [[ -e "$d" ]] && { rm -rf "$d" || failed+=("删除 $d"); }
+      fi
+    done
+  else                                    # 台账还没建起来就失败了(极早期): 退回旧行为
+    for d in /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway; do
+      [[ -e "$d" ]] || continue
+      rm -rf "$d" || failed+=("删除 $d")
+    done
+  fi
   rm -f /usr/local/bin/{pdg,pdg-set-token,proxy-gateway-open-cert-http.sh,proxy-gateway-restore-firewall.sh} \
     || failed+=("删除本次安装的管理脚本")
   _rollback_bins        # 按事务台账还原/清除二进制(装前存在的还原原件, 不存在的删半成品)
@@ -410,6 +457,22 @@ fi
 
 # ── 5. 目录 + 静态文件 ──
 c_g "铺设文件…"
+# 记目录事务: 在**动这些目录之前**记下"装前存在吗", 存在的先备份一份内容。
+# 回滚据此只撤本次的改动: 本次新建的删掉, 装前就有的按备份还原(不再无差别 rm -rf)。
+_dir_txn_record(){
+  local d bak
+  for d in "$@"; do
+    if [[ -e "$d" ]]; then
+      bak="$(mktemp -d)" || { c_y "无法为 $d 备份 → 中止(拒绝在无法回退的前提下改动它)"; return 1; }
+      cp -a "$d/." "$bak/" 2>/dev/null || { rm -rf "$bak"; c_y "备份 $d 失败 → 中止"; return 1; }
+      DIR_TXN+=("$d|1|$bak")
+    else
+      DIR_TXN+=("$d|0|")
+    fi
+  done
+}
+_dir_txn_record /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway \
+  || die "目录备份失败, 未改动任何文件。"
 install -d /etc/mosdns/rules /etc/sing-box/rs /opt/pdg-bot "$CERT_DIR" /etc/letsencrypt/renewal-hooks/deploy /etc/systemd/journald.conf.d
 install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py            /opt/pdg-bot/bot.py
 install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/

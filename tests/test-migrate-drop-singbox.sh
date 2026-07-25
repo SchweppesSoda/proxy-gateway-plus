@@ -40,7 +40,8 @@ mk(){   # $1=当前 backend 标记; 造出"仍是 sing-box 的老机器"现场
   printf '{}\n' > "$SB/etc/privdns-gateway/mitm.json"
   printf 'x\n'  > "$SB/etc/nftables.conf"
   printf 'y\n'  > "$SB/etc/mihomo/config.yaml"
-  printf '{}\n' > "$SB/etc/sing-box/config.json"
+  printf '%s\n' '{"inbounds":[{"type":"direct","tag":"in-https"},{"type":"direct","tag":"in-http"},{"type":"mixed","tag":"tg-proxy"}]}' \
+    > "$SB/etc/sing-box/config.json"
   printf '#!/bin/sh\nexit 0\n' > "$SB/usr/local/bin/sing-box"; chmod 755 "$SB/usr/local/bin/sing-box"
   # 用**老版装机真正生成的** unit 形态(lib/units.sh 历史模板 pdg_unit_singbox), 否则归属
   # 判定认不出它是本项目的东西 —— 那正是第三方 sing-box 该走的分支, 不能拿它冒充自家的。
@@ -94,7 +95,7 @@ EOF
 
 run(){  # $1=env $2=要调的函数
   # shellcheck disable=SC2086
-  env SB="$SB" $1 bash -c "set -uo pipefail
+  env SB="$SB" PDG_ROOT_PREFIX="$SB" $1 bash -c "set -uo pipefail
 REPO_DIR='$ROOT'
 $(harness)
 source '$ROOT/lib/versions.sh' 2>/dev/null
@@ -183,7 +184,7 @@ out=$(run "RENDER_MODE=raise" migrate_drop_singbox)   # 渲染会炸: 真去迁�
   && ok "已是 mihomo + 第三方 sing-box: 不重复迁移也不删它" || bad "8c: out=$out"
 
 # 带归属标记的(本项目装的)→ 即便 unit 形态不匹配也认得出来, 该删就删
-mk singbox; tp_unit; : > "$SB/etc/privdns-gateway/singbox.pdg-owned"
+mk singbox; tp_unit; printf 'PDG-SINGBOX-OWNED v1\ncreated=2026-01-01T00:00:00Z\n' > "$SB/etc/privdns-gateway/singbox.pdg-owned"
 out=$(run "RENDER_MODE=ok" migrate_drop_singbox)
 [[ ! -e "$SB/etc/systemd/system/sing-box.service" ]] \
   && ok "带归属标记: 认定为本项目安装 → 正常清理" || bad "8d: 归属标记未生效"

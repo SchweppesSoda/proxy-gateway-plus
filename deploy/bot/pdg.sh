@@ -26,26 +26,15 @@ _pdg_platform_present(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/n
 _pdg_svcs(){ local s; s="mosdns $(_pdg_core_svc) pdg-bot"; [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"; echo "$s"; }
 
 # ── sing-box 文件归属 ────────────────────────────────────────────────────────
-# 迁移/卸载要删 sing-box 的 unit 与二进制, 但机器上那份未必是本项目装的 —— 用户完全
-# 可能自己在跑一个 sing-box 干别的。删掉别人的东西是不可逆的, 故只删**能证明是我们装的**。
-# 判据(任一成立):
-#   ① 归属标记文件(本项目装 sing-box 时留下; v1.6 起已不装 sing-box, 故仅老机器可能有);
-#   ② unit 的 ExecStart 指向**本项目的**二进制与数据模型路径
-#      (/usr/local/bin/sing-box run -c /etc/sing-box/config.json) —— 这是老版装机生成的形态。
-#      只认 ExecStart 一行: Description 等其余字段用户完全可能改过(加注释、改描述、加 drop-in),
-#      拿它一起卡会把"自家但被改过"的 unit 误判成第三方而永久保留。ExecStart 同时指向我们的
-#      二进制路径和我们的配置路径, 第三方极难与之重合, 单这一条已足够可靠。
-# 都不成立 = 来源不明 → 一律保留, 只提示, 绝不代用户决定。
-PDG_SINGBOX_OWNED_MARK=/etc/privdns-gateway/singbox.pdg-owned
+# 判据集中在 lib/singbox.sh(install/uninstall/pdg 共用), 详见该文件注释:
+# 只有可信归属标记, 或"完整匹配历史 PDG unit 形态 + 现场另有本项目特征", 才算自家的。
+# 手工装 sing-box 最常见的 ExecStart 与本项目历史模板逐字一致, 单凭它认亲会误删别人的东西。
 _pdg_singbox_is_ours(){
-  local unit="${1:-/etc/systemd/system/sing-box.service}"
-  [[ -e "${PDG_SINGBOX_OWNED_MARK:-/etc/privdns-gateway/singbox.pdg-owned}" ]] && return 0
-  [[ -f "$unit" ]] || return 1
-  grep -qE '^ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config\.json([[:space:]]|$)' "$unit"
+  # shellcheck source=lib/singbox.sh
+  source "$REPO_DIR/lib/singbox.sh" 2>/dev/null || return 1
+  pdg_singbox_is_ours "$@"
 }
 
-# 停用并删除**本项目装的** sing-box unit 与二进制; 来源不明则原样保留并给出手工清理指引。
-# $1 = 场景描述(仅用于文案)。恒返回 0: 保留第三方文件不是错误, 不该让调用方判失败。
 _pdg_drop_singbox_files(){
   local why="${1:-}" unit=/etc/systemd/system/sing-box.service bin=/usr/local/bin/sing-box
   [[ -e "$unit" || -e "$bin" ]] || return 0
@@ -54,8 +43,12 @@ _pdg_drop_singbox_files(){
     c_y "  (确认它无用可自行清理: systemctl disable --now sing-box; rm -f $unit $bin)"
     return 0
   fi
+  # 确认是自家的 → 先落一份可信标记再动手: 中途崩了(断电/被杀)下次仍认得出是本项目所有,
+  # 不至于因为 unit 已删、判据失效而退化成"证明不了", 从此再也清不掉残留。
+  # shellcheck source=lib/singbox.sh
+  source "$REPO_DIR/lib/singbox.sh" 2>/dev/null && pdg_singbox_mark_owned
   systemctl disable --now sing-box >/dev/null 2>&1 || true
-  rm -f "$unit" "$bin" "${PDG_SINGBOX_OWNED_MARK:-/etc/privdns-gateway/singbox.pdg-owned}"
+  rm -f "$unit" "$bin" "${PDG_ROOT_PREFIX:-}/etc/privdns-gateway/singbox.pdg-owned"
   return 0
 }
 # iOS: 从已渲染的 nft 移除 GMS 5228-5230(iOS 走 APNs, 不需要)。nft 模板对两平台通用 —— 装机/切核

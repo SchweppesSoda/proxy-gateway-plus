@@ -5,13 +5,17 @@ set -uo pipefail
 
 # sing-box 归属判定: v1.6 起本项目不再装 sing-box, 但老机器上可能仍有一份。机器上那份未必
 # 是我们装的(用户完全可能自己跑一个干别的) —— 删别人的东西不可逆, 故只删能证明是本项目装的。
-# 判据与 pdg 的 _pdg_singbox_is_ours 一致: 归属标记, 或 unit 是老版 pdg_unit_singbox 的形态。
+# 判据集中在 lib/singbox.sh(与 pdg / install 共用): 可信归属标记, 或"完整匹配历史 PDG unit
+# 形态 + 现场另有本项目特征"。单凭一条 ExecStart 不算数 —— 那正是手工安装最常见的写法。
 SB_UNIT=/etc/systemd/system/sing-box.service
 SB_OWNED=0
-if [[ -e /etc/privdns-gateway/singbox.pdg-owned ]]; then SB_OWNED=1
-elif [[ -f "$SB_UNIT" ]] \
-     && grep -qE '^ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config\.json([[:space:]]|$)' "$SB_UNIT"; then
-  SB_OWNED=1
+_UN_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+if [[ -f "$_UN_HERE/lib/singbox.sh" ]]; then
+  # shellcheck source=lib/singbox.sh
+  source "$_UN_HERE/lib/singbox.sh"
+  pdg_singbox_is_ours "$SB_UNIT" && SB_OWNED=1
+else
+  echo "警告: 找不到 lib/singbox.sh, 无法判定 sing-box 归属 → 一律保留(不删)。"
 fi
 
 systemctl disable --now pdg-bot pdg-probe81 mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
@@ -44,8 +48,15 @@ echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot 与 Let's Encry
 
 if [[ "${1:-}" == "--purge" ]]; then
   echo "[--purge] 删除配置与数据…"
-  # /etc/sing-box 是本项目的数据模型目录(config.json/rs/ui), 与"第三方 sing-box 程序"无关, 照删。
-  rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway   # /etc/privdns-gateway 含 bot.env(token) + CA 私钥
+  rm -rf /etc/mosdns /etc/mihomo /opt/pdg-bot /etc/privdns-gateway   # /etc/privdns-gateway 含 bot.env(token) + CA 私钥
+  # /etc/sing-box 平时是本项目的数据模型目录(config.json/rs/ui) —— 但**只有确认 sing-box 属于
+  # 本项目时才敢删**: 证明不了归属就说明这台机器上的 sing-box 是别人的, 那这个目录里放的多半
+  # 也是别人的配置, 删掉不可逆。
+  if [[ "$SB_OWNED" == 1 ]]; then
+    rm -rf /etc/sing-box
+  elif [[ -e /etc/sing-box ]]; then
+    echo "[--purge] /etc/sing-box 归属无法确认(疑为第三方 sing-box 的配置)→ 整个目录保留。"
+  fi
   rm -f /usr/local/bin/mosdns /usr/local/bin/mihomo \
         /usr/local/bin/pdg /usr/local/bin/pdg-set-token \
         /usr/local/bin/proxy-gateway-open-cert-http.sh \

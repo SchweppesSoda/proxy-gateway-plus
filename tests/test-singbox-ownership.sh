@@ -6,9 +6,11 @@
 # 二进制。但机器上那份未必是我们装的 —— 用户完全可能自己跑一个 sing-box 干别的事。
 # 删掉别人的东西不可逆, 也不该由本项目代为决定。
 #
-# 判据(与 pdg 的 _pdg_singbox_is_ours / uninstall.sh 同源):
-#   ① 归属标记 /etc/privdns-gateway/singbox.pdg-owned; 或
-#   ② unit 是老版 pdg_unit_singbox 生成的形态(ExecStart 指向本项目配置路径)。
+# 判据集中在 lib/singbox.sh(pdg / install / uninstall 共用), 满足其一才算自家的:
+#   ① **可信**归属标记(文件存在且首行是约定 token; 空文件/乱写不算);
+#   ② **完整匹配**历史 PDG unit 形态, **并且**现场另有本项目特征(config.json 确是我们的数据
+#      模型 + 有 backend 标记)。
+# 只凭一条 ExecStart 不认亲 —— 那正是手工安装 sing-box 最常见的写法, 会误删别人的东西。
 # 迁移侧的归属用例在 test-migrate-drop-singbox.sh; 这里覆盖 uninstall / --purge。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
@@ -30,8 +32,15 @@ mkfake(){   # $1=unit 形态: ours | thirdparty ; $2=是否放归属标记
     cat > "$SB/etc/systemd/system/sing-box.service" <<'U'
 [Unit]
 Description=sing-box
+After=network-online.target
+Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
 U
   else
     cat > "$SB/etc/systemd/system/sing-box.service" <<'U'
@@ -43,11 +52,22 @@ U
   fi
   printf 'THIRD-PARTY-BINARY\n' > "$SB/usr/local/bin/sing-box"
   printf 'x\n' > "$SB/usr/local/bin/mihomo"
-  [[ "${2:-}" == mark ]] && : > "$SB/etc/privdns-gateway/singbox.pdg-owned"
+  printf 'singbox\n' > "$SB/etc/privdns-gateway/backend"
+  if [[ "$1" == ours ]]; then
+    # 判据要求"形态完整匹配 + 现场另有本项目特征": config.json 必须是我们的数据模型
+    printf '%s\n' '{"inbounds":[{"type":"direct","tag":"in-https"},{"type":"direct","tag":"in-http"},{"type":"mixed","tag":"tg-proxy"}]}' \
+      > "$SB/etc/sing-box/config.json"
+  else
+    printf '%s\n' '{"inbounds":[{"type":"mixed","tag":"his-own"}]}' > "$SB/etc/sing-box/config.json"
+  fi
+  # 归属标记必须**可信**(首行是约定 token), 空文件不算
+  [[ "${2:-}" == mark ]] && printf 'PDG-SINGBOX-OWNED v1\ncreated=2026-01-01T00:00:00Z\n' \
+    > "$SB/etc/privdns-gateway/singbox.pdg-owned"
   export SB
 }
 
 run_uninstall(){   # $1=额外参数(--purge)
+  mkdir -p "$WORK/lib"; cp "$ROOT/lib/singbox.sh" "$WORK/lib/"
   sed -e "s#/etc/#$SB/etc/#g" -e "s#/usr/local/bin/#$SB/usr/local/bin/#g" \
       -e "s#/opt/pdg-bot#$SB/opt/pdg-bot#g" -e "s#/opt/privdns-gateway#$SB/opt/privdns-gateway#g" \
       -e "s#/var/lib/privdns-gateway#$SB/var/lib/privdns-gateway#g" \
@@ -56,7 +76,7 @@ run_uninstall(){   # $1=额外参数(--purge)
   sed -i -e "s#$SB/usr/local/bin/sing-box run -c $SB/etc/sing-box/config#/usr/local/bin/sing-box run -c /etc/sing-box/config#" "$WORK/u.sh"
   # root 门是唯一打桩项(EUID 只读, 赋不了值), 与其它测试 stub need_root 同理; 其余逻辑原样跑
   sed -i -e 's#^\[\[ \$EUID -eq 0 \]\].*#true#' "$WORK/u.sh"
-  env SB="$SB" bash -c "
+  env SB="$SB" PDG_ROOT_PREFIX="$SB" bash -c "
     systemctl(){ :; }; nft(){ :; }
     bash '$WORK/u.sh' ${1:-}
   " 2>&1
@@ -98,22 +118,20 @@ run_uninstall --purge >/dev/null
 [[ ! -e "$SB/usr/local/bin/sing-box" ]] \
   && ok "--purge: 归属标记存在 → 认定自家并删除" || bad "4: 归属标记未生效"
 
-# ── 5. 自家 unit 被用户改过(改 Description / 加注释 / 加字段)仍应认得出 ──
-# 判据只认 ExecStart 那一行 —— 它同时指向本项目的二进制与数据模型路径。若把 Description
-# 之类也一起卡, "自家但被改过"的 unit 会被误判成第三方而**永久保留**, 迁移与卸载都清不掉。
+# ── 5. unit 被改过 → 形态不再完整匹配, 按"证明不了归属"保守保留 ──
+# 判据已收紧为"完整形态匹配 + 本项目特征": 单条 ExecStart 是手工安装最常见的写法, 认亲会误删
+# 别人的东西。代价是改过 unit 的老机器会被保守保留 —— 想让它被识别, 落一份可信归属标记即可。
 mkfake ours
-python3 - "$SB/etc/systemd/system/sing-box.service" <<'PY'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-s = s.replace("Description=sing-box", "Description=sing-box (我自己加了备注)")
-s = "# 我手动加的注释行\n" + s + "Restart=always\nLimitNOFILE=1048576\n"
-open(p, "w").write(s)
-PY
+sed -i 's/^Description=sing-box$/Description=sing-box (我自己加了备注)/' "$SB/etc/systemd/system/sing-box.service"
+run_uninstall --purge >/dev/null
+[[ -e "$SB/etc/systemd/system/sing-box.service" ]] \
+  && ok "unit 被改过 → 形态不匹配, 保守保留(不误删)" || bad "5: 形态不匹配却仍被删"
+
+mkfake ours mark
+sed -i 's/^Description=sing-box$/Description=sing-box (改过)/' "$SB/etc/systemd/system/sing-box.service"
 run_uninstall --purge >/dev/null
 [[ ! -e "$SB/etc/systemd/system/sing-box.service" ]] \
-  && ok "自家 unit 被用户改过(Description/注释/额外字段)仍认得出并清理" \
-  || bad "5: 改过的自家 unit 被误判成第三方而保留"
+  && ok "改过的 unit + 可信归属标记 → 仍能正常清理" || bad "5b: 有标记却没清理"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
