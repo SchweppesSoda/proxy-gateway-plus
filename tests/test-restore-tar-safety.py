@@ -300,7 +300,105 @@ def main():
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
+    limits_main()
     print(f"\n通过 {pass_n} 项断言")
+
+
+def _reload_bot(**env):
+    """按给定环境变量重新载入模块 —— 限额是 import 期算出来的, 只能整份重载来验。"""
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update({k: str(v) for k, v in env.items()})
+    try:
+        spec2 = importlib.util.spec_from_file_location(
+            "bot_env", os.path.join(ROOT, "deploy/bot/pdg-bot.py"))
+        m = importlib.util.module_from_spec(spec2)
+        try:
+            spec2.loader.exec_module(m)
+        except SystemExit:
+            pass
+        return m
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def limits_main():
+    """限额必须**可调**但**关不掉**。
+
+    写死 512 个成员 / 8MB 单文件的后果很实在: 规则集多一点的机器备份就恢复不了, 而用户
+    除了改代码没有别的办法。反过来, 若允许随便调, 一个 PDG_RESTORE_MAX_TOTAL_BYTES=0
+    或者天文数字就把这道防线关掉了 —— 那正是它要挡的东西。故: 可调, 但只在安全区间内,
+    写错/越界一律落回安全值, 且照样拒得住炸弹。"""
+    # ── 1. 不设环境变量 → 保持原默认值(不因为引入可配置而悄悄改行为) ──
+    m = _reload_bot()
+    if (m.RESTORE_MAX_MEMBERS, m.RESTORE_MAX_FILE_BYTES, m.RESTORE_MAX_TOTAL_BYTES) != \
+            (512, 8 * 1024 * 1024, 64 * 1024 * 1024):
+        bad("默认限额被改动了: %s" % ((m.RESTORE_MAX_MEMBERS, m.RESTORE_MAX_FILE_BYTES,
+                                       m.RESTORE_MAX_TOTAL_BYTES),))
+    ok("未配置时限额保持原默认(512 / 8MB / 64MB)")
+
+    # ── 2. 调高之后, 原本被拒的合法大备份能恢复 ──
+    n = 600                                        # > 默认 512
+    blob = mktar(lambda t: [addfile(t, f"{bot.RESTORE_RS_PREFIX}f{i}.json", b"{}") for i in range(n)])
+    with tempfile.TemporaryDirectory() as d, tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+        try:
+            bot._safe_extract(tar, d)
+            bad("600 个成员在默认 512 上限下竟然解开了")
+        except ValueError:
+            pass
+    m = _reload_bot(PDG_RESTORE_MAX_MEMBERS=1000)
+    if m.RESTORE_MAX_MEMBERS != 1000:
+        bad(f"限额没按 PDG_RESTORE_MAX_MEMBERS 调整: {m.RESTORE_MAX_MEMBERS}")
+    with tempfile.TemporaryDirectory() as d, tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+        m._safe_extract(tar, d)                     # 调高后应当能解开
+        got = len(os.listdir(os.path.join(d, bot.RESTORE_RS_PREFIX.rstrip("/"))))
+        if got != n:
+            bad(f"调高上限后仍没全部解出: {got}/{n}")
+    ok("调高上限后, 原本被拒的大备份(600 个成员)可以正常恢复")
+
+    # ── 3. 关不掉: 0 / 负数 / 天文数字都落回安全区间 ──
+    m = _reload_bot(PDG_RESTORE_MAX_MEMBERS=0, PDG_RESTORE_MAX_FILE_BYTES=-1,
+                    PDG_RESTORE_MAX_TOTAL_BYTES=10 ** 15)
+    if m.RESTORE_MAX_MEMBERS < 16:
+        bad(f"成员上限被调到了 {m.RESTORE_MAX_MEMBERS}(等于关掉防线)")
+    if m.RESTORE_MAX_FILE_BYTES < 64 * 1024:
+        bad(f"单文件上限被调到了 {m.RESTORE_MAX_FILE_BYTES}")
+    if m.RESTORE_MAX_TOTAL_BYTES > 2 * 1024 * 1024 * 1024:
+        bad(f"总量上限被调到了 {m.RESTORE_MAX_TOTAL_BYTES}(等于关掉压缩炸弹防线)")
+    ok("0 / 负数 / 天文数字一律夹回安全区间(限额可调但关不掉)")
+
+    # 夹回之后, 压缩炸弹照样拒得住(不是只把数字改了而防线已失效)。
+    # 造一个"想把总量限制关掉"的配置: 总量写 0(夹回 1MB 下限)、成员数写天文数字(夹回上限)
+    m = _reload_bot(PDG_RESTORE_MAX_TOTAL_BYTES=0, PDG_RESTORE_MAX_MEMBERS=999999999)
+    chunk = b"A" * (1024 * 1024)
+    n_needed = int(m.RESTORE_MAX_TOTAL_BYTES // len(chunk)) + 4
+    if n_needed >= m.RESTORE_MAX_MEMBERS:
+        bad(f"夹回后的组合不该还需要 {n_needed} 个成员才超限")
+    bomb = mktar(lambda t: [addfile(t, f"{bot.RESTORE_RS_PREFIX}b{i}.json", chunk)
+                            for i in range(n_needed)])
+    with tempfile.TemporaryDirectory() as d, tarfile.open(fileobj=io.BytesIO(bomb)) as tar:
+        try:
+            m._safe_extract(tar, d)
+            bad("夹回安全值后压缩炸弹仍被解开")
+        except ValueError:
+            pass
+    ok("夹回安全值后, 压缩炸弹照样被拒(不是只把数字改了而防线已失效)")
+
+    # ── 4. 写错(非数字)→ 用默认值, 不让一个笔误把恢复功能整个搞瘫 ──
+    m = _reload_bot(PDG_RESTORE_MAX_MEMBERS="八百")
+    if m.RESTORE_MAX_MEMBERS != 512:
+        bad(f"非数字配置没落回默认: {m.RESTORE_MAX_MEMBERS}")
+    ok("配置写成非数字 → 落回默认值(恢复功能不因笔误瘫痪)")
+
+    # ── 5. 单文件上限 > 总量上限是自相矛盾的 → 总量取两者较大, 免得任何文件都过不了 ──
+    m = _reload_bot(PDG_RESTORE_MAX_FILE_BYTES=200 * 1024 * 1024,
+                    PDG_RESTORE_MAX_TOTAL_BYTES=1024 * 1024)
+    if m.RESTORE_MAX_TOTAL_BYTES < m.RESTORE_MAX_FILE_BYTES:
+        bad(f"单文件上限比总量上限还大: {m.RESTORE_MAX_FILE_BYTES} > {m.RESTORE_MAX_TOTAL_BYTES}")
+    ok("单文件上限 > 总量上限时自动调和(不会配出一个谁都过不了的组合)")
 
 
 if __name__ == "__main__":

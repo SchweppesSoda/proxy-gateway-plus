@@ -60,8 +60,24 @@ sudo ./install.sh
 | 代理域名打不开 | `systemctl status mihomo`;出口加了吗、密码对不对(bot「🚦 测出口」)|
 | 内网卡段填错 | 改 `/etc/mosdns/config.yaml` 的 `npn_clients` 和 `/etc/nftables.conf`,`systemctl restart mosdns && nft -f /etc/nftables.conf` |
 | bot 不理你 | `systemctl status pdg-bot`;token / user id 对不对(`/etc/privdns-gateway/bot.env`)|
+| 恢复备份报"成员过多/过大" | 规则集多的机器会撞上默认上限,见下方"恢复备份的解包限额" |
 
 日志:`journalctl -u mosdns -u mihomo -u pdg-bot -n 50`。
+
+### 恢复备份的解包限额
+
+备份包是外部输入(谁都能往 bot 发一个文件),所以解包有数量/体积上限,压缩炸弹一律拒整包。
+规则集特别多的机器可能会撞上默认值 —— 在 `/etc/privdns-gateway/bot.env` 里调,然后
+`systemctl restart pdg-bot`:
+
+| 变量 | 默认 | 可调范围 |
+|---|---|---|
+| `PDG_RESTORE_MAX_MEMBERS` | 512 个 | 16 ~ 20000 |
+| `PDG_RESTORE_MAX_FILE_BYTES` | 8 MiB | 64 KiB ~ 512 MiB |
+| `PDG_RESTORE_MAX_TOTAL_BYTES` | 64 MiB | 1 MiB ~ 2 GiB |
+
+越界的值会被夹回区间(写 0 或天文数字并不能把这道防线关掉),写成非数字则按默认值处理;
+两种情况都会在 `journalctl -u pdg-bot` 里留一行说明。
 
 ## 非交互 / 自动化安装
 

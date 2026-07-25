@@ -2518,9 +2518,36 @@ RESTORE_MAP = {
 }
 # 备份包是**外部输入**(bot 从 Telegram 收文件, 谁都能发一个) → 解包必须按白名单来。
 RESTORE_RS_PREFIX = RS_DIR.lstrip("/") + "/"          # etc/sing-box/rs/ 下的规则集
-RESTORE_MAX_MEMBERS = 512                             # 成员数量上限
-RESTORE_MAX_FILE_BYTES = 8 * 1024 * 1024              # 单文件上限
-RESTORE_MAX_TOTAL_BYTES = 64 * 1024 * 1024            # 解出总量上限(压缩炸弹)
+
+def _restore_limit(name, default, lo, hi):
+    """解包限额: 可用 bot.env 里的 PDG_RESTORE_* 调整, 但**只在安全区间内**。
+
+    写死上限的代价很实在 —— 规则集多一点的机器备份就恢复不了, 用户除了改代码没别的办法。
+    但也不能随便调: 一个 0 或者天文数字就把这道防线关掉了, 那正是它要挡的东西。故越界一律
+    夹回区间, 写成非数字就用默认值(不让一个笔误把恢复功能整个搞瘫), 两种情况都写一行日志。"""
+    raw = os.environ.get(name, "")
+    if not str(raw).strip():
+        return default
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        print("[restore] %s=%r 不是整数, 用默认值 %d" % (name, raw, default), file=sys.stderr)
+        return default
+    c = max(lo, min(hi, v))
+    if c != v:
+        print("[restore] %s=%d 超出安全区间 [%d, %d], 按 %d 生效" % (name, v, lo, hi, c),
+              file=sys.stderr)
+    return c
+
+
+RESTORE_MAX_MEMBERS = _restore_limit(                 # 成员数量上限
+    "PDG_RESTORE_MAX_MEMBERS", 512, 16, 20000)
+RESTORE_MAX_FILE_BYTES = _restore_limit(              # 单文件上限
+    "PDG_RESTORE_MAX_FILE_BYTES", 8 * 1024 * 1024, 64 * 1024, 512 * 1024 * 1024)
+RESTORE_MAX_TOTAL_BYTES = _restore_limit(             # 解出总量上限(压缩炸弹)
+    "PDG_RESTORE_MAX_TOTAL_BYTES", 64 * 1024 * 1024, 1024 * 1024, 2 * 1024 * 1024 * 1024)
+# 单文件上限比总量还大是自相矛盾的配置 —— 照那么算任何文件都过不了, 恢复直接不可用
+RESTORE_MAX_TOTAL_BYTES = max(RESTORE_MAX_TOTAL_BYTES, RESTORE_MAX_FILE_BYTES)
 
 
 class _RestoreAbort(Exception):
