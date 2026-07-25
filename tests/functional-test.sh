@@ -33,8 +33,28 @@ case "$(uname -m)" in
   *) fail "不支持的架构: $(uname -m)" ;;
 esac
 
-# ── 1. 取 mihomo(优先用 PATH 里的钉死版; 否则按钉死 SHA256 下载)──
-if command -v mihomo >/dev/null && mihomo -v 2>/dev/null | grep -q "$MIHOMO_VER"; then
+# ── 1. 取 mihomo ────────────────────────────────────────────────────────────
+# PATH 上那个未必可信: 可能是别的测试留下的**桩**(只会回一句版本号), 拿它跑功能测试等于
+# 什么都没验证却全绿。故两道关: ① 版本必须**精确**等于钉死版(pdg_mihomo_is_version, 子串
+# 判断会让 v1.19.1 匹配上 v1.19.10); ② 真跑一次 `mihomo -t` 校验一份最小配置, 确认它确实
+# 具备内核能力。任一不过就按钉死 SHA256 重新下载。
+mihomo_usable(){
+  command -v mihomo >/dev/null 2>&1 || return 1
+  pdg_mihomo_is_version "$MIHOMO_VER" || return 1
+  local d rc_good rc_bad
+  d="$(mktemp -d)" || return 1
+  # 正反两份配置都要判对, 才算真内核:
+  #   好配置必须**通过** —— 排除"恒返回非零"的坏桩;
+  #   坏配置必须**被拒** —— 排除"恒返回 0"的假桩(测试里的 mihomo 桩正是这种, 只回一句版本号
+  #   然后 exit 0; 只看好配置的退出码根本识不破它, 功能测试会在什么都没验的情况下全绿)。
+  printf '{"log-level":"silent","mixed-port":17890,"proxies":[],"rules":["MATCH,DIRECT"]}\n' > "$d/good.yaml"
+  printf '{"proxies":[{"name":"x","type":"definitely-not-a-real-protocol","server":"1.1.1.1","port":1}],"rules":["MATCH,DIRECT"]}\n' > "$d/bad.yaml"
+  mihomo -t -d "$d" -f "$d/good.yaml" >/dev/null 2>&1; rc_good=$?
+  mihomo -t -d "$d" -f "$d/bad.yaml"  >/dev/null 2>&1; rc_bad=$?
+  rm -rf "$d"
+  [[ "$rc_good" == 0 && "$rc_bad" != 0 ]]
+}
+if mihomo_usable; then
   MH="$(command -v mihomo)"; note "用现有 mihomo: $MH ($(mihomo -v 2>/dev/null | head -1))"
 else
   note "下载 mihomo $MIHOMO_VER ($ARCH)…"

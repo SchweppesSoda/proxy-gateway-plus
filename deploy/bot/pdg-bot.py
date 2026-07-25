@@ -2352,7 +2352,7 @@ def test_domain(domain):
     tag, why = _singbox_route(d)
     res = head + f"→ 📤 出口 <b>{tag}</b>(命中: {why})"
     if not real:
-        res += "\n<i>(没探到 DNS 结果, 直连/代理未实测; 以上为 sing-box 规则模拟)</i>"
+        res += "\n<i>(没探到 DNS 结果, 直连/代理未实测; 以上为本地规则模拟)</i>"
     return res
 
 # ── 自定义 DoT 域名 (certbot standalone 签证书 → 换 mosdns DoT 证书) ──
