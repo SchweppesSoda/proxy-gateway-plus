@@ -2453,22 +2453,27 @@ def _stage_restore_targets(bakdir):
 
 
 def _rollback_restore_targets(bakdir, staged):
-    """把所有目标还原回暂存时的样子; 逐项独立处理, 单项失败不挡住其余还原。"""
+    """把所有目标还原回暂存时的样子。逐项独立处理(单项失败不挡住其余还原), 但**必须如实
+    报告**: 返回 (是否全部成功, 未恢复项列表)。静默吞掉异常会让调用方照报"全部还原",
+    而现网其实还停在半恢复态 —— 那比直接说失败危险得多。"""
+    failed = []
     for p, slot in staged:
         try:
             if slot is None:                      # 原本不存在 → 删掉恢复过程创建的
                 if os.path.isdir(p):
-                    shutil.rmtree(p, ignore_errors=True)
+                    shutil.rmtree(p)
                 elif os.path.exists(p):
                     os.remove(p)
             elif os.path.isdir(slot):
-                shutil.rmtree(p, ignore_errors=True)
+                if os.path.isdir(p):
+                    shutil.rmtree(p)
                 shutil.copytree(slot, p)
             else:
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 shutil.copy2(slot, p)
-        except Exception:  # noqa: BLE001  单项失败不该中断其余还原
-            pass
+        except Exception as e:  # noqa: BLE001  单项失败不中断其余还原, 但要记账
+            failed.append("%s(%s)" % (p, type(e).__name__))
+    return (not failed), failed
 
 
 def _restore_member_allowed(name):
@@ -2651,7 +2656,14 @@ def restore_from(data):
         # 停在"半恢复"状态: model 与 mosdns、规则集互相错位, 而界面只说一句"已回滚"。
         # 这里先把**全部目标**暂存, 任一步失败就整体还原。
         bak = tempfile.mkdtemp(prefix="pdgrsbak")
-        staged = _stage_restore_targets(bak)
+        # 暂存阶段单独兜: 这时现网**一个字节都还没改**, 失败就干净退出并清掉临时目录 ——
+        # 没必要留备份, 也不该把异常抛给调用方当"未知错误"。
+        try:
+            staged = _stage_restore_targets(bak)
+        except Exception as e:  # noqa: BLE001
+            shutil.rmtree(bak, ignore_errors=True)
+            return False, "恢复前暂存现网配置失败(%s), 未改动任何文件。" % type(e).__name__
+        keep_bak = False
         try:
             restored = []
             for arc, dst in RESTORE_MAP.items():
@@ -2676,13 +2688,35 @@ def restore_from(data):
             if subs:
                 msg += "\n(跨机导入: 已保留本机身份 " + "、".join(kept) + ", 只搬了出口+分流+规则集)"
             return True, msg
-        except _RestoreAbort as e:
-            _rollback_restore_targets(bak, staged)
-            _core_apply()                       # 用还原回来的 model 重回已知 good
-            sh(["systemctl", "restart", "mosdns"])
-            return False, "%s\n已回滚(model / mosdns / 规则集 / rs 目录 全部还原)。" % e
+        except Exception as e:  # noqa: BLE001
+            # 捕获**普通异常**而不只是 _RestoreAbort: copy/copytree/磁盘满/权限错误一样会让
+            # 现网停在半恢复态。KeyboardInterrupt/SystemExit 继承 BaseException, 不在此列 ——
+            # 用户按 Ctrl-C 或进程被要求退出时不该被这里吞掉。
+            why = str(e) if isinstance(e, _RestoreAbort) else \
+                "恢复过程出错: %s: %s" % (type(e).__name__, e)
+            rb_ok, rb_failed = _rollback_restore_targets(bak, staged)
+            # 回滚后必须**验证**到位, 而不是假定成功: 文件回到原样 + 内核能起 + 两个服务 active
+            if rb_ok:
+                capp_ok, capp_err, _ = _core_apply()      # 用还原回来的 model 重回已知 good
+                if not capp_ok:
+                    rb_ok = False
+                    rb_failed.append("内核未能用还原后的配置启动(%s)" % (capp_err or "")[-120:])
+                else:
+                    r2 = sh(["systemctl", "restart", "mosdns"])
+                    if r2.returncode != 0 or not _svc_active("mosdns"):
+                        rb_ok = False
+                        rb_failed.append("mosdns 未能重新启动")
+            if rb_ok:
+                return False, "%s\n已回滚: model / mosdns / 规则集 / rs 目录 全部还原, 服务已恢复。" % why
+            # 回滚不完整: 绝不谎称"全部还原"; 保留事务备份目录, 并把路径与未恢复项交给用户
+            keep_bak = True
+            return False, ("%s\n⚠️ 回滚未完成, 现网可能处于半恢复状态。\n"
+                           "未恢复项: %s\n"
+                           "事务备份已保留(内含恢复前的原文件, 请据此人工修复): %s"
+                           % (why, "、".join(rb_failed) or "(未知)", bak))
         finally:
-            shutil.rmtree(bak, ignore_errors=True)
+            if not keep_bak:
+                shutil.rmtree(bak, ignore_errors=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

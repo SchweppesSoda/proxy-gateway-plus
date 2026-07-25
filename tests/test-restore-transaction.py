@@ -12,11 +12,13 @@
 
 本测试在每个阶段注入失败, 断言: 返回失败 + **所有目标文件逐字节回到恢复前**。
 """
+import glob
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -167,6 +169,9 @@ def check_all_restored(before, label):
 
 def main():
     blob = backup_blob()
+    # 本测试会故意制造"回滚不完整"的场景, 那时实现会**有意保留**事务备份目录(供人工修复)。
+    # 跑完要把本次新产生的清掉, 不给后续留垃圾。
+    bak_before = set(glob.glob(os.path.join(tempfile.gettempdir(), "pdgrsbak*")))
 
     # ── 0. 前置: 确认这些目标确实都在恢复范围内(否则后面的断言是空的) ──
     with tempfile.TemporaryDirectory() as tmp:
@@ -256,6 +261,122 @@ def main():
             bad("缺 config.json 的备份却恢复成功")
         check_all_restored(before, "缺 config.json")
         ok("备份缺网关配置 → 拒绝, 且现网一个文件都没动")
+
+    # ══ 事务边界: 普通异常(copy/copytree/磁盘满/权限)也必须走回滚 ══════════════
+    # 旧实现只 `except _RestoreAbort` —— shutil.copy / copytree 抛的普通异常会**绕过回滚**
+    # 直接冒泡, 现网停在半恢复态; 而 finally 又把事务备份目录删了, 连人工补救的依据都没了。
+
+    class Boom(OSError):
+        """模拟磁盘满/权限错误这类普通异常(不是我们自己的 _RestoreAbort)。"""
+
+    def with_failing(attr, should_fail):
+        """把 bot.shutil 的某个函数换成"满足条件就抛普通异常"的版本 —— 这是**故障注入**,
+        不是把被测逻辑 mock 掉: 真实的暂存/复制/回滚代码照跑。"""
+        real = getattr(bot.shutil, attr)
+
+        def wrapper(*a, **k):
+            if should_fail(*a):
+                raise Boom("injected failure in %s" % attr)
+            return real(*a, **k)
+        setattr(bot.shutil, attr, wrapper)
+        return real
+
+    def restore_shutil(attr, real):
+        setattr(bot.shutil, attr, real)
+
+    # ── 单文件 copy 失败(落盘阶段) → 全部还原 ──
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp)
+        before = snapshot()
+        real = with_failing("copy", lambda src, dst=None, *a: dst is not None and str(dst).endswith("custom_hijack.txt"))
+        try:
+            okr, msg = bot.restore_from(blob)
+        finally:
+            restore_shutil("copy", real)
+        if okr:
+            bad("落盘阶段 copy 抛普通异常, 却报恢复成功")
+        check_all_restored(before, "copy 失败")
+        ok("阶段·单文件 copy 抛普通异常 → 走回滚 + 全部目标还原(不再绕过 except)")
+
+    # ── rs 目录 copytree 失败 → 全部还原(rs 是先 rmtree 再 copytree, 最危险的一步) ──
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp)
+        before = snapshot()
+        real = with_failing("copytree", lambda *a, **k: True)
+        try:
+            okr, msg = bot.restore_from(blob)
+        finally:
+            restore_shutil("copytree", real)
+        if okr:
+            bad("rs 目录 copytree 失败却报恢复成功")
+        check_all_restored(before, "copytree 失败")
+        ok("阶段·rs 目录 copytree 失败 → 全部目标还原(含被 rmtree 掉的 rs/)")
+
+    # ── 暂存阶段失败: 现网还没动过 → 安全退出, 不留临时目录 ──
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp)
+        before = snapshot()
+        leftover_before = len(glob.glob(os.path.join(tempfile.gettempdir(), "pdgrsbak*")))
+        real = with_failing("copytree", lambda *a, **k: True)   # 暂存 rs 目录时就炸
+        try:
+            okr, msg = bot.restore_from(blob)
+        finally:
+            restore_shutil("copytree", real)
+        if okr:
+            bad("暂存失败却报恢复成功")
+        check_all_restored(before, "暂存失败")
+        leftover_after = len(glob.glob(os.path.join(tempfile.gettempdir(), "pdgrsbak*")))
+        if leftover_after > leftover_before:
+            bad("暂存失败后留下了事务备份临时目录(现网未改, 无需保留)")
+        ok("阶段·暂存失败 → 现网未改 + 安全退出 + 不留临时目录")
+
+    # ── 回滚**自身**失败: 不得声称"全部还原", 必须保留备份目录并报出路径与未恢复项 ──
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp)
+        leftover_before = set(glob.glob(os.path.join(tempfile.gettempdir(), "pdgrsbak*")))
+        # 落盘阶段先失败, 触发回滚; 回滚里的 copy2 再失败 → 回滚不完整
+        real_copy = with_failing("copy", lambda src, dst=None, *a: dst is not None and str(dst).endswith("custom_hijack.txt"))
+        # 只在**回滚方向**失败: 暂存是 copy2(现网 → 备份目录), 回滚是 copy2(备份目录 → 现网)。
+        # 一律失败会先炸在暂存阶段(那时现网还没改), 根本走不到回滚。
+        real_copy2 = with_failing("copy2", lambda src, dst=None, *a: dst is not None and "pdgrsbak" not in str(dst))
+        try:
+            okr, msg = bot.restore_from(blob)
+        finally:
+            restore_shutil("copy", real_copy)
+            restore_shutil("copy2", real_copy2)
+        if okr:
+            bad("回滚失败却报恢复成功")
+        if "全部还原" in msg:
+            bad(f"回滚不完整却仍声称'全部还原': {msg}")
+        leftover_after = set(glob.glob(os.path.join(tempfile.gettempdir(), "pdgrsbak*")))
+        kept = leftover_after - leftover_before
+        if not kept:
+            bad("回滚不完整却把事务备份目录删了(人工补救的依据没了)")
+        if not any(str(d) in msg for d in kept):
+            bad(f"未在结果里给出保留的备份目录路径: {msg}")
+        ok("阶段·回滚自身失败 → 不谎称全部还原 + 保留备份目录并给出路径与未恢复项")
+        for d in kept:                                   # 本用例自己制造的残留, 清掉
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ── 回滚函数的契约: 返回 (是否全部成功, 未恢复项) ──
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp)
+        bakdir = tempfile.mkdtemp(prefix="pdgrsbak")
+        try:
+            staged = bot._stage_restore_targets(bakdir)
+            r = bot._rollback_restore_targets(bakdir, staged)
+            if not (isinstance(r, tuple) and len(r) == 2):
+                bad(f"_rollback_restore_targets 未返回 (ok, failed) 二元组: {r!r}")
+            okr, failed = r
+            if not okr or failed:
+                bad(f"正常回滚却报失败: {r!r}")
+            ok("_rollback_restore_targets 返回 (是否全部成功, 未恢复项), 不再静默吞异常")
+        finally:
+            shutil.rmtree(bakdir, ignore_errors=True)
+
+    # 收尾: 清掉本次运行产生的事务备份目录(注入的服务故障会让实现有意保留它们)
+    for d in set(glob.glob(os.path.join(tempfile.gettempdir(), "pdgrsbak*"))) - bak_before:
+        shutil.rmtree(d, ignore_errors=True)
 
     print(f"\n通过 {pass_n} 项断言")
 
