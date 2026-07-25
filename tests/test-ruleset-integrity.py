@@ -600,4 +600,3 @@ def ruleset_main():
 
 if __name__ == "__main__":
     ruleset_main()
-

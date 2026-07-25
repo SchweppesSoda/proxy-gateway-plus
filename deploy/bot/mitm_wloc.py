@@ -16,6 +16,7 @@ wire 格式(苹果私有, 逆向公开): 头部(locale/identifier 长度前缀)+
 import collections
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -45,10 +46,12 @@ def _active_loc(w):
 
 
 class WlocConfig:
-    """按 mtime_ns 缓存的 mitm.json 视图 —— pdg-mitm 不重启也能换坐标。
+    """mitm.json 的读取口 —— pdg-mitm 不重启也能换坐标。
 
-    切地点原先要重启 pdg-mitm(顺带重启 mosdns、重渲内核), 慢且没必要: 接管域名只由 enabled
-    决定, 换坐标并不影响它。这里每次请求先 stat 一下, 变了才整份重读。
+    **每次请求整份读**, 不做 mtime 缓存。原先按 mtime_ns 判"变没变", 但 mtime 的分辨率不是
+    无限的: bot 连着两次 os.replace(改坐标本来就快)完全可能落在同一个 mtime_ns 上, 于是第二
+    次改动被当成"没变"而漏掉 —— 手机拿到的还是上一个坐标, 且这种漏读没有任何征兆。
+    mitm.json 只有几百字节, 一次 WLOC 请求本来就要跟 Apple 走一个来回, 省这一次 read 毫无意义。
 
     读不到 / 坏档时**保留上一次的有效快照**并记下错误类型: 配置正在被原子替换、或者临时被
     写坏, 都不该让正在进来的定位请求突然用一个空坐标。半读取的内容一律不用。"""
@@ -56,73 +59,88 @@ class WlocConfig:
     def __init__(self, path=None):
         self.path = path or MITM_CONFIG
         self._lock = threading.Lock()
-        self._mtime = None
-        self._snap = None
+        self._snap = None                             # last-known-good
         self._error = ""
 
     def _load(self):
-        """(snapshot, mtime_ns, error_type)。mtime 取自同一个 fd —— 先 stat 再 open 会
-        把新文件的内容记成旧文件的 mtime, 之后就再也不刷新了。"""
+        """(snapshot, error_type)。整份读 —— os.replace 保证读到的要么是旧文件要么是新文件,
+        不会是半个。"""
         try:
             with open(self.path, "rb") as f:
-                mt = os.fstat(f.fileno()).st_mtime_ns
                 cfg = json.loads(f.read().decode("utf-8"))
         except Exception as e:  # noqa: BLE001
-            return None, None, type(e).__name__
+            return None, type(e).__name__
         w = ((cfg or {}).get("wloc") or {}) if isinstance(cfg, dict) else {}
         loc = _active_loc(w)
         if not loc:
-            return None, None, "NoActiveLocation"
+            return None, "NoActiveLocation"
         try:
             snap = Snapshot(str(w.get("active") or loc.get("name") or ""),
                             float(loc["lat"]), float(loc["lon"]),
                             int(w.get("generation") or 0))
         except (TypeError, ValueError, KeyError) as e:
-            return None, None, type(e).__name__
-        return snap, mt, ""
+            return None, type(e).__name__
+        return snap, ""
 
     def snapshot(self):
         """(Snapshot 或 None, error_type)。None = 从来没读到过有效配置。"""
-        try:
-            mt = os.stat(self.path).st_mtime_ns
-        except OSError as e:
-            with self._lock:
-                self._error = type(e).__name__
-                return self._snap, self._error
-        with self._lock:
-            if mt == self._mtime and self._snap is not None:
-                return self._snap, ""
-        snap, real_mt, err = self._load()
+        snap, err = self._load()
         with self._lock:
             if snap is not None:
-                self._mtime, self._snap, self._error = real_mt, snap, ""
+                self._snap, self._error = snap, ""
             else:
                 self._error = err                     # 保留 last-known-good, 只记错误
             return self._snap, self._error
+
+
+_status_lock = threading.Lock()                       # 进程内串行化状态更新(每连接一个线程)
 
 
 def write_status(generation, target_name, upstream_ok, patched, error_type="", path=None):
     """写最近一次 WLOC 命中状态(原子替换, 0600)。
 
     只记这几项 —— BSSID、请求头、Apple 请求正文、设备标识一概不落盘: 这个文件是给 bot 看
-    "手机来过没有"的, 不是抓包记录。"""
+    "手机来过没有"的, 不是抓包记录。
+
+    两条并发纪律(pdg-mitm 每个连接一个线程, 慢请求会跨过快请求):
+      · 临时文件用**同目录唯一名**再 replace —— 固定的 .tmp 会被另一个线程边写边替换掉,
+        replace 过去的可能是半份内容;
+      · **旧 generation 不许覆盖新 generation** —— 上一个目标的请求晚几秒才结束, 一落盘就
+        把新目标的命中记录冲掉, bot 那边看到的就是"刚切的地点没人来过"。"""
     p = path or STATUS_FILE
-    doc = {"generation": int(generation), "target_name": str(target_name or ""),
+    try:
+        gen = int(generation)
+    except (TypeError, ValueError):
+        gen = 0
+    doc = {"generation": gen, "target_name": str(target_name or ""),
            "received_at": time.time(), "upstream_ok": bool(upstream_ok),
            "patched": bool(patched), "error_type": str(error_type or ""),
            "pid": os.getpid()}
-    try:
-        d = os.path.dirname(p)
-        if d:
-            os.makedirs(d, mode=0o700, exist_ok=True)
-        t = p + ".tmp"
-        fd = os.open(t, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(doc, f, ensure_ascii=False)
-        os.chmod(t, 0o600)
-        os.replace(t, p)
-    except OSError:
-        pass                                          # 状态文件写不了不该影响定位改写本身
+    with _status_lock:
+        try:
+            cur = json.load(open(p, encoding="utf-8"))
+            if isinstance(cur, dict) and int(cur.get("generation") or 0) > gen:
+                return doc                            # 已有更新的一代 → 不回退
+        except Exception:  # noqa: BLE001             # 没有/坏档: 当作没有, 照写
+            pass
+        try:
+            d = os.path.dirname(p)
+            if d:
+                os.makedirs(d, mode=0o700, exist_ok=True)
+            fd, t = tempfile.mkstemp(prefix=os.path.basename(p) + ".", dir=d or ".")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(doc, f, ensure_ascii=False)
+                os.chmod(t, 0o600)
+                os.replace(t, p)
+            except Exception:  # noqa: BLE001
+                try:
+                    os.remove(t)                      # 失败别把半份临时文件留在目录里
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            pass                                      # 状态文件写不了不该影响定位改写本身
     return doc
 
 

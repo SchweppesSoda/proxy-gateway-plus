@@ -287,7 +287,60 @@ def main():
                 bad(f"状态文件里出现了敏感内容: {leak}")
         ok("状态文件不含 BSSID / 请求头 / 请求正文等敏感内容")
 
-        write_cfg(cfg, *B, generation=201)
+        # ── 7. 时间戳没变但内容换了: 也必须读到新坐标 ──
+        # mtime_ns 的分辨率不是无限的, bot 连着两次 os.replace 完全可能落在同一个时间戳上。
+        # 这里把新配置的 mtime **强制设回**旧值, 稳定复现那一刻: 只要还按 mtime 判"变没变",
+        # 这一步必然读到旧坐标。
+        write_cfg(cfg, *A, generation=300)
+        wloc_request(port, ca_crt)                  # 让 A/300 进缓存
+        old_mt = os.stat(cfg).st_mtime_ns
+        write_cfg(cfg, *B, generation=301)
+        os.utime(cfg, ns=(old_mt, old_mt))
+        if os.stat(cfg).st_mtime_ns != old_mt:
+            bad("样本没造对: mtime 没能设回旧值")
+        _, r7 = wloc_request(port, ca_crt)
+        got = coords_of(r7)
+        if abs(got[0] - B[1]) > 1e-6 or abs(got[1] - B[2]) > 1e-6:
+            bad(f"时间戳相同但内容已换时读到了旧坐标(仍在靠 mtime 判变化): {got}")
+        ok("时间戳与上一次完全相同、内容已替换 → 照样读到新坐标(不靠 mtime 判变化)")
+
+        # ── 8. 并发写状态: 唯一临时文件 + 旧 generation 不覆盖新的 ──
+        import mitm_wloc as WW
+        stat2 = os.path.join(os.path.dirname(status), "concurrent-status.json")
+        errs2 = []
+
+        def writer(g):
+            try:
+                for _ in range(30):
+                    WW.write_status(g, "gen%d" % g, True, True, path=stat2)
+            except Exception as e:  # noqa: BLE001
+                errs2.append("%s: %s" % (type(e).__name__, e))
+
+        ths = [threading.Thread(target=writer, args=(g,)) for g in (11, 12, 13, 14)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join(30)
+        if errs2:
+            bad(f"并发写状态出错: {errs2[:2]}")
+        with open(stat2, encoding="utf-8") as f:
+            final = json.load(f)                     # 能解析 = 没写出半份
+        if final.get("generation") != 14:
+            bad(f"并发写完后不是最新一代: {final}")
+        leftovers = [n for n in os.listdir(os.path.dirname(stat2))
+                     if n.startswith("concurrent-status.json.")]
+        if leftovers:
+            bad(f"并发写留下了临时文件残件: {leftovers[:3]}")
+        ok("4 线程并发写状态: 内容完整、最终留最新一代、无临时文件残件")
+
+        WW.write_status(9, "旧目标", True, True, path=stat2)
+        with open(stat2, encoding="utf-8") as f:
+            after_old = json.load(f)
+        if after_old.get("generation") != 14 or after_old.get("target_name") != "gen14":
+            bad(f"旧 generation 覆盖了更新的状态: {after_old}")
+        ok("旧 generation 的请求晚到 → 不覆盖已写入的更新状态")
+
+        write_cfg(cfg, *B, generation=400)
     finally:
         proc.terminate()
         try:

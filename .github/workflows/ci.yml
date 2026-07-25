@@ -215,6 +215,12 @@ jobs:
       - name: "WLOC 事务化回归 (BUSY/CA/内核/pdg-mitm/mosdns 故障注入均回滚, 不留 enabled=true)"
         run: python3 tests/test-mitm-wloc-txn.py
 
+      - name: "WLOC 热切换回归 (切地点零 systemctl/零重渲 + 配置锁 + 加改语义 + 监听不覆盖菜单)"
+        run: python3 tests/test-wloc-hotswitch.py
+
+      - name: "WLOC 热加载回归 (真起 pdg-mitm: 同 PID 换坐标 + 并发不混坐标 + 状态文件)"
+        run: python3 tests/test-wloc-hotreload.py
+
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
         run: python3 tests/test-platform-isolation.py
 

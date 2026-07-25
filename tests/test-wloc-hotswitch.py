@@ -236,6 +236,49 @@ def main():
             bad("删到没地点了却还留着接管域名")
         ok("删除最后一个地点: 走完整关闭事务(撤接管域名)")
 
+    # ══ 4b. 加/改地点的三种语义 ════════════════════════════════════════════
+    # 以前含糊: 改当前地点会被 pdg-mitm 立刻热加载, 但 generation 不变, bot 还让用户"到列表
+    # 点它" —— 点了不产生任何新效果, 用户以为没生效。
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp); seed(enabled=True)
+        okr, msg, gen = bot.wloc_add_gen("京都", 35.0116, 135.7681)   # 新增的不是当前目标
+        w = json.load(open(bot.MITM_CONFIG))["wloc"]
+        if not okr or gen != 0 or w["active"] != "东京" or w["generation"] != 3:
+            bad(f"新增非当前地点不该切换/不该动 generation: gen={gen} {w}")
+        if "京都" not in [l["name"] for l in w["locations"]]:
+            bad("新增的地点没存进去")
+        ok("新增非当前地点: 只保存, 不切换、不动 generation")
+
+        SPY.__init__()
+        okr, msg, gen = bot.wloc_add_gen("东京", 35.9, 139.9)          # 改的就是当前目标
+        w = json.load(open(bot.MITM_CONFIG))["wloc"]
+        if not okr or gen != 4 or w["generation"] != 4:
+            bad(f"改当前地点没当成一次热切换: gen={gen} {w}")
+        cur = [l for l in w["locations"] if l["name"] == "东京"][0]
+        if cur["lat"] != 35.9 or cur["lon"] != 139.9:
+            bad(f"新坐标没存进去: {cur}")
+        if SPY.apply or SPY.ca or SPY.sh:
+            bad(f"改当前地点却动了服务: apply={SPY.apply} sh={SPY.sh}")
+        if "已更新" not in msg or "热加载" not in msg:
+            bad(f"没提示当前目标坐标已更新并热加载: {msg}")
+        if "地点/切换" in msg or "再点" in msg:
+            bad(f"仍在让用户去列表重复点击: {msg}")
+        ok("修改当前地点(WLOC 已开启): 视为热切换, generation +1, 不再让用户重复点击")
+
+        SPY.__init__()
+        seed(enabled=False)
+        okr, msg, gen = bot.wloc_add_gen("东京", 36.1, 140.1)
+        w = json.load(open(bot.MITM_CONFIG))["wloc"]
+        if not okr or gen != 0 or w["generation"] != 3:
+            bad(f"未开启时改当前地点不该 +generation: gen={gen} {w}")
+        if [l for l in w["locations"] if l["name"] == "东京"][0]["lat"] != 36.1:
+            bad("未开启时新坐标没存下来")
+        if "开启" not in msg:
+            bad(f"未开启时没提示开启后才生效: {msg}")
+        if SPY.apply or SPY.sh:
+            bad(f"未开启却动了服务: apply={SPY.apply} sh={SPY.sh}")
+        ok("修改当前地点(WLOC 未开启): 只保存, 提示开启后才生效")
+
     # ══ 5. 并发切换: mitm.json 任何时刻都是完整 JSON ════════════════════════
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp); seed(enabled=True)
@@ -272,9 +315,10 @@ def main():
         bot.edit = lambda chat, mid, text, kb=None: edits.append((chat, mid, text))
 
         # (a) 对上 generation 且 patched → 报"已收到 iPhone 的新定位请求"
+        since = time.time()
         okr, msg, gen = bot.wloc_switch_gen("大阪")
         write_status(bot.WLOC_STATUS_FILE, gen, "大阪")
-        fut = bot._wloc_watch_async(1, 11, gen, "大阪", timeout=5, interval=0.05)
+        fut = bot._wloc_watch_async(1, 11, gen, "大阪", timeout=5, interval=0.05, since=since)
         fut.result(10)
         if not edits or "已收到 iPhone 的新定位请求" not in edits[-1][2]:
             bad(f"命中后没更新成功消息: {edits}")
@@ -286,8 +330,9 @@ def main():
 
         # (b) 超时: 如实说没收到, 并给出排查项(含 iOS 26 可能要重启)
         edits.clear()
+        since = time.time()
         okr, msg, gen = bot.wloc_switch_gen("东京")
-        fut = bot._wloc_watch_async(1, 12, gen, "东京", timeout=0.6, interval=0.05)
+        fut = bot._wloc_watch_async(1, 12, gen, "东京", timeout=0.6, interval=0.05, since=since)
         fut.result(10)
         if not edits or "尚未收到" not in edits[-1][2]:
             bad(f"超时没提示未收到请求: {edits}")
@@ -298,19 +343,21 @@ def main():
 
         # (c) 上游失败 / 没改写: 报真实原因, 不冒充成功
         edits.clear()
+        since = time.time()
         okr, msg, gen = bot.wloc_switch_gen("大阪")
         write_status(bot.WLOC_STATUS_FILE, gen, "大阪", upstream_ok=False, patched=False,
                      error_type="ForwardFailed")
-        bot._wloc_watch_async(1, 13, gen, "大阪", timeout=5, interval=0.05).result(10)
+        bot._wloc_watch_async(1, 13, gen, "大阪", timeout=5, interval=0.05, since=since).result(10)
         if "ForwardFailed" not in edits[-1][2] or "已收到 iPhone 的新定位请求" in edits[-1][2]:
             bad(f"上游失败没如实报: {edits[-1][2]}")
         ok("上游失败 → 报真实原因(不报成功)")
 
         edits.clear()
+        since = time.time()
         okr, msg, gen = bot.wloc_switch_gen("东京")
         write_status(bot.WLOC_STATUS_FILE, gen, "东京", upstream_ok=True, patched=False,
                      error_type="NoCoordsInResponse")
-        bot._wloc_watch_async(1, 14, gen, "东京", timeout=5, interval=0.05).result(10)
+        bot._wloc_watch_async(1, 14, gen, "东京", timeout=5, interval=0.05, since=since).result(10)
         if "没有可改写的坐标" not in edits[-1][2]:
             bad(f"未改写没如实报: {edits[-1][2]}")
         ok("拿到响应但没改写成 → 如实说明, 不算成功")
@@ -344,6 +391,141 @@ def main():
         ok(f"后台等待提交耗时 {submit_cost * 1000:.1f} ms —— 主轮询不等它")
         write_status(bot.WLOC_STATUS_FILE, gen, "大阪")
         fut.result(10)
+
+    # ══ 6b. 监听绝不覆盖用户当前正看的界面 ═════════════════════════════════
+    # 切完地点用户往往立刻点「返回 WLOC / 主菜单」。监听还在等的话, 30 秒后它会把那条消息
+    # 原地改成"尚未收到请求" —— 用户正看的菜单没了。监听绑 (chat, message_id, token),
+    # 对同一条消息的任何新回调都让旧监听立即失效。
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp); seed(enabled=True)
+        edits = []
+        bot.edit = lambda chat, mid, text, kb=None: edits.append((chat, mid, text))
+        since = time.time()
+        _, _, gen = bot.wloc_switch_gen("大阪")
+        fut = bot._wloc_watch_async(7, 70, gen, "大阪", timeout=3, interval=0.05, since=since)
+        edits.append((7, 70, "MENU"))                  # 用户点了「返回 WLOC」, 这条消息被改成菜单
+        bot.wloc_invalidate_watch(7, 70)               # handle_cb 进来就会做这件事
+        write_status(bot.WLOC_STATUS_FILE, gen, "大阪")
+        fut.result(10)
+        if [e[2] for e in edits] != ["MENU"]:
+            bad(f"监听把菜单覆盖了(编辑顺序: {[e[2][:12] for e in edits]})")
+        ok("返回菜单后命中晚到 → 监听已失效, 不覆盖菜单")
+
+        edits.clear()
+        since = time.time()
+        _, _, gen = bot.wloc_switch_gen("东京")
+        fut = bot._wloc_watch_async(7, 71, gen, "东京", timeout=0.5, interval=0.05, since=since)
+        edits.append((7, 71, "MENU"))
+        bot.wloc_invalidate_watch(7, 71)
+        fut.result(10)
+        if [e[2] for e in edits] != ["MENU"]:
+            bad(f"超时提示覆盖了菜单: {[e[2][:12] for e in edits]}")
+        ok("返回菜单后监听超时 → 同样不覆盖菜单")
+
+        # 失效之后再切一次, 新监听要照常工作
+        edits.clear()
+        since = time.time()
+        _, _, gen = bot.wloc_switch_gen("大阪")
+        fut = bot._wloc_watch_async(7, 72, gen, "大阪", timeout=3, interval=0.05, since=since)
+        write_status(bot.WLOC_STATUS_FILE, gen, "大阪")
+        fut.result(10)
+        if not edits or "已收到" not in edits[-1][2]:
+            bad(f"新监听没工作: {edits}")
+        ok("旧监听失效后, 新的切换仍能正常启动监听并回报命中")
+
+        # 历史状态(本次切换之前就存在)不算命中 —— /run 没清干净时不该冒充刚刚的请求
+        edits.clear()
+        _, _, gen = bot.wloc_switch_gen("东京")
+        stale = {"generation": gen, "target_name": "东京", "received_at": time.time() - 600,
+                 "upstream_ok": True, "patched": True, "error_type": "", "pid": 1}
+        with open(bot.WLOC_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(stale, f, ensure_ascii=False)
+        bot._wloc_watch_async(7, 73, gen, "东京", timeout=0.5, interval=0.05,
+                              since=time.time()).result(10)
+        if not edits or "尚未收到" not in edits[-1][2]:
+            bad(f"历史状态被当成了本次命中: {edits}")
+        ok("历史状态(received_at 早于本次切换)不算命中")
+
+        # 目标名对不上也不算命中(generation 恰好撞上的情况)
+        edits.clear()
+        since = time.time()
+        _, _, gen = bot.wloc_switch_gen("大阪")
+        write_status(bot.WLOC_STATUS_FILE, gen, "别的地方")
+        bot._wloc_watch_async(7, 74, gen, "大阪", timeout=0.5, interval=0.05,
+                              since=since).result(10)
+        if not edits or "尚未收到" not in edits[-1][2]:
+            bad(f"目标名对不上却算成了命中: {edits}")
+        ok("目标名对不上不算命中")
+
+        # 状态字段类型异常: 监听不许直接崩(崩了连超时提示都没有)
+        edits.clear()
+        since = time.time()
+        _, _, gen = bot.wloc_switch_gen("东京")
+        with open(bot.WLOC_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"generation": "不是数字", "target_name": None,
+                       "received_at": "刚刚", "patched": "yes"}, f, ensure_ascii=False)
+        bot._wloc_watch_async(7, 75, gen, "东京", timeout=0.5, interval=0.05,
+                              since=since).result(10)
+        if not edits or "尚未收到" not in edits[-1][2]:
+            bad(f"状态字段异常时监听没能正常收尾: {edits}")
+        ok("状态字段类型异常 → 当作没命中, 监听不崩、超时提示照常")
+
+    # ══ 6c. 配置锁: 持锁期间任何 WLOC 写入都必须被拒 ═══════════════════════
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp); seed(enabled=True)
+        before = open(bot.MITM_CONFIG, encoding="utf-8").read()
+        with bot._cfg_guard() as got:                  # 模拟"另一个操作正持锁"
+            if not got:
+                bad("测试自己都没拿到锁")
+            okr, msg, gen = bot.wloc_add_gen("京都", 35.0116, 135.7681)
+            if okr or msg != bot.BUSY_MSG:
+                bad(f"持锁时 wloc_add 竟然成功了: {okr} {msg}")
+            okr2, msg2, _ = bot.wloc_switch_gen("大阪")
+            okr3, msg3 = bot.wloc_del("上海")
+            if okr2 or msg2 != bot.BUSY_MSG or okr3 or msg3 != bot.BUSY_MSG:
+                bad(f"持锁时 switch/del 没被拒: {okr2} {msg2} | {okr3} {msg3}")
+        if open(bot.MITM_CONFIG, encoding="utf-8").read() != before:
+            bad("持锁期间配置被写了")
+        ok("持锁期间 add / switch / del 一律返回 BUSY 且一个字节都没写")
+
+    # ══ 6d. 并发增删切换: 不丢地点、不出悬空 active、不动其它配置字段 ═══════
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp); seed(enabled=True)
+        cfg = json.load(open(bot.MITM_CONFIG))
+        cfg["other_plugin"] = {"keep": "me"}           # 无关字段, 全程不许被动
+        with open(bot.MITM_CONFIG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        errs = []
+
+        def worker(i):
+            try:
+                for k in range(12):
+                    bot.wloc_add_gen("城市%d" % i, 30.0 + i, 120.0 + k)
+                    bot.wloc_switch_gen("东京" if k % 2 else "大阪")
+                    bot.wloc_del("城市%d" % i)
+            except Exception as e:  # noqa: BLE001
+                errs.append("%s: %s" % (type(e).__name__, e))
+
+        ths = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join(60)
+        if errs:
+            bad(f"并发增删切换出错: {errs[:2]}")
+        final = json.load(open(bot.MITM_CONFIG))
+        w = final["wloc"]
+        names = [l["name"] for l in w["locations"]]
+        for seeded in ("东京", "大阪", "上海"):
+            if seeded not in names:
+                bad(f"并发过程中把原有地点弄丢了: {names}")
+        if len(names) != len(set(names)):
+            bad(f"出现重复地点: {names}")
+        if w["active"] not in names:
+            bad(f"active 悬空(指向不存在的地点): active={w['active']} names={names}")
+        if final.get("other_plugin") != {"keep": "me"}:
+            bad(f"其它配置字段被覆盖了: {final.get('other_plugin')}")
+        ok(f"4 线程并发增删切换 144 次: 地点不丢不重、active 不悬空、无关字段完好")
 
     # ══ 7. Android: 看不到也调不动 ═════════════════════════════════════════
     with tempfile.TemporaryDirectory() as tmp:
