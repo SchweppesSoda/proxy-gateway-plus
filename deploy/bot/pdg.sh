@@ -1552,6 +1552,50 @@ run_all_migrations(){
 
 # 迁移到 mihomo 时渲染并应用 mihomo 的 nft 入站模型(REDIRECT→7893)。出口/分流/证书/DoT/mosdns
 # 全不动(model 共用)。$1 目前恒为 mihomo(唯一内核), 保留形参以兼容 _activate_mihomo_core 调用。
+# 找出**除 table inet pdg 之外**挂在 `hook input` 上的 base chain。
+# 为什么这条是硬门槛: PDG 的 input chain 是 `policy drop`, 而 nftables 里同一 hook 上的多个
+# base chain **都会执行** —— 任一条判 drop, 包就没了。于是用户自己的 input chain 里对 9443 /
+# WireGuard 的 accept 会被 PDG 这条 drop 架空: 配置文本还在, 端口实际已经不通, 而迁移还报成功。
+# 这种"看着保留、其实失效"比直接报错危险得多, 故一律中止, 交由用户手工合并。
+# 检测同时看**配置文件**与**当前运行 ruleset**(两边都可能只有一侧有), 宁可保守中止。
+# stdout: 冲突描述(每行一条); 有冲突返回 0, 没有返回 1。
+_pdg_nft_foreign_input_chains(){
+  local conf="${1:-/etc/nftables.conf}" tmp rc
+  # 走临时文件而不是管道: `python3 -` 的程序本身来自 heredoc(即 stdin), 管道进来的数据会被
+  # heredoc 顶掉, sys.stdin 读到的是空 —— 检测会静默失效(shellcheck SC2259 正是提示这个)。
+  tmp="$(mktemp)" || return 1
+  { [[ -f "$conf" ]] && cat "$conf"; echo "### __PDG_LIVE__ ###"; nft list ruleset 2>/dev/null; } > "$tmp"
+  python3 - "$tmp" <<'PY'
+import re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+conf_txt, _, live_txt = raw.partition("### __PDG_LIVE__ ###")
+tbl_open = re.compile(r"^\s*table\s+(\S+)\s+(\S+)\s*\{")
+hook_in  = re.compile(r"\bhook\s+input\b")
+found = []
+for src, txt in (("配置文件", conf_txt), ("运行 ruleset", live_txt)):
+    cur, depth = None, 0
+    for ln in txt.split("\n"):
+        m = tbl_open.match(ln)
+        if m and depth == 0:
+            cur = "%s %s" % (m.group(1), m.group(2)); depth = 0
+        if cur is not None:
+            depth += ln.count("{") - ln.count("}")
+            if hook_in.search(ln) and cur != "inet pdg":
+                found.append("%s: 表 `%s` 有挂 hook input 的 base chain" % (src, cur))
+            if depth <= 0:
+                cur = None
+seen, out = set(), []
+for f in found:
+    if f not in seen:
+        seen.add(f); out.append(f)
+print("\n".join(out))
+sys.exit(0 if out else 1)
+PY
+  rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
 # 把渲染好的 pdg 表块**合并**进现网 nftables.conf: 只替换本项目管理区(table inet pdg 的
 # 声明/delete/表体), 其余内容逐字节保留。$1=渲染好的块文件 $2=目标 conf $3=输出文件。
 # 无法证明能安全合并(pdg 块括号不配平 / 文件里有 flush ruleset 又还有别的表)→ 返回非 0,
@@ -1640,6 +1684,14 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   icidr=$(python3 -c "import sys;sys.path.insert(0,'/opt/pdg-bot');import checks;print(checks._internal_cidr())" 2>/dev/null)
   [[ -n "$sshp" && -n "$icidr" ]] || { echo "提取 SSH端口/内网段失败(ssh=$sshp cidr=$icidr)"; return 1; }
   [[ -f "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" ]] || { echo "缺 nftables-mihomo.conf(先 pdg update)"; return 1; }
+  # 兜底(调用方本应已在更早处拦下): 别的 input base chain 与 PDG 的 policy drop 不兼容,
+  # 在写文件/执行 nft 之前中止, 免得"文本保留、端口失效"。
+  local _fic2
+  if _fic2="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; then
+    echo "检测到自定义 input base chain, 与 PDG 的 policy drop 不兼容 → 未改动防火墙:"
+    printf '%s\n' "$_fic2" | sed 's/^/    /'
+    return 1
+  fi
   local wd rendered merged bak rc
   wd="$(mktemp -d)" || { echo "无法创建临时目录"; return 1; }
   rendered="$wd/pdg.nft"; merged="$wd/merged.conf"; bak="$wd/nftables.conf.bak"
@@ -1791,6 +1843,20 @@ migrate_drop_singbox(){
   if [[ "$cur" == mihomo ]] && ! _pdg_singbox_is_ours; then
     _pdg_drop_singbox_files "非本项目安装"      # 只打印保留提示, 不删
     return 0
+  fi
+  # 前置硬门槛: 现场若还有别的 input base chain, PDG 的 policy drop 会把它们的放行架空
+  # (配置看着还在、端口实际不通)。必须在**动任何东西之前**中止 —— 下核、翻标记、渲染配置、
+  # 写 unit、改 nft、切服务, 一个都还没做。
+  local _fic
+  if _fic="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; then
+    c_y "检测到自定义 input base chain, 无法保证与 PDG 默认拒绝策略(policy drop)兼容 → 中止迁移。"
+    printf '%s\n' "$_fic" | sed 's/^/    /'
+    c_y "  原因: nftables 同一 hook 上的多个 base chain 都会执行, 任一条 drop 包就没了 ——"
+    c_y "        PDG 的 input chain 是 policy drop, 会把上面这些表里的放行(如自定义端口/VPN)架空,"
+    c_y "        表面上配置都在, 实际端口不通。这种失效比直接报错更难排查, 故不自动处理。"
+    c_y "  怎么办: 把上述表里需要的放行规则并入 table inet pdg 的 input chain(或改用非 input hook),"
+    c_y "          再重试 sudo pdg update。现场未做任何改动, sing-box 仍在正常运行。"
+    return 1
   fi
   c_y "检测到 sing-box 运行时(v1.6.0 已移除)→ 迁移到 mihomo 唯一内核(出口/分流/证书/DoT 不动)…"
   _activate_mihomo_core || { echo "❌ 迁移到 mihomo 失败(见上)。请在 TG bot 处理无法转换的出口后, 重试 sudo pdg update。"; return 1; }
