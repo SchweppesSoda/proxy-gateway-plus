@@ -9,11 +9,15 @@ set -uo pipefail
 # 形态 + 现场另有本项目特征"。单凭一条 ExecStart 不算数 —— 那正是手工安装最常见的写法。
 SB_UNIT=/etc/systemd/system/sing-box.service
 SB_OWNED=0
+SB_WHY="(未判定)"
 _UN_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
 if [[ -f "$_UN_HERE/lib/singbox.sh" ]]; then
   # shellcheck source=lib/singbox.sh
   source "$_UN_HERE/lib/singbox.sh"
   pdg_singbox_is_ours "$SB_UNIT" && SB_OWNED=1
+  # 原因要在 --purge 动手**之前**问出来: backend 标记等判据文件待会儿就被删了, 事后再问,
+  # 报出来的会是"缺 backend"这种由卸载自己造成的假原因。
+  [[ "$SB_OWNED" == 0 ]] && SB_WHY="$(pdg_singbox_why_not_ours "$SB_UNIT")"
 else
   echo "警告: 找不到 lib/singbox.sh, 无法判定 sing-box 归属 → 一律保留(不删)。"
 fi
@@ -43,8 +47,20 @@ fi
 
 echo "已停止并移除 systemd 单元、防火墙表(inet pdg)、并尽量还原 DNS。"
 echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot 与 Let's Encrypt 证书。"
-[[ "$SB_OWNED" == 0 && -e "$SB_UNIT" ]] && \
-  echo "注意: /etc/systemd/system/sing-box.service 无法确认是本项目安装的 → 已保留未动。"
+# 归属证明不了 → 全保留。但不能只丢一句"已保留": 用户手工改过 unit 的情况下也会走到这里,
+# 机器上从此挂着一个没人管的 sing-box。逐条列出留了什么、为什么判不出来、怎么自己清。
+_sb_report_kept(){   # $1=with-config(--purge 时连配置目录一起列)
+  local kept; kept="$(pdg_singbox_kept_paths "${1:-}")"
+  [[ -n "$kept" ]] || return 0
+  echo "注意: 以下 sing-box 文件无法确认是本项目安装的 → 已原样保留:"
+  printf '%s\n' "$kept" | sed 's/^/    /'
+  echo "  判不出归属的原因: $SB_WHY"
+  echo "  确认它无用可自行清理:"
+  echo "    systemctl disable --now sing-box"
+  echo "    rm -rf $(printf '%s' "$kept" | tr '\n' ' ')"
+}
+[[ "$SB_OWNED" == 0 && "${1:-}" != "--purge" ]] && declare -F pdg_singbox_kept_paths >/dev/null \
+  && _sb_report_kept
 
 if [[ "${1:-}" == "--purge" ]]; then
   echo "[--purge] 删除配置与数据…"
@@ -52,22 +68,17 @@ if [[ "${1:-}" == "--purge" ]]; then
   # /etc/sing-box 平时是本项目的数据模型目录(config.json/rs/ui) —— 但**只有确认 sing-box 属于
   # 本项目时才敢删**: 证明不了归属就说明这台机器上的 sing-box 是别人的, 那这个目录里放的多半
   # 也是别人的配置, 删掉不可逆。
-  if [[ "$SB_OWNED" == 1 ]]; then
-    rm -rf /etc/sing-box
-  elif [[ -e /etc/sing-box ]]; then
-    echo "[--purge] /etc/sing-box 归属无法确认(疑为第三方 sing-box 的配置)→ 整个目录保留。"
-  fi
+  [[ "$SB_OWNED" == 1 ]] && rm -rf /etc/sing-box
   rm -f /usr/local/bin/mosdns /usr/local/bin/mihomo \
         /usr/local/bin/pdg /usr/local/bin/pdg-set-token \
         /usr/local/bin/proxy-gateway-open-cert-http.sh \
         /usr/local/bin/proxy-gateway-restore-firewall.sh \
         /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
   # sing-box 二进制同样只删本项目装的; 来源不明的留给用户自己处置
-  if [[ "$SB_OWNED" == 1 ]]; then
-    rm -f /usr/local/bin/sing-box
-  elif [[ -e /usr/local/bin/sing-box ]]; then
-    echo "[--purge] /usr/local/bin/sing-box 无法确认是本项目安装的 → 已保留(如确认无用请自行删除)。"
-  fi
+  [[ "$SB_OWNED" == 1 ]] && rm -f /usr/local/bin/sing-box
+  # 保留清单(unit / 二进制 / 整个 /etc/sing-box)一次性报全, 不散在各处只提一句
+  [[ "$SB_OWNED" == 0 ]] && declare -F pdg_singbox_kept_paths >/dev/null \
+    && _sb_report_kept with-config
   rm -rf /opt/privdns-gateway /var/lib/privdns-gateway   # 仓库副本 + 快照 (放最后, 脚本已载入内存, 删它安全)
   echo "已 purge。证书目录 /etc/letsencrypt 仍保留(含账户), 如需彻底清除请手动 certbot delete。"
 fi

@@ -86,6 +86,40 @@ pdg_singbox_is_ours(){
   return 0
 }
 
+# 判据宁可误判成"不是自家的"(删别人的东西不可逆), 代价是用户手工改过本项目的 unit 之后,
+# 卸载/迁移会留下一堆文件。那就必须说清**为什么**判不出来 —— 一句"无法确认"用户无从下手,
+# 知道是哪一条不成立才谈得上自己判断该不该删。回显一行原因。
+pdg_singbox_why_not_ours(){
+  local pfx="${PDG_ROOT_PREFIX:-}"
+  local unit="${1:-$pfx/etc/systemd/system/sing-box.service}"
+  pdg_singbox_marker_ok && { echo "(实为本项目所有)"; return 0; }
+  [[ -f "$unit" ]] || { echo "没有归属标记, 且 $unit 不存在"; return 0; }
+  if [[ "$(_pdg_unit_norm "$unit")" != "$(pdg_singbox_canonical_unit | sed -e 's/[[:space:]]*$//' -e '/^$/d')" ]]; then
+    echo "没有归属标记, 且 $unit 的内容与本项目历史形态不一致(被手工改过, 或本就是别人装的)"
+    return 0
+  fi
+  if ! pdg_singbox_config_is_ours; then
+    echo "没有归属标记, 且 $pfx/etc/sing-box/config.json 不是本项目的数据模型(缺特征入站 in-https/in-http/tg-proxy)"
+    return 0
+  fi
+  if [[ ! -f "$pfx/etc/privdns-gateway/backend" ]]; then
+    echo "没有归属标记, 且缺 $pfx/etc/privdns-gateway/backend —— 这台机器没有本项目的安装痕迹"
+    return 0
+  fi
+  echo "未知原因"
+}
+
+# 归属证明不了时**确实存在**因而被保留的路径(每行一条)。$1=with-config 则连 /etc/sing-box 一起列。
+# 只列存在的: 让用户去 rm 一个根本没有的文件, 提示就变成噪音了。
+pdg_singbox_kept_paths(){
+  local pfx="${PDG_ROOT_PREFIX:-}" p
+  for p in "$pfx/etc/systemd/system/sing-box.service" "$pfx/usr/local/bin/sing-box"; do
+    [[ -e "$p" ]] && echo "$p"
+  done
+  [[ "${1:-}" == with-config && -e "$pfx/etc/sing-box" ]] && echo "$pfx/etc/sing-box"
+  return 0
+}
+
 # 确认归属后**落一份可信标记**再动手: 中途崩了下次也还认得出是自家的, 不至于退化成"证明不了"。
 pdg_singbox_mark_owned(){
   local pfx="${PDG_ROOT_PREFIX:-}" d="${PDG_ROOT_PREFIX:-}/etc/privdns-gateway"

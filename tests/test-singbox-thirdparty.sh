@@ -132,9 +132,13 @@ run_uninstall --purge >/dev/null
   && ok "--purge: 确属旧版 PDG 的 sing-box 仍被正常清理" || bad "自家 sing-box 没清掉"
 
 # ── 迁移路径 ────────────────────────────────────────────────────────────────
-sed -n '/^pdg_singbox_is_ours(){/,/^}/p'   "$ROOT/lib/singbox.sh"    > "$WORK/fn.sh"
-sed -n '/^pdg_singbox_mark_owned(){/,/^}/p' "$ROOT/lib/singbox.sh"  >> "$WORK/fn.sh"
-sed -n '/^_pdg_drop_singbox_files(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
+# 判据整份 source 进来(生产里 pdg 也是 source lib/singbox.sh, 不是抽单个函数),
+# 再抽出被测的清理函数 —— 它认 PDG_ROOT_PREFIX, 沙箱路径无需改写。
+{ echo ". '$ROOT/lib/singbox.sh'"
+  echo '_pdg_singbox_is_ours(){ pdg_singbox_is_ours "$@"; }'
+  sed -n '/^_pdg_drop_singbox_files(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
+} > "$WORK/fn.sh"
+grep -q '^_pdg_drop_singbox_files(){' "$WORK/fn.sh" || { echo "抽取 _pdg_drop_singbox_files 失败"; exit 1; }
 mk thirdparty; before="$(snap)"
 env SB="$SB" PDG_ROOT_PREFIX="$SB" bash -c "
 c_g(){ echo \"\$*\"; }; c_y(){ echo \"\$*\"; }
@@ -143,6 +147,51 @@ source '$WORK/fn.sh'
 _pdg_drop_singbox_files 迁移" >/dev/null 2>&1
 [[ "$(snap)" == "$before" ]] \
   && ok "迁移清理: 第三方 sing-box 逐字节未变" || bad "迁移清理动了第三方文件"
+
+# ── 保守判据的另一面: 保留了什么、为什么、怎么手动清 ────────────────────────
+# 判据宁可误判成"不是自家的"(删别人的东西不可逆)。代价是: 用户手工改过本项目的 unit 之后,
+# 卸载会留下一堆文件却不说留了什么 —— 机器上从此挂着一个没人管的 sing-box。
+# 故: 保留时必须逐条列出**确实存在**的路径, 说清判不出归属的原因, 并给出可直接执行的清理命令。
+mk thirdparty
+out="$(run_uninstall)"
+grep -q "$SB/etc/systemd/system/sing-box.service" <<<"$out" \
+  && ok "保留提示: 点名了 unit 路径" || bad "没列出保留的 unit: $out"
+grep -q "$SB/usr/local/bin/sing-box" <<<"$out" \
+  && ok "保留提示: 点名了二进制路径" || bad "没列出保留的二进制"
+grep -qE 'rm -r?f .*sing-box' <<<"$out" \
+  && ok "保留提示: 给了可直接执行的清理命令" || bad "没给清理命令: $out"
+grep -qE 'config.json|数据模型' <<<"$out" \
+  && ok "保留提示: 说清了判不出归属的原因" || bad "没说原因: $out"
+
+# --purge 下 /etc/sing-box 整个保留 → 也要点名(否则用户根本不知道这个目录还在)
+mk thirdparty
+out="$(run_uninstall --purge)"
+grep -q "$SB/etc/sing-box" <<<"$out" \
+  && ok "--purge 保留提示: 点名了 /etc/sing-box 目录" || bad "没点名保留的配置目录"
+
+# 不存在的东西不要瞎报(别让用户去 rm 一个根本没有的文件)
+mk thirdparty; rm -f "$SB/usr/local/bin/sing-box"
+out="$(run_uninstall)"
+grep -q "$SB/usr/local/bin/sing-box" <<<"$out" \
+  && bad "二进制已不存在却仍在保留清单里" || ok "保留清单只列**确实存在**的路径"
+
+# 原因要随判据分支变化, 不能是一句放之四海的套话
+mk pdg; rm -f "$SB/etc/privdns-gateway/singbox.pdg-owned" "$SB/etc/privdns-gateway/backend"
+out="$(run_uninstall)"
+grep -q 'backend' <<<"$out" \
+  && ok "原因随分支变化: 缺 backend 标记时如实说明" || bad "原因是套话, 没指出缺 backend: $out"
+
+# 迁移路径同样要点名 + 给命令
+mk thirdparty
+out="$(env SB="$SB" PDG_ROOT_PREFIX="$SB" bash -c "
+c_g(){ echo \"\$*\"; }; c_y(){ echo \"\$*\"; }
+systemctl(){ :; }
+source '$WORK/fn.sh'
+_pdg_drop_singbox_files 迁移" 2>&1)"
+{ grep -q 'sing-box.service' <<<"$out" && grep -q 'rm -f' <<<"$out"; } \
+  && ok "迁移清理: 保留时点名路径并给出清理命令" || bad "迁移提示不完整: $out"
+grep -qE 'config.json|数据模型|backend|形态' <<<"$out" \
+  && ok "迁移清理: 说清了判不出归属的原因" || bad "迁移提示没说原因: $out"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

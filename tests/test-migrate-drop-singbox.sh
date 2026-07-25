@@ -31,6 +31,9 @@ sed -i -e 's#/etc/#$SB/etc/#g' -e 's#/opt/pdg-bot#$SB/opt/pdg-bot#g' \
        -e 's#/usr/local/bin/#$SB/usr/local/bin/#g' "$WORK/fn.sh"
 # 归属判据里的 ExecStart 特征行是**目标机上的真实路径**, 不能被上面的沙箱重写改掉
 sed -i -e 's#\$SB/usr/local/bin/sing-box run -c \$SB/etc/sing-box/config#/usr/local/bin/sing-box run -c /etc/sing-box/config#' "$WORK/fn.sh"
+# 已经自己认 PDG_ROOT_PREFIX 的路径不要再叠一层沙箱前缀(叠了会变成 $SB$SB/… 而永远不存在,
+# 断言就成了空转 —— 文件"没被删"只是因为函数压根没找到它)
+sed -i -e 's#\$pfx\$SB/#$pfx/#g' -e 's#\${PDG_ROOT_PREFIX:-}\$SB/#${PDG_ROOT_PREFIX:-}/#g' "$WORK/fn.sh"
 
 mk(){   # $1=当前 backend 标记; 造出"仍是 sing-box 的老机器"现场
   SB="$WORK/root"; rm -rf "$SB"

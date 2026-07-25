@@ -36,10 +36,16 @@ _pdg_singbox_is_ours(){
 }
 
 _pdg_drop_singbox_files(){
-  local why="${1:-}" unit=/etc/systemd/system/sing-box.service bin=/usr/local/bin/sing-box
+  local why="${1:-}" pfx="${PDG_ROOT_PREFIX:-}"
+  local unit="$pfx/etc/systemd/system/sing-box.service" bin="$pfx/usr/local/bin/sing-box"
   [[ -e "$unit" || -e "$bin" ]] || return 0
   if ! _pdg_singbox_is_ours "$unit"; then
-    c_y "  检测到 sing-box${why:+($why)}, 但无法确认是本项目安装的 → 原样保留, 不删。"
+    local kept reason
+    kept="$(pdg_singbox_kept_paths 2>/dev/null)"
+    reason="$(pdg_singbox_why_not_ours "$unit" 2>/dev/null)"
+    c_y "  检测到 sing-box${why:+($why)}, 但无法确认是本项目安装的 → 原样保留, 不删:"
+    [[ -n "$kept" ]] && printf '%s\n' "$kept" | sed 's/^/      /'
+    c_y "  判不出归属的原因: ${reason:-未知}"
     c_y "  (确认它无用可自行清理: systemctl disable --now sing-box; rm -f $unit $bin)"
     return 0
   fi
