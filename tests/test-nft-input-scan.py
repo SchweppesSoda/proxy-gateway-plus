@@ -114,6 +114,40 @@ def main():
     assert len(f) == 2 and len(set(f)) == 2, f
     ok("配置文件与运行 ruleset 各报一条, 已去重")
 
+    # ── 4b. 只认**真正的链声明**, 不认注释/字符串里的字样 ──
+    # 误报的方向虽然保守(中止迁移), 但代价是用户被一条注释永久挡在升级门外, 且完全看不出
+    # 为什么 —— 配置里那行明明是注释。
+    commented = """table inet mynat {
+  # 这台机器早期在这里挂过 hook input 的链, 后来移到 pdg 了, 留个注释备查
+  chain postrouting {
+    type nat hook postrouting priority 100; policy accept;
+    # type filter hook input priority 0; policy drop;   （已废弃）
+    oifname "eth0" masquerade
+  }
+}
+"""
+    assert nftscan.scan_text(commented, "") == [], nftscan.scan_text(commented, "")
+    ok("注释里写着 hook input → 不误报(用户不会被一行注释挡在升级门外)")
+
+    quoted = """table inet myfilter {
+  chain fwd {
+    type filter hook forward priority 0; policy accept;
+    log prefix "hook input drop test " accept
+  }
+}
+"""
+    assert nftscan.scan_text(quoted, "") == [], nftscan.scan_text(quoted, "")
+    ok("字符串字面量里出现 hook input → 不误报")
+
+    # 反向: 真的链声明一个都不能漏(收紧匹配不能把真冲突放过去)
+    for decl in ("    type filter hook input priority 0; policy drop;",
+                 "\t\ttype filter hook input priority filter; policy drop;",
+                 "    type filter hook input priority -150; policy accept;",
+                 "    type filter hook input priority mangle + 10; policy accept;"):
+        txt = "table inet other {\n  chain c {\n%s\n  }\n}\n" % decl
+        assert len(nftscan.scan_text(txt, "")) == 1, (decl, nftscan.scan_text(txt, ""))
+    ok("各种真实写法的 input 链声明(数字/具名/负数/表达式优先级)一个不漏")
+
     # ── 5. live_ruleset: 读不到必须 readable=False, 不能与"读到了且干净"混为一谈 ──
     with tempfile.TemporaryDirectory() as tmp:
         # (a) nft 返回非 0(权限不足的真实形态: Operation not permitted)
@@ -205,6 +239,18 @@ def main():
     lvl, _, detail = checks.check_nft_input_chains()
     assert lvl == "warn" and "读不到" in detail, (lvl, detail)
     ok("doctor: 读不到运行 ruleset → warn(不谎报 ok)")
+
+    # warn 得让人知道下一步做什么: 非 root 就直说重跑一次 sudo, 别只丢一句"读不到"
+    checks.os.geteuid = lambda: 1000
+    _, _, detail = checks.check_nft_input_chains()
+    assert "sudo pdg doctor" in detail, detail
+    ok("doctor: 非 root 时告诉用户 sudo pdg doctor 才能看全")
+    # 已经是 root 还读不到 → 那是 nftables 本身的问题, 别误导用户去加 sudo
+    checks.os.geteuid = lambda: 0
+    _, _, detail = checks.check_nft_input_chains()
+    assert "sudo" not in detail and "nftables" in detail, detail
+    ok("doctor: root 下仍读不到 → 指向 nftables 本身, 不误导去加 sudo")
+    checks.os.geteuid = os.geteuid
 
     # ── 8. 单一来源: pdg.sh 不得再自带一份解析实现 ──
     pdg_src = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")

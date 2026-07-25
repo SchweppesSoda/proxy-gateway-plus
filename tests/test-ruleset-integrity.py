@@ -11,9 +11,14 @@
 现在: dropped 非空即判失败并列出被丢弃的规则集; .mrs 放行; .srs 在入口就拒(并给出替换指引);
 已有 .srs 的老机器迁移时会被拦下, 保留 sing-box 运行, 而不是迁过去悄悄少一条分流。
 """
+import contextlib
 import importlib.util
 import json
 import os
+import random
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -235,8 +240,6 @@ if __name__ == "__main__":
 # 添加 → 刷新 → 渲染 → 内核校验。
 # ══════════════════════════════════════════════════════════════════════════════
 import http.server
-import shutil
-import subprocess
 import threading
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -271,6 +274,49 @@ def serve_dir(d):
 def mihomo_bin():
     """有真 mihomo 就用它做内核校验; 没有则返回 None(该断言跳过并说明)。"""
     return shutil.which("mihomo")
+
+
+@contextlib.contextmanager
+def no_zstd():
+    """把 zstd 命令从 PATH 上摘掉(模拟没装 zstd 的机器)。"""
+    d = tempfile.mkdtemp(prefix="pdgnozstd")
+    old = os.environ["PATH"]
+    # 只保留必要目录里的其它命令: 造一个只含符号链接、独独没有 zstd 的 bin 目录
+    for p in old.split(os.pathsep):
+        if not os.path.isdir(p):
+            continue
+        for f in os.listdir(p):
+            if f == "zstd":
+                continue
+            dst = os.path.join(d, f)
+            if not os.path.exists(dst):
+                try:
+                    os.symlink(os.path.join(p, f), dst)
+                except OSError:
+                    pass
+    os.environ["PATH"] = d
+    try:
+        yield
+    finally:
+        os.environ["PATH"] = old
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def make_big_mrs():
+    """造一份"头部落在压缩块里"的大 .mrs(没有 zstd 命令就返回 None)。
+
+    真实的大规则集就是这个形态 —— 光靠"在原始字节里找 MRS"根本找不到。"""
+    if not shutil.which("zstd"):
+        return None
+    # 内容要**可压缩**(真实规则集就是一堆相似域名): 不可压缩的数据 zstd 会原样存字面量,
+    # 头部反而留在明处, 造不出我们要复现的那个形态。
+    body = bytearray(b"MRS\x01\x00")
+    rnd = random.Random(20260725)
+    for i in range(40000):
+        body += b"%s%d.example%d.com\n" % (rnd.choice([b"a", b"bb", b"ccc"]), i, i % 997)
+    p = subprocess.run(["zstd", "-q", "-19", "-c"], input=bytes(body),
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return p.stdout if p.returncode == 0 and p.stdout else None
 
 
 def zstd_or_raw(data):
@@ -473,6 +519,57 @@ def ruleset_main():
             if name in bot._mihomo_rulesets():
                 bad("本地文件认不出类型却仍被渲染(等于猜)")
             ok("本地文件也认不出 → 仍跳过并交由上层报错(不猜)")
+
+        # ── 大 .mrs: 头部落在压缩块里, "在原始字节里找 MRS"这条兜底根本找不到 ──
+        # 真实规则集(几十万条域名)就是这个量级。之前只有小文件能被认出来, 大文件全部退化成
+        # "要用户手填", 而用户根本不知道为什么同样是 .mrs 有的要填有的不要。
+        big = make_big_mrs()
+        if big is None:
+            print("[SKIP] 本机无 zstd 命令, 造不出大 .mrs 样本(跳过该用例)")
+        else:
+            if big.find(b"MRS", 0, 65536) >= 0:
+                bad("样本没造对: 大 .mrs 的头部不该能在原始字节里直接找到")
+            if bot.mrs_behavior(big) != "domain":
+                bad("大 .mrs(头部在压缩块内)的 behavior 没认出来: %r" % bot.mrs_behavior(big))
+            ok("大 .mrs(头部在压缩块内, 盲扫找不到)照样认出 behavior")
+
+            # 本机连 zstd 都没有时: 老实认不出, 并**指出装 zstd 就能自动识别** ——
+            # 只说"请指定类型"等于让用户永远手填下去
+            (Path(www) / "big.mrs").write_bytes(big)
+            with tempfile.TemporaryDirectory() as tmp, no_zstd():
+                setup(tmp)
+                if bot.mrs_behavior(big) is not None:
+                    bad("无 zstd 时不该还能认出大 .mrs 的类型")
+                okr, msg = bot.add_ruleset(base + "/big.mrs", "hk")
+                if okr:
+                    bad("无 zstd、认不出类型的大 .mrs 却被接受")
+                if "zstd" not in msg:
+                    bad(f"没告诉用户装 zstd 即可自动识别: {msg}")
+                ok("无 zstd → 认不出时明确提示装 zstd(而不是让用户永远手填)")
+
+                # 小文件在无 zstd 时仍能靠原始字节扫出来(别把已有能力弄丢)
+                if bot.mrs_behavior(mrs_bytes) != "domain":
+                    bad("无 zstd 时小 .mrs 也认不出了(原始扫描兜底被弄丢)")
+                ok("无 zstd 时小 .mrs 仍能靠原始字节兜底认出")
+
+        # 有 python zstd 模块的环境不该依赖外部命令(接线要通)
+        with no_zstd():
+            fake = types.ModuleType("pyzstd")
+            fake.decompress = lambda d: b"MRS\x01\x01" + b"\x00" * 16
+            sys.modules["pyzstd"] = fake
+            try:
+                if bot.mrs_behavior(b"\x28\xb5\x2f\xfd" + b"\x00" * 32) != "ipcidr":
+                    bad("有 python zstd 模块时没走模块路径")
+                ok("有 python zstd 模块时不依赖外部 zstd 命令")
+            finally:
+                sys.modules.pop("pyzstd", None)
+
+        # 装机依赖里必须带 zstd, 否则上面那条"装了就能自动识别"在新机器上永远用不上
+        inst = (ROOT / "install.sh").read_text(encoding="utf-8")
+        apt = [ln for ln in inst.splitlines() if "apt-get install" in ln and "nftables" in ln]
+        if not apt or not any(re.search(r"\bzstd\b", ln) for ln in apt):
+            bad("install.sh 的依赖列表里没有 zstd")
+        ok("装机依赖含 zstd(新机器开箱即可自动识别 .mrs 类型)")
 
         # .mrs 只支持 domain / ipcidr: classical 连 mihomo 自己的 convert-ruleset 都会崩,
         # 收下它等于配出一份内核加载不了的规则

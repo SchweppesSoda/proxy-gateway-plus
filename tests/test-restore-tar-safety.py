@@ -325,6 +325,19 @@ def _reload_bot(**env):
                 os.environ[k] = v
 
 
+def _free_bytes(path):
+    """path 所在文件系统的可用字节(路径不存在就往上找)。测试自备一份, 不用被测代码的。"""
+    p = os.path.abspath(path or "/")
+    while True:
+        try:
+            return shutil.disk_usage(p).free
+        except OSError:
+            up = os.path.dirname(p)
+            if up == p:
+                return 0
+            p = up
+
+
 def limits_main():
     """限额必须**可调**但**关不掉**。
 
@@ -366,8 +379,10 @@ def limits_main():
         bad(f"成员上限被调到了 {m.RESTORE_MAX_MEMBERS}(等于关掉防线)")
     if m.RESTORE_MAX_FILE_BYTES < 64 * 1024:
         bad(f"单文件上限被调到了 {m.RESTORE_MAX_FILE_BYTES}")
-    if m.RESTORE_MAX_TOTAL_BYTES > 2 * 1024 * 1024 * 1024:
-        bad(f"总量上限被调到了 {m.RESTORE_MAX_TOTAL_BYTES}(等于关掉压缩炸弹防线)")
+    ceiling = max(64 * 1024 * 1024, _free_bytes(m.RS_DIR) // 2)
+    if m.RESTORE_MAX_TOTAL_BYTES > ceiling:
+        bad(f"总量上限被调到了 {m.RESTORE_MAX_TOTAL_BYTES}, 超过天花板 {ceiling}"
+            "(等于关掉压缩炸弹防线)")
     ok("0 / 负数 / 天文数字一律夹回安全区间(限额可调但关不掉)")
 
     # 夹回之后, 压缩炸弹照样拒得住(不是只把数字改了而防线已失效)。
@@ -386,6 +401,32 @@ def limits_main():
         except ValueError:
             pass
     ok("夹回安全值后, 压缩炸弹照样被拒(不是只把数字改了而防线已失效)")
+
+    # ── 3b. 天花板不是拍脑袋的常数, 而是"别把盘写满" ──
+    # 固定 2GiB 意味着盘再大也调不上去(超大备份仍得改代码), 盘再小也能配到 2GiB(照样能
+    # 把根分区写满)。上限应当跟着恢复目标所在文件系统的可用空间走。
+    m = _reload_bot(PDG_RESTORE_MAX_TOTAL_BYTES=10 ** 15)
+    free = _free_bytes(m.RS_DIR)       # 用测试自己的一份实现算, 不借被测代码的
+    if m.RESTORE_MAX_TOTAL_BYTES > free // 2:
+        bad(f"总量上限 {m.RESTORE_MAX_TOTAL_BYTES} 超过可用空间的一半({free // 2})")
+    if m.RESTORE_MAX_TOTAL_BYTES < 64 * 1024 * 1024:
+        bad(f"天花板把默认值都压下去了: {m.RESTORE_MAX_TOTAL_BYTES}")
+    ok("总量上限的天花板跟着可用磁盘走(盘大能调高, 盘小不至于被写满)")
+
+    # 磁盘信息取不到时不能崩, 也不能借机放开限制
+    real_du = shutil.disk_usage
+
+    def boom(_p):
+        raise OSError("no such fs")
+
+    shutil.disk_usage = boom
+    try:
+        m = _reload_bot(PDG_RESTORE_MAX_TOTAL_BYTES=10 ** 15)
+        if m.RESTORE_MAX_TOTAL_BYTES > 2 * 1024 * 1024 * 1024:
+            bad(f"读不到磁盘信息时放开了上限: {m.RESTORE_MAX_TOTAL_BYTES}")
+        ok("读不到磁盘信息 → 退回保守天花板(不崩, 也不借机放开)")
+    finally:
+        shutil.disk_usage = real_du
 
     # ── 4. 写错(非数字)→ 用默认值, 不让一个笔误把恢复功能整个搞瘫 ──
     m = _reload_bot(PDG_RESTORE_MAX_MEMBERS="八百")

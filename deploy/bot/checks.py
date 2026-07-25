@@ -721,8 +721,13 @@ def check_nft_input_chains():
                 "base chain 都会执行, 上述表里的放行会被架空(端口看着开着实际不通)。"
                 "请把需要的放行并入 table inet pdg 的 input chain, 或把那些链改挂到非 input hook。")
     if not readable:
+        # 只说"读不到"等于把问题丢回给用户。分清是权限还是 nftables 本身 —— 前者重跑一次就好,
+        # 后者加多少 sudo 都没用。
+        how = ("请用 <code>sudo pdg doctor</code> 重跑以完整检查"
+               if os.geteuid() != 0 else
+               "本机 nftables 不可用或未加载(nft list ruleset 失败), 请先确认 nftables 正常")
         return ("warn", "input 链冲突",
-                "读不到运行中的 nftables ruleset(需 root), 仅据 " + NFT_CONF + " 判断: 未见冲突")
+                "读不到运行中的 nftables ruleset, 仅据 " + NFT_CONF + " 判断: 未见冲突。" + how)
     return ("ok", "input 链冲突", "只有 table inet pdg 挂在 hook input 上")
 
 

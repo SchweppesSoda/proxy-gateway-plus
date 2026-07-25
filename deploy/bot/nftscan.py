@@ -21,7 +21,16 @@ NFT_CONF = "/etc/nftables.conf"
 OURS = "inet pdg"                    # 本项目自己的表, 不算冲突
 
 _TBL_OPEN = re.compile(r"^\s*table\s+(\S+)\s+(\S+)\s*\{?\s*$")
-_HOOK_IN = re.compile(r"\bhook\s+input\b")
+# 只认**真正的 base chain 声明**(`type <类型> hook input priority …`), 不认注释或字符串里
+# 恰好出现的字样。误报虽然方向保守(中止迁移), 代价却是用户被一行注释永久挡在升级门外, 而且
+# 从配置上完全看不出为什么 —— 那行明明只是注释。
+_HOOK_IN = re.compile(r"\btype\s+\w+\s+hook\s+input\b")
+_QUOTED = re.compile(r'"[^"]*"')
+
+
+def _strip_noise(line):
+    """去掉行内注释与字符串字面量 —— 判据只该看真正生效的配置。"""
+    return _QUOTED.sub('""', line).split("#", 1)[0]
 
 
 def scan_text(conf_txt, live_txt):
@@ -29,7 +38,8 @@ def scan_text(conf_txt, live_txt):
     found, seen = [], set()
     for src, txt in (("配置文件", conf_txt or ""), ("运行 ruleset", live_txt or "")):
         cur, depth, opened = None, 0, False
-        for ln in txt.split("\n"):
+        for raw in txt.split("\n"):
+            ln = _strip_noise(raw)
             m = _TBL_OPEN.match(ln)
             if m and cur is None:
                 cur, depth, opened = "%s %s" % (m.group(1), m.group(2)), 0, False

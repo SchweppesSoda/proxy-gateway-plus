@@ -74,10 +74,12 @@ sudo ./install.sh
 |---|---|---|
 | `PDG_RESTORE_MAX_MEMBERS` | 512 个 | 16 ~ 20000 |
 | `PDG_RESTORE_MAX_FILE_BYTES` | 8 MiB | 64 KiB ~ 512 MiB |
-| `PDG_RESTORE_MAX_TOTAL_BYTES` | 64 MiB | 1 MiB ~ 2 GiB |
+| `PDG_RESTORE_MAX_TOTAL_BYTES` | 64 MiB | 1 MiB ~ 可用磁盘的一半 |
 
 越界的值会被夹回区间(写 0 或天文数字并不能把这道防线关掉),写成非数字则按默认值处理;
-两种情况都会在 `journalctl -u pdg-bot` 里留一行说明。
+两种情况都会在 `journalctl -u pdg-bot` 里留一行说明。总量上限的天花板跟着 `/etc/sing-box`
+所在文件系统的可用空间走 —— 盘大就能调高,盘小也不至于被一个备份写满(问不到磁盘信息时
+退回 2 GiB)。
 
 ## 非交互 / 自动化安装
 

@@ -333,7 +333,8 @@ trap 'on_exit $?' EXIT
 c_g "安装依赖…"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl tar unzip nftables python3 openssl certbot dnsutils tcpdump jq ca-certificates vnstat >/dev/null
+# zstd: 读 mihomo .mrs 规则集的头部(判 domain/ipcidr), 没它大文件就只能让用户手填类型
+apt-get install -y -qq curl tar unzip zstd nftables python3 openssl certbot dnsutils tcpdump jq ca-certificates vnstat >/dev/null
 systemctl enable --now vnstat >/dev/null 2>&1 || true   # 网卡流量统计(轻量, ~3MB)
 
 # ── 2. mosdns ──

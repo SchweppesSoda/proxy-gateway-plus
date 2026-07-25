@@ -1762,12 +1762,61 @@ MRS_BEHAVIORS = ("domain", "ipcidr")
 _MRS_BEHAVIOR_BYTE = {0: "domain", 1: "ipcidr"}
 
 
+def _zstd_head_mod(data, n):
+    """用 python 的 zstd 实现解出头部(没有任何可用实现则返回 b'')。
+
+    3.14 起标准库自带 compression.zstd; 之前的版本(Debian 12 是 3.11)可能装了 pyzstd /
+    zstandard。有模块就不必依赖外部命令。"""
+    try:
+        from compression import zstd as _cz          # python >= 3.14
+        return _cz.decompress(data)[:n]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import pyzstd
+        return pyzstd.decompress(data)[:n]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompressobj().decompress(data)[:n]
+    except Exception:  # noqa: BLE001
+        return b""
+
+
+def _zstd_head_cli(data, n):
+    """调 zstd 命令解出头部。只读前 n 字节就掐掉 —— 大规则集解出来可能几十 MB,
+    为了 5 个字节没必要全解。"""
+    if not shutil.which("zstd"):
+        return b""
+    fd, tmp = tempfile.mkstemp(prefix="pdgmrs")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        p = subprocess.Popen(["zstd", "-dcq", tmp], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        try:
+            return p.stdout.read(n) or b""
+        finally:
+            p.stdout.close()
+            p.kill()
+            p.wait(timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return b""
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _mrs_head(data, n=8):
     """取 .mrs 解压后的头部若干字节(取不到返回 b'')。
 
     MRS 是 zstd 压缩的二进制: 解压后为 b"MRS" + 版本(1B) + behavior(1B) + …。
-    没有 zstd 模块可用(Debian 12 的 python3.11 就没有)时退回调 zstd 命令; 再不行就在原始
-    字节里找 b"MRS" —— 小文件的 zstd 字面量常以原样存放, 找得到就能用, 找不到就老实说不知道。"""
+    依次: python zstd 模块 → zstd 命令 → 在原始字节里找 b"MRS"。最后那条只对小文件有效 ——
+    真实的大规则集头部落在 Huffman 压缩的字面量块里, 盲扫根本找不到(所以装机依赖里带了
+    zstd; 见 _mrs_unreadable_hint)。三条都不成立就老实说不知道, 绝不猜。"""
     if not isinstance(data, (bytes, bytearray)):
         return b""
     data = bytes(data)
@@ -1775,15 +1824,20 @@ def _mrs_head(data, n=8):
         return data[:n]
     if data[:4] != b"\x28\xb5\x2f\xfd":          # 连 zstd 帧头都不是 → 不是 .mrs
         return b""
-    try:
-        p = subprocess.run(["zstd", "-dc"], input=data, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=30)
-        if p.returncode == 0 and p.stdout[:3] == b"MRS":
-            return p.stdout[:n]
-    except (OSError, subprocess.SubprocessError):
-        pass
+    for head in (_zstd_head_mod(data, n), _zstd_head_cli(data, n)):
+        if head[:3] == b"MRS":
+            return head
     i = data.find(b"MRS", 0, 65536)
     return data[i:i + n] if i >= 0 else b""
+
+
+def _mrs_unreadable_hint():
+    """认不出类型时的下一步。本机没 zstd 就直说 —— 装上它这类文件就能自动识别,
+    否则用户只会以为"这个源就是要手填", 一直填下去。"""
+    if shutil.which("zstd") or _zstd_head_mod(b"", 1) != b"":
+        return ""
+    return ("\n提示: 本机没有 <code>zstd</code>, 大一点的 .mrs 就读不出类型了。"
+            "装上即可自动识别: <code>sudo apt-get install -y zstd</code>")
 
 
 def mrs_behavior(data):
@@ -1837,7 +1891,8 @@ def add_ruleset(url, target, label="", behavior=""):
                 return False, (".mrs 需要指定规则类型(behavior): 这份文件的二进制头认不出类型"
                                "(不是 MRS 或版本不认识)。\n"
                                "请在规则集后面补上类型: " + " / ".join(MRS_BEHAVIORS) + "\n"
-                               "例: <code>https://.../geo.mrs hk 名称 domain</code>")
+                               "例: <code>https://.../geo.mrs hk 名称 domain</code>"
+                               + _mrs_unreadable_hint())
             open(path, "wb").write(data); count = None
         else:
             path = os.path.join(RS_DIR, name + ".json"); fmt = "source"
@@ -2540,12 +2595,37 @@ def _restore_limit(name, default, lo, hi):
     return c
 
 
+def _fs_free(path):
+    """path 所在文件系统的可用字节(路径还不存在就往上找存在的祖先); 问不出来返回 0。"""
+    p = os.path.abspath(path or "/")
+    while True:
+        try:
+            return shutil.disk_usage(p).free
+        except OSError:
+            up = os.path.dirname(p)
+            if up == p:
+                return 0
+            p = up
+
+
+def _restore_total_ceiling():
+    """总量上限能调到多高。
+
+    拍一个 2GiB 的常数有两头不对: 盘大的机器调不上去(超大备份还是得改代码), 盘小的机器
+    却能配到 2GiB 把根分区写满。真正该守的是"别把盘写满" —— 天花板取可用空间的一半。
+    问不出磁盘信息(容器里的怪文件系统)就退回保守常数, 不借机放开。"""
+    free = _fs_free(RS_DIR)
+    if not free:
+        return 2 * 1024 * 1024 * 1024
+    return max(64 * 1024 * 1024, free // 2)
+
+
 RESTORE_MAX_MEMBERS = _restore_limit(                 # 成员数量上限
     "PDG_RESTORE_MAX_MEMBERS", 512, 16, 20000)
 RESTORE_MAX_FILE_BYTES = _restore_limit(              # 单文件上限
     "PDG_RESTORE_MAX_FILE_BYTES", 8 * 1024 * 1024, 64 * 1024, 512 * 1024 * 1024)
 RESTORE_MAX_TOTAL_BYTES = _restore_limit(             # 解出总量上限(压缩炸弹)
-    "PDG_RESTORE_MAX_TOTAL_BYTES", 64 * 1024 * 1024, 1024 * 1024, 2 * 1024 * 1024 * 1024)
+    "PDG_RESTORE_MAX_TOTAL_BYTES", 64 * 1024 * 1024, 1024 * 1024, _restore_total_ceiling())
 # 单文件上限比总量还大是自相矛盾的配置 —— 照那么算任何文件都过不了, 恢复直接不可用
 RESTORE_MAX_TOTAL_BYTES = max(RESTORE_MAX_TOTAL_BYTES, RESTORE_MAX_FILE_BYTES)
 
