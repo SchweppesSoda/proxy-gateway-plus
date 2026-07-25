@@ -28,15 +28,56 @@ e2e_skip(){ echo "[SKIP] $1"; echo "──────────────�
 # 两边都碰不到开发机的真实配置。
 _e2e_git_safe(){ grep -q 'directory = \*' /etc/gitconfig 2>/dev/null || printf '[safe]\n\tdirectory = *\n' >> /etc/gitconfig 2>/dev/null || true; }
 
+# 把机器清回"什么都没装过"的状态。namespace 模式下 overlay 本来就干净, 这里主要给容器模式
+# (CI 里多个脚本共用一个容器)用: 二进制、unit、归属/后端标记、快照、仓库副本、服务桩一个不留。
+e2e_reset_box(){
+  systemctl disable --now pdg-bot pdg-probe81 pdg-mitm mosdns mihomo sing-box >/dev/null 2>&1 || true
+  # sing-box 是**必须**清掉的那个: 装机会把来源不明的 sing-box 判成第三方冲突而中止,
+  # 跨版本回滚用例正好留一份在这。mihomo / mosdns 反过来要**留着** —— 它们是从网上下的
+  # 真内核(几十 MB), 每个脚本重下一遍既慢又会在没网时把用例整条 skip 掉(假绿)。
+  rm -f /usr/local/bin/sing-box \
+        /usr/local/bin/pdg /usr/local/bin/pdg-set-token \
+        /usr/local/bin/proxy-gateway-open-cert-http.sh \
+        /usr/local/bin/proxy-gateway-restore-firewall.sh 2>/dev/null || true
+  rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-mitm,mosdns,mihomo,sing-box,pdg-rules-update,pdg-health}.service \
+        /etc/systemd/system/{pdg-rules-update,pdg-health}.timer \
+        /etc/systemd/journald.conf.d/50-pdg.conf 2>/dev/null || true
+  rm -rf /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /opt/pdg-bot \
+         /opt/privdns-gateway /var/lib/privdns-gateway 2>/dev/null || true
+  rm -f /etc/nftables.conf.pdg-orig /etc/resolv.conf.pdg-orig 2>/dev/null || true
+  rm -rf /tmp/e2e-svc /tmp/e2e-nft-ruleset /tmp/e2e-calls.log /tmp/e2e-inject \
+         /tmp/e2e-origin.git /tmp/e2e-xver-origin.git /tmp/e2e-cli-origin.git \
+         /tmp/e2e-empty-origin.git 2>/dev/null || true
+  # 前一个脚本装的**桩命令**同样是"上一个脚本留下的状态": e2e-install 会留一个假 curl
+  # (下载什么都写 "stub" 几个字节), 下一个脚本想取真内核时就只能拿到一个坏档而整条 skip。
+  # 每个脚本都会自己造它需要的桩(e2e_stub_system / 各自的 setup), 进场清掉是安全的。
+  rm -f /usr/local/bin/{systemctl,nft,curl,tcpdump,apt-get,dpkg,certbot,vnstat,ss,tar} 2>/dev/null || true
+  # 真内核二进制留着(几十 MB, 每个脚本重下一遍既慢又会在没网时把用例整条 skip 成假绿);
+  # 但**桩**版本要清 —— 拿 `-t` 恒 0 的假 mihomo 当内核, 配置校验类用例会静默失效。
+  if command -v mihomo >/dev/null 2>&1 && ! e2e_mihomo_is_real; then
+    rm -f /usr/local/bin/mihomo 2>/dev/null || true
+  fi
+  if [[ -f /usr/local/bin/mosdns ]] && [[ "$(stat -c %s /usr/local/bin/mosdns 2>/dev/null || echo 0)" -lt 1000000 ]]; then
+    rm -f /usr/local/bin/mosdns 2>/dev/null || true      # 小于 1MB = 桩, 不是真 mosdns
+  fi
+  mkdir -p /var/lib/privdns-gateway /etc/mosdns/rules /etc/sing-box /etc/mihomo \
+           /etc/privdns-gateway /etc/systemd/system /etc/systemd/journald.conf.d /tmp/e2e-svc 2>/dev/null || true
+  : > /etc/nftables.conf
+  # 清 bash 的命令哈希: 上面刚跑过 mihomo(能力探测)又把它删了, 不清的话后续 `command -v mihomo`
+  # 仍会命中缓存里的旧路径, 于是"没有就造个桩"的分支被跳过, 装机改走下载 → 撞上假 curl → SHA 失败。
+  hash -r 2>/dev/null || true
+}
+
 # 重入 namespace: 外层建 overlay 目录并 unshare, 内层挂载
 e2e_enter(){
   # 已经身处一次性隔离环境且是 root(CI 的容器 job) → 直接跑, 不必再自建 namespace。
   # GitHub runner(ubuntu-24.04)用 AppArmor 禁掉了非特权用户命名空间, unshare -rm 不可用,
   # 所以 CI 走容器这条路; 本地开发机则走 namespace, 两边跑的是同一份测试主体。
   if [[ "${PDG_E2E_ISOLATED:-}" == 1 && "$(id -u)" == 0 ]]; then
-    mkdir -p /var/lib/privdns-gateway /etc/mosdns/rules /etc/sing-box /etc/mihomo \
-             /etc/privdns-gateway /etc/systemd/system /etc/systemd/journald.conf.d 2>/dev/null || true
-    [[ -e /etc/nftables.conf ]] || : > /etc/nftables.conf
+    # 容器是一次性的, 但**同一个容器里顺序跑多个脚本**时它并不是一次性的: 前一个脚本留下的
+    # /usr/local/bin/sing-box 会让下一个脚本的装机路径判成"机器上已有第三方 sing-box"而中止。
+    # 进场先把现场清干净 —— 每个 E2E 都必须自带完整前提, 不许指望上一个脚本留下的状态。
+    e2e_reset_box
     _e2e_git_safe
     return 0
   fi
@@ -81,9 +122,14 @@ verb="$1"; shift
 now=0; [ "$1" = "--now" ] && { now=1; shift; }
 case "$verb" in
   daemon-reload|reset-failed|preset|mask|unmask) exit 0;;
-  enable)  for u in "$@"; do echo 1 > "$D/${u}.en"; [ "$now" = 1 ] && echo 1 > "$D/${u}.ac"; done; exit 0;;
+  enable)  for u in "$@"; do echo 1 > "$D/${u}.en"
+             # .fail 标记 = 这个 unit "起得来但立刻崩" → 起完仍是 inactive
+             if [ "$now" = 1 ]; then [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"; fi
+           done; exit 0;;
   disable) for u in "$@"; do echo 0 > "$D/${u}.en"; [ "$now" = 1 ] && echo 0 > "$D/${u}.ac"; done; exit 0;;
-  start|restart) for u in "$@"; do echo 1 > "$D/${u}.ac"; done; exit 0;;
+  start|restart) for u in "$@"; do
+                   [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"
+                 done; exit 0;;
   stop)    for u in "$@"; do echo 0 > "$D/${u}.ac"; done; exit 0;;
   is-active)
       u="$1"; v=$(cat "$D/${u}.ac" 2>/dev/null)
@@ -107,12 +153,32 @@ S
   : > /tmp/e2e-calls.log
 }
 
-# 把某 unit 置为"起不来"(供故障注入)
+# 把某 unit 置为"当前不在跑"(供故障注入)。注意: 之后任何 restart 都会把它拉回 active,
+# 要模拟"启动后立刻崩溃"请用 e2e_svc_crash。
 e2e_svc_fail(){ mkdir -p /tmp/e2e-svc; echo 0 > "/tmp/e2e-svc/$1.ac"; }
+
+# "起得来但立刻崩": restart 返回 0, 但服务随即变回 inactive —— 真实现场里最常见的失败形态,
+# 也正是"只看 systemctl 返回值"这种写法看不出来的那种。
+e2e_svc_crash(){ mkdir -p /tmp/e2e-svc; : > "/tmp/e2e-svc/$1.fail"; echo 0 > "/tmp/e2e-svc/$1.ac"; }
+e2e_svc_heal(){ rm -f "/tmp/e2e-svc/$1.fail"; echo 1 > "/tmp/e2e-svc/$1.ac"; }
+
+# PATH 上那个 mihomo 是不是**真内核**: 正反两份配置都要判对。串行跑时它很可能是上一个脚本
+# 留下的桩(`-t` 恒 0), 拿它当内核用, "配置不合法就不许重启"这类用例会静默失效。
+e2e_mihomo_is_real(){
+  command -v mihomo >/dev/null 2>&1 || return 1
+  local d rc_good rc_bad; d="$(mktemp -d)" || return 1
+  printf '{"log-level":"silent","mixed-port":17899,"proxies":[],"rules":["MATCH,DIRECT"]}\n' > "$d/good.yaml"
+  printf '{"proxies":[{"name":"x","type":"definitely-not-a-real-protocol","server":"1.1.1.1","port":1}],"rules":["MATCH,DIRECT"]}\n' > "$d/bad.yaml"
+  mihomo -t -d "$d" -f "$d/good.yaml" >/dev/null 2>&1; rc_good=$?
+  mihomo -t -d "$d" -f "$d/bad.yaml"  >/dev/null 2>&1; rc_bad=$?
+  rm -rf "$d"
+  [[ "$rc_good" == 0 && "$rc_bad" != 0 ]]
+}
 
 # 取真内核二进制(钉死版本); 拿不到回非 0, 调用方据此跳过
 e2e_fetch_mihomo(){
-  command -v mihomo >/dev/null 2>&1 && return 0
+  e2e_mihomo_is_real && return 0
+  rm -f /usr/local/bin/mihomo 2>/dev/null || true      # 桩要换成真的
   # shellcheck source=/dev/null
   . "$E2E_ROOT/lib/versions.sh"
   curl -fsSL --retry 2 -m 120 \

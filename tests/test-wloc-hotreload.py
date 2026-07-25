@@ -2,7 +2,8 @@
 """pdg-mitm 不重启也能换坐标(WLOC 热加载)。
 
 切一次地点原先要重启 pdg-mitm、重启 mosdns、重渲内核 —— 只为把新经纬度送进插件。现在
-mitm.json 由 WlocConfig 按 mtime_ns 热加载, 服务进程从头到尾同一个 PID。
+切换只原子更新 mitm.json, WlocConfig 在下一次 WLOC 请求开始时读取当前配置(整份读, 不看
+mtime), 服务进程从头到尾同一个 PID。
 
 本用例起一个**真的 pdg-mitm 子进程**(真 socks5 + 真 CA 签的叶子证书 + 真 TLS + 真插件),
 只把"向 Apple 转发"这一步换成本地假上游(测试机连不到 gs-loc.apple.com)。验证:

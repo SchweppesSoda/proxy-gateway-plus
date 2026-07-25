@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # 平台隔离: 安装/更新/迁移矩阵回归(pdg.sh 迁移函数, 打桩 + 沙箱路径, 不碰真 /)。
 #   A. migrate_platform_marker: platform 文件 / profile.env / pdg-mitm 证据 / WLOC 证据 / 完全缺失。
-#   B. GMS 迁移仅 Android(iOS 跳过)。
+#   B. GMS 防火墙端口迁移: Android 补 5228-5230, iOS 跳过(sing-box 侧已随内核退役)。
 #   C. migrate_ios_gms_cleanup: 删 in-gms-* 入站 + nft 移除 5228-5230(iOS)。
 #   D. migrate_android_cleanup: 删 iOS 专属 unit/文件, 保留 CA/地点数据为休眠。
 #   E. _pdg_svcs: Android 无 pdg-probe81, iOS 有。
@@ -15,12 +15,34 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }   # 抽取一个函数体
+skip(){ echo "[SKIP] $1"; }                                  # 不计入 pass: 没断言就别冒充断言
+# 抽真身并确认它真的到位了。函数被改名/删除时 xt 只输出空串, eval "" 又是成功的 —— 后面的
+# `f x && bad || ok` 就会因为 127(command not found)稳稳落到 ok 分支, 整段变成假绿
+# (migrate_singbox_gms 随 sing-box 退役后, 本文件就这么绿了一整轮)。
+use_fn(){
+  local f body
+  for f in "$@"; do
+    body="$(xt "$f")"
+    [[ -n "$body" ]] || { bad "抽取失败: pdg.sh 里没有 $f()"; return 1; }
+    eval "$body" || { bad "eval 函数体失败: $f"; return 1; }
+    declare -F "$f" >/dev/null || { bad "eval 后函数仍不存在: $f"; return 1; }
+  done
+}
+# 关键调用: 退出码非 0(127=命令不存在也在内)一律记 FAIL, 不指望后面的 grep 替它兜底
+run_ok(){
+  local what="$1"; shift; local out rc
+  out="$("$@" 2>&1)"; rc=$?
+  (( rc == 0 )) && return 0
+  bad "$what: 退出码 $rc | $(tr '\n' ' ' <<<"$out" | head -c 200)"
+  return 1
+}
 
 # ── A. migrate_platform_marker(路径 env 注入)──────────────────────────────────
-eval "$(xt migrate_platform_marker)"
+use_fn migrate_platform_marker
 c_g(){ :; }; c_y(){ :; }
 mk_marker(){ PDG_PLATFORM_FILE="$WORK/platform" PROFILE_ENV="$WORK/profile.env" \
-             PDG_MITM_JSON="$WORK/mitm.json" PDG_MITM_UNIT="$WORK/pdg-mitm.service" migrate_platform_marker; }
+             PDG_MITM_JSON="$WORK/mitm.json" PDG_MITM_UNIT="$WORK/pdg-mitm.service" \
+             migrate_platform_marker || bad "migrate_platform_marker 退出码 $?"; }
 reset_ev(){ rm -f "$WORK/platform" "$WORK/profile.env" "$WORK/mitm.json" "$WORK/pdg-mitm.service" "$WORK/platform.guessed"; }
 
 reset_ev; printf 'ios\n' > "$WORK/platform"; mk_marker
@@ -37,7 +59,7 @@ reset_ev; mk_marker
 [[ "$(cat "$WORK/platform")" == android ]] && ok "无任何证据 → 安全回退 android" || bad "回退未生效"
 
 # ── E. _pdg_svcs(平台服务集)──────────────────────────────────────────────────
-eval "$(xt _pdg_svcs)"; _pdg_core_svc(){ echo sing-box; }
+use_fn _pdg_svcs; _pdg_core_svc(){ echo sing-box; }
 _pdg_platform(){ echo android; }
 [[ "$(_pdg_svcs)" == "mosdns sing-box pdg-bot" ]] && ok "Android 服务集不含 pdg-probe81" || bad "Android 服务集错: $(_pdg_svcs)"
 _pdg_platform(){ echo ios; }
@@ -54,7 +76,7 @@ reset_ev; printf 'PDG_PLATFORM=android\n' > "$WORK/profile.env"; mk_marker
   && ok "有确凿证据(profile.env) → 不打 .guessed" || bad "A2b: 确凿证据也被当成推测"
 
 # 推测状态下 migrate_android_cleanup 必须跳过破坏性清理
-eval "$(xt migrate_android_cleanup)"
+use_fn migrate_android_cleanup
 c_y(){ echo "$*"; }        # 本段要断言提示文案(文件顶部把 c_y 打桩成静默了)
 reset_ev; mk_marker                     # → android + .guessed
 mkdir -p "$WORK/optbot"; : > "$WORK/optbot/probe81.py"
@@ -105,24 +127,42 @@ out=$(bash -c "c_g(){ :; }; c_y(){ :; }; install(){ :; }; systemctl(){ echo acti
 source '$WORK/bmfn.sh'; migrate_backend_marker; cat '$BM/etc/privdns-gateway/backend'" 2>/dev/null)
 [[ "$out" == mihomo ]] && ok "backend: 已有合法标记 → 幂等不改" || bad "A3e: $out"
 
-# ── B. GMS 迁移仅 Android(iOS 跳过)──────────────────────────────────────────
-eval "$(xt migrate_singbox_gms)"; eval "$(xt migrate_fw_gms)"
-sing-box(){ return 0; }; systemctl(){ [[ "$1" == is-active ]] && echo active; return 0; }; nft(){ return 0; }
-# sing-box 本项目形态(有 sniff_override_destination), 无 5228
-cat > "$WORK/sb.json" <<'JSON'
-{"inbounds":[{"type":"direct","tag":"in-http","listen_port":80,"sniff_override_destination":true},
-             {"type":"direct","tag":"in-https","listen_port":443}],"outbounds":[],"route":{}}
-JSON
+# ── B. GMS 防火墙端口迁移: 仅 Android 补 5228-5230, iOS 跳过 ──────────────
+# sing-box 侧的 migrate_singbox_gms 已随 sing-box 运行时一并退役, 原用例调的是一个不存在的
+# 函数(见文件头 use_fn 注释)。换成**当前仍在跑**的防火墙侧, 并钉住"它确实没了": 哪天再冒
+# 出来, 得连同它的平台跳过用例一起补回来, 而不是又静静地假绿。
+if grep -q '^migrate_singbox_gms()' "$ROOT/deploy/bot/pdg.sh"; then
+  bad "migrate_singbox_gms 又回来了: 需要补回它的 iOS 跳过用例"
+else
+  ok "migrate_singbox_gms 已随 sing-box 退役(不再有 model 入站迁移)"
+fi
+use_fn migrate_fw_gms
+systemctl(){ [[ "$1" == is-active ]] && echo active; return 0; }
+nft(){ return 0; }              # -c 校验与加载都当成功: 本段只验改写判据
+nf_orig='table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 8445 } accept\n}\n'
+# iOS: 原装形态也不能补 —— GMS/FCM 是 Android 的推送通道
 _pdg_platform(){ echo ios; }
-migrate_singbox_gms "$WORK/sb.json"
-grep -q '5228' "$WORK/sb.json" && bad "iOS 不应补 GMS 入站" || ok "migrate_singbox_gms: iOS 跳过(不补 5228)"
-# nft 原装端口集, 无 5228
-printf 'table inet pdg {\n  chain input { ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 8445 } accept }\n}\n' > "$WORK/nf"
-migrate_fw_gms "$WORK/nf"
+printf "$nf_orig" > "$WORK/nf"
+run_ok "migrate_fw_gms(iOS)" migrate_fw_gms "$WORK/nf"
 grep -q '5228' "$WORK/nf" && bad "iOS 不应补 GMS 防火墙端口" || ok "migrate_fw_gms: iOS 跳过(不补 5228-5230)"
+# Android: 原装形态要补上
+_pdg_platform(){ echo android; }
+printf "$nf_orig" > "$WORK/nf"
+run_ok "migrate_fw_gms(Android)" migrate_fw_gms "$WORK/nf"
+grep -qF 'tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept' "$WORK/nf" \
+  && ok "migrate_fw_gms: Android 原装端口集补上 5228-5230" || bad "Android 未补 GMS 端口: $(cat "$WORK/nf")"
+snapb="$(cat "$WORK/nf")"
+run_ok "migrate_fw_gms(幂等)" migrate_fw_gms "$WORK/nf"
+[[ "$(cat "$WORK/nf")" == "$snapb" ]] && ok "migrate_fw_gms: 已有 5228 → 幂等不再改" || bad "二跑又改了防火墙配置"
+# 自定义端口集不认: 宁可提示手动加, 也不猜着改用户的规则
+printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 443, 9443 } accept\n}\n' > "$WORK/nfcust"
+snapb="$(cat "$WORK/nfcust")"
+run_ok "migrate_fw_gms(自定义)" migrate_fw_gms "$WORK/nfcust"
+[[ "$(cat "$WORK/nfcust")" == "$snapb" ]] && ok "migrate_fw_gms: 非原装端口集不自动改写" || bad "改写了自定义端口集"
+rm -f "$WORK"/nf.pregms.* "$WORK"/nfcust.pregms.*
 
 # ── C. migrate_ios_gms_cleanup: 删 in-gms-* + nft 移除 5228-5230 ────────────────
-eval "$(xt migrate_ios_gms_cleanup)"; eval "$(xt _pdg_nft_strip_gms)"; _pdg_core_svc(){ echo sing-box; }
+use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms; _pdg_core_svc(){ echo sing-box; }
 cat > "$WORK/sbg.json" <<'JSON'
 {"inbounds":[{"type":"direct","tag":"in-https","listen_port":443},
              {"type":"direct","tag":"in-gms-5228","listen_port":5228},
@@ -131,30 +171,32 @@ cat > "$WORK/sbg.json" <<'JSON'
 JSON
 printf 'table inet pdg {\n  chain input { ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept }\n}\n' > "$WORK/nfg"
 _pdg_platform(){ echo ios; }
-migrate_ios_gms_cleanup "$WORK/sbg.json" "$WORK/nfg"
+run_ok "migrate_ios_gms_cleanup(iOS)" migrate_ios_gms_cleanup "$WORK/sbg.json" "$WORK/nfg"
 { ! grep -q 'in-gms-5228' "$WORK/sbg.json" && ! grep -q 'in-gms-5230' "$WORK/sbg.json"; } \
   && ok "iOS 清理: sing-box 删掉 in-gms-5228/5229/5230 入站" || bad "in-gms-* 未删净"
 grep -q 'in-https' "$WORK/sbg.json" && ok "iOS 清理: 非 GMS 入站(in-https)保留" || bad "误删了非 GMS 入站"
 grep -q '5228' "$WORK/nfg" && bad "nft 仍含 5228" || ok "iOS 清理: nft 端口集移除 5228-5230"
 # iOS 清理幂等: 再跑不变
-snap="$(cat "$WORK/sbg.json")"; migrate_ios_gms_cleanup "$WORK/sbg.json" "$WORK/nfg"
+snap="$(cat "$WORK/sbg.json")"
+run_ok "migrate_ios_gms_cleanup(幂等)" migrate_ios_gms_cleanup "$WORK/sbg.json" "$WORK/nfg"
 [[ "$(cat "$WORK/sbg.json")" == "$snap" ]] && ok "iOS 清理幂等(二跑不变)" || bad "二跑改动了配置"
 # Android 上该清理跳过
 _pdg_platform(){ echo android; }
 cat > "$WORK/sba.json" <<'JSON'
 {"inbounds":[{"type":"direct","tag":"in-gms-5228","listen_port":5228}],"outbounds":[],"route":{}}
 JSON
-migrate_ios_gms_cleanup "$WORK/sba.json" "$WORK/nfg"
+run_ok "migrate_ios_gms_cleanup(Android)" migrate_ios_gms_cleanup "$WORK/sba.json" "$WORK/nfg"
 grep -q 'in-gms-5228' "$WORK/sba.json" && ok "Android: iOS GMS 清理不执行(保留 GMS)" || bad "Android 误删了 GMS"
 
 # ── C3. mihomo REDIRECT 形态: 只从端口集去 5228-5230, 必须保留整条 { 80, 443 } redirect ──
 # 回归: 旧实现 sed 按行删含 5228 的 redirect → 连 80/443 一起删掉 → 网关 80/443 不再 REDIRECT 到 mihomo(断网)。
 _pdg_platform(){ echo ios; }
 printf 'table inet pdg {\n\tchain prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t\tip saddr 172.22.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n\t}\n}\n' > "$WORK/nfmh"
-migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfmh"   # sb 不存在 → 只走 nft 分支
+run_ok "migrate_ios_gms_cleanup(mihomo)" migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfmh"   # sb 不存在 → 只走 nft 分支
 grep -qE 'tcp dport [{][^}]*5228' "$WORK/nfmh" && bad "mihomo: 端口集仍含 5228-5230" || ok "mihomo: 端口集已精确去掉 5228-5230"
 grep -qF 'tcp dport { 80, 443 } redirect to :7893' "$WORK/nfmh" && ok "mihomo: { 80, 443 } redirect 整条保留(不再误删)" || bad "mihomo: 80/443 redirect 被误删!"
-snap="$(cat "$WORK/nfmh")"; migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfmh"
+snap="$(cat "$WORK/nfmh")"
+run_ok "migrate_ios_gms_cleanup(mihomo 幂等)" migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfmh"
 [[ "$(cat "$WORK/nfmh")" == "$snap" ]] && ok "mihomo REDIRECT 清理幂等(二跑不变)" || bad "二跑改动了 nft"
 # nft 语法校验: 需要真 nft 二进制(type -P 只找可执行文件, 绕开本测试里的 nft() 桩), 且本环境
 # 确实能跑 nft -c —— nft 即便只做 -c 也要开 netlink, 非 root(如 CI runner)会连合法规则集一起拒。
@@ -166,21 +208,23 @@ if [[ -n "$_nftbin" ]] && "$_nftbin" -c -f "$WORK/nftprobe" >/dev/null 2>&1; the
   if "$_nftbin" -c -f "$WORK/nfmh" >/dev/null 2>&1; then ok "迁移后 nft -c 校验通过"
   else bad "迁移后 nft -c 校验不过: $("$_nftbin" -c -f "$WORK/nfmh" 2>&1 | head -2 | tr '\n' ' ')"; fi
 else
-  ok "迁移后 nft -c 校验(本环境 nft 不可用或无 netlink 权限, 跳过)"
+  skip "迁移后 nft -c 校验: 本环境 nft 不可用或无 netlink 权限(CI 的容器 E2E 里有真 nft)"
 fi
 # 自定义/非原装 5228 形态(逐端口而非区间)无法安全识别 → 还原不破坏
 printf 'table inet pdg {\n\tchain prerouting { ip saddr X tcp dport { 80, 443, 5228, 5229, 5230 } redirect to :7893 }\n}\n' > "$WORK/nfcustom"
-snapc="$(cat "$WORK/nfcustom")"; migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfcustom"
+snapc="$(cat "$WORK/nfcustom")"
+run_ok "migrate_ios_gms_cleanup(自定义)" migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfcustom"
 [[ "$(cat "$WORK/nfcustom")" == "$snapc" ]] && ok "自定义 5228 形态无法安全识别 → 还原不破坏配置" || bad "破坏了自定义配置"
 
 # ── C2. _pdg_nft_strip_gms: iOS 渲染后剥掉 GMS(装机/切核共用)──────────────────
-eval "$(xt _pdg_nft_strip_gms)"
 printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept\n  ip saddr 10.0.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n}\n' > "$WORK/nfr"
-_pdg_platform(){ echo ios; }; _pdg_nft_strip_gms "$WORK/nfr"
+_pdg_platform(){ echo ios; }
+run_ok "_pdg_nft_strip_gms(iOS)" _pdg_nft_strip_gms "$WORK/nfr"
 grep -q '5228' "$WORK/nfr" && bad "iOS strip 未去净 5228-5230" || ok "_pdg_nft_strip_gms(iOS): 端口集 + REDIRECT 均去掉 5228-5230"
 grep -q '8445' "$WORK/nfr" && grep -q 'redirect to :7893' "$WORK/nfr" && ok "strip 只去 GMS, 其余端口/REDIRECT 保留" || bad "strip 误伤其它端口"
 printf 'x tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept\n' > "$WORK/nfa"
-_pdg_platform(){ echo android; }; _pdg_nft_strip_gms "$WORK/nfa"
+_pdg_platform(){ echo android; }
+run_ok "_pdg_nft_strip_gms(Android)" _pdg_nft_strip_gms "$WORK/nfa"
 grep -q '5228-5230' "$WORK/nfa" && ok "Android: _pdg_nft_strip_gms 空操作(保留 GMS)" || bad "Android 误删了 GMS"
 
 # ── D. migrate_android_cleanup: 删 iOS 残留 unit/文件, 保留 CA/地点数据 ──────────

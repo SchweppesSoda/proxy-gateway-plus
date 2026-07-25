@@ -193,6 +193,91 @@ _pdg_drop_singbox_files 迁移" 2>&1)"
 grep -qE 'config.json|数据模型|backend|形态' <<<"$out" \
   && ok "迁移清理: 说清了判不出归属的原因" || bad "迁移提示没说原因: $out"
 
+# ── /etc/sing-box 是**数据模型**目录: 与运行时归属分开判 ────────────────────
+# v1.6 起本项目不装 sing-box 运行时 → 运行时归属恒为否。拿它决定 --purge 删不删
+# /etc/sing-box, 结果就是纯 mihomo 的新装机器 purge 完, config.json 里的出口密码、UUID、
+# 节点地址原样躺在盘上。模型归属另有标记与保守判据。
+mk_mihomo_only(){   # 新装现场: 没有 sing-box 运行时, 但有本项目的数据模型 + 模型归属标记
+  SB="$WORK/root"; rm -rf "$SB"
+  mkdir -p "$SB/etc/systemd/system" "$SB/etc/privdns-gateway" "$SB/usr/local/bin" \
+           "$SB/etc/sing-box" "$SB/etc/mosdns" "$SB/etc/mihomo" "$SB/opt/pdg-bot" \
+           "$SB/etc/systemd/journald.conf.d" "$SB/opt/privdns-gateway" "$SB/var/lib/privdns-gateway"
+  cat > "$SB/etc/sing-box/config.json" <<'J'
+{ "inbounds": [{"type":"direct","tag":"in-https","listen_port":443},
+               {"type":"direct","tag":"in-http","listen_port":80},
+               {"type":"mixed","tag":"tg-proxy","listen_port":8445}],
+  "outbounds": [{"type":"shadowsocks","tag":"hk","server":"1.2.3.4","server_port":8388,
+                 "method":"aes-256-gcm","password":"SECRET-PASSWORD-9f2c"}],
+  "route": {"rules": [], "final": "hk"} }
+J
+  printf 'mihomo\n' > "$SB/etc/privdns-gateway/backend"
+  printf 'PDG_BOT_TOKEN=x\n' > "$SB/etc/privdns-gateway/bot.env"
+  printf 'x\n' > "$SB/opt/pdg-bot/bot.py"
+  printf 'x\n' > "$SB/opt/privdns-gateway/install.sh"
+  printf 'log: {}\n' > "$SB/etc/mosdns/config.yaml"
+  printf 'x\n' > "$SB/usr/local/bin/mihomo"
+  export SB
+}
+
+mk_mihomo_only
+PDG_ROOT_PREFIX="$SB" pdg_sbmodel_mark_owned
+PDG_ROOT_PREFIX="$SB" pdg_sbmodel_is_ours \
+  && ok "判据: 新装落了模型归属标记 → /etc/sing-box 判为本项目数据模型" || bad "新装的数据模型被判成第三方"
+PDG_ROOT_PREFIX="$SB" pdg_singbox_is_ours \
+  && bad "没有 sing-box 运行时却被判成运行时归本项目" || ok "判据: 运行时归属与模型归属互不牵连"
+run_uninstall --purge >/dev/null
+[[ ! -e "$SB/etc/sing-box" ]] \
+  && ok "--purge: 本项目的数据模型目录被删除(出口密码/UUID 不留在盘上)" || bad "purge 后 /etc/sing-box 还在"
+
+# 老 PDG 机器: 没有模型标记, 靠多个项目特征保守迁移
+mk_mihomo_only; rm -f "$SB/etc/privdns-gateway/sbmodel.pdg-owned"
+PDG_ROOT_PREFIX="$SB" pdg_sbmodel_is_ours \
+  && ok "判据: 老装无标记但项目特征齐全 → 保守认定为本项目数据模型" || bad "老装模型被判成第三方"
+run_uninstall --purge >/dev/null
+[[ ! -e "$SB/etc/sing-box" ]] && ok "--purge: 老 PDG 的数据模型同样被删除" || bad "老装模型没删掉"
+
+# 第三方: config.json 不是本项目数据模型 → 一律保留(哪怕现场有本项目痕迹)
+mk thirdparty; rm -f "$SB/etc/privdns-gateway/sbmodel.pdg-owned"
+before="$(snap)"
+PDG_ROOT_PREFIX="$SB" pdg_sbmodel_is_ours \
+  && bad "第三方配置目录被判成本项目数据模型" || ok "判据: 第三方 config.json → 模型不归本项目"
+run_uninstall --purge >/dev/null
+[[ "$(snap)" == "$before" ]] && ok "--purge: 第三方 sing-box 目录仍逐字节保留" || bad "purge 动了第三方目录"
+grep -qF "$SENTINEL" "$SB/etc/sing-box/config.json" && ok "--purge: 第三方 sentinel 仍在" || bad "第三方配置被删"
+
+# 混合场景: 数据模型是我们的, 但 sing-box 运行时是别人手工装的 → 模型删、运行时留
+mk_mihomo_only
+PDG_ROOT_PREFIX="$SB" pdg_sbmodel_mark_owned
+cat > "$SB/etc/systemd/system/sing-box.service" <<'U'
+[Unit]
+Description=sing-box service (third party, hand rolled)
+[Service]
+ExecStart=/opt/mysingbox/sing-box run -c /opt/mysingbox/my.json
+U
+printf 'THIRD-PARTY-BINARY\n' > "$SB/usr/local/bin/sing-box"; chmod 755 "$SB/usr/local/bin/sing-box"
+out="$(run_uninstall --purge)"
+[[ ! -e "$SB/etc/sing-box" ]] && ok "混合场景: 本项目的数据模型被删" || bad "混合场景模型没删"
+{ [[ -e "$SB/etc/systemd/system/sing-box.service" ]] && [[ -e "$SB/usr/local/bin/sing-box" ]]; } \
+  && ok "混合场景: 第三方运行时(unit + 二进制)原样保留" || bad "混合场景删了第三方运行时"
+grep -q 'sing-box.service' <<<"$out" && ok "混合场景: 保留清单点名了第三方 unit" || bad "没点名保留项: $out"
+
+# 无法确认: 有本项目数据模型形态, 但现场特征不足(只有 backend) → 保守保留并说明原因
+mk_mihomo_only
+rm -f "$SB/etc/privdns-gateway/sbmodel.pdg-owned" "$SB/etc/privdns-gateway/bot.env"
+rm -rf "$SB/opt/pdg-bot" "$SB/opt/privdns-gateway" "$SB/etc/mosdns"
+PDG_ROOT_PREFIX="$SB" pdg_sbmodel_is_ours \
+  && bad "特征不足却认定为本项目数据模型(该保守时不保守)" || ok "判据: 项目特征不足 → 不认定, 保守保留"
+out="$(run_uninstall --purge)"
+[[ -e "$SB/etc/sing-box/config.json" ]] && ok "--purge: 无法确认时数据模型保留" || bad "无法确认却删了"
+grep -q '判不出归属的原因' <<<"$out" && ok "--purge: 说清了为何保留" || bad "没说原因: $out"
+
+# 普通卸载(不带 --purge)照旧保留配置
+mk_mihomo_only
+PDG_ROOT_PREFIX="$SB" pdg_sbmodel_mark_owned
+run_uninstall >/dev/null
+[[ -e "$SB/etc/sing-box/config.json" ]] \
+  && ok "普通卸载: 配置照旧保留(只有 --purge 才删)" || bad "普通卸载把配置删了"
+
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
 [[ "$nfail" == 0 ]]

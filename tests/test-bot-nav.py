@@ -11,8 +11,17 @@ assert '"callback_data": "nav:ops"' in bot, "ops result keyboard should return t
 assert 'set_tfo(data == "tfo:on"); edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK)' in bot, (
     "TFO toggle result must not show the whole first-level menu"
 )
-assert 'edit(chat, mid, f"✅ 已重启 {_core_svc()} + mosdns" if ok else msg, OPS_BACK)' in bot, (
-    "restart result must stay in ops navigation"
+# 「🔄 重启服务」的每条出口(内核失败 / mosdns 起不来 / 全部成功)都必须留在运维子菜单,
+# 不许刷出一级菜单。这里按分支取代码段再逐条查, 而不是钉死某一行字面量 —— 那样文案一改
+# 断言就废, 却又不是真的坏了。
+_restart_branch = bot.split('if data == "restart":', 1)[1].split('if data == "updgeo":', 1)[0]
+_edits = _restart_branch.count("edit(chat, mid")
+assert _edits >= 3, "重启分支应当分别处理: 内核失败 / mosdns 起不来 / 全部成功"
+# 每次编辑都配一个 OPS_BACK(消息可能跨行, 所以数总量而不是逐行看)
+assert _restart_branch.count("OPS_BACK") >= _edits, "restart result must stay in ops navigation"
+assert "MENU)" not in _restart_branch, "重启结果不该刷出一级菜单"
+assert "mosdns 未能起来" in _restart_branch, (
+    "mosdns 重启结果必须核实 —— 不能只看 apply_sb 成功就回「已重启」"
 )
 assert 'msg = f"✅ geosite 已更新; 规则集刷新 {n} 个"' in bot and "edit(chat, mid, msg, OPS_BACK)" in bot, (
     "rule-update result path should stay covered"

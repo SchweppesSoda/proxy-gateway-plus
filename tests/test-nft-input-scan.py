@@ -12,6 +12,7 @@
 """
 import importlib.util
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -31,6 +32,49 @@ pass_n = 0
 def ok(msg):
     global pass_n
     print("[OK]  ", msg); pass_n += 1
+
+
+# ── "nft 在, 但不在 PATH 上"这套现场的搭件(第 10~12 段共用)────────────────────
+def _shim_repo(tmp, candidates=()):
+    """影子仓库: nftscan.py 是真实文件的原样拷贝, 只改 NFT_CANDIDATES 这一处常量(它就是为
+    "测试可以指到别处"留的); lib/ 直接软链回真仓库。python 侧(--nft-path)与 shell 侧(没有
+    python3 时按文本读)因此永远读到同一份清单 —— 被测的是真代码, 不是复刻。"""
+    repo = os.path.join(tmp, "repo")
+    os.makedirs(os.path.join(repo, "deploy", "bot"))
+    os.symlink(str(ROOT / "lib"), os.path.join(repo, "lib"))
+    _set_candidates(repo, candidates)
+    return repo
+
+
+def _set_candidates(repo, paths):
+    src = (ROOT / "deploy/bot/nftscan.py").read_text(encoding="utf-8")
+    body = "".join('"%s", ' % p for p in paths)
+    out = re.sub(r"^NFT_CANDIDATES = \([^)]*\)", "NFT_CANDIDATES = (%s)" % body,
+                 src, count=1, flags=re.M)
+    assert out != src, "nftscan.py 里没有可替换的 NFT_CANDIDATES 常量"
+    with open(os.path.join(repo, "deploy", "bot", "nftscan.py"), "w", encoding="utf-8") as fh:
+        fh.write(out)
+
+
+def _fake_nft(path, log=None, rc=0):
+    """假 nft: 把每次调用的参数记进 log(用来断言"它到底被调用了没"), 按 rc 退出。"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\n")
+        if log:
+            fh.write('printf "%%s\\n" "$*" >> %s\n' % log)
+        fh.write("exit %d\n" % rc)
+    os.chmod(path, 0o755)
+    return path
+
+
+def _clean_env(**extra):
+    """PATH 里剔掉一切含 nft 的目录 —— `command -v nft` 必须查不到, 其它命令仍可用。"""
+    path = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
+                           if d and not os.path.exists(os.path.join(d, "nft")))
+    env = dict(os.environ, PATH=path, **extra)
+    assert subprocess.run(["bash", "-c", "command -v nft"], env=env,
+                          capture_output=True).returncode != 0, "PATH 没清干净"
+    return env
 
 
 # ── 真实形态的 nftables 配置文本 ───────────────────────────────────────────────
@@ -139,14 +183,117 @@ def main():
     assert nftscan.scan_text(quoted, "") == [], nftscan.scan_text(quoted, "")
     ok("字符串字面量里出现 hook input → 不误报")
 
-    # 反向: 真的链声明一个都不能漏(收紧匹配不能把真冲突放过去)
+    # 反向: 真的链声明一个都不能漏(收紧匹配不能把真冲突放过去)。每条都带一条放行 ——
+    # 空链是惰性的、按新判据本就不算冲突, 这里要验的是"各种写法都能被认出来"。
     for decl in ("    type filter hook input priority 0; policy drop;",
                  "\t\ttype filter hook input priority filter; policy drop;",
                  "    type filter hook input priority -150; policy accept;",
                  "    type filter hook input priority mangle + 10; policy accept;"):
-        txt = "table inet other {\n  chain c {\n%s\n  }\n}\n" % decl
+        txt = ("table inet other {\n  chain c {\n%s\n    tcp dport 9443 accept\n  }\n}\n"
+               % decl)
         assert len(nftscan.scan_text(txt, "")) == 1, (decl, nftscan.scan_text(txt, ""))
     ok("各种真实写法的 input 链声明(数字/具名/负数/表达式优先级)一个不漏")
+
+    # ── 4c. Debian 的 nftables 包自带空骨架 → 不算冲突 ──
+    # 真机验证抓到的: 全新 Debian 12 装了 nftables 就有这么一份 /etc/nftables.conf ——
+    # 三条 base chain 全是 policy accept、一条规则都没有。它既不 drop 包也没有会被架空的
+    # 放行, 完全惰性; 把它当冲突拒掉等于绝大多数新机器都装不上, 而用户根本不知道该删哪行。
+    STOCK = """#!/usr/sbin/nft -f
+flush ruleset
+table inet filter {
+\tchain input {
+\t\ttype filter hook input priority filter;
+\t}
+\tchain forward {
+\t\ttype filter hook forward priority filter;
+\t}
+\tchain output {
+\t\ttype filter hook output priority filter;
+\t}
+}
+"""
+    assert nftscan.scan_text(STOCK, "") == [], nftscan.scan_text(STOCK, "")
+    ok("Debian 自带的空骨架(policy accept + 零规则)不算冲突")
+
+    # 骨架里只要有一条放行, 就是真冲突(它会被 PDG 的 policy drop 架空)
+    withrule = STOCK.replace("type filter hook input priority filter;",
+                             "type filter hook input priority filter;\n\t\ttcp dport 9443 accept")
+    f = nftscan.scan_text(withrule, "")
+    assert len(f) == 1 and "1 条规则" in f[0], f
+    ok("骨架里加一条放行 → 判为冲突, 并说明是几条规则")
+
+    # 链自己是 policy drop: 一条规则都没有也照样冲突(它会把本项目要放行的端口丢掉)
+    dropped = STOCK.replace("type filter hook input priority filter;",
+                            "type filter hook input priority filter; policy drop;")
+    f = nftscan.scan_text(dropped, "")
+    assert len(f) == 1 and "policy drop" in f[0], f
+    ok("链是 policy drop(哪怕空的)→ 判为冲突并点明原因")
+
+    # ── 4d. nft 装在 sbin 但 PATH 里没有 → 照样要读到运行 ruleset ──
+    # 真实现场: nft 在 /usr/sbin, 而 `su`(不带 -)、cron、某些容器的 root PATH 没有 sbin。
+    # 只按 PATH 找的话读不到运行规则 → 扫描回"无法确认" → 调用方按"nft 没装, 没有现网规则
+    # 可冲突"放过去, 于是一整套现网 input 链被当成裸机。
+    with tempfile.TemporaryDirectory() as tmp:
+        sbin = os.path.join(tmp, "sbin"); os.makedirs(sbin)
+        fake_nft = os.path.join(sbin, "nft")
+        # 桩只用 shell 内建 echo: 下面会把 PATH 清空, cat/printf(1) 这些外部命令都不在了
+        with open(fake_nft, "w") as fh:
+            fh.write("#!/bin/sh\n" + "".join(
+                "echo '%s'\n" % ln.replace("'", "'\\''") for ln in LIVE_FOREIGN.split("\n")))
+        os.chmod(fake_nft, 0o755)
+        bare = os.path.join(tmp, "bin"); os.makedirs(bare)      # PATH 里只有这个空目录
+        old_path, old_cand = os.environ["PATH"], nftscan.NFT_CANDIDATES
+        os.environ["PATH"] = bare
+        nftscan.NFT_CANDIDATES = (fake_nft,)                    # 等价于"nft 只在 sbin 里"
+        try:
+            assert nftscan.nft_bin() == fake_nft, "PATH 里没有 nft 时应当回落到 sbin 候选路径"
+            txt, readable = nftscan.live_ruleset()
+            assert readable is True, "nft 在 sbin 却被判成读不到"
+            assert "inet ufw" in txt, txt[:80]
+        finally:
+            os.environ["PATH"] = old_path
+            nftscan.NFT_CANDIDATES = old_cand
+        ok("nft 只在 sbin(PATH 里没有)→ 仍能读到运行 ruleset, 不退化成「无法确认」")
+
+    # 真的一个都没有时才算找不到
+    with tempfile.TemporaryDirectory() as tmp:
+        bare = os.path.join(tmp, "bin"); os.makedirs(bare)
+        old_path, old_cand = os.environ["PATH"], nftscan.NFT_CANDIDATES
+        os.environ["PATH"] = bare
+        nftscan.NFT_CANDIDATES = (os.path.join(tmp, "nowhere", "nft"),)
+        try:
+            assert nftscan.nft_bin() == "", "所有候选路径都没有 nft 时应当返回空"
+            _, readable = nftscan.live_ruleset()
+            assert readable is False
+        finally:
+            os.environ["PATH"] = old_path
+            nftscan.NFT_CANDIDATES = old_cand
+        ok("PATH 与 sbin 候选都没有 nft → 如实回报读不到")
+
+    # --nft-path: shell 侧与扫描器共用这一份判据
+    with tempfile.TemporaryDirectory() as tmp:
+        sbin = os.path.join(tmp, "sbin"); os.makedirs(sbin)
+        bare = os.path.join(tmp, "bin"); os.makedirs(bare)
+        nft2 = os.path.join(sbin, "nft")
+        with open(nft2, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(nft2, 0o755)
+        # PATH 里有 → 打印路径 + exit 0
+        r = subprocess.run([sys.executable, str(NFTSCAN), "--nft-path"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, PATH=sbin))
+        assert r.returncode == 0 and r.stdout.strip() == nft2, (r.returncode, r.stdout)
+        # PATH 里没有(且候选路径也没有)→ 不打印 + exit 1
+        r = subprocess.run([sys.executable, str(NFTSCAN), "--nft-path"],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, PATH=bare))
+        if os.path.exists("/usr/sbin/nft") or os.path.exists("/sbin/nft"):
+            assert r.returncode == 0 and r.stdout.strip().endswith("nft"), (r.returncode, r.stdout)
+            ok("--nft-path: PATH 里没有但系统 sbin 里有 → 仍报出真实路径(exit 0)")
+        else:
+            assert r.returncode == 1 and not r.stdout.strip(), (r.returncode, r.stdout)
+            ok("--nft-path: 哪儿都没有 → exit 1 且不打印")
+        ok("--nft-path 供 shell 侧复用同一判据(PATH 命中时报出该路径)")
 
     # ── 5. live_ruleset: 读不到必须 readable=False, 不能与"读到了且干净"混为一谈 ──
     with tempfile.TemporaryDirectory() as tmp:
@@ -281,6 +428,173 @@ def main():
                                         REPO_DIR=str(ROOT)))
             assert r.returncode == want, (want, r.returncode, r.stdout, r.stderr)
         ok("pdg.sh 前置门与 nftscan CLI 结论一致(有冲突/干净)")
+
+    # ── 10. cmd_platform 的 nft -c 守卫: 不再靠 PATH 里有没有 nft ──
+    # 回归: 守卫原本是 `command -v nft && ! nft -c -f /etc/nftables.conf`。nft 装在
+    # /usr/sbin —— `su`(不带 -)、cron、精简容器的 root PATH 里没有 sbin, 于是整条校验被
+    # 静默跳过: 平台切换会把一份 nft 根本不认的 nftables.conf 当成"校验通过"放行, 事务
+    # 照常提交, 直到下次开机防火墙起不来才发作。
+    pdg_src_txt = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+
+    def _fn_body(name):
+        head = "%s(){" % name
+        assert head in pdg_src_txt, "pdg.sh 里没有 %s()" % name
+        return head + pdg_src_txt.split(head, 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+    # cmd_platform 里那段守卫的**真实代码行**(不是复刻), 连同它的注释一起取出来执行
+    lines = pdg_src_txt.split("\n")
+    gi = [i for i, ln in enumerate(lines) if "nft 的位置与扫描器同一份判据" in ln]
+    assert len(gi) == 1, "cmd_platform 的 nft 守卫标记行没找到(或不止一处): %s" % gi
+    gj = next(i for i in range(gi[0], len(lines)) if lines[i] == "  fi")
+    guard_src = "\n".join(lines[gi[0]:gj + 1])
+    assert "_pdg_nft_bin" in guard_src and "-c -f /etc/nftables.conf" in guard_src, guard_src
+    guard_code = "\n".join(ln for ln in guard_src.split("\n") if not ln.strip().startswith("#"))
+    assert "command -v nft" not in guard_code, "守卫又退回 command -v nft 了: %s" % guard_code
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # nft 只存在于一个**不在 PATH 上**的目录里(模拟 /usr/sbin 未导出)
+        sbin = os.path.join(tmp, "sbin"); os.makedirs(sbin)
+        nft_path = os.path.join(sbin, "nft")
+        repo = _shim_repo(tmp, (nft_path,))
+
+        def write_nft(rc):
+            _fake_nft(nft_path, rc=rc)
+
+        env = _clean_env(REPO_DIR=repo)
+
+        def run(script, extra_env=None):
+            return subprocess.run(["bash", "-c", _fn_body("_pdg_nft_bin") + script],
+                                  capture_output=True, text=True,
+                                  env=dict(env, **(extra_env or {})))
+
+        write_nft(0)
+        r = run("_pdg_nft_bin")
+        assert r.stdout.strip() == nft_path, (r.stdout, r.stderr)
+        ok("_pdg_nft_bin: PATH 上没有 nft, 但 sbin 里有 → 照样解析到真实路径")
+
+        _set_candidates(repo, ())                      # 机器上真没有 nft
+        r = run("_pdg_nft_bin")
+        assert r.returncode == 0 and r.stdout.strip() == "", (r.returncode, r.stdout)
+        ok("_pdg_nft_bin: 机器上真没有 nft → 回空串(不报错、不瞎猜路径)")
+        _set_candidates(repo, (nft_path,))
+
+        # 守卫本身: nft 不在 PATH 上, 校验依然要发生
+        harness = ('_plat_rollback(){ echo ROLLBACK; }\n'
+                   'g(){ local wd="%s"; mkdir -p "$wd"\n%s\n  echo PASSED_GUARD\n}\n'
+                   'g; echo "rc=$?"\n' % (os.path.join(tmp, "wd"), guard_src))
+        write_nft(1)                                   # nft -c 判这份配置不合法
+        r = run(harness)
+        assert "校验未过" in r.stdout and "ROLLBACK" in r.stdout, (r.stdout, r.stderr)
+        assert "PASSED_GUARD" not in r.stdout and "rc=1" in r.stdout, r.stdout
+        ok("守卫(PATH 无 nft, sbin 有): nft -c 不过 → 中止 + 回滚, 不再静默放行")
+
+        write_nft(0)                                   # nft -c 通过
+        r = run(harness)
+        assert "PASSED_GUARD" in r.stdout and "ROLLBACK" not in r.stdout, r.stdout
+        ok("守卫: nft -c 通过 → 正常放行")
+
+        _set_candidates(repo, ())                      # 机器上确实没装 nft
+        r = run(harness)
+        assert "PASSED_GUARD" in r.stdout and "ROLLBACK" not in r.stdout, r.stdout
+        ok("守卫: 机器上真没有 nft → 不拿「校验不过」卡住切换")
+
+    # ── 11. lib/nftbin.sh: 判据只有一份, 且没有 python3 也不退化成只看 PATH ──
+    # 老实现的兜底是 `command -v nft` —— 机器上缺 python3 时, "nft 在 /usr/sbin 但 PATH 没
+    # 导出"这个正主场景又漏回去了。现在没 python3 就从 nftscan.py 里读**同一份** NFT_CANDIDATES。
+    with tempfile.TemporaryDirectory() as tmp:
+        sbin = os.path.join(tmp, "sbin"); os.makedirs(sbin)
+        nft_path = _fake_nft(os.path.join(sbin, "nft"), os.path.join(tmp, "nft.log"))
+        repo = _shim_repo(tmp, (nft_path,))
+        env = _clean_env(REPO_DIR=repo)
+        call = ". '%s/lib/nftbin.sh'; pdg_nft_bin" % repo
+
+        r = subprocess.run(["bash", "-c", call], capture_output=True, text=True, env=env)
+        assert r.returncode == 0 and r.stdout.strip() == nft_path, (r.stdout, r.stderr)
+        ok("nftbin: PATH 上没有 nft → 经 nftscan 找到候选路径")
+
+        # 真没有 python3(PATH 里连它都没有)—— 仍要找得到
+        nopy = os.path.join(tmp, "nopy"); os.makedirs(nopy)
+        for d in env["PATH"].split(os.pathsep):
+            if not os.path.isdir(d):
+                continue
+            for exe in os.listdir(d):
+                if exe.startswith("python"):
+                    continue
+                link = os.path.join(nopy, exe)
+                if not os.path.exists(link):
+                    try:
+                        os.symlink(os.path.join(d, exe), link)
+                    except OSError:
+                        pass
+        nopy_env = dict(env, PATH=nopy)
+        assert subprocess.run(["bash", "-c", "command -v python3"], env=nopy_env,
+                              capture_output=True).returncode != 0, "python3 没剔干净"
+        r = subprocess.run(["bash", "-c", call], capture_output=True, text=True, env=nopy_env)
+        assert r.returncode == 0 and r.stdout.strip() == nft_path, (r.stdout, r.stderr)
+        ok("nftbin: 机器上没有 python3 → 从 nftscan.py 读同一份候选清单, 照样找得到")
+
+        # 判据文件本身缺失 → 只剩 PATH, 且如实返回非 0(不瞎猜路径)
+        os.remove(os.path.join(repo, "deploy", "bot", "nftscan.py"))
+        r = subprocess.run(["bash", "-c", call], capture_output=True, text=True, env=env)
+        assert r.returncode != 0 and r.stdout.strip() == "", (r.returncode, r.stdout)
+        ok("nftbin: 连 nftscan.py 都没有 → 返回非 0 且不打印(调用方好据此提示)")
+
+    # ── 12. 三个"只看 PATH"的老现场: uninstall 与两个 certbot 钩子 ──
+    # 它们和 cmd_platform 是同一类漏检, 后果各不相同: 卸载留下内核里的 inet pdg 表(端口继续
+    # 被 policy drop 挡着)、续期钩子把 80 口的放行插到 iptables(nft 那边根本没放行)。
+    with tempfile.TemporaryDirectory() as tmp:
+        sbin = os.path.join(tmp, "sbin"); os.makedirs(sbin)
+        log = os.path.join(tmp, "nft.log")
+        nft_path = _fake_nft(os.path.join(sbin, "nft"), log)
+        repo = _shim_repo(tmp, (nft_path,))
+        stub = os.path.join(tmp, "stub"); os.makedirs(stub)
+        ipt_log = os.path.join(tmp, "iptables.log")
+        _fake_nft(os.path.join(stub, "iptables"), ipt_log)      # 落到 iptables 分支就会留痕
+        with open(os.path.join(stub, "systemctl"), "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")                     # 别真去动本机服务
+        os.chmod(os.path.join(stub, "systemctl"), 0o755)
+        base = _clean_env(REPO_DIR=repo)
+        env = dict(base, PATH=stub + os.pathsep + base["PATH"])
+
+        def nft_calls():
+            with open(log, encoding="utf-8") as fh:
+                return fh.read()
+
+        # 12a. uninstall.sh 的防火墙段(真实代码行, 只是 _UN_HERE 指到影子仓库)
+        un_lines = (ROOT / "uninstall.sh").read_text(encoding="utf-8").split("\n")
+        bi = next(i for i, ln in enumerate(un_lines) if "删本项目独立表 inet pdg" in ln)
+        bj = next(i for i in range(bi, len(un_lines)) if un_lines[i] == "fi")
+        block = "\n".join(un_lines[bi:bj + 1])
+        assert "command -v nft >/dev/null" not in block, "uninstall 又退回只看 PATH 了: %s" % block
+        open(log, "w").close()
+        r = subprocess.run(["bash", "-c", '_UN_HERE=%r\n%s' % (repo, block)],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 0, (r.returncode, r.stderr)
+        assert "delete table inet pdg" in nft_calls(), (nft_calls(), r.stderr)
+        ok("uninstall: PATH 上没有 nft 也照样删掉内核里的 inet pdg 表")
+
+        # 12b/12c. certbot 钩子: 拷一份把绝对路径指到沙箱(不给生产代码加接缝)
+        conf = os.path.join(tmp, "nftables.conf")
+        with open(conf, "w") as fh:
+            fh.write("table inet pdg {}\n")
+        for name, want in (("proxy-gateway-open-cert-http.sh",
+                            "insert rule inet pdg input tcp dport 80 accept"),
+                           ("proxy-gateway-restore-firewall.sh", "-f %s" % conf)):
+            src = (ROOT / "deploy/cert" / name).read_text(encoding="utf-8")
+            assert "command -v nft >/dev/null 2>&1 && nft " not in src, "%s 又退回只看 PATH" % name
+            hook = os.path.join(tmp, name)
+            with open(hook, "w", encoding="utf-8") as fh:
+                fh.write(src.replace("/opt/privdns-gateway/lib", os.path.join(repo, "lib"))
+                            .replace("/etc/nftables.conf", conf))
+            os.chmod(hook, 0o755)
+            open(log, "w").close(); open(ipt_log, "w").close()
+            r = subprocess.run(["bash", hook], capture_output=True, text=True, env=env)
+            assert r.returncode == 0, (name, r.returncode, r.stderr)
+            assert want in nft_calls(), (name, nft_calls(), r.stderr)
+            with open(ipt_log, encoding="utf-8") as fh:
+                assert fh.read().strip() == "", "%s 落到了 iptables 分支(等于 nft 侧没生效)" % name
+            ok("certbot %s: PATH 上没有 nft 也走 nft 分支(不误落 iptables)"
+               % ("pre-hook" if "open" in name else "post-hook"))
 
     print("\n通过 %d 项断言" % pass_n)
 

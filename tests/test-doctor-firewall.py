@@ -9,8 +9,13 @@ checks_src = (ROOT / "deploy/bot/checks.py").read_text(encoding="utf-8")
 assert '{"53", "80", "81", "443", "853", "5228", "5229", "5230", "7893", "8445"}' in checks_src, (
     "doctor firewall leak detection must include TG SOCKS5 8445, GMS 5228-5230 and mihomo redir 7893"
 )
-assert "53/80/81/443/853/5228-5230/7893/8445" in checks_src, (
-    "doctor firewall OK text should mention 8445, 5228-5230 and 7893"
+# 端口清单必须**按平台**生成: iOS 上不能声称 GMS 5228-5230 已就位(装机就剥掉了),
+# Android 上也不该提 :81(那是 iOS 专属的 OnDemand 探测端点)。8445 是两平台共用的 TG SOCKS5。
+assert "def platform_ports_text(" in checks_src, "端口清单应由 platform_ports_text() 按平台生成"
+_code = "\n".join(ln for ln in checks_src.splitlines()
+                   if not ln.lstrip().startswith("#") and '"""' not in ln)
+assert '"53/80/81/443/853/5228-5230/7893/8445"' not in _code, (
+    "不该再有写死的全平台端口串(注释里作为反面例子提到不算)"
 )
 
 # 动态: 端口区间写法(如 5228-5230)对全网开放也要被识别为泄露; 限内网来源则不报。
@@ -152,3 +157,29 @@ finally:
     checks._platform = _orig_platform
 
 print("doctor-firewall regression OK")
+
+# ── 端口文案按平台动态生成 ──────────────────────────────────────────────────
+import os, tempfile  # noqa: E402
+
+_d = tempfile.mkdtemp()
+checks.PLATFORM_FILE = os.path.join(_d, "platform")
+checks._run = lambda cmd: (0, "chain input {\n ip saddr 172.22.0.0/16 tcp dport { 53, 80-81, 443, 853, 5228-5230, 7893, 8445 } accept\n}", "")
+
+open(checks.PLATFORM_FILE, "w").write("android")
+_t = checks.platform_ports_text()
+assert "5228-5230" in _t and "仅 Android" in _t, _t
+assert "81" not in _t.replace("8445", ""), "Android 不该提 iOS 专属的 :81: " + _t
+assert "8445" in _t, "8445(TG SOCKS5)两平台共用"
+_st, _, _detail = checks.check_nft()
+assert _st == "ok" and "5228-5230" in _detail and "仅 Android" in _detail, (_st, _detail)
+print("[OK]   Android: 端口文案含 5228-5230(仅 Android), 不提 :81")
+
+open(checks.PLATFORM_FILE, "w").write("ios")
+_t = checks.platform_ports_text()
+assert "81(仅 iOS)" in _t, _t
+assert "5228" not in _t, "iOS 上不得声称 GMS 5228-5230 已就位: " + _t
+assert "8445" in _t, "8445(TG SOCKS5)两平台共用"
+_st, _, _detail = checks.check_nft()
+assert _st == "ok" and "5228" not in _detail and "81(仅 iOS)" in _detail, (_st, _detail)
+print("[OK]   iOS: 端口文案含 81(仅 iOS), 不含 5228-5230")
+print("platform port text regression OK")

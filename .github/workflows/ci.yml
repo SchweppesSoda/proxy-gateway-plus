@@ -97,8 +97,11 @@ jobs:
       - name: "第三方 sing-box 保护 (标准 ExecStart 也不认亲; 迁移/卸载/purge 后 sentinel 不变)"
         run: bash tests/test-singbox-thirdparty.sh
 
-      - name: "平台隔离安装/迁移矩阵 (marker 证据回退/GMS 仅安卓/iOS GMS 清理/服务集按平台)"
+      - name: "平台隔离安装/迁移矩阵 (marker 证据回退/GMS 仅安卓/iOS GMS 清理/服务集按平台; 抽不到函数即 FAIL)"
         run: bash tests/test-platform-install.sh
+
+      - name: "测试自身不许假绿 (抽不到函数/命令不存在/退出码非 0 必须记 FAIL)"
+        run: bash tests/test-false-green-guard.sh
 
       - name: "GMS 推送端口迁移回归 (fw/sing-box 补 5228-5230, 自定义跳过, 失败回滚)"
         run: bash tests/test-gms-migration.sh
@@ -169,6 +172,9 @@ jobs:
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 
+      - name: "nft input 链冲突判据 (单一来源 + 读不到≠没有 + platform 守卫不靠 PATH 找 nft)"
+        run: python3 tests/test-nft-input-scan.py
+
       - name: "分流规则→mosdns 劫持同步回归 (指到出口的域名必须被 mosdns 劫持, 否则规则是死的)"
         run: python3 tests/test-rule-hijack-sync.py
 
@@ -221,6 +227,12 @@ jobs:
       - name: "WLOC 热加载回归 (真起 pdg-mitm: 同 PID 换坐标 + 并发不混坐标 + 状态文件)"
         run: python3 tests/test-wloc-hotreload.py
 
+      - name: "文案与当前行为一致 (WLOC 热加载/:81 返回 200/端口按平台)"
+        run: python3 tests/test-wording-accuracy.py
+
+      - name: "Bot 凭据三态 (都空=正常禁用/只配一半=配置错/配齐才要求 pdg-bot 在跑)"
+        run: python3 tests/test-bot-credentials.py
+
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
         run: python3 tests/test-platform-isolation.py
 
@@ -248,9 +260,31 @@ jobs:
     # 为什么用容器而不是 runner 上的 unshare: ubuntu-24.04 runner 用 AppArmor 禁掉了非特权
     # 用户命名空间, unshare -rm 不可用, 脚本会整条跳过(CI 绿但零覆盖)。容器本身就是一次性
     # 隔离环境且以 root 运行, 直接置 PDG_E2E_ISOLATED=1 跑同一份测试主体。
+    #
+    # **一个脚本一个 job**: 以前所有脚本挤在同一个容器里顺序跑, 前一个留下的东西会让后一个
+    # 挂掉 —— e2e-cross-version-rollback 留下 /usr/local/bin/sing-box, 于是 e2e-install 的
+    # 装机路径判成"机器上已有来源不明的 sing-box"而中止(单独跑 23/23, 串起来只有 11/34),
+    # 失败原因和被测代码毫无关系。矩阵拆开后每个脚本都有干净容器; 脚本自身进场也会
+    # e2e_reset_box(见 tests/e2e-lib.sh), 两道保险。
     runs-on: ubuntu-latest
     container:
       image: debian:12
+    strategy:
+      fail-fast: false
+      matrix:
+        script:
+          - e2e-migrate.sh
+          - e2e-exit-rule.sh
+          - e2e-drop-singbox.sh
+          - e2e-custom-nft.sh
+          - e2e-cross-version-rollback.sh
+          - e2e-install.sh
+          - e2e-install-nft.sh
+          - e2e-platform-switch.sh
+          - e2e-update.sh
+          - e2e-wloc.sh
+          - e2e-cli-ops.sh
+    name: "E2E ${{ matrix.script }}"
     steps:
       # fetch-depth: 0 —— 跨版本回滚用例要取**真的** v1.5.12 代码当更新器; 默认浅克隆没有
       # tag, 那条用例会静默 skip(CI 绿但零覆盖), 正是本项目最怕的假绿。
@@ -261,30 +295,31 @@ jobs:
         run: |
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl >/dev/null
-      - name: E2E 老装升级 (v1.4.x 现场跑真实 pdg __migrate, 三场景 + 幂等)
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
+      - name: "跑 ${{ matrix.script }}"
         env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-migrate.sh
-      - name: E2E 加落地+分流 (真 parse_link/apply_sb → 真 mihomo -t → 真 mosdns 解析)
-        env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-exit-rule.sh
-      - name: E2E sing-box→mihomo 迁移 (真 mihomo 二进制 + 真协议出口一个不丢 + 不可转换出口必须点名拒绝)
-        env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-drop-singbox.sh
+        run: bash tests/${{ matrix.script }}
 
-      - name: E2E 自定义防火墙保护 (额外 table/VPN/NAT/转发/开放端口: 迁移后逐字节不变)
-        env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-custom-nft.sh
-
-      - name: E2E 跨版本回滚 (v1.5.12 更新器 + 当前代码, 迁移后注入 doctor 失败: unit 不得被清空)
-        env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-cross-version-rollback.sh
-      - name: "E2E 全新安装 (真跑 install.sh: 落地全套 / 拒绝重装 / 失败回滚干净)"
-        env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-install.sh
-      - name: "E2E 更新全流程 (真 git 仓库两个 tag: 更新成功 / doctor失败回滚 / 快照回滚)"
-        env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-update.sh
-      - name: E2E WLOC (真事务开关 + 真坐标改写 + 平台门控)
-        env: { PDG_E2E_ISOLATED: "1" }
-        run: bash tests/e2e-wloc.sh
+  # 串行 hermetic 守卫: 就算将来有人把这些脚本又塞回同一个环境顺序跑, 也必须全绿。
+  # 这条专门盯"脚本之间互相踩"的回归 —— 矩阵拆开只是让 CI 不受影响, 并不能保证脚本本身干净。
+  e2e-serial:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
+      - name: "E2E 串行 hermetic (同一容器里按原顺序连着跑, 每个都必须全绿)"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_SERIAL_SCRIPTS: >-
+            e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
+            e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
+            e2e-platform-switch.sh e2e-update.sh e2e-wloc.sh e2e-cli-ops.sh
+        run: bash tests/e2e-serial-hermetic.sh
