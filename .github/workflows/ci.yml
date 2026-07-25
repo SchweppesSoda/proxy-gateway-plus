@@ -109,6 +109,9 @@ jobs:
       - name: "内网卡段取值回归 (真 pty: 抓包/手输并行谁先用谁 + 形态校验 + 半截输入不漏)"
         run: python3 tests/test-cidr-input.py
 
+      - name: "老机器 unit 重部署 (sing-box 悬空依赖换 mihomo / 保住装机 CERT_DIR / 幂等)"
+        run: bash tests/test-unit-redeploy.sh
+
       - name: "内核版本精确匹配 (v1.19.1 不得匹配 v1.19.10; 读不到版本不跳过安装)"
         run: bash tests/test-version-match.sh
 

@@ -1212,7 +1212,7 @@ def set_wda_mode(on):
     okc, errc = _write_unlock_file([])
     if okc:
         return True, "✅ 已切到【🛬 落地出口】: 解锁域名回落各自出口(hk/tw), mosdns 解锁清单已清空。"
-    return True, ("✅ 已切到【🛬 落地出口】(sing-box 规则已撤)。\n"
+    return True, ("✅ 已切到【🛬 落地出口】(内核分流规则已撤)。\n"
                   "⚠️ 但清空 mosdns unlock.txt 失败(" + errc + "): 本机解析这些域名可能仍走解锁 DNS, 可再点一次 🛬 或手动清空。")
 
 # ── 持久化开关 (profile.env: PDG_LOWMEM / PDG_TFO …) ──
@@ -2543,7 +2543,7 @@ def restore_from(data):
         newsb = os.path.join(tmp, "etc/sing-box/config.json")
         newmos = os.path.join(tmp, "etc/mosdns/config.yaml")
         if not os.path.exists(newsb):
-            return False, "备份里没有 sing-box 配置, 拒绝恢复"
+            return False, "备份里没有网关配置(config.json), 拒绝恢复"
         # 机器感知: 用「本机」身份覆盖备份带来的 server_ip / 内网卡段 / 证书路径。
         # 这样跨机导入(如把 .153 的备份导到 .200)只搬出口+分流+规则集, 不会把别人的 IP/证书路径搬来搞错位。
         cur = _machine_id(SB, MOSDNS_CONF)

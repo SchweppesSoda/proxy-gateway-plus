@@ -1,6 +1,6 @@
 # 排障手册 (Playbook)
 
-出问题先跑一条 **`sudo pdg doctor`** —— 9 项只读检查会直接点出大部分故障(服务、sing-box 版本、DoT A 记录、dot-domain 一致性、内网卡段、防火墙、证书、本机 DNS、sing-box check)。
+出问题先跑一条 **`sudo pdg doctor`** —— 只读检查会直接点出大部分故障(服务、mihomo 版本、DoT A 记录、dot-domain 一致性、内网卡段、防火墙、代理入口、GMS 推送、限流、内存模式、证书、本机 DNS、mihomo 配置 check)。
 下面是按症状的细查。
 
 ---
@@ -15,7 +15,7 @@ iOS 靠描述文件的 OnDemand「探测 `:81` 成功才启用 DoT」。
 多半是 mosdns 没在应答。
 - **查**:`sudo pdg doctor` 看「服务 / 本机DNS」;`systemctl status mosdns`;`journalctl -u mosdns -n 30`。
 - **常见根因**:mosdns 证书路径不对(如跨机导入了别人配置,指向不存在的 `/etc/dnsdist/certs`)→ mosdns 崩溃重启。
-  doctor 的「DoT A 记录 / sing-box 配置」也会连带异常。
+  doctor 的「DoT A 记录 / mihomo 配置」也会连带异常。
 - **修**:把 `/etc/mosdns/config.yaml` 的 `cert:` 指到真实存在的证书(`/etc/mosdns/certs/…`),`systemctl restart mosdns`。
 
 ## 流量没到本机 / 内网卡不通
@@ -28,12 +28,13 @@ iOS 靠描述文件的 OnDemand「探测 `:81` 成功才启用 DoT」。
   ② `dot-domain` 文件与证书 CN 不一致(doctor 的「DoT 域名一致性」会警告)→ 续期会部署错证书。
 - **修**:① 安全组放行 80;② `echo <证书CN域名> > /opt/pdg-bot/dot-domain`。
 
-## sing-box 报 "入站字段已废弃" / 行为异常
-- **根因**:sing-box 版本不对。本网关**必须 1.12.x**;1.13+ 移除了 `sniff_override_destination`,会导致流量回环、整体失效;旧于 1.12 会打废弃告警。
-- **修**:`sing-box version` 确认;不对就重跑 install.sh(自动装 1.12.x)。doctor 的「sing-box 版本」会 FAIL/WARN。
+## 内核版本不对 / 行为异常
+- **根因**:mihomo 版本与本发布版钉死的不一致(手工换过内核, 或更新中途失败)。
+- **修**:`mihomo -v` 确认;不对就 `sudo pdg update`(会按 lib/versions.sh 钉死版本装并校验 SHA256)。doctor 的「mihomo 版本」「mihomo 配置」会 WARN/FAIL。
+- > v1.6.0 起已彻底移除 sing-box 运行时(它被钉死在 1.12.x:1.13+ 移除了本网关依赖的 `sniff_override_destination`)。老机器 `sudo pdg update` 会自动迁到 mihomo。
 
 ## 代理域名走错出口 / 不确定某域名走哪
-- 用 bot **📑 分流管理 → 🔎 测域名**,或思路:mosdns 先判直连(国内)还是劫持(其余),sing-box 再按 `route.rules` 首条匹配选出口。
+- 用 bot **📑 分流管理 → 🔎 测域名**,或思路:mosdns 先判直连(国内)还是劫持(其余),mihomo 再按规则首条匹配选出口。
 
 ## bot 按钮反应慢
 - 点一次按钮 = 2 个到 Telegram 的来回,延迟下限就是本机到 `api.telegram.org` 的 RTT(物理距离,代码压不掉)。
@@ -41,7 +42,7 @@ iOS 靠描述文件的 OnDemand「探测 `:81` 成功才启用 DoT」。
   一个 token 只能一个实例轮询——要么只在一台跑 `pdg-bot`,要么各用各的 bot。
 
 ## 流量统计"看着不准"
-- bot 📈流量 的「实时」来自 clash_api = **sing-box 本会话**(重启清零)且**只算经代理的流量**;不是机器总用量。
+- bot 📈流量 的「实时」来自 clash_api = **内核本会话**(mihomo 重启即清零)且**只算经代理的流量**;不是机器总用量。
 - 要准确的今日/本月/累计看「总用量(vnstat·网卡真实)」或 `sudo pdg traffic`(vnstat 刚装需跑几分钟才有数)。
 
 ## 改坏了想退回

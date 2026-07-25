@@ -1,5 +1,10 @@
 # 设计:MITM 插件框架 + Apple WLOC 位置改写(v1.5.0 特性 B)
 
+> **阅读提示(v1.6.0 后)**:本文写于"sing-box / mihomo 双核并存"时期,文中"两核对称""sing-box:
+> outbound+route"等描述属**当时的设计背景**。v1.6.0 已彻底移除 sing-box 运行时,mihomo 是唯一
+> 内核 —— 实际实现里只剩 mihomo 一侧(`proxies` + `rules`)。其余设计要点(mosdns 强制劫持、
+> 自签 CA 终止 TLS、forward+patch)均未变。
+
 > 状态:**✅ 已跑通并真机验证**(2026-07-21,.200 + iPhone iOS 26.5.2:北京、东京丸之内均成功切换)。框架(自签 CA + TLS 终止 + forward+patch + 多地点 bot + mosdns 强制劫持 + mihomo 路由)全部实现,单元测试 + 真机双重覆盖。首个插件:Apple WLOC(截 gs-loc.apple.com / gs-loc-cn.apple.com,把网络定位改写成设定坐标)。
 
 ## 0. 跑通配方与已知限制(务必先读)

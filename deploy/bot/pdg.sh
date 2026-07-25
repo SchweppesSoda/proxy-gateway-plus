@@ -1165,6 +1165,42 @@ migrate_mihomo_safepaths(){
 # 老装升级: 确保所有 bot 模块(.py)都部署到 /opt/pdg-bot。修「旧版 cmd_update 安装列表缺新模块
 # (如 sb2mihomo/mitm_*)、首次升级时序滞后漏装」→ 迁移/WLOC 渲染报 ModuleNotFoundError。
 # pdg-bot.py 由主安装装成 bot.py, 此处跳过。幂等。
+# 老装迁移: 把仓库里的 systemd unit 重新部署到已装机器。幂等。
+# cmd_update 只装 pdg-health.service/timer, 从不重装 pdg-bot / pdg-rules-update ——
+# 于是老机器一直带着 `After=... sing-box.service ...`(v1.6 已无 sing-box, 依赖悬空且与实际
+# 内核不符, 排障时极易误导)。
+# 关键: pdg-bot.service 里有 __CERT_DIR__ 占位符, 必须沿用**装机时那个证书目录**(从现有 unit
+# 里读回来), 直接拿模板覆盖会把占位符原样写进去, bot 就读不到证书了。
+# 只更新**已经存在**的 unit(没装过就不该凭空造), 内容没变则不写也不 reload。
+migrate_deploy_units(){
+  [[ -d "$REPO_DIR/deploy/bot" ]] || return 0
+  local changed=0 u src cur tmp certdir
+  for u in pdg-bot pdg-rules-update; do
+    src="$REPO_DIR/deploy/bot/$u.service"
+    cur="/etc/systemd/system/$u.service"
+    [[ -f "$src" && -f "$cur" ]] || continue
+    tmp="$(mktemp)" || continue
+    if [[ "$u" == pdg-bot ]]; then
+      # 从现有 unit 取回证书目录(Environment=PDG_CERT=<dir>/fullchain.pem), 取不到用装机默认值
+      certdir="$(sed -n 's#^Environment=PDG_CERT=\(.*\)/fullchain\.pem[[:space:]]*$#\1#p' "$cur" | head -1)"
+      certdir="${certdir:-/etc/mosdns/certs}"
+      sed -e "s|__CERT_DIR__|$certdir|g" "$src" > "$tmp"
+    else
+      cp -f "$src" "$tmp"
+    fi
+    if [[ -s "$tmp" ]] && ! cmp -s "$tmp" "$cur"; then
+      if install -m644 "$tmp" "$cur" 2>/dev/null; then
+        changed=1; c_g "  更新 systemd unit: $u.service"
+      else
+        c_y "  更新 $u.service 失败(保留原文件)"
+      fi
+    fi
+    rm -f "$tmp"
+  done
+  [[ "$changed" == 1 ]] && systemctl daemon-reload 2>/dev/null
+  return 0
+}
+
 migrate_deploy_botfiles(){
   [[ -d "$REPO_DIR/deploy/bot" ]] || return 0
   local f base plat; plat="$(_pdg_platform)"
@@ -1499,7 +1535,7 @@ run_all_migrations(){
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
-  migrate_deploy_botfiles || true
+  migrate_deploy_botfiles || true; migrate_deploy_units || true
   migrate_mosdns_hijack_shape || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true

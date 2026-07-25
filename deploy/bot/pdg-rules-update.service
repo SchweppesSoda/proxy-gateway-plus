@@ -1,6 +1,6 @@
 [Unit]
 Description=PrivDNS Gateway 定时刷新 geosite + 规则集
-After=network-online.target sing-box.service mosdns.service
+After=network-online.target mihomo.service mosdns.service
 Wants=network-online.target
 
 [Service]
