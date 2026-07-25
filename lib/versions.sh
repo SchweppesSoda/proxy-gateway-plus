@@ -43,6 +43,21 @@ pdg_mihomo_is_version(){
   [[ -n "$got" && "$got" == "$want" ]]
 }
 
+# mosdns 同理。装机曾用 `command -v mosdns` 判定 —— PATH 上有任何一个 mosdns(第三方装的、
+# 或早年遗留的老版)就跳过下载, 于是既不升到钉死版, 也**跳过了 SHA256 供应链校验**,
+# 网关最终跑着一个来路不明的解析器, 而安装日志上连"下载 mosdns"这行都不会出现。
+pdg_mosdns_version(){
+  local out
+  out="$(mosdns version 2>/dev/null | head -1)" || return 0
+  [[ "$out" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] && printf 'v%s\n' "${BASH_REMATCH[1]}"
+}
+
+pdg_mosdns_is_version(){
+  local want="${1#v}" got
+  got="$(pdg_mosdns_version)"; got="${got#v}"
+  [[ -n "$got" && "$got" == "$want" ]]
+}
+
 # pdg_verify_sha256 <文件> <期望hash> [名称]  → 不符返回非 0 并打印期望/实际
 pdg_verify_sha256(){
   local file="$1" exp="$2" name="${3:-$1}" got

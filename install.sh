@@ -290,7 +290,10 @@ apt-get install -y -qq curl tar unzip nftables python3 openssl certbot dnsutils 
 systemctl enable --now vnstat >/dev/null 2>&1 || true   # 网卡流量统计(轻量, ~3MB)
 
 # ── 2. mosdns ──
-if ! command -v mosdns >/dev/null; then
+# 按**钉死版本**判定, 不是"装了就算数": 机器上原有的 mosdns(第三方装的/早年老版)会让
+# `command -v mosdns` 成立而整段跳过 —— 既不升到钉死版, 也跳过 SHA256 供应链校验,
+# 安装日志上连"下载 mosdns"这行都不会出现(现场就这么发现的)。
+if ! pdg_mosdns_is_version "$MOSDNS_VER"; then
   c_g "下载 mosdns $MOSDNS_VER ($MARCH)…"
   t=$(mktemp -d)
   curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-${MARCH}.zip" -o "$t/m.zip"
