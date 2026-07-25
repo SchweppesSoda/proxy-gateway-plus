@@ -115,8 +115,10 @@ grep -q 'pdg_write_unit pdg_unit_mihomo' "$ROOT/install.sh" && grep -q 'pdg_writ
 # ── F. v1.6.0: 换核命令已移除 —— 不该再有 switch-core 入口/双核分支残留 ─────────
 { ! grep -q 'cmd_switch_core' "$ROOT/deploy/bot/pdg.sh" && ! grep -q 'switch-core)' "$ROOT/deploy/bot/pdg.sh"; } \
   && ok "pdg.sh 无 switch-core 命令残留(mihomo 为唯一内核)" || bad "pdg.sh 仍有 switch-core 残留"
-grep -q 'pdg_unit_singbox' "$ROOT/lib/units.sh" \
-  && bad "units.sh 仍有 pdg_unit_singbox(应随 sing-box 运行时一并移除)" \
+# 只认**函数定义**: 注释里提到这个名字是合理的(pdg_write_unit 的原子化就是为了挡住
+# 旧 updater 调它), 拿裸 grep 会误报。
+grep -qE '^[[:space:]]*pdg_unit_singbox\(\)' "$ROOT/lib/units.sh" \
+  && bad "units.sh 仍定义了 pdg_unit_singbox(应随 sing-box 运行时一并移除)" \
   || ok "units.sh 已无 sing-box unit 模板"
 
 echo "────────────────────────────────────────"
