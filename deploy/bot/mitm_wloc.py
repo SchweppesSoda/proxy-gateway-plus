@@ -13,8 +13,117 @@ wire 格式(苹果私有, 逆向公开): 头部(locale/identifier 长度前缀)+
 纯 stdlib 手写 protobuf(沿用 parse-geosite.py 的路子), 不引入依赖。
 """
 
+import collections
+import json
+import os
+import threading
+import time
+
 _LOCALE = b"en_US"
 _IDENT = b"com.apple.locationd"
+
+MITM_CONFIG = os.environ.get("PDG_MITM_CONFIG", "/etc/privdns-gateway/mitm.json")
+# 最近一次 WLOC 命中的运行时状态(bot 据此告诉用户"手机真的来过请求了")。
+# 放 /run: 重启即清, 不进备份, 也不该被当成配置。
+STATUS_FILE = os.environ.get("PDG_WLOC_STATUS", "/run/privdns-gateway/wloc-status.json")
+
+# 一次请求处理期间用的**不可变**目标快照 —— 中途配置换了也不影响本次, 绝不半新半旧。
+Snapshot = collections.namedtuple("Snapshot", "active lat lon generation")
+
+
+def _active_loc(w):
+    """取激活地点; 兼容老单坐标格式 {lat,lon}。"""
+    locs = w.get("locations")
+    if locs:
+        for loc in locs:
+            if loc.get("name") == w.get("active"):
+                return loc
+        return locs[0]
+    if "lat" in w and "lon" in w:
+        return {"name": w.get("active") or "默认", "lat": w["lat"], "lon": w["lon"]}
+    return None
+
+
+class WlocConfig:
+    """按 mtime_ns 缓存的 mitm.json 视图 —— pdg-mitm 不重启也能换坐标。
+
+    切地点原先要重启 pdg-mitm(顺带重启 mosdns、重渲内核), 慢且没必要: 接管域名只由 enabled
+    决定, 换坐标并不影响它。这里每次请求先 stat 一下, 变了才整份重读。
+
+    读不到 / 坏档时**保留上一次的有效快照**并记下错误类型: 配置正在被原子替换、或者临时被
+    写坏, 都不该让正在进来的定位请求突然用一个空坐标。半读取的内容一律不用。"""
+
+    def __init__(self, path=None):
+        self.path = path or MITM_CONFIG
+        self._lock = threading.Lock()
+        self._mtime = None
+        self._snap = None
+        self._error = ""
+
+    def _load(self):
+        """(snapshot, mtime_ns, error_type)。mtime 取自同一个 fd —— 先 stat 再 open 会
+        把新文件的内容记成旧文件的 mtime, 之后就再也不刷新了。"""
+        try:
+            with open(self.path, "rb") as f:
+                mt = os.fstat(f.fileno()).st_mtime_ns
+                cfg = json.loads(f.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            return None, None, type(e).__name__
+        w = ((cfg or {}).get("wloc") or {}) if isinstance(cfg, dict) else {}
+        loc = _active_loc(w)
+        if not loc:
+            return None, None, "NoActiveLocation"
+        try:
+            snap = Snapshot(str(w.get("active") or loc.get("name") or ""),
+                            float(loc["lat"]), float(loc["lon"]),
+                            int(w.get("generation") or 0))
+        except (TypeError, ValueError, KeyError) as e:
+            return None, None, type(e).__name__
+        return snap, mt, ""
+
+    def snapshot(self):
+        """(Snapshot 或 None, error_type)。None = 从来没读到过有效配置。"""
+        try:
+            mt = os.stat(self.path).st_mtime_ns
+        except OSError as e:
+            with self._lock:
+                self._error = type(e).__name__
+                return self._snap, self._error
+        with self._lock:
+            if mt == self._mtime and self._snap is not None:
+                return self._snap, ""
+        snap, real_mt, err = self._load()
+        with self._lock:
+            if snap is not None:
+                self._mtime, self._snap, self._error = real_mt, snap, ""
+            else:
+                self._error = err                     # 保留 last-known-good, 只记错误
+            return self._snap, self._error
+
+
+def write_status(generation, target_name, upstream_ok, patched, error_type="", path=None):
+    """写最近一次 WLOC 命中状态(原子替换, 0600)。
+
+    只记这几项 —— BSSID、请求头、Apple 请求正文、设备标识一概不落盘: 这个文件是给 bot 看
+    "手机来过没有"的, 不是抓包记录。"""
+    p = path or STATUS_FILE
+    doc = {"generation": int(generation), "target_name": str(target_name or ""),
+           "received_at": time.time(), "upstream_ok": bool(upstream_ok),
+           "patched": bool(patched), "error_type": str(error_type or ""),
+           "pid": os.getpid()}
+    try:
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        t = p + ".tmp"
+        fd = os.open(t, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.chmod(t, 0o600)
+        os.replace(t, p)
+    except OSError:
+        pass                                          # 状态文件写不了不该影响定位改写本身
+    return doc
 
 
 # ── protobuf 编码 ──
@@ -391,8 +500,24 @@ class WLOCPlugin:
     不碰 gspe*-ssl.ls.apple.com —— 那是 Apple 地图瓦片, 劫了会砸地图。"""
     domains = ["gs-loc.apple.com", "gs-loc-cn.apple.com"]
 
-    def __init__(self, lat, lon, accuracy=50):
-        self.lat, self.lon, self.accuracy = lat, lon, accuracy
+    def __init__(self, lat=None, lon=None, accuracy=50, config=None):
+        """config=WlocConfig → 每次请求按 mitm.json 取最新坐标(热加载);
+        给 lat/lon 则是固定坐标(单测/旧调用方)。"""
+        self.accuracy = accuracy
+        self._config = config
+        self._static = None if config is not None else Snapshot("", float(lat), float(lon), 0)
+        # 兼容旧属性访问(只读取当前值; 热加载模式下反映最近一次快照)
+        self.lat = None if config is not None else float(lat)
+        self.lon = None if config is not None else float(lon)
+
+    def snapshot(self):
+        """本次请求要用的目标 —— **取一次**, 整个请求都用它, 不会半新半旧。"""
+        if self._config is None:
+            return self._static, ""
+        snap, err = self._config.snapshot()
+        if snap is not None:
+            self.lat, self.lon = snap.lat, snap.lon
+        return snap, err
 
     def handle(self, tls, host, port):
         data = b""
@@ -416,6 +541,14 @@ class WLOCPlugin:
             body += chunk
         import sys
         reqline = head.split(b"\r\n", 1)[0].decode("latin1", "ignore")[:60]
+        # 目标快照取一次: 同一个请求里绝不能混用新旧坐标(切换正好落在转发中途也一样)
+        snap, cfg_err = self.snapshot()
+        if snap is None:                          # 从没读到过有效配置 → 不猜坐标, 502 让 iOS 回落
+            sys.stderr.write("[pdg-wloc] %s <= %s | 无可用目标配置(%s)\n" % (host, reqline, cfg_err))
+            sys.stderr.flush()
+            write_status(0, "", upstream_ok=False, patched=False, error_type=cfg_err or "NoConfig")
+            tls.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            return
         try:
             fwd = _forward(host, head, body)      # 转发手机原始请求 → 真响应(格式 100% 对)
         except Exception as e:                    # noqa: BLE001
@@ -424,15 +557,22 @@ class WLOCPlugin:
         if fwd is None:                           # 转发失败: 502 让 iOS 回落(不给坏格式)
             sys.stderr.write("[pdg-wloc] %s <= %s | body=%d 转发失败\n" % (host, reqline, len(body)))
             sys.stderr.flush()
+            write_status(snap.generation, snap.active, upstream_ok=False, patched=False,
+                         error_type="ForwardFailed")
             tls.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             return
         rctype, rbody = fwd
         # 只改坐标, 保留 Apple 原本精度: 收紧精度会触发 iOS 反作弊(过度精确+瞬移)→ 退回真实定位, 实测适得其反。
-        patched = patch_response(rbody, self.lat, self.lon)
-        sys.stderr.write("[pdg-wloc] %s <= %s | req=%d resp=%d patched=%d %s → (%s, %s)\n"
+        patched = patch_response(rbody, snap.lat, snap.lon)
+        sys.stderr.write("[pdg-wloc] %s <= %s | req=%d resp=%d patched=%d %s → (%s, %s) gen=%d\n"
                          % (host, reqline, len(body), len(rbody), len(patched),
-                            "改写OK" if patched != rbody else "未命中坐标", self.lat, self.lon))
+                            "改写OK" if patched != rbody else "未命中坐标",
+                            snap.lat, snap.lon, snap.generation))
         sys.stderr.flush()
+        # cfg_err 不为空 = 这次用的是 last-known-good(配置正被替换或临时坏掉)。请求本身照常
+        # 完成, 但要如实记下来 —— 否则"配置坏了却一直按旧坐标应答"从状态上完全看不出来。
+        write_status(snap.generation, snap.active, upstream_ok=True, patched=patched != rbody,
+                     error_type=cfg_err or ("" if patched != rbody else "NoCoordsInResponse"))
         tls.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: " + rctype
                     + b"\r\nContent-Length: " + str(len(patched)).encode()
                     + b"\r\nConnection: close\r\n\r\n" + patched)

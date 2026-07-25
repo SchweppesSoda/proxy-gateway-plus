@@ -580,7 +580,7 @@ def _mitm_transact(new_wloc):
             _restore(); return False, "MITM 应用异常(%s), 已回滚。" % type(e).__name__
 
 def _wloc_state():
-    """归一化 WLOC 配置(迁移老单坐标格式)→ {enabled, accuracy, active, locations:[{name,lat,lon}]}。"""
+    """归一化 WLOC 配置(迁移老单坐标格式)→ {enabled, accuracy, active, generation, locations:[…]}。"""
     w = dict(_mitm_config().get("wloc") or {})
     locs = w.get("locations")
     if locs is None:                              # 迁移老格式 {lat,lon} → 一个"默认"地点
@@ -588,6 +588,10 @@ def _wloc_state():
     w["locations"] = locs
     w.setdefault("accuracy", 50)
     w.setdefault("enabled", False)
+    try:
+        w["generation"] = int(w.get("generation") or 0)
+    except (TypeError, ValueError):
+        w["generation"] = 0
     if w.get("active") not in [l["name"] for l in locs]:
         w["active"] = locs[0]["name"] if locs else None
     return w
@@ -602,8 +606,28 @@ def _wloc_active(w=None):
 def _wloc_save(w):
     cfg = _mitm_config()
     cfg["wloc"] = {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
-                   "active": w.get("active"), "locations": w.get("locations", [])}
+                   "active": w.get("active"), "generation": int(w.get("generation") or 0),
+                   "locations": w.get("locations", [])}
     _save_mitm_config(cfg)
+
+def _wloc_edit_locked(mutate):
+    """在配置锁内读-改-写 mitm.json(内部 os.replace, 不留半个 JSON)。
+
+    切地点走这里而不是 _mitm_transact: 接管域名只由 enabled 决定, 换坐标既不影响 CA、也不
+    影响 hijack 表和内核路由, 而 pdg-mitm 现在会自己按 mtime 热加载坐标 —— 那一整套
+    (预热证书/重渲内核/重启 pdg-mitm/重启 mosdns)对"只换经纬度"是纯粹的浪费, 还会断一次
+    DNS。返回改后的 w; 锁忙返回 None。"""
+    with _cfg_guard() as got:
+        if not got:
+            return None
+        w = _wloc_state()
+        mutate(w)
+        _wloc_save(w)
+        return w
+
+def _wloc_bump(w):
+    """generation +1 —— bot 靠它认出"这次 WLOC 命中对应的是我刚才那次切换"。"""
+    w["generation"] = int(w.get("generation") or 0) + 1
 
 def wloc_add(name, lat, lon):
     """加/改一个命名地点(不自动启用; 无激活项时设为激活)。"""
@@ -626,31 +650,63 @@ def wloc_del(name):
     w = _wloc_state()
     if not any(l["name"] == name for l in w["locations"]):
         return False, "没有这个地点"
-    w["locations"] = [l for l in w["locations"] if l["name"] != name]
-    if w.get("active") == name:
-        w["active"] = w["locations"][0]["name"] if w["locations"] else None
-        if not w["active"]:
-            w["enabled"] = False
+    remaining = [l for l in w["locations"] if l["name"] != name]
+    if w.get("active") != name:
+        # 删的不是当前目标: 接管域名与坐标都没变 → 只更新列表, 一个服务都不用动
+        if _wloc_edit_locked(lambda ww: ww.__setitem__(
+                "locations", [l for l in ww["locations"] if l["name"] != name])) is None:
+            return False, BUSY_MSG
+        return True, f"✅ 已删除 <b>{name}</b>"
+    if remaining:
+        # 删的是当前目标, 还有别的 → 切到剩下的第一个, 走热切换(仍不必重启任何服务)
+        nxt = remaining[0]["name"]
+        def _mut(ww):
+            ww["locations"] = [l for l in ww["locations"] if l["name"] != name]
+            ww["active"] = nxt
+            _wloc_bump(ww)
+        if _wloc_edit_locked(_mut) is None:
+            return False, BUSY_MSG
+        return True, f"✅ 已删除 <b>{name}</b>，当前目标切到 <b>{nxt}</b>"
+    # 删掉最后一个地点: 没有目标可用 → WLOC 必须关掉, 接管域名要撤 → 走完整事务
+    w["locations"] = []
+    w["active"] = None
+    if not w.get("enabled"):
+        if _wloc_edit_locked(lambda ww: ww.update({"locations": [], "active": None})) is None:
+            return False, BUSY_MSG
+        return True, f"✅ 已删除 <b>{name}</b>（已无地点）"
+    w["enabled"] = False
     ok, msg = _mitm_transact(w)          # 事务化(内部写 mitm.json): 失败则不落新态, 回滚旧态
-    return (True, f"✅ 已删除 <b>{name}</b>") if ok else (False, msg)
+    return (True, f"✅ 已删除 <b>{name}</b>（已无地点，WLOC 已关闭）") if ok else (False, msg)
 
-def wloc_switch(name):
-    """切换激活地点(启用中则热重载坐标)。"""
+def wloc_switch_gen(name):
+    """切换激活地点。返回 (ok, msg, generation)。
+
+    快路径: 只在配置锁内原子改 mitm.json 的 active + generation。不预热 CA、不写 hijack、
+    不重渲内核、不重启 mihomo/mosdns/pdg-mitm —— 那些只有"接管域名变了"(开/关 WLOC)才需要,
+    而 pdg-mitm 会按 mtime 自己热加载新坐标。目标是这条路径 1 秒内完成。"""
     if _platform() != "ios":
-        return False, "位置改写(WLOC)仅 iOS 平台可用。"
+        return False, "位置改写(WLOC)仅 iOS 平台可用。", 0
     w = _wloc_state()
     if not any(l["name"] == name for l in w["locations"]):
-        return False, "没有这个地点"
-    w["active"] = name
-    if w.get("enabled"):
-        ok, msg = _mitm_transact(w)      # 开启中: 事务化热切坐标(失败回滚, active 不变脏)
-        if not ok:
-            return False, msg
-    else:
-        _wloc_save(w)                    # 未开启: 只存, 不动服务
+        return False, "没有这个地点", 0
+    def _mut(ww):
+        ww["active"] = name
+        _wloc_bump(ww)
+    w = _wloc_edit_locked(_mut)
+    if w is None:
+        return False, BUSY_MSG, 0
     loc = _wloc_active(w)
-    tail = "" if w.get("enabled") else "\n(WLOC 未开启, 点「开启」才生效)"
-    return True, f"✅ 已切到 <b>{name}</b>({loc['lat']}, {loc['lon']})" + tail
+    if not w.get("enabled"):
+        return True, (f"✅ 已选中 <b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
+                      "WLOC 未开启，这个地点还不会生效 —— 点「✅ 开启」后才会改写定位。"), w["generation"]
+    return True, (f"✅ 网关目标已切换：<b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
+                  "WLOC 已热加载，无需重启网关服务。\n\n"
+                  "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), w["generation"]
+
+def wloc_switch(name):
+    """切换激活地点(兼容 2 元组返回)。"""
+    ok, msg, _gen = wloc_switch_gen(name)
+    return ok, msg
 
 def wloc_enable(on):
     """开/关 WLOC(开启需已有激活地点)。"""
@@ -660,6 +716,8 @@ def wloc_enable(on):
     if on and not _wloc_active(w):
         return False, "请先「➕ 添加地点」设一个坐标再开启。"
     w["enabled"] = bool(on)
+    if on:
+        _wloc_bump(w)                    # 开启也是一次新目标 → 让 bot 能等这一代的命中
     ok, msg = _mitm_transact(w)          # 事务化: 失败则 enabled 不被持久化(回滚), 不留"返回失败却 enabled=true"
     if not ok:
         return False, msg
@@ -668,8 +726,77 @@ def wloc_enable(on):
         return True, (f"✅ 位置改写已开启：<b>{w['active']}</b>（{loc['lat']}, {loc['lon']}）\n\n"
                       "首次开启后，请到「📱 客户端」重新生成并安装 iOS 描述文件，"
                       "然后在「证书信任设置」中信任 PrivDNS Gateway MITM CA。\n\n"
-                      "若位置没有刷新，请重新开关定位服务或重启手机。")
+                      "然后关闭 iPhone 定位服务，等 2 秒再打开 —— 下一次 Apple 网络定位请求就会用新坐标。")
     return True, "✅ 位置改写已关闭。"
+
+def wloc_generation():
+    """当前 WLOC 目标代号(bot 等命中用)。"""
+    return int(_wloc_state().get("generation") or 0)
+
+# ── 等一次真实的 WLOC 命中 ───────────────────────────────────────────────────
+# 网关能保证的只有"下一次 WLOC 请求会用新坐标"; 手机什么时候发那次请求、locationd 缓存要不要
+# 清, 都不归网关管。所以这里等的是**手机真的来过请求**这件事实, 措辞也只说到这一步 ——
+# 绝不把"网关改写了响应"说成"手机位置已经变了"。
+WLOC_STATUS_FILE = os.environ.get("PDG_WLOC_STATUS", "/run/privdns-gateway/wloc-status.json")
+_wloc_watch_gen: dict[int, int] = {}             # chat -> 最近一次切换的 generation
+_wloc_watch_lock = threading.Lock()
+
+def _wloc_read_status():
+    try:
+        with open(WLOC_STATUS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:  # noqa: BLE001            # 文件还没有 / 正在被替换 / 坏档 → 当作还没命中
+        return None
+
+def _wloc_hit_text(st, target):
+    """把一次命中翻译成给用户的话。区分三种结局, 不含糊。"""
+    if st.get("upstream_ok") and st.get("patched"):
+        return (f"✅ 已收到 iPhone 的新定位请求\n"
+                f"Apple 网络定位响应已改写为：<b>{target}</b>\n\n"
+                "若地图仍显示旧位置，属于 iOS 缓存或 GPS 覆盖。")
+    if not st.get("upstream_ok"):
+        return (f"❌ 收到了 iPhone 的新定位请求，但网关取 Apple 原始响应失败"
+                f"（{st.get('error_type') or '未知'}），本次未改写。\n"
+                "请检查网关到 Apple 的出网是否正常，稍后再试一次开关定位服务。")
+    return (f"⚠️ 收到了 iPhone 的新定位请求，Apple 响应也拿到了，但里面没有可改写的坐标字段"
+            f"（{st.get('error_type') or '未知'}），本次未改写。")
+
+WLOC_MISS_TEXT = ("⚠️ 网关目标已切换，但尚未收到 iPhone 的新 WLOC 请求。\n\n"
+                  "请检查：\n"
+                  "· 当前使用内网卡\n"
+                  "· 控制中心 Wi-Fi 已点灰\n"
+                  "· 网关 CA 已信任\n"
+                  "· iOS 定位缓存；iOS 26 必要时重启")
+
+def _wloc_watch_async(chat, mid, gen, target, timeout=30.0, interval=0.5, kb=None):
+    """后台等这一代 generation 的命中, 最多 timeout 秒, 然后原地编辑那条消息。
+
+    放后台执行器里跑 —— 主 getUpdates 循环一秒都不等它。不走 run_bg: 那会占住 per-chat BUSY,
+    等待期间用户连再切一次地点都做不了。用户又切了新地点时, 旧任务发现 generation 变了就
+    闭嘴退出, 绝不覆盖新切换的消息。"""
+    with _wloc_watch_lock:
+        _wloc_watch_gen[chat] = gen
+    def superseded():
+        with _wloc_watch_lock:
+            return _wloc_watch_gen.get(chat) != gen
+    def go():
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if superseded():
+                return
+            st = _wloc_read_status()
+            if st is not None and int(st.get("generation") or -1) == gen:
+                if not superseded():
+                    edit(chat, mid, _wloc_hit_text(st, target), kb or WLOC_BACK)
+                return
+            time.sleep(interval)
+        if not superseded():
+            edit(chat, mid, WLOC_MISS_TEXT, kb or WLOC_BACK)
+    try:
+        return _EXEC.submit(go)
+    except Exception:  # noqa: BLE001            # 执行器满/已关 → 不等了, 消息保持"已切换"即可
+        return None
 
 def set_wloc(on, lat=None, lon=None):
     """兼容旧接口: 给了 lat/lon 就存成「默认」地点并激活, 再开/关。"""
@@ -3305,10 +3432,16 @@ def handle_cb(chat, mid, data):
              "① 添加地点并开启 WLOC\n"
              "② 返回「📱 客户端」，重新生成并安装 iOS 描述文件\n"
              "③ 到「设置 → 通用 → 关于本机 → 证书信任设置」，信任 PrivDNS Gateway MITM CA\n\n"
-             "<b>手机端（全程用内网卡）：</b>\n"
-             "· 首次 / 后续无法定位时：设置 → 通用 → 传输或还原 iPhone → 还原 → 还原位置与隐私 → 重启手机\n"
-             "· 关闭再开启定位服务：设置 → 隐私与安全性 → 定位服务\n"
-             "· 控制中心关 Wi-Fi（把图标点灰，不是在设置里关）",
+             "<b>切换地点的推荐顺序（全程用内网卡）：</b>\n"
+             "① 控制中心把 Wi-Fi 点灰（不是在设置里关 Wi-Fi）\n"
+             "② 在 Bot「📍 地点 / 切换」里点目标地点\n"
+             "③ 等 Bot 显示「WLOC 已热加载」\n"
+             "④ 设置 → 隐私与安全性 → 定位服务：关闭，等 2 秒后重新开启\n"
+             "⑤ 打开目标 App\n"
+             "⑥ iOS 26 如果一直没有发起新的 WLOC 请求，可能仍需重启手机\n\n"
+             "切地点只改网关配置，不重启任何服务；网关能保证的是<b>下一次</b> Apple 网络定位"
+             "请求用新坐标，iOS 自己的定位缓存不归网关清。\n"
+             "长期无法定位时：设置 → 通用 → 传输或还原 iPhone → 还原 → 还原位置与隐私 → 重启手机",
              {"inline_keyboard": [
                  [{"text": "🟢 已开启" if on else "✅ 开启", "callback_data": "wloc:on"},
                   {"text": "关闭", "callback_data": "wloc:off"}],
@@ -3325,7 +3458,8 @@ def handle_cb(chat, mid, data):
                 + f"{l['name']} ({l['lat']}, {l['lon']})", "callback_data": f"wloc:sw:{i}"}]
               for i, l in enumerate(w["locations"])]
         kb.append([{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}])
-        edit(chat, mid, "点一个地点即切换到它(开启中会热切换):", {"inline_keyboard": kb}); return
+        edit(chat, mid, "点一个地点即切换到它。\n开启中为热切换：只改网关配置，不重启服务；"
+                        "切完请关闭定位服务、等 2 秒再开启。", {"inline_keyboard": kb}); return
     if data == "wloc:add":
         state[chat] = "wloc_add"
         send(chat, "发「<b>名称 纬度,经度</b>」如 <code>上海 31.2304,121.4737</code>(小数;北纬东经为正)。/cancel 取消。", BACK); return
@@ -3340,10 +3474,15 @@ def handle_cb(chat, mid, data):
     if data.startswith("wloc:sw:"):
         w = _wloc_state(); i = int(data.rsplit(":", 1)[1])
         if 0 <= i < len(w["locations"]):
-            ok, msg = wloc_switch(w["locations"][i]["name"])
-            edit(chat, mid, msg if ok else ("❌ " + msg),
-                 {"inline_keyboard": [[{"text": "📍 地点列表", "callback_data": "wloc:list"}],
-                                      [{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}]]})
+            name = w["locations"][i]["name"]
+            kb = {"inline_keyboard": [[{"text": "📍 地点列表", "callback_data": "wloc:list"}],
+                                      [{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}],
+                                      [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+            ok, msg, gen = wloc_switch_gen(name)   # 快路径: 只写配置, 不动任何服务
+            edit(chat, mid, msg if ok else ("❌ " + msg), kb)
+            if ok and _wloc_state().get("enabled"):
+                # 切换本身已经完成了; 下面只是在后台等手机真的来一次请求, 好把结果如实回报
+                _wloc_watch_async(chat, mid, gen, name, kb=kb)
         return
     if data.startswith("wloc:rm:"):
         w = _wloc_state(); i = int(data.rsplit(":", 1)[1])

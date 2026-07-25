@@ -18,6 +18,35 @@ WLOC 改的是 **Apple 网络定位查询**(`gs-loc.apple.com` / 国区 `gs-loc-
 ### 关键实现:forward+patch(**不能自造响应**)
 早期版本"凭空构造"一个 gs-loc 响应,头部/格式对不上,iOS 直接丢弃。现在 `mitm_wloc.handle` 改成:**把手机原始请求(连 `User-Agent: locationd/...` 等头一起、去掉 Accept-Encoding)转发给真 gs-loc → 拿回真 protobuf 响应 → 递归把每个 location 子消息的 field1/field2(纬/经×1e8)patch 成目标坐标 → 原样返回**。格式 100% 保真,iOS 才接受。要点:响应按 Content-Length 读完就停(别等 close,否则 200 keep-alive 会超时丢响应);上游真 IP 用外部 DNS(8.8.8.8/1.1.1.1/223.5.5.5)解析,绕开本机 mosdns 的劫持。
 
+### 切地点 = 热切换(不重启任何服务)
+
+接管域名只由 `wloc.enabled` 决定,**换经纬度并不改变它**。所以切地点走一条快路径:
+
+- bot 在配置锁内**原子改写** `mitm.json` 的 `active`,并把 `generation` 整数 +1;
+- 不预热 CA、不写 `mitm_hijack.txt`、不重渲内核、不重启 mihomo / mosdns / pdg-mitm;
+- `pdg-mitm` 侧由 `mitm_wloc.WlocConfig` 按 `mtime_ns` 缓存配置:每个 WLOC 请求开始时取**一次**
+  不可变快照 `(active, lat, lon, generation)`,整个请求都用它 —— 切换正好落在转发中途也不会
+  半新半旧。配置临时不可读或坏档时保留 last-known-good,并把错误类型记进状态文件,绝不用半读取的内容。
+- 开 / 关 WLOC(接管域名真的变了)仍走原来的完整事务:CA → hijack → 内核 → pdg-mitm → mosdns,
+  任一步失败全量回滚。
+
+`generation` 是一次切换的代号,用来把"手机来的这次请求"对上"用户刚才那次点击"。`pdg-mitm` 每
+处理完一次 WLOC 请求就原子写一份运行时状态到 `/run/privdns-gateway/wloc-status.json`(0600):
+
+```json
+{"generation": 8, "target_name": "大阪", "received_at": 1.7e9,
+ "upstream_ok": true, "patched": true, "error_type": "", "pid": 12345}
+```
+
+只有这几项 —— BSSID、请求头、Apple 请求正文、设备标识一概不落盘。bot 切换后在后台线程池里
+等最多 30 秒(不占 per-chat BUSY,主 getUpdates 一秒都不等它):等到同 `generation` 的记录就把
+原消息改成"已收到 iPhone 的新定位请求";没等到就如实说没等到。等待期间用户又切了地点的话,
+旧任务发现 `generation` 变了会直接退出,不覆盖新消息。
+
+**措辞边界**:网关能保证的只有"下一次 WLOC 请求会用新坐标"。它无法让 iOS 清 locationd 缓存,
+也无法强制手机立刻发请求,所以 bot 只说到"网关目标已切换 / 已收到新请求并改写了响应",
+绝不说成"手机位置已经变了"。
+
 ### 能力与限制
 - ✅ **任意城市,含跨国**(北京、东京丸之内均实测成功)。早期"跨国转圈定不了位"是**切换瞬态**,不是永久拒绝。
 - ⏳ **iOS 26 缓存极重**:切城市后手机严重滞后,必须「设置→隐私→定位服务」关开一次或重启才刷新;切到差很远的地方会先转圈再稳。
@@ -26,10 +55,10 @@ WLOC 改的是 **Apple 网络定位查询**(`gs-loc.apple.com` / 国区 `gs-loc-
 ## 使用
 
 1. 装机选 iOS(`PDG_PLATFORM=ios`)→ 自动装 `pdg-mitm` 服务。
-2. bot「🛠 运维 → 🍏 位置改写」→「➕ 添加地点」发「名称 纬度,经度」(如 `上海 31.2304,121.4737`)→「📍 地点/切换」点城市 →「✅ 开启」。多地点随时增删,开启中热切换。
+2. bot「🛠 运维 → 🍏 位置改写」→「➕ 添加地点」发「名称 纬度,经度」(如 `上海 31.2304,121.4737`)→「📍 地点/切换」点城市 →「✅ 开启」。多地点随时增删;**开启中切地点是热切换,不重启任何服务**(见下文)。
 3. bot「📱 客户端 → iOS 描述文件」装到 iPhone(描述文件已内含网关 CA)。
 4. **iPhone 手动信任 CA**:设置 → 通用 → VPN与设备管理(装描述文件)→ 关于 → 证书信任设置 → 对「PrivDNS Gateway MITM CA」开完全信任。
-5. 用时:内网卡在用 + **控制中心关 WiFi**;切城市后去「定位服务」关开一次刷新。
+5. 用时:内网卡在用 + **控制中心关 WiFi**;切城市后去「定位服务」关一次、等 2 秒再开,让手机重新发起一次 WLOC 请求。
 
 > ⚠️ **信任代价**:设备信任这张 CA = 它能解密该设备**所有 HTTPS**。系统只对声明的接管域名(gs-loc)实际 MITM,其余不解密,但能力是广的。仅用于自己的设备。
 

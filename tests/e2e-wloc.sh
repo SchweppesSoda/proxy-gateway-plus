@@ -107,6 +107,57 @@ PY
     && ok "响应头部字节不变(iOS 对格式敏感)" || bad "头部被改动"
 fi
 
+# ══ 2.5 切地点走快路径: 一个服务都不许重启 ══════════════════════════════════
+# 只改经纬度时接管域名没变 —— CA、hijack 表、内核路由都不用动, pdg-mitm 自己按 mtime 热加载。
+# 这里以**整个装机现场**为背景验证: 切换前后 hijack/内核配置逐字节不变, 且期间没有任何
+# systemctl 调用(桩把每次调用记在 /tmp/e2e-calls.log)。
+echo; echo "── 2.5 切换地点(快路径) ──"
+python3 - > /tmp/wloc-add.out 2>&1 <<'PY'
+import sys; sys.path.insert(0, "/opt/pdg-bot")
+import bot
+print(bot.wloc_add("札幌", 43.0621, 141.3544))
+PY
+HIJ_SHA="$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | cut -d' ' -f1)"
+CFG_SHA="$(sha256sum /etc/mihomo/config.yaml | cut -d' ' -f1)"
+GEN_BEFORE="$(python3 -c "import json;print(json.load(open('/etc/privdns-gateway/mitm.json'))['wloc'].get('generation',0))")"
+CALLS_BEFORE="$(wc -l < /tmp/e2e-calls.log)"
+SW_T0="$(date +%s%N)"
+python3 - > /tmp/wloc-sw.out 2>&1 <<'PY'
+import sys; sys.path.insert(0, "/opt/pdg-bot")
+import bot
+okr, msg, gen = bot.wloc_switch_gen("札幌")
+print(("OK|" if okr else "FAIL|") + str(gen) + "|" + msg.replace("\n", " "))
+PY
+SW_MS=$(( ($(date +%s%N) - SW_T0) / 1000000 ))
+grep -q '^OK|' /tmp/wloc-sw.out && ok "切换到札幌成功(含 python 冷启动共 ${SW_MS}ms)" \
+  || bad "切换失败: $(cat /tmp/wloc-sw.out)"
+python3 -c "
+import json,sys
+w=json.load(open('/etc/privdns-gateway/mitm.json'))['wloc']
+sys.exit(0 if w['active']=='札幌' and w.get('generation',0)==$GEN_BEFORE+1 else 1)" \
+  && ok "mitm.json: active=札幌 且 generation +1" || bad "active/generation 没落对"
+[[ "$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | cut -d' ' -f1)" == "$HIJ_SHA" ]] \
+  && ok "劫持表逐字节未变(接管域名没变, 不该重写)" || bad "hijack 表被改写了"
+[[ "$(sha256sum /etc/mihomo/config.yaml | cut -d' ' -f1)" == "$CFG_SHA" ]] \
+  && ok "mihomo 配置逐字节未变(不重渲内核)" || bad "内核配置被重渲了"
+NEW_CALLS="$(tail -n +$((CALLS_BEFORE + 1)) /tmp/e2e-calls.log | grep -c systemctl)"
+[[ "$NEW_CALLS" == 0 ]] \
+  && ok "切换期间零 systemctl 调用(mihomo/mosdns/pdg-mitm 均未重启)" \
+  || bad "切换期间执行了 systemctl: $(tail -n +$((CALLS_BEFORE + 1)) /tmp/e2e-calls.log | grep systemctl | head -3)"
+
+# 热加载: 同一个 WlocConfig 实例在配置换掉后给出新目标(pdg-mitm 进程不必重启)
+python3 - > /tmp/wloc-reload.out 2>&1 <<'PY'
+import sys; sys.path.insert(0, "/opt/pdg-bot")
+import bot, mitm_wloc
+cfg = mitm_wloc.WlocConfig("/etc/privdns-gateway/mitm.json")
+s1, _ = cfg.snapshot()
+bot.wloc_switch_gen("大阪")
+s2, _ = cfg.snapshot()
+print("SNAP|%s,%s|%s,%s" % (s1.active, s1.generation, s2.active, s2.generation))
+PY
+grep -qE 'SNAP\|札幌,[0-9]+\|大阪,[0-9]+' /tmp/wloc-reload.out \
+  && ok "同一 WlocConfig 实例热加载出新目标(不重启 pdg-mitm)" || bad "热加载没生效: $(cat /tmp/wloc-reload.out)"
+
 # ══ 3. 关闭 WLOC: 事务必须把接管彻底撤掉 ════════════════════════════════════
 echo; echo "── 3. 关闭 WLOC ──"
 python3 - > /tmp/wloc-off.out 2>&1 <<PY
