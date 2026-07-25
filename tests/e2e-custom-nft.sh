@@ -187,5 +187,83 @@ grep -q 'redirect to :7893' <<<"$rs" \
 grep -q 'tcp dport { 22 } accept' /etc/nftables.conf \
   && ok "SSH 端口仍放行(没把自己锁在门外)" || bad "2f: SSH 放行没了"
 
-rm -f "$NFT_STATE"
+# ══ 场景 3: `nft list ruleset` 读不到 → 不能当成"现场干净"就往下切 ═══════════
+# 配置文件干净、但内存里可能还挂着 input 链(非 root / nft 不可用时根本看不到)。
+# 旧实现把读失败静默当成没有冲突, 于是照常迁移 —— "配置保留、端口不通"换个入口又回来了。
+echo; echo "── 3. 运行 ruleset 读不到(权限不足/nft 不可用) ──"
+seed_sb
+cat > /etc/nftables.conf <<'NFT'
+#!/usr/sbin/nft -f
+table inet pdg
+delete table inet pdg
+
+table inet pdg {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        tcp dport { 22 } accept
+    }
+}
+NFT
+nft -f /etc/nftables.conf
+CONF_SHA3="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+RULESET_SHA3="$(nft list ruleset | sha256sum | cut -d' ' -f1)"
+SVC_BEFORE3="$(svc_state)"
+# 只让 `list ruleset` 失败(真实形态: nft 在, 但读 ruleset 要 CAP_NET_ADMIN), 其余子命令照旧
+cp /usr/local/bin/nft /usr/local/bin/nft.real
+cat > /usr/local/bin/nft <<'S'
+#!/bin/sh
+if [ "$1" = list ] && [ "$2" = ruleset ]; then
+  echo "Error: Could not process rule: Operation not permitted" >&2; exit 1
+fi
+exec /usr/local/bin/nft.real "$@"
+S
+chmod 755 /usr/local/bin/nft
+
+out=$(bash /usr/local/bin/pdg __migrate 2>&1); rc=$?
+[[ "$rc" != 0 ]] && ok "读不到运行 ruleset → 迁移中止(不冒充现场干净)" || bad "3: 居然照常迁移了 rc=$rc"
+grep -q '无法确认' <<<"$out" \
+  && ok "说明了原因: 无法确认是否存在其它 input base chain" || bad "3b: 没说清原因: $(tail -4 <<<"$out")"
+cp -f /usr/local/bin/nft.real /usr/local/bin/nft      # 还原后再验现场
+[[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA3" ]] \
+  && ok "中止后 /etc/nftables.conf 逐字节未变" || bad "3c: 配置被改写了"
+[[ "$(nft list ruleset | sha256sum | cut -d' ' -f1)" == "$RULESET_SHA3" ]] \
+  && ok "中止后运行中的 ruleset 未变" || bad "3d: 运行规则被改了"
+[[ "$(svc_state)" == "$SVC_BEFORE3" ]] \
+  && ok "中止后核心服务状态未变" || bad "3e: 服务状态变了: $SVC_BEFORE3 → $(svc_state)"
+[[ "$(cat /etc/privdns-gateway/backend)" == singbox ]] \
+  && ok "中止后 backend 标记仍是 singbox" || bad "3f: backend=$(cat /etc/privdns-gateway/backend)"
+
+# ══ 场景 4: 迁移**之后**用户再加 input 链 → doctor 要报出来 ═════════════════
+# 前置门只管迁移当时; 之后现场变了没人再提醒, 端口看着开着实际不通。
+echo; echo "── 4. 迁移后新增 input 链 → pdg doctor 报冲突 ──"
+cat >> /etc/nftables.conf <<'NFT'
+
+table inet lateradd {
+    chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport 9443 accept
+    }
+}
+NFT
+nft -f /etc/nftables.conf
+d_out=$(python3 -c "
+import sys; sys.path.insert(0,'/opt/pdg-bot')
+import checks
+print(checks.check_nft_input_chains())" 2>&1)
+grep -q "'fail'" <<<"$d_out" && grep -q 'lateradd' <<<"$d_out" \
+  && ok "doctor 报出后加的 input 链(inet lateradd)" || bad "4: doctor 没报: $d_out"
+# 去掉后应回到 ok(不是恒报警)
+python3 - <<'PY'
+txt = open("/etc/nftables.conf", encoding="utf-8").read()
+open("/etc/nftables.conf", "w", encoding="utf-8").write(txt.split("table inet lateradd")[0])
+PY
+nft -f /etc/nftables.conf
+d_out=$(python3 -c "
+import sys; sys.path.insert(0,'/opt/pdg-bot')
+import checks
+print(checks.check_nft_input_chains())" 2>&1)
+grep -q "'ok'" <<<"$d_out" && ok "冲突链移除后 doctor 回到 ok(不恒报警)" || bad "4b: $d_out"
+
+rm -f "$NFT_STATE" /usr/local/bin/nft.real
 e2e_summary

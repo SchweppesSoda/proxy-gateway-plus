@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """PrivDNS Gateway 只读检查库。doctor.py 跑全部, healthcheck.py 跑子集。
 每个 check() 返回 (level, label, detail), level ∈ 'ok'|'warn'|'fail'|'info'。只读, 不改任何东西。"""
-import os, re, json, ipaddress, subprocess, urllib.request
+import os, re, json, ipaddress, subprocess, sys, urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nftscan  # noqa: E402  与迁移前置门共用的 input 链冲突判据(单一来源)
 
 SB = "/etc/sing-box/config.json"
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
@@ -705,8 +708,27 @@ def check_rulesets():
     return ("ok", "规则集", "%d 个, 格式均可被 mihomo 加载" % len(meta))
 
 
+def check_nft_input_chains():
+    """除 table inet pdg 外还有挂 hook input 的 base chain → 本项目的放行会被架空。
+
+    装机/迁移时有前置门挡着, 但那只管当时: 之后用户自己往 filter 表加一条 input 链, 谁也不会
+    再提醒 —— 端口看着开着、实际不通, 而且从配置文件上完全看不出问题。判据与迁移前置门共用
+    nftscan.py, 不另写一份。"""
+    found, readable = nftscan.scan()
+    if found:
+        return ("fail", "input 链冲突",
+                "; ".join(found) + " —— PDG 的 input chain 是 policy drop, 同一 hook 上每条 "
+                "base chain 都会执行, 上述表里的放行会被架空(端口看着开着实际不通)。"
+                "请把需要的放行并入 table inet pdg 的 input chain, 或把那些链改挂到非 input hook。")
+    if not readable:
+        return ("warn", "input 链冲突",
+                "读不到运行中的 nftables ruleset(需 root), 仅据 " + NFT_CONF + " 判断: 未见冲突")
+    return ("ok", "input 链冲突", "只有 table inet pdg 挂在 hook input 上")
+
+
 ALL = [check_platform, check_services, check_core_version, check_dot_arecord, check_dot_domain_sync,
-       check_internal_cidr, check_nft, check_redirect, check_gms, check_mosdns_ratelimit, check_mem,
+       check_internal_cidr, check_nft, check_nft_input_chains, check_redirect, check_gms,
+       check_mosdns_ratelimit, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,

@@ -1551,42 +1551,19 @@ run_all_migrations(){
 # WireGuard 的 accept 会被 PDG 这条 drop 架空: 配置文本还在, 端口实际已经不通, 而迁移还报成功。
 # 这种"看着保留、其实失效"比直接报错危险得多, 故一律中止, 交由用户手工合并。
 # 检测同时看**配置文件**与**当前运行 ruleset**(两边都可能只有一侧有), 宁可保守中止。
-# stdout: 冲突描述(每行一条); 有冲突返回 0, 没有返回 1。
+# 判据本身放在 deploy/bot/nftscan.py —— 迁移前置门与 doctor 共用同一份, 免得两处正则各写
+# 一遍慢慢漂移(一边判冲突一边判干净, 比都不判还糟)。
+# stdout: 冲突描述(每行一条)。返回 0=有冲突, 1=确认没有, 2=读不到运行 ruleset 无法确认。
 _pdg_nft_foreign_input_chains(){
-  local conf="${1:-/etc/nftables.conf}" tmp rc
-  # 走临时文件而不是管道: `python3 -` 的程序本身来自 heredoc(即 stdin), 管道进来的数据会被
-  # heredoc 顶掉, sys.stdin 读到的是空 —— 检测会静默失效(shellcheck SC2259 正是提示这个)。
-  tmp="$(mktemp)" || return 1
-  { [[ -f "$conf" ]] && cat "$conf"; echo "### __PDG_LIVE__ ###"; nft list ruleset 2>/dev/null; } > "$tmp"
-  python3 - "$tmp" <<'PY'
-import re, sys
-raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-conf_txt, _, live_txt = raw.partition("### __PDG_LIVE__ ###")
-tbl_open = re.compile(r"^\s*table\s+(\S+)\s+(\S+)\s*\{")
-hook_in  = re.compile(r"\bhook\s+input\b")
-found = []
-for src, txt in (("配置文件", conf_txt), ("运行 ruleset", live_txt)):
-    cur, depth = None, 0
-    for ln in txt.split("\n"):
-        m = tbl_open.match(ln)
-        if m and depth == 0:
-            cur = "%s %s" % (m.group(1), m.group(2)); depth = 0
-        if cur is not None:
-            depth += ln.count("{") - ln.count("}")
-            if hook_in.search(ln) and cur != "inet pdg":
-                found.append("%s: 表 `%s` 有挂 hook input 的 base chain" % (src, cur))
-            if depth <= 0:
-                cur = None
-seen, out = set(), []
-for f in found:
-    if f not in seen:
-        seen.add(f); out.append(f)
-print("\n".join(out))
-sys.exit(0 if out else 1)
-PY
-  rc=$?
-  rm -f "$tmp"
-  return "$rc"
+  local conf="${1:-/etc/nftables.conf}" scan
+  for scan in "${REPO_DIR:-/opt/privdns-gateway}/deploy/bot/nftscan.py" /opt/pdg-bot/nftscan.py; do
+    [[ -f "$scan" ]] || continue
+    python3 "$scan" "$conf"
+    return $?
+  done
+  # 判据脚本都不在 → 不能假装现场干净(那正是这道门要挡的事), 按"无法确认"处理
+  echo "找不到 nftscan.py(判据脚本缺失), 无法确认 input 链冲突"
+  return 2
 }
 
 # 把渲染好的 pdg 表块**合并**进现网 nftables.conf: 只替换本项目管理区(table inet pdg 的
@@ -1679,9 +1656,15 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   [[ -f "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" ]] || { echo "缺 nftables-mihomo.conf(先 pdg update)"; return 1; }
   # 兜底(调用方本应已在更早处拦下): 别的 input base chain 与 PDG 的 policy drop 不兼容,
   # 在写文件/执行 nft 之前中止, 免得"文本保留、端口失效"。
-  local _fic2
-  if _fic2="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; then
+  local _fic2 _frc2
+  _fic2="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; _frc2=$?
+  if [[ "$_frc2" == 0 ]]; then
     echo "检测到自定义 input base chain, 与 PDG 的 policy drop 不兼容 → 未改动防火墙:"
+    printf '%s\n' "$_fic2" | sed 's/^/    /'
+    return 1
+  fi
+  if [[ "$_frc2" == 2 ]]; then     # 读不到运行 ruleset: 不能假装干净就往下写规则
+    echo "无法确认 input 链冲突 → 未改动防火墙:"
     printf '%s\n' "$_fic2" | sed 's/^/    /'
     return 1
   fi
@@ -1840,8 +1823,17 @@ migrate_drop_singbox(){
   # 前置硬门槛: 现场若还有别的 input base chain, PDG 的 policy drop 会把它们的放行架空
   # (配置看着还在、端口实际不通)。必须在**动任何东西之前**中止 —— 下核、翻标记、渲染配置、
   # 写 unit、改 nft、切服务, 一个都还没做。
-  local _fic
-  if _fic="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; then
+  local _fic _frc
+  _fic="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; _frc=$?
+  # 2 = 读不到运行中的 ruleset(非 root / nft 不可用): 内存里的冲突链没进视野, 不能当成干净。
+  # 迁移本来就要写 nft 规则, 这台机器上迟早也过不去 —— 早停一步, 现场还没被动过。
+  if [[ "$_frc" == 2 ]]; then
+    c_y "无法确认现场是否存在其它 input base chain → 中止迁移(现场未做任何改动)。"
+    printf '%s\n' "$_fic" | sed 's/^/    /'
+    c_y "  怎么办: 用 root 重试 sudo pdg update; 若本机确无 nftables, 请先装好 nftables 再迁移。"
+    return 1
+  fi
+  if [[ "$_frc" == 0 ]]; then
     c_y "检测到自定义 input base chain, 无法保证与 PDG 默认拒绝策略(policy drop)兼容 → 中止迁移。"
     printf '%s\n' "$_fic" | sed 's/^/    /'
     c_y "  原因: nftables 同一 hook 上的多个 base chain 都会执行, 任一条 drop 包就没了 ——"
