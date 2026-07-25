@@ -47,6 +47,8 @@ sys.modules["mitm_ca"] = types.SimpleNamespace(
 spec = u.spec_from_file_location("pdg_bot", ROOT / "deploy/bot/pdg-bot.py")
 bot = u.module_from_spec(spec); spec.loader.exec_module(bot)
 
+real_edit_only = bot.edit_only          # 留底: 有一组用例要测真的 edit_only, 别用桩
+
 pass_n = 0
 
 
@@ -312,7 +314,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp); seed(enabled=True)
         edits = []
-        bot.edit = lambda chat, mid, text, kb=None: edits.append((chat, mid, text))
+        # 监听走的是 edit_only(只编辑、不补发), 桩要打在它上面
+        bot.edit_only = lambda chat, mid, text, kb=None: (edits.append((chat, mid, text)), True)[1]
 
         # (a) 对上 generation 且 patched → 报"已收到 iPhone 的新定位请求"
         since = time.time()
@@ -399,7 +402,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp); seed(enabled=True)
         edits = []
-        bot.edit = lambda chat, mid, text, kb=None: edits.append((chat, mid, text))
+        # 监听走的是 edit_only(只编辑、不补发), 桩要打在它上面
+        bot.edit_only = lambda chat, mid, text, kb=None: (edits.append((chat, mid, text)), True)[1]
         since = time.time()
         _, _, gen = bot.wloc_switch_gen("大阪")
         fut = bot._wloc_watch_async(7, 70, gen, "大阪", timeout=3, interval=0.05, since=since)
@@ -469,6 +473,53 @@ def main():
         if not edits or "尚未收到" not in edits[-1][2]:
             bad(f"状态字段异常时监听没能正常收尾: {edits}")
         ok("状态字段类型异常 → 当作没命中, 监听不崩、超时提示照常")
+
+    # ══ 6e. 原消息被删掉: 监听只编辑, 绝不补发新消息 ═══════════════════════
+    # 用户切完随手把那条消息删了。普通 edit() 编辑失败会退化成 send() —— 刚清掉的东西 30 秒
+    # 后又冒出来一条。监听走 edit_only: 编辑不成就安静结束。
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp); seed(enabled=True)
+        calls = []
+        real_post = bot.post
+
+        def fake_post(method, params):
+            calls.append(method)
+            if method == "editMessageText":       # 真实形态: 消息已删 → 400 message to edit not found
+                return {"ok": False, "error_code": 400,
+                        "description": "Bad Request: message to edit not found"}
+            return {"ok": True, "result": {"message_id": 999}}
+
+        bot.post = fake_post
+        bot.edit_only = real_edit_only            # 用真的 edit_only(这正是被测对象)
+        try:
+            # (a) 命中后编辑: 消息已删 → 不得发新消息
+            since = time.time()
+            _, _, gen = bot.wloc_switch_gen("大阪")
+            write_status(bot.WLOC_STATUS_FILE, gen, "大阪")
+            bot._wloc_watch_async(8, 80, gen, "大阪", timeout=3, interval=0.05,
+                                  since=since).result(10)
+            if "sendMessage" in calls:
+                bad(f"原消息被删后监听补发了新消息: {calls}")
+            if calls.count("editMessageText") < 1:
+                bad(f"监听没尝试编辑: {calls}")
+            ok("命中回报时原消息已删 → 只尝试编辑, 不补发新消息")
+
+            # (b) 超时提示同样不补发
+            calls.clear()
+            since = time.time()
+            _, _, gen = bot.wloc_switch_gen("东京")
+            bot._wloc_watch_async(8, 81, gen, "东京", timeout=0.4, interval=0.05,
+                                  since=since).result(10)
+            if "sendMessage" in calls:
+                bad(f"超时提示在原消息已删时补发了新消息: {calls}")
+            ok("超时提示时原消息已删 → 同样不补发新消息")
+
+            # (c) 编辑失败不该反复骚扰: 一次回报最多两次编辑尝试(HTML + 纯文本回退)
+            if calls.count("editMessageText") > 2:
+                bad(f"编辑失败后反复重试/通知: {calls}")
+            ok("编辑失败只试到纯文本回退为止, 不反复通知用户")
+        finally:
+            bot.post = real_post
 
     # ══ 6c. 配置锁: 持锁期间任何 WLOC 写入都必须被拒 ═══════════════════════
     with tempfile.TemporaryDirectory() as tmp:

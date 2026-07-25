@@ -278,6 +278,24 @@ def edit(chat, mid, text, kb=None):
         return
     send(chat, text, kb)             # 仍不行(如消息已删)再发新消息
 
+def edit_only(chat, mid, text, kb=None):
+    """只尝试原地编辑, **绝不退化成发新消息**。成功 True, 失败 False。
+
+    给后台监听这类"事后回报"用: 用户可能早就把那条消息删了, 这时普通 edit() 的 fallback
+    会凭空发一条新消息弹到聊天里 —— 用户刚清掉的东西又冒出来。编辑不成就安静结束,
+    只在日志里留一行(不含正文)。"""
+    p = {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML",
+         "reply_markup": kb or MENU, "disable_web_page_preview": True}
+    r = post("editMessageText", p)
+    if r.get("ok"):
+        return True
+    p.pop("parse_mode", None)        # HTML 解析失败(文本含 < & 等)→ 退回纯文本再试一次
+    r = post("editMessageText", p)
+    if r.get("ok"):
+        return True
+    print("wloc watch edit skipped", (r or {}).get("error_code"), flush=True)
+    return False
+
 def delete_message(chat, mid):
     """尽力删除一条消息(用于抹掉含节点凭据的原始链接消息)。失败返回 False, 不抛、不回显内容。"""
     if not mid:
@@ -920,12 +938,12 @@ def _wloc_watch_async(chat, mid, gen, target, timeout=30.0, interval=0.5, kb=Non
             st = _wloc_read_status()
             if _wloc_status_hit(st, gen, target, start):
                 if not superseded():
-                    edit(chat, mid, _wloc_hit_text(st, target), kb or WLOC_BACK)
+                    edit_only(chat, mid, _wloc_hit_text(st, target), kb or WLOC_BACK)
                     done()
                 return
             time.sleep(interval)
         if not superseded():
-            edit(chat, mid, WLOC_MISS_TEXT, kb or WLOC_BACK)
+            edit_only(chat, mid, WLOC_MISS_TEXT, kb or WLOC_BACK)
             done()
     try:
         return _EXEC.submit(go)
