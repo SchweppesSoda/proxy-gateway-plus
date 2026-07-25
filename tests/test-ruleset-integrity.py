@@ -276,11 +276,31 @@ def mihomo_bin():
     return shutil.which("mihomo")
 
 
+_ZSTD_MODS = ("compression.zstd", "pyzstd", "zstandard")
+
+
+class _BlockZstdImport:
+    """import 时挡掉所有 python zstd 实现(meta_path 钩子)。"""
+
+    def find_spec(self, name, path=None, target=None):
+        if name in _ZSTD_MODS:
+            raise ImportError("no zstd (blocked by test)")
+        return None
+
+
 @contextlib.contextmanager
 def no_zstd():
-    """把 zstd 命令从 PATH 上摘掉(模拟没装 zstd 的机器)。"""
+    """模拟一台**彻底没有 zstd** 的机器: PATH 上没有 zstd 命令, python 也 import 不到实现。
+
+    只摘命令是不够的 —— mrs_behavior 先试 compression.zstd / pyzstd / zstandard, 只有全都
+    没有才会退到外部命令。本地 Debian 12(3.11 且没装这些包)恰好两条路都没有, 于是"摘掉命令"
+    看起来够用; 换到带这些模块的机器(CI runner 就是), 前提根本不成立, 这条负向用例便会失败 ——
+    它测的是"认不出来", 而那台机器其实认得出来。前提要自己造齐, 不能靠跑测试的机器碰巧没装。"""
     d = tempfile.mkdtemp(prefix="pdgnozstd")
     old = os.environ["PATH"]
+    saved = {n: sys.modules.pop(n) for n in _ZSTD_MODS if n in sys.modules}   # 绕开 import 缓存
+    blocker = _BlockZstdImport()
+    sys.meta_path.insert(0, blocker)
     # 只保留必要目录里的其它命令: 造一个只含符号链接、独独没有 zstd 的 bin 目录
     for p in old.split(os.pathsep):
         if not os.path.isdir(p):
@@ -299,6 +319,11 @@ def no_zstd():
         yield
     finally:
         os.environ["PATH"] = old
+        try:
+            sys.meta_path.remove(blocker)
+        except ValueError:
+            pass
+        sys.modules.update(saved)
         shutil.rmtree(d, ignore_errors=True)
 
 

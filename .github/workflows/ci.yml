@@ -286,6 +286,13 @@ jobs:
           - e2e-cli-ops.sh
     name: "E2E ${{ matrix.script }}"
     steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        # 容器镜像里没有 git 时, actions/checkout 会退化成"用 REST API 下载 tarball" ——
+        # 工作区里**没有 .git**。跑 install.sh 的 E2E 于是全部停在"复制后的仓库没有 .git,
+        # 更新/卸载会用不了"这条硬检查上, 而失败原因与被测代码毫无关系。
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
       # fetch-depth: 0 —— 跨版本回滚用例要取**真的** v1.5.12 代码当更新器; 默认浅克隆没有
       # tag, 那条用例会静默 skip(CI 绿但零覆盖), 正是本项目最怕的假绿。
       - uses: actions/checkout@v5
@@ -307,6 +314,13 @@ jobs:
     container:
       image: debian:12
     steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        # 容器镜像里没有 git 时, actions/checkout 会退化成"用 REST API 下载 tarball" ——
+        # 工作区里**没有 .git**。跑 install.sh 的 E2E 于是全部停在"复制后的仓库没有 .git,
+        # 更新/卸载会用不了"这条硬检查上, 而失败原因与被测代码毫无关系。
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
