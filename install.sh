@@ -148,6 +148,66 @@ if [[ "$PRIOR_INSTALL" == 1 ]]; then
     || die "覆盖重装前快照失败 → 中止(拒绝在无法恢复配置的前提下覆盖已有部署)。"
 fi
 
+# ── 防火墙冲突: 同样在改动任何东西之前中止 ──────────────────────────────────
+# 本项目的 table inet pdg 带 `hook input priority 0; policy drop`, 而 nftables 里同一 hook
+# 上的多个 base chain **都会执行** —— 任一条判 drop 包就没了。机器上已有别的 input base chain
+# 时装上去, 用户那些放行(自定义端口/VPN)会被架空: 配置看着还在, 端口实际不通。
+# 判据与迁移共用 deploy/bot/nftscan.py, 不另写一套。
+# **安全检查前置依赖**: 扫描器是 python3 写的。极简 Debian 12 默认没有 python3, 那时
+# `python3 …` 直接 127 —— 旧写法的 case 只认 0 和 2, 127 静默落空, 于是"有冲突的机器照样
+# 装下去", 这道门等于不存在。所以先把 python3 装上(只装它, 与后面那批正式依赖分开: 这是
+# 为了**能做检查**, 不是开始部署), 装不上就中止 —— 检查做不了就不能往下走。
+_NFTSCAN="$REPO_DIR/deploy/bot/nftscan.py"
+[[ -f "$_NFTSCAN" ]] || die "缺少防火墙冲突扫描器 $_NFTSCAN → 中止安装(未改动任何文件)。
+  仓库不完整? 请重新 clone 后再装。"
+if ! command -v python3 >/dev/null 2>&1; then
+  c_y "[*] 安全检查前置依赖: 本机没有 python3, 先装上它才能做防火墙冲突检查…"
+  apt-get update -qq >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-minimal >/dev/null 2>&1 \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1 || true
+  command -v python3 >/dev/null 2>&1 \
+    || die "装不上 python3 → 无法检查现有 nftables 是否与本项目冲突, 中止安装(未改动配置)。
+  本项目本来就依赖 python3(bot / 自检 / 渲染都用它)。请先手工装好:
+    sudo apt-get update && sudo apt-get install -y python3
+  再重跑本脚本。"
+fi
+
+# 退出码本身就是结论(0=有冲突 1=干净 2=读不到), 非零是正常返回 —— 赋值必须自己接住,
+# 否则 set -e 会在"现场干净"时把安装直接杀掉。stderr 单独留一份: 出了别的错(解释器炸了 /
+# 脚本语法坏了)要能看见原因, 不能只丢一句"检查失败"。
+_nft_rc=0
+_nft_err="$(mktemp)" || die "无法创建临时文件"
+_nft_conflict="$(python3 "$_NFTSCAN" /etc/nftables.conf 2>"$_nft_err")" || _nft_rc=$?
+_nft_stderr="$(head -c 2000 "$_nft_err" 2>/dev/null)"; rm -f "$_nft_err"
+case "$_nft_rc" in
+  0) die "检测到与本项目不兼容的 nftables input 链 → 中止安装(未改动任何文件)。
+$(printf '%s\n' "$_nft_conflict" | sed 's/^/    /')
+  本项目的 table inet pdg 是 policy drop, 而同一 hook 上每条 base chain 都会执行 ——
+  上面这些表里的放行会被架空(端口看着开着、实际不通), 比直接报错更难查。
+  请把需要的放行并入 table inet pdg 的 input chain(或把那些链改挂到非 input hook), 再重跑。" ;;
+  1) : ;;   # 确认无冲突 → 继续
+  2) # 读不到运行中的 ruleset。机器上压根没有 nft = 还没装 nftables, 没有现网规则可冲突,
+     # 照常继续(本脚本随后会装 nftables); nft 在却读不到 = 权限/内核异常, 不能盲目往下写规则。
+     #
+     # "在不在"必须与扫描器用**同一份**判据: `command -v nft` 只看 PATH, 而 nft 装在
+     # /usr/sbin —— `su`(不带 -)、cron、某些容器的 root PATH 里没有 sbin, 于是明明装着
+     # nftables 却被判成"没装", 一整套现网 input 链就这么被当成裸机放过去了。
+     _nft_bin="$(python3 "$_NFTSCAN" --nft-path 2>/dev/null || true)"
+     if [[ -n "$_nft_bin" && -x "$_nft_bin" ]]; then
+       die "无法确认现有 nftables 规则(nft 在 $_nft_bin, 但 list ruleset 读不到)
+  → 中止安装(未改动任何文件)。
+$(printf '%s\n' "$_nft_conflict" | sed 's/^/    /')
+  请用 root 重跑; 若 nftables 本身不可用(内核缺 nf_tables 模块等), 请先修好它再装。"
+     fi
+     c_y "[*] 本机还没有 nftables(扫描器也找不到 nft)→ 仅依据 /etc/nftables.conf 判定, 继续安装。" ;;
+  *) # 127=找不到解释器 / 126=不可执行 / 1xx=被信号杀 / 其它=扫描器自己出错。
+     # 一律中止: "检查没跑成"和"检查通过"是两回事, 后者才有资格继续装。
+     die "防火墙冲突检查没能跑起来(退出码 $_nft_rc)→ 中止安装(未改动任何文件)。
+$( [[ -n "$_nft_stderr" ]] && printf '  扫描器输出:\n%s\n' "$(printf '%s\n' "$_nft_stderr" | sed 's/^/    /')" )
+  常见原因: python3 不可用或版本过旧(127/126)、$_NFTSCAN 损坏、被 OOM/信号杀掉。
+  先确认 \`python3 $_NFTSCAN /etc/nftables.conf; echo \$?\` 能跑出 0/1/2, 再重跑本脚本。" ;;
+esac
+
 _sha(){ sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
 # 覆盖既有内核/解析器二进制前先留一份原件。别人装的 mosdns/sing-box/mihomo(哪怕版本
@@ -334,7 +394,9 @@ c_g "安装依赖…"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 # zstd: 读 mihomo .mrs 规则集的头部(判 domain/ipcidr), 没它大文件就只能让用户手填类型
-apt-get install -y -qq curl tar unzip zstd nftables python3 openssl certbot dnsutils tcpdump jq ca-certificates vnstat >/dev/null
+# iproute2: install.sh 用 ss 探 SSH 端口, pdg status/report/doctor 也靠它看监听 —— 极简
+# Debian 12 默认不带, 缺了它"监听端口"整块是空的, 而装机不会报任何错。
+apt-get install -y -qq curl tar unzip zstd nftables iproute2 python3 openssl certbot dnsutils tcpdump jq ca-certificates vnstat >/dev/null
 systemctl enable --now vnstat >/dev/null 2>&1 || true   # 网卡流量统计(轻量, ~3MB)
 
 # ── 2. mosdns ──
@@ -482,6 +544,7 @@ install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py      /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/checks.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/nftscan.py          /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/nftmerge.py         /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/doctor.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
@@ -498,10 +561,22 @@ install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh   /usr/l
 install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh       /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
 install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh                     /usr/local/bin/pdg-set-token
 install -m755 "$REPO_DIR"/deploy/bot/pdg.sh                               /usr/local/bin/pdg
-# 把仓库放到 /opt/privdns-gateway 供 `pdg update` / `pdg uninstall` 用
+# 把仓库放到 /opt/privdns-gateway 供 `pdg update` / `pdg uninstall` 用。
+# 复制失败**必须中止**: 旧写法 `|| true` 吞掉错误, 装完机器上没有仓库副本, 之后 pdg update
+# 和 pdg uninstall 都无从谈起, 而装机全程一句提示都没有。
 if [[ "$REPO_DIR" != "/opt/privdns-gateway" ]]; then
-  [[ -d /opt/privdns-gateway/.git ]] || { rm -rf /opt/privdns-gateway; cp -a "$REPO_DIR" /opt/privdns-gateway 2>/dev/null || true; }
+  if [[ ! -d /opt/privdns-gateway/.git ]]; then
+    rm -rf /opt/privdns-gateway
+    cp -a "$REPO_DIR" /opt/privdns-gateway || die "复制仓库到 /opt/privdns-gateway 失败(磁盘满/权限?)"
+    [[ -d /opt/privdns-gateway/.git ]] || die "复制后的 /opt/privdns-gateway 里没有 .git —— 更新/卸载会用不了"
+  fi
 fi
+# 属主统一收归 root: 用户常见做法是普通账号 git clone 后 sudo ./install.sh, 复制过去的副本
+# 于是归那个普通用户所有。之后 root 跑 pdg update, git 会以 "dubious ownership" 拒绝一切操作
+# (连 describe/tag 都读不到), 表现成"更新检查不出新版"这种莫名其妙的样子。
+chown -R root:root /opt/privdns-gateway 2>/dev/null || true
+git config --system --get-all safe.directory 2>/dev/null | grep -qx '/opt/privdns-gateway' \
+  || git config --system --add safe.directory /opt/privdns-gateway 2>/dev/null || true
 : > /etc/mosdns/rules/custom_direct.txt
 : > /etc/mosdns/rules/custom_hijack.txt   # bot 指到出口的域名(必须被 mosdns 劫持才会进代理)
 : > /etc/mosdns/rules/unlock.txt          # WDA 解锁域名集(空=休眠; bot『🔓 解锁走 WDA』填充)
@@ -530,11 +605,27 @@ esac
 install -d -m700 /etc/privdns-gateway
 # 写本次管理的三个键; 在已有安装上覆盖重装时(与上面读回 PDG_LOWMEM/PDG_HIJACK_MODE 的意图一致),
 # 保留 profile.env 里其余键 —— 尤其 PDG_TFO(bot 持久化的 TFO 意图)与未知/自定义键, 不被重装清掉。
+#
+# 走临时文件 + 原子替换, 且每一步的失败都要看见。旧写法是
+#     { printf …; [[ -f old ]] && grep -v … old; } > new && mv new old
+# 新装时 `[[ -f old ]]` 为假 → 整个 group 返回 1 → `&& mv` 不执行(而 && 列表里的失败又不触发
+# set -e), 于是机器上只剩一个 profile.env.new: PDG_HIJACK_MODE 根本没落盘, 下一次 pdg restart
+# 读不到就按默认 all 把 mosdns 形态改回去 —— 装机时选的 gfw 悄悄没了。
+_prof_tmp="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || die "创建 profile.env 临时文件失败"
 {
   printf 'PDG_LOWMEM=%s\nPDG_HIJACK_MODE=%s\nPDG_PLATFORM=%s\n' "$LOWMEM" "$HIJACK_MODE" "$PLATFORM"
-  [[ -f /etc/privdns-gateway/profile.env ]] && \
-    grep -vE '^[[:space:]]*(PDG_LOWMEM|PDG_HIJACK_MODE|PDG_PLATFORM)=' /etc/privdns-gateway/profile.env
-} > /etc/privdns-gateway/profile.env.new && mv -f /etc/privdns-gateway/profile.env.new /etc/privdns-gateway/profile.env
+  if [[ -f /etc/privdns-gateway/profile.env ]]; then
+    # grep -v 在"旧文件只有受管键"时没有输出 → 返回 1, 不能让它把整段判成失败
+    grep -vE '^[[:space:]]*(PDG_LOWMEM|PDG_HIJACK_MODE|PDG_PLATFORM)=' \
+      /etc/privdns-gateway/profile.env || true
+  fi
+} > "$_prof_tmp" || { rm -f "$_prof_tmp"; die "写 profile.env 失败(磁盘满/只读?)"; }
+chmod 600 "$_prof_tmp"
+mv -f "$_prof_tmp" /etc/privdns-gateway/profile.env \
+  || { rm -f "$_prof_tmp"; die "落盘 profile.env 失败"; }
+rm -f /etc/privdns-gateway/profile.env.new          # 清掉历史版本留下的半成品
+grep -q "^PDG_HIJACK_MODE=$HIJACK_MODE$" /etc/privdns-gateway/profile.env \
+  || die "profile.env 未写入预期的 PDG_HIJACK_MODE"
 printf '%s\n' "$PLATFORM" > /etc/privdns-gateway/platform
 
 render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
@@ -558,10 +649,33 @@ json.dump(c, open(f, "w"), ensure_ascii=False, indent=2)
 PY
 fi
 chmod 700 /etc/sing-box; chmod 600 /etc/sing-box/config.json   # config 含出口密码/uuid
+# /etc/sing-box 是本项目的**数据模型**目录(即便 v1.6 起已不装 sing-box 运行时)。落一份归属
+# 标记, 卸载 --purge 才知道该删它 —— 里面是出口密码/UUID/节点地址, 留在盘上等于凭据没清。
+# 标记落在 /etc/privdns-gateway 下, 已在目录事务台账里(装机失败回滚会连它一起还原)。
+pdg_sbmodel_mark_owned || die "写数据模型归属标记失败(磁盘满/只读?)"
 [[ -e /etc/nftables.conf.pdg-orig ]] || cp -a /etc/nftables.conf /etc/nftables.conf.pdg-orig 2>/dev/null || true  # 供 uninstall 还原
 # 内核后端: 标记(恒 mihomo)+ 防火墙(mihomo REDIRECT 入站变体)+ 初始渲染 mihomo 配置
 printf '%s\n' "$CORE" > /etc/privdns-gateway/backend
-render "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
+# 防火墙: **合并**而不是整文件覆盖 —— 用户的 VPN/NAT/转发/开放端口原样保留(与迁移同一实现)。
+# iOS 的 GMS 剥离在**渲染出来的块上**做, 不在合并结果上做: 后者会拿正则去扫用户自己的规则行。
+_nft_block="$(mktemp)"; _nft_merged="$(mktemp)"
+render "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$_nft_block"
+if [[ "$PLATFORM" == ios ]]; then
+  sed -E -i 's#(tcp dport [{] 53, 80, 81, 443, 853), 5228-5230, 8445 [}] accept#\1, 8445 } accept#' "$_nft_block"
+  sed -E -i 's#(tcp dport [{] 80, 443), 5228-5230 [}] redirect#\1 } redirect#' "$_nft_block"
+fi
+python3 "$REPO_DIR/deploy/bot/nftmerge.py" "$_nft_block" /etc/nftables.conf "$_nft_merged" \
+  || { rm -f "$_nft_block" "$_nft_merged"
+       die "无法安全合并 /etc/nftables.conf(见上方冲突位置)→ 未改动防火墙。
+  请把本项目所需规则手工并入 table inet pdg 后重试, 或先备份并清理冲突配置。"; }
+# 用与扫描器同一份解析结果调 nft(PATH 缺 sbin 时不能因此跳过校验 —— 那等于不校验就落盘)
+_nft_exe="$(python3 "$_NFTSCAN" --nft-path 2>/dev/null || true)"
+[[ -n "$_nft_exe" && -x "$_nft_exe" ]] || _nft_exe=""     # 输出不是可执行文件就当没拿到
+if [[ -n "$_nft_exe" ]] && ! "$_nft_exe" -c -f "$_nft_merged" >/dev/null 2>&1; then
+  rm -f "$_nft_block" "$_nft_merged"; die "合并后的 nftables 配置校验(nft -c)未过 → 未改动防火墙。"
+fi
+cp -f "$_nft_merged" /etc/nftables.conf || { rm -f "$_nft_block" "$_nft_merged"; die "写入 /etc/nftables.conf 失败"; }
+rm -f "$_nft_block" "$_nft_merged"
 install -d -m700 /etc/mihomo
 python3 - <<PY
 import json, os, sys
@@ -573,11 +687,6 @@ with open("/etc/mihomo/config.yaml", "w") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)   # JSON 即合法 YAML
 os.chmod("/etc/mihomo/config.yaml", 0o600)
 PY
-# iOS: 走 APNs 不需要 GMS 5228-5230 → 渲染后从 nft 剥掉(accept 端口集 + mihomo REDIRECT 集)。
-if [[ "$PLATFORM" == ios ]]; then
-  sed -E -i 's#(tcp dport [{] 53, 80, 81, 443, 853), 5228-5230, 8445 [}] accept#\1, 8445 } accept#' /etc/nftables.conf
-  sed -E -i 's#(tcp dport [{] 80, 443), 5228-5230 [}] redirect#\1 } redirect#' /etc/nftables.conf
-fi
 render "$REPO_DIR/deploy/bot/pdg-bot.service"         > /etc/systemd/system/pdg-bot.service
 chmod 644 /etc/systemd/system/pdg-bot.service        # 不再含 token (token 在 bot.env)
 

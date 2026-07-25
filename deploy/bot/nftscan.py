@@ -13,6 +13,7 @@ WireGuard 的 accept 会被架空: 配置文本还在, 端口实际已经不通�
 CLI:  nftscan.py [nftables.conf]
 退出码: 0=有冲突(已打印) 1=确认无冲突 2=读不到运行 ruleset, 无法确认。
 """
+import os
 import re
 import subprocess
 import sys
@@ -26,6 +27,11 @@ _TBL_OPEN = re.compile(r"^\s*table\s+(\S+)\s+(\S+)\s*\{?\s*$")
 # 从配置上完全看不出为什么 —— 那行明明只是注释。
 _HOOK_IN = re.compile(r"\btype\s+\w+\s+hook\s+input\b")
 _QUOTED = re.compile(r'"[^"]*"')
+_POLICY_DROP = re.compile(r"\bpolicy\s+drop\b")
+# PATH 里找不到 nft 时依次试这些位置(Debian 装在 /usr/sbin)。列成常量: 测试可以指到别处,
+# 免得为了验"PATH 没有但 sbin 里有"去 patch os.path.isfile 这类底层函数。
+NFT_CANDIDATES = ("/usr/sbin/nft", "/sbin/nft", "/usr/local/sbin/nft",
+                  "/usr/bin/nft", "/bin/nft", "/usr/local/bin/nft")
 
 
 def _strip_noise(line):
@@ -34,10 +40,20 @@ def _strip_noise(line):
 
 
 def scan_text(conf_txt, live_txt):
-    """扫描配置文本与运行 ruleset 文本, 返回冲突描述列表(每源一条, 已去重)。"""
+    """扫描配置文本与运行 ruleset 文本, 返回冲突描述列表(每源一条, 已去重)。
+
+    **空骨架不算冲突**: Debian 的 nftables 包自带一份 /etc/nftables.conf, 里面是一个
+    `table inet filter`, 三条 base chain 全是 `policy accept` 且一条规则都没有 —— 全新
+    VPS 上装了 nftables 就长这样。它既不 drop 任何包、也没有会被架空的放行, 完全惰性;
+    把它当冲突拒掉, 等于绝大多数新机器都装不上, 而用户根本不知道要删哪一行。
+    真正要挡的是两种: 链里**有规则**(那些放行会被 PDG 的 policy drop 架空), 或者链自己
+    就是 **policy drop**(那它会把本项目要放行的端口直接丢掉)。"""
     found, seen = [], set()
     for src, txt in (("配置文件", conf_txt or ""), ("运行 ruleset", live_txt or "")):
         cur, depth, opened = None, 0, False
+        chain_depth = None          # 正处在某条 foreign input chain 里
+        chain_rules = 0
+        chain_policy_drop = False
         for raw in txt.split("\n"):
             ln = _strip_noise(raw)
             m = _TBL_OPEN.match(ln)
@@ -49,18 +65,55 @@ def scan_text(conf_txt, live_txt):
             if depth > 0:
                 opened = True
             if _HOOK_IN.search(ln) and cur != OURS:
-                item = "%s: 表 `%s` 有挂 hook input 的 base chain" % (src, cur)
-                if item not in seen:
-                    seen.add(item); found.append(item)
+                chain_depth = depth                     # 从下一行起是链体
+                chain_rules = 0
+                chain_policy_drop = bool(_POLICY_DROP.search(ln))
+            elif chain_depth is not None:
+                if depth < chain_depth:                 # 链结束: 结账
+                    if chain_rules or chain_policy_drop:
+                        why = "policy drop" if chain_policy_drop else "%d 条规则" % chain_rules
+                        item = ("%s: 表 `%s` 有挂 hook input 的 base chain(%s)"
+                                % (src, cur, why))
+                        if item not in seen:
+                            seen.add(item); found.append(item)
+                    chain_depth = None
+                elif ln.strip().strip("{}").strip():     # 非空、非纯括号 = 一条规则
+                    chain_rules += 1
             if opened and depth <= 0:
                 cur, opened = None, False
+        if chain_depth is not None and (chain_rules or chain_policy_drop):   # 文本到头还没闭合
+            why = "policy drop" if chain_policy_drop else "%d 条规则" % chain_rules
+            item = "%s: 表 `%s` 有挂 hook input 的 base chain(%s)" % (src, cur, why)
+            if item not in seen:
+                seen.add(item); found.append(item)
     return found
+
+
+def nft_bin():
+    """找到 nft 可执行文件的路径(找不到返回 "")。
+
+    不能只靠 PATH: nft 装在 /usr/sbin, 而 `su`(不带 -)、cron、某些容器的 root PATH 里没有
+    sbin 目录。那时 `nft` 找不到 → 读不到运行 ruleset → 扫描返回"无法确认", 调用方再按
+    "nft 没装, 没有现网规则可冲突"放行 —— 机器上明明有一整套 input 链, 却被当成裸机装上去。
+    所以按 PATH → 常见 sbin 路径依次找; 这也是 shell 侧(install.sh)判断"nft 到底在不在"的
+    同一份依据(见 --nft-path)。"""
+    from shutil import which
+    p = which("nft")
+    if p:
+        return p
+    for cand in NFT_CANDIDATES:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return ""
 
 
 def live_ruleset():
     """(文本, readable)。readable=False 表示**没读到**, 不代表现场干净。"""
+    exe = nft_bin()
+    if not exe:
+        return "", False
     try:
-        p = subprocess.run(["nft", "list", "ruleset"],
+        p = subprocess.run([exe, "list", "ruleset"],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=15)
     except (OSError, subprocess.SubprocessError):
@@ -85,6 +138,15 @@ def scan(conf=NFT_CONF):
 
 
 def main(argv):
+    # --nft-path: 只回答"nft 到底在不在(在哪)" —— 让 shell 侧不必自己 `command -v nft`,
+    # 那个判断会漏掉 PATH 里没有 sbin 的情况, 两处各写一份迟早给出相反答案。
+    # 找到 → 打印路径并 exit 0; 找不到 → 不打印, exit 1。
+    if "--nft-path" in argv[1:]:
+        exe = nft_bin()
+        if exe:
+            print(exe)
+            return 0
+        return 1
     conf = argv[1] if len(argv) > 1 else NFT_CONF
     found, readable = scan(conf)
     if found:
