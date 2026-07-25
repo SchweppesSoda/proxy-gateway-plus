@@ -273,16 +273,33 @@ def mihomo_bin():
     return shutil.which("mihomo")
 
 
+def zstd_or_raw(data):
+    """把 MRS 的 zstd 外壳拆掉(拆不了就原样返回) —— 只给测试造"未知版本"的畸形档用。"""
+    try:
+        p = subprocess.run(["zstd", "-dc"], input=data, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        if p.returncode == 0 and p.stdout[:3] == b"MRS":
+            return p.stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return data
+
+
 def ruleset_main():
     mrs_fix = FIXTURES / "ruleset-domain.mrs"
-    if not mrs_fix.exists():
-        bad("缺少真实 MRS fixture: %s" % mrs_fix)
+    ip_fix = FIXTURES / "ruleset-ipcidr.mrs"
+    for f in (mrs_fix, ip_fix):
+        if not f.exists():
+            bad("缺少真实 MRS fixture: %s" % f)
     mrs_bytes = mrs_fix.read_bytes()
+    ipcidr_bytes = ip_fix.read_bytes()
 
     www = tempfile.mkdtemp(prefix="pdgwww")
     (Path(www) / "cn.yaml").write_bytes(YAML_PROVIDER)
     (Path(www) / "cn.list").write_bytes(SURGE_LIST)
     (Path(www) / "geo.mrs").write_bytes(mrs_bytes)
+    (Path(www) / "ip.mrs").write_bytes(ipcidr_bytes)
+    (Path(www) / "opaque.mrs").write_bytes(b"\x28\xb5\x2f\xfd\x00\x00\x00")   # 像 .mrs 但认不出
     base, shutdown = serve_dir(www)
     try:
         # ── 真实 YAML provider: 添加 → 解析出规则 → 刷新 → 渲染进运行配置 ──
@@ -360,15 +377,108 @@ def ruleset_main():
             ok("坏 .mrs → 刷新明确失败并回滚到上一份好档(不断网)")
             (Path(www) / "geo.mrs").write_bytes(mrs_bytes)
 
-        # ── .mrs 未声明 behavior: 不得静默当成 domain ──
+        # ── .mrs 的 behavior 从二进制头**认**出来, 而不是猜, 也不是逼用户手填 ──
+        # MRS = zstd 压缩, 解压后是 b"MRS" + 版本(1B) + behavior(1B: 0=domain 1=ipcidr)。
+        # 认得出就自动填; 认不出(版本不认识/不是 MRS)才要求显式声明 —— 猜错的后果是
+        # "规则看着加了却永不命中", 比拒绝难查得多。
+        if bot.mrs_behavior(mrs_bytes) != "domain":
+            bad("真实 domain .mrs 的 behavior 没认出来: %r" % bot.mrs_behavior(mrs_bytes))
+        if bot.mrs_behavior(ipcidr_bytes) != "ipcidr":
+            bad("真实 ipcidr .mrs 的 behavior 没认出来: %r" % bot.mrs_behavior(ipcidr_bytes))
+        ok("两份真实 .mrs(domain/ipcidr)的 behavior 都从二进制头认了出来")
+        if bot.mrs_behavior(b"not an mrs at all") is not None:
+            bad("非 MRS 数据被认出了 behavior")
+        # 版本号不是 1 → 布局可能变了, 宁可不认(别拿旧假设去解析新格式)
+        future = bytearray(zstd_or_raw(mrs_bytes))
+        i = future.find(b"MRS")
+        future[i + 3] = 9
+        if bot.mrs_behavior(bytes(future)) is not None:
+            bad("未知 MRS 版本仍被解析了 behavior")
+        ok("非 MRS / 未知版本 → 不认(返回 None), 不做危险假设")
+
         with tempfile.TemporaryDirectory() as tmp:
             setup(tmp)
-            okr, msg = bot.add_ruleset(base + "/geo.mrs", "hk")
+            okr, msg = bot.add_ruleset(base + "/geo.mrs", "hk")     # 不带 behavior
+            if not okr:
+                bad(f"能认出 behavior 的 .mrs 仍被拒: {msg}")
+            info = next(iter(json.load(open(bot.RS_META)).values()))
+            if info.get("behavior") != "domain":
+                bad(f".mrs 的 behavior 没自动认出并记录: {info}")
+            cfg = json.load(open(bot.MIHOMO_CFG))
+            prov = next(iter(cfg.get("rule-providers", {}).values()), {})
+            if prov.get("format") != "mrs" or prov.get("behavior") != "domain":
+                bad(f"自动识别的 .mrs 没按 mrs/domain 渲染进运行配置: {prov}")
+            ok("未声明 behavior 的 .mrs: 自动识别为 domain 并渲染进运行配置")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            okr, msg = bot.add_ruleset(base + "/ip.mrs", "hk")
+            info = next(iter(json.load(open(bot.RS_META)).values()))
+            if not okr or info.get("behavior") != "ipcidr":
+                bad(f"ipcidr .mrs 没被认出: {okr} {msg} {info}")
+            ok("ipcidr 的 .mrs 同样自动识别(没有一律当 domain)")
+            mh = mihomo_bin()
+            if mh:
+                r = subprocess.run([mh, "-t", "-d", bot.MIHOMO_DIR, "-f", bot.MIHOMO_CFG],
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    bad(f"真 mihomo -t 拒绝了自动识别 behavior 的 .mrs 配置: {(r.stdout + r.stderr)[-300:]}")
+                ok("真 mihomo -t 接受自动识别 behavior 的 .mrs 运行配置")
+
+        # 用户填错类型 → 以文件里的为准(文件是事实), 并说明已纠正
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            okr, msg = bot.add_ruleset(base + "/geo.mrs", "hk", behavior="ipcidr")
+            info = next(iter(json.load(open(bot.RS_META)).values()))
+            if info.get("behavior") != "domain":
+                bad(f"用户填错类型时没以文件为准: {info}")
+            if "domain" not in msg:
+                bad(f"纠正了类型却没告诉用户: {msg}")
+            ok("用户填错 behavior → 以文件二进制头为准并说明(不按错的渲染)")
+
+        # 认不出来的 .mrs: 仍旧拒绝并要求显式声明, 绝不猜
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            okr, msg = bot.add_ruleset(base + "/opaque.mrs", "hk")
             if okr:
-                bad(".mrs 未声明 behavior 却被接受(静默按 domain 处理是错的)")
+                bad("认不出 behavior 的 .mrs 却被接受(等于猜)")
             if "behavior" not in msg and "类型" not in msg:
-                bad(f".mrs 拒绝文案没说清要指定类型: {msg}")
-            ok(".mrs 未声明 behavior → 拒绝并要求指定类型(不静默硬编码 domain)")
+                bad(f"拒绝文案没说清要指定类型: {msg}")
+            ok("认不出 behavior 的 .mrs → 仍要求显式声明(不猜)")
+
+        # 老机器: RS_META 里的旧 .mrs 条目没有 behavior 字段 —— 靠本地已下好的文件补上,
+        # 不必让用户逐条手填(此前这类条目一律被跳过, 分流静默失效)
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            bot.add_ruleset(base + "/geo.mrs", "hk", behavior="domain")
+            m = json.load(open(bot.RS_META))
+            name, info = next(iter(m.items()))
+            del m[name]["behavior"]                       # 造出老条目
+            json.dump(m, open(bot.RS_META, "w"))
+            rs = bot._mihomo_rulesets()
+            if name not in rs or rs[name].get("behavior") != "domain":
+                bad(f"老条目没能从本地 .mrs 文件补出 behavior: {rs}")
+            ok("老条目(缺 behavior)从本地 .mrs 文件补出类型, 不再被静默跳过")
+
+            # 刷新时把认出来的类型**持久化**回元数据, 省得每次渲染重新嗅探
+            bot.refresh_rulesets()
+            if json.load(open(bot.RS_META))[name].get("behavior") != "domain":
+                bad("刷新后没把识别出的 behavior 回填进元数据")
+            ok("刷新把识别出的 behavior 回填进元数据(一次性收敛)")
+
+            # 本地文件也认不出 → 仍旧跳过, 不猜
+            open(info["path"], "wb").write(b"garbage-not-mrs")
+            m = json.load(open(bot.RS_META)); del m[name]["behavior"]
+            json.dump(m, open(bot.RS_META, "w"))
+            if name in bot._mihomo_rulesets():
+                bad("本地文件认不出类型却仍被渲染(等于猜)")
+            ok("本地文件也认不出 → 仍跳过并交由上层报错(不猜)")
+
+        # .mrs 只支持 domain / ipcidr: classical 连 mihomo 自己的 convert-ruleset 都会崩,
+        # 收下它等于配出一份内核加载不了的规则
+        if "classical" in bot.MRS_BEHAVIORS:
+            bad(".mrs 仍接受 classical(mihomo 不支持该组合)")
+        ok(".mrs 的可选类型收敛为 domain / ipcidr(不再放行 mihomo 不支持的 classical)")
 
         # ── 刷新部分失败: 必须如实报出是哪一个 ──
         with tempfile.TemporaryDirectory() as tmp:

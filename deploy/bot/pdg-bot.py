@@ -427,10 +427,13 @@ def _mihomo_rulesets():
         if low.endswith((".yaml", ".yml")):
             behavior, fmt = "classical", "yaml"
         elif low.endswith(".mrs") or str(info.get("format", "")) == "mrs":
-            # .mrs 是编译后的二进制, behavior 判不出来就**不能猜** —— 猜错的后果是"规则看着
-            # 加了却永不命中"。没有显式记录的一律不渲染, 让它进 dropped 由上层点名报错。
+            # .mrs 是编译后的二进制。元数据里没记 behavior(老机器上的旧条目就没有)时, 从本地
+            # 已下好的文件二进制头认一次; 认得出就用, 认不出**不能猜** —— 猜错的后果是"规则看着
+            # 加了却永不命中"。仍认不出的一律不渲染, 让它进 dropped 由上层点名报错。
             bh = str(info.get("behavior", ""))
-            if bh not in ("domain", "ipcidr", "classical"):
+            if bh not in MRS_BEHAVIORS:
+                bh = _mrs_behavior_of_file(info.get("path") or "") or ""
+            if bh not in MRS_BEHAVIORS:
                 continue
             behavior, fmt = bh, "mrs"
         else:                                          # Surge/Clash .list/.txt: DOMAIN/-SUFFIX/-KEYWORD/IP-CIDR 混合
@@ -1753,7 +1756,54 @@ def _build_source(url, path):
     json.dump({"version": 1, "rules": [rule]}, open(path, "w"), ensure_ascii=False)
     return len(dom) + len(suf) + len(kw) + len(ip), (len(dom) + len(suf) + len(kw) == 0)
 
-MRS_BEHAVIORS = ("domain", "ipcidr", "classical")
+# mihomo 的 .mrs 只有这两种 behavior —— classical 连它自己的 convert-ruleset 都会崩,
+# 收下等于配出一份内核加载不了的规则集。
+MRS_BEHAVIORS = ("domain", "ipcidr")
+_MRS_BEHAVIOR_BYTE = {0: "domain", 1: "ipcidr"}
+
+
+def _mrs_head(data, n=8):
+    """取 .mrs 解压后的头部若干字节(取不到返回 b'')。
+
+    MRS 是 zstd 压缩的二进制: 解压后为 b"MRS" + 版本(1B) + behavior(1B) + …。
+    没有 zstd 模块可用(Debian 12 的 python3.11 就没有)时退回调 zstd 命令; 再不行就在原始
+    字节里找 b"MRS" —— 小文件的 zstd 字面量常以原样存放, 找得到就能用, 找不到就老实说不知道。"""
+    if not isinstance(data, (bytes, bytearray)):
+        return b""
+    data = bytes(data)
+    if data[:3] == b"MRS":                       # 未压缩(防御性: 万一以后不再压)
+        return data[:n]
+    if data[:4] != b"\x28\xb5\x2f\xfd":          # 连 zstd 帧头都不是 → 不是 .mrs
+        return b""
+    try:
+        p = subprocess.run(["zstd", "-dc"], input=data, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=30)
+        if p.returncode == 0 and p.stdout[:3] == b"MRS":
+            return p.stdout[:n]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    i = data.find(b"MRS", 0, 65536)
+    return data[i:i + n] if i >= 0 else b""
+
+
+def mrs_behavior(data):
+    """从 .mrs 二进制里**认**出 behavior(domain/ipcidr); 认不出返回 None。
+
+    认不出就返回 None, 由调用方要求用户显式声明 —— 猜错的后果是"规则看着加了却永不命中",
+    比直接拒绝难查得多。版本号不是 1 也一律不认: 布局可能已经变了。"""
+    h = _mrs_head(data)
+    if len(h) < 5 or h[:3] != b"MRS" or h[3] != 1:
+        return None
+    return _MRS_BEHAVIOR_BYTE.get(h[4])
+
+
+def _mrs_behavior_of_file(path):
+    """本地已下好的 .mrs 里认 behavior(读不到/认不出返回 None)。"""
+    try:
+        with open(path, "rb") as f:
+            return mrs_behavior(f.read(1 << 20))
+    except OSError:
+        return None
 
 
 def add_ruleset(url, target, label="", behavior=""):
@@ -1771,17 +1821,24 @@ def add_ruleset(url, target, label="", behavior=""):
     try:
         if low.endswith(".mrs"):
             # mihomo 原生二进制规则集: 直接存盘, 由 rule-provider 按 mrs 格式加载。
-            # behavior 必须**显式声明** —— .mrs 是编译后的二进制, 从文件本身可靠地判不出它是
-            # domain 还是 ipcidr 集; 一律按 domain 猜, 猜错就是"规则看着加了却永不命中"。
-            if behavior not in MRS_BEHAVIORS:
-                return False, (".mrs 需要显式指定规则类型(behavior), 无法从文件可靠判断。\n"
-                               "请在规则集后面补上类型: " + " / ".join(MRS_BEHAVIORS) + "\n"
-                               "例: <code>https://.../geo.mrs hk 名称 domain</code>")
+            # behavior 先从文件二进制头**认**(文件就是事实), 认不出才要求用户显式声明 ——
+            # 一律按 domain 猜, 猜错就是"规则看着加了却永不命中"。
             path = os.path.join(RS_DIR, name + ".mrs"); fmt = "mrs"
             data = _fetch_bytes(url)
             if not data:
                 raise ValueError("下载到空的 .mrs(源站异常?)")
-            open(path, "wb").write(data); count = None; warn = ""
+            sniffed = mrs_behavior(data)
+            warn = ""
+            if sniffed and behavior and behavior != sniffed:
+                warn = f"\n(你填的类型是 {behavior}, 但文件里写着 {sniffed} —— 已按文件为准)"
+            if sniffed:
+                behavior = sniffed
+            elif behavior not in MRS_BEHAVIORS:
+                return False, (".mrs 需要指定规则类型(behavior): 这份文件的二进制头认不出类型"
+                               "(不是 MRS 或版本不认识)。\n"
+                               "请在规则集后面补上类型: " + " / ".join(MRS_BEHAVIORS) + "\n"
+                               "例: <code>https://.../geo.mrs hk 名称 domain</code>")
+            open(path, "wb").write(data); count = None
         else:
             path = os.path.join(RS_DIR, name + ".json"); fmt = "source"
             count, ip_only = _build_source(url, path)
@@ -1875,6 +1932,12 @@ def refresh_rulesets():
                 if not data:
                     raise ValueError("空响应")
                 open(tmp, "wb").write(data)
+                # 顺手把认出来的类型回填进元数据: 老条目本来没有这个字段, 补上之后就不必每次
+                # 渲染都重新嗅探, 也不再因为"没记类型"被跳过(下面 _save_rs_meta 一并落盘)。
+                if info["format"] == "mrs" and info.get("behavior") not in MRS_BEHAVIORS:
+                    bh = mrs_behavior(data)
+                    if bh:
+                        info["behavior"] = bh
             else:
                 info["count"] = _build_source(info["url"], tmp)[0]   # 先写临时文件
             n += 1
@@ -3283,7 +3346,7 @@ def handle_text(chat, text, mid=None):
             state[chat] = "del_rule"; send(chat, "发要删除的域名。/cancel 取消。", BACK); return
         if cmd == "/addrs":
             state[chat] = "add_rs"; send(chat, "发「<b>规则集URL 出口 [名称] [类型]</b>」（支持 .list / .txt / .yaml / .mrs；"
-                       ".mrs 需补类型 domain/ipcidr/classical）。/cancel 取消。", BACK); return
+                       ".mrs 类型一般自动识别，认不出时再补 domain/ipcidr）。/cancel 取消。", BACK); return
         if cmd == "/delexit":
             tags = deletable_tags(load())
             send(chat, "选择删除的出口/组：" if tags else "无可删出口", kb_pick("delx", tags) if tags else BACK); return
@@ -3370,8 +3433,8 @@ def handle_text(chat, text, mid=None):
     if act == "add_rs":
         p = text.split()
         if len(p) < 2:
-            send_plain(chat, "格式: 规则集URL 出口 [名称] [类型(仅 .mrs 需要)]"); return
-        # .mrs 需要显式类型: 末尾若是 domain/ipcidr/classical 就当类型, 其余算名称
+            send_plain(chat, "格式: 规则集URL 出口 [名称] [类型(仅 .mrs 且认不出类型时需要)]"); return
+        # .mrs 的类型一般从文件二进制头认出来; 末尾若显式写了 domain/ipcidr 就当类型, 其余算名称
         behavior = ""
         rest = p[2:]
         if rest and rest[-1].lower() in MRS_BEHAVIORS:
