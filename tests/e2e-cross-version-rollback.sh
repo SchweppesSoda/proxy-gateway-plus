@@ -14,6 +14,13 @@
 #   sing-box.service 变成 0 字节, 机器既回不到 sing-box 也没了可用 unit, 界面还可能说"已回滚"。
 #
 # 断言: 回滚后 sing-box unit 非空且可用、服务 active+enabled、backend 标记与仓库版本都已复位。
+#
+# 覆盖范围: 要踩到这个 P0, 旧版必须同时满足两条 ——
+#   ① 回滚里会调 pdg_write_unit pdg_unit_singbox(v1.5.8 起);
+#   ② 自检门失败时**真的会触发回滚**。v1.5.8/v1.5.9 的门是 `doctor ... || true` 且依赖 jq,
+#      自检失败会被吞掉、update 直接报成功(那是 v1.5.10 修掉的另一个缺陷) —— 那两版压根走不到
+#      回滚, 也就踩不到本 P0。
+# 故实际受影响区间是 **v1.5.10~v1.5.12**; 这里取其中最旧与最新各跑一遍(中间版本该处代码一致)。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -21,9 +28,19 @@ E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 source "$(dirname "${BASH_SOURCE[0]}")/e2e-lib.sh"
 e2e_enter "$@"
 
-OLD_TAG=v1.5.12
-git -C "$E2E_ROOT" rev-parse "$OLD_TAG" >/dev/null 2>&1 || e2e_skip "本地没有 $OLD_TAG(浅克隆?), 跨版本用例跳过"
+# 受影响版本(既调 pdg_unit_singbox, 自检门又真会回滚): v1.5.10~v1.5.12; 取最旧+最新
+OLD_TAGS="${PDG_XVER_TAGS:-v1.5.10 v1.5.12}"
+AVAIL=""
+for _t in $OLD_TAGS; do
+  git -C "$E2E_ROOT" rev-parse "$_t" >/dev/null 2>&1 && AVAIL="$AVAIL $_t"
+done
+[[ -n "${AVAIL// /}" ]] || e2e_skip "本地没有任何受影响旧 tag($OLD_TAGS; 浅克隆?), 跨版本用例跳过"
 
+# 每个受影响旧版跑一遍完整现场(装机 → 该版本 update → 迁移成功 → 注入 doctor 失败 → 该版本回滚)
+# 函数体不缩进: 内部有 heredoc, 缩进会把结束定界符一起缩进而破坏它。
+run_case_for_tag(){
+OLD_TAG="$1"
+echo; echo "══════════ 更新器版本: $OLD_TAG ══════════"
 e2e_stub_system
 e2e_seed_install
 e2e_seed_mosdns all
@@ -128,5 +145,9 @@ grep -q 'ExecStart=/usr/local/bin/sing-box' /etc/systemd/system/sing-box.service
   && ok "backend 标记已复位为 singbox" || bad "backend=$(cat /etc/privdns-gateway/backend)"
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$OLD_SHA" ]] \
   && ok "仓库版本已复位到 $OLD_TAG" || bad "仓库停在 $(git -C "$REPO" describe --tags 2>/dev/null)"
+
+}
+
+for _tag in $AVAIL; do run_case_for_tag "$_tag"; done
 
 e2e_summary

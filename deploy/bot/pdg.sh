@@ -30,16 +30,18 @@ _pdg_svcs(){ local s; s="mosdns $(_pdg_core_svc) pdg-bot"; [[ "$(_pdg_platform)"
 # 可能自己在跑一个 sing-box 干别的。删掉别人的东西是不可逆的, 故只删**能证明是我们装的**。
 # 判据(任一成立):
 #   ① 归属标记文件(本项目装 sing-box 时留下; v1.6 起已不装 sing-box, 故仅老机器可能有);
-#   ② unit 与 lib/units.sh 历史模板 pdg_unit_singbox 的特征行一致 —— ExecStart 指向本项目
-#      的配置路径 /etc/sing-box/config.json, 这是老版装机生成的形态。
+#   ② unit 的 ExecStart 指向**本项目的**二进制与数据模型路径
+#      (/usr/local/bin/sing-box run -c /etc/sing-box/config.json) —— 这是老版装机生成的形态。
+#      只认 ExecStart 一行: Description 等其余字段用户完全可能改过(加注释、改描述、加 drop-in),
+#      拿它一起卡会把"自家但被改过"的 unit 误判成第三方而永久保留。ExecStart 同时指向我们的
+#      二进制路径和我们的配置路径, 第三方极难与之重合, 单这一条已足够可靠。
 # 都不成立 = 来源不明 → 一律保留, 只提示, 绝不代用户决定。
 PDG_SINGBOX_OWNED_MARK=/etc/privdns-gateway/singbox.pdg-owned
 _pdg_singbox_is_ours(){
   local unit="${1:-/etc/systemd/system/sing-box.service}"
   [[ -e "${PDG_SINGBOX_OWNED_MARK:-/etc/privdns-gateway/singbox.pdg-owned}" ]] && return 0
   [[ -f "$unit" ]] || return 1
-  grep -qE '^ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config\.json[[:space:]]*$' "$unit" \
-    && grep -qE '^Description=sing-box[[:space:]]*$' "$unit"
+  grep -qE '^ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config\.json([[:space:]]|$)' "$unit"
 }
 
 # 停用并删除**本项目装的** sing-box unit 与二进制; 来源不明则原样保留并给出手工清理指引。
@@ -1584,26 +1586,32 @@ while i < n:
         i += 1; continue
     if open_.match(ln):                      # 整个 table inet pdg { ... } 块
         first_hit = len(keep) if first_hit is None else first_hit
+        start_line = i + 1                   # 1-indexed, 报给用户看
         depth = 0
         while i < n:
             depth += lines[i].count("{") - lines[i].count("}")
             i += 1
             if depth <= 0:
                 break
-        else:
-            print("pdg 表块括号不配平, 无法安全合并", file=sys.stderr); sys.exit(2)
         if depth > 0:
-            print("pdg 表块括号不配平, 无法安全合并", file=sys.stderr); sys.exit(2)
+            print("冲突位置: %s 第 %d 行起的 `table inet pdg {` 块括号不配平(到文件末尾仍未闭合)"
+                  % (target_f, start_line), file=sys.stderr)
+            print("  该行: %s" % lines[start_line - 1].strip(), file=sys.stderr)
+            sys.exit(2)
         continue
     keep.append(ln); i += 1
 
 # 剩下的内容里若还有 flush ruleset + 别的表 → 应用时会连别人的表一起冲掉, 不能算安全合并
-rest = "\n".join(keep)
-if re.search(r"^\s*flush\s+ruleset\s*$", rest, re.M):
-    others = [m.group(0).strip() for m in other_table.finditer(rest)]
+rest_lines = keep
+flush_ln = next((k + 1 for k, ln in enumerate(rest_lines)
+                 if re.match(r"^\s*flush\s+ruleset\s*$", ln)), None)
+if flush_ln:
+    others = [(k + 1, ln.strip()) for k, ln in enumerate(rest_lines) if other_table.match(ln)]
     if others:
-        print("现网 nftables.conf 含 `flush ruleset` 且另有表(%s) —— 合并后应用会冲掉它们, 拒绝自动处理"
-              % ", ".join(others[:3]), file=sys.stderr)
+        print("冲突位置: %s 第 %d 行 `flush ruleset`, 且文件里另有表 —— 合并后一应用会连它们一起冲掉:"
+              % (target_f, flush_ln), file=sys.stderr)
+        for lno, txt in others[:5]:
+            print("    第 %d 行: %s" % (lno, txt), file=sys.stderr)
         sys.exit(3)
 
 if first_hit is None:                         # 现网没有 pdg 区 → 追加到末尾

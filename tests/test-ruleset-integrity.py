@@ -191,6 +191,31 @@ def main():
             bad("正常规则集没进 mihomo 运行配置")
         ok("正常 .list 规则集照常添加, 并真的进了 mihomo 运行配置")
 
+    # ── 9. doctor 要提前预警遗留 .srs, 而不是等 update 被挡住才让用户回头查 ──
+    import importlib.util as _il
+    _s = _il.spec_from_file_location("checks", ROOT / "deploy/bot/checks.py")
+    checks = _il.module_from_spec(_s)
+    _s.loader.exec_module(checks)
+    with tempfile.TemporaryDirectory() as tmp:
+        checks.RS_META = os.path.join(tmp, "none.json")
+        if checks.check_rulesets() is not None:
+            bad("没有规则集时不该显示该检查项")
+        checks.RS_META = os.path.join(tmp, "ok.json")
+        json.dump({"rs_a": {"url": "https://x/a.list", "format": "source"}},
+                  open(checks.RS_META, "w"))
+        lv, _lab, _d = checks.check_rulesets()
+        if lv != "ok":
+            bad(f"正常规则集被判成 {lv}")
+        checks.RS_META = os.path.join(tmp, "srs.json")
+        json.dump({"rs_old": {"url": "https://x/geo.srs", "format": "binary", "label": "旧规则"}},
+                  open(checks.RS_META, "w"))
+        lv, _lab, detail = checks.check_rulesets()
+        if lv != "fail" or "旧规则" not in detail:
+            bad(f"遗留 .srs 未被 doctor 判 fail 并点名: {lv} {detail}")
+        if "pdg update" not in detail or "分流管理" not in detail:
+            bad(f"doctor 提示不具可操作性: {detail}")
+        ok("doctor 提前预警遗留 .srs(点名 + 说明会挡住 update + 给出处理入口)")
+
     print(f"\n通过 {pass_n} 项断言")
 
 

@@ -10,8 +10,9 @@ SB_UNIT=/etc/systemd/system/sing-box.service
 SB_OWNED=0
 if [[ -e /etc/privdns-gateway/singbox.pdg-owned ]]; then SB_OWNED=1
 elif [[ -f "$SB_UNIT" ]] \
-     && grep -qE '^ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config\.json[[:space:]]*$' "$SB_UNIT" \
-     && grep -qE '^Description=sing-box[[:space:]]*$' "$SB_UNIT"; then SB_OWNED=1; fi
+     && grep -qE '^ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config\.json([[:space:]]|$)' "$SB_UNIT"; then
+  SB_OWNED=1
+fi
 
 systemctl disable --now pdg-bot pdg-probe81 mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
 [[ "$SB_OWNED" == 1 ]] && systemctl disable --now sing-box 2>/dev/null || true

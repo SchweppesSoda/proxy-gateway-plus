@@ -12,6 +12,7 @@ NFT_CONF = "/etc/nftables.conf"
 PLATFORM_FILE = "/etc/privdns-gateway/platform"
 PLATFORM_GUESSED = PLATFORM_FILE + ".guessed"   # 存在 = 平台是推测出来的, 没人确认过
 REPO_DIR = "/opt/privdns-gateway"   # 已装仓库(比对部署文件是否与当前发布同版本)
+RS_META = "/opt/pdg-bot/rulesets.json"   # 规则集元数据(与 bot 同源)
 # 面板 UI 在 /etc/sing-box/ui/dist, 不在 mihomo 工作目录下 → SAFE_PATHS 放行, 否则 `mihomo -t` 拒。
 os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
 
@@ -677,9 +678,36 @@ def check_mitm():
         return ("fail", "MITM 插件", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
     return ("ok", "MITM 插件", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
 
+def check_rulesets():
+    """规则集能否进入 mihomo 运行配置。
+
+    mihomo 读不了 sing-box 的二进制 `.srs`; 这类**老机器遗留**的规则集会让渲染器把对应规则
+    丢弃 → _core_apply/迁移一律判失败。若等到 `pdg update` 才发现, 用户是"更新被挡住"才回头
+    查原因。这里提前报出来, 并直说该怎么办。只读, 不改任何东西。"""
+    try:
+        meta = json.load(open(RS_META, encoding="utf-8"))
+    except Exception:  # noqa: BLE001  没有规则集元数据 = 没加过规则集
+        return None
+    if not isinstance(meta, dict) or not meta:
+        return None
+    stale = []
+    for name, info in meta.items():
+        if not isinstance(info, dict):
+            continue
+        url = str(info.get("url", "")).lower().split("?", 1)[0]
+        if url.endswith(".srs") or str(info.get("format", "")) == "binary" \
+           or str(info.get("path", "")).endswith(".srs"):
+            stale.append(str(info.get("label") or name))
+    if stale:
+        return ("fail", "规则集", "这些是 sing-box 二进制 .srs, mihomo 读不了 → 分流不会生效, "
+                                  "且会挡住 `pdg update`: " + "、".join(stale[:6])
+                                  + "。请在 bot「📑 分流管理」里删掉它们, 换成 .list/.txt/.yaml/.mrs。")
+    return ("ok", "规则集", "%d 个, 格式均可被 mihomo 加载" % len(meta))
+
+
 ALL = [check_platform, check_services, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_nft, check_redirect, check_gms, check_mosdns_ratelimit, check_mem,
-       check_cert, check_dns, check_core_config, check_mitm_structure, check_mitm]
+       check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加

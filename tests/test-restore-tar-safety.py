@@ -13,6 +13,7 @@
 且合法备份仍能正常解出。
 """
 import io
+import json
 import os
 import shutil
 import sys
@@ -206,6 +207,44 @@ def main():
             if not os.path.exists(os.path.join(dest, rel)):
                 bad(f"合法成员未解出: {rel}")
         ok("合法备份(含 rs/ 规则集)完整解出, 保护没误伤正常恢复")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+    # ── 守卫: 备份产出的成员必须全部在恢复白名单内 ──
+    # _safe_extract 的白名单是硬编码的; 将来往 BACKUP_FILES 里加了文件却忘了同步白名单,
+    # 那份文件会在恢复时被**静默跳过** —— 备份看着有、恢复回来却没有, 且没有任何报错。
+    # 这条守卫把"备份写什么"与"恢复认什么"钉在一起。
+    base = tempfile.mkdtemp(prefix="pdgsync")
+    try:
+        os.makedirs(os.path.join(base, "etc/mosdns/rules"), exist_ok=True)
+        os.makedirs(os.path.join(base, "opt/pdg-bot"), exist_ok=True)
+        os.makedirs(os.path.join(base, "etc/sing-box/rs"), exist_ok=True)
+        bot.SB = os.path.join(base, "etc/sing-box/config.json")
+        bot.MOSDNS_CONF = os.path.join(base, "etc/mosdns/config.yaml")
+        bot.MOSDNS_DIRECT = os.path.join(base, "etc/mosdns/rules/custom_direct.txt")
+        bot.MOSDNS_HIJACK = os.path.join(base, "etc/mosdns/rules/custom_hijack.txt")
+        bot.RS_META = os.path.join(base, "opt/pdg-bot/rulesets.json")
+        bot.RS_DIR = os.path.join(base, "etc/sing-box/rs")
+        bot.BACKUP_FILES = [bot.SB, bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK, bot.RS_META]
+        json.dump({"outbounds": [], "route": {"rules": []}}, open(bot.SB, "w"))
+        for p in (bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK):
+            open(p, "w").write("x\n")
+        json.dump({}, open(bot.RS_META, "w"))
+        open(os.path.join(bot.RS_DIR, "a.list"), "w").write("DOMAIN,a.com\n")
+        blob = bot.backup_blob()
+        tar = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz")
+        missed = []
+        for m in tar.getmembers():
+            if not m.isreg():
+                continue
+            # 备份用的是本机绝对路径去头; 测试里路径被重定向过, 换算回归档相对形态再判
+            rel = m.name.lstrip("./")
+            rel = rel.replace(base.lstrip("/") + "/", "")
+            if not bot._restore_member_allowed(rel):
+                missed.append(rel)
+        if missed:
+            bad(f"备份产出的成员不在恢复白名单内(恢复时会被静默跳过): {missed}")
+        ok("守卫: backup_blob 产出的每个成员都在恢复白名单内(备份/恢复不会脱节)")
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

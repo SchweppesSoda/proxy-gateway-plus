@@ -98,6 +98,23 @@ run_uninstall --purge >/dev/null
 [[ ! -e "$SB/usr/local/bin/sing-box" ]] \
   && ok "--purge: 归属标记存在 → 认定自家并删除" || bad "4: 归属标记未生效"
 
+# ── 5. 自家 unit 被用户改过(改 Description / 加注释 / 加字段)仍应认得出 ──
+# 判据只认 ExecStart 那一行 —— 它同时指向本项目的二进制与数据模型路径。若把 Description
+# 之类也一起卡, "自家但被改过"的 unit 会被误判成第三方而**永久保留**, 迁移与卸载都清不掉。
+mkfake ours
+python3 - "$SB/etc/systemd/system/sing-box.service" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("Description=sing-box", "Description=sing-box (我自己加了备注)")
+s = "# 我手动加的注释行\n" + s + "Restart=always\nLimitNOFILE=1048576\n"
+open(p, "w").write(s)
+PY
+run_uninstall --purge >/dev/null
+[[ ! -e "$SB/etc/systemd/system/sing-box.service" ]] \
+  && ok "自家 unit 被用户改过(Description/注释/额外字段)仍认得出并清理" \
+  || bad "5: 改过的自家 unit 被误判成第三方而保留"
+
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
 [[ "$nfail" == 0 ]]
