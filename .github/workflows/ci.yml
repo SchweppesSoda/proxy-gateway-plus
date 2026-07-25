@@ -154,7 +154,7 @@ jobs:
       - name: "面板快照/回滚净化回归 (secret 不入档)"
         run: bash tests/test-panel-snapshot.sh
 
-      - name: "规则集完整性 (dropped 非空即拒/.srs 入口拒/.mrs 放行/加完真的进运行配置)"
+      - name: "规则集完整性 (dropped 非空即拒/.srs 拒/真实 YAML provider + 真实 .mrs fixture 走本地 HTTP)"
         run: python3 tests/test-ruleset-integrity.py
 
       - name: "bot 测域名规则集显示名回归"

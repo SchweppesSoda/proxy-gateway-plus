@@ -14,7 +14,7 @@ assert 'set_tfo(data == "tfo:on"); edit(chat, mid, msg if ok else ("❌ " + msg)
 assert 'edit(chat, mid, f"✅ 已重启 {_core_svc()} + mosdns" if ok else msg, OPS_BACK)' in bot, (
     "restart result must stay in ops navigation"
 )
-assert 'edit(chat, mid, (f"✅ geosite 已更新; 规则集刷新 {n} 个" if r.returncode == 0' in bot, (
+assert 'msg = f"✅ geosite 已更新; 规则集刷新 {n} 个"' in bot and "edit(chat, mid, msg, OPS_BACK)" in bot, (
     "rule-update result path should stay covered"
 )
 assert '), OPS_BACK); return' in bot, "rule-update result must use OPS_BACK"

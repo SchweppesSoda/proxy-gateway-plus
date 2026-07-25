@@ -173,15 +173,18 @@ def main():
         json.dump({
             "rs_a": {"url": "https://x/netflix.list", "outbound": "ss1"},
             "rs_b": {"url": "https://x/geo.yaml", "outbound": "ss1"},
-            "rs_c": {"url": "https://x/set.mrs", "outbound": "ss1"},
+            # .mrs 的 behavior 必须**显式记录**才渲染 —— 它是编译后的二进制, 判不出来就不能猜
+            "rs_c": {"url": "https://x/set.mrs", "outbound": "ss1", "behavior": "domain"},
             "rs_d": {"url": "https://x/legacy.srs", "outbound": "ss1"},
+            "rs_e": {"url": "https://x/nobehavior.mrs", "outbound": "ss1"},
         }, open(bot.RS_META, "w"))
         rs = bot._mihomo_rulesets()
         assert rs["rs_a"] == {"url": "https://x/netflix.list", "behavior": "classical", "format": "text"}
         assert rs["rs_b"]["format"] == "yaml"
         assert rs["rs_c"]["format"] == "mrs" and rs["rs_c"]["behavior"] == "domain"
         assert "rs_d" not in rs, ".srs(sing-box 二进制)应跳过"
-        ok("_mihomo_rulesets 分类 text/yaml/mrs + 跳过 .srs")
+        assert "rs_e" not in rs, "没记 behavior 的 .mrs 不该被猜成 domain, 应跳过(交由 dropped 报错)"
+        ok("_mihomo_rulesets 分类 text/yaml/mrs(behavior 须显式) + 跳过 .srs 与无 behavior 的 .mrs")
         # model 带 rule_set 规则 → 渲染出 rule-providers + RULE-SET
         model = json.load(open(bot.SB))
         model["route"]["rules"].insert(1, {"rule_set": "rs_a", "outbound": "ss1"})

@@ -426,8 +426,13 @@ def _mihomo_rulesets():
             continue
         if low.endswith((".yaml", ".yml")):
             behavior, fmt = "classical", "yaml"
-        elif low.endswith(".mrs"):                     # mihomo 原生二进制规则集(sing-box 不支持, 换核后可用)
-            behavior, fmt = "domain", "mrs"
+        elif low.endswith(".mrs") or str(info.get("format", "")) == "mrs":
+            # .mrs 是编译后的二进制, behavior 判不出来就**不能猜** —— 猜错的后果是"规则看着
+            # 加了却永不命中"。没有显式记录的一律不渲染, 让它进 dropped 由上层点名报错。
+            bh = str(info.get("behavior", ""))
+            if bh not in ("domain", "ipcidr", "classical"):
+                continue
+            behavior, fmt = bh, "mrs"
         else:                                          # Surge/Clash .list/.txt: DOMAIN/-SUFFIX/-KEYWORD/IP-CIDR 混合
             behavior, fmt = "classical", "text"
         out[name] = {"url": info.get("url", ""), "behavior": behavior, "format": fmt}
@@ -1698,6 +1703,22 @@ def _fetch_surge(url):
         line = line.split("#", 1)[0].split("//", 1)[0].strip()
         if not line:
             continue
+        # Clash/mihomo 的 YAML provider 形如:
+        #     payload:
+        #       - DOMAIN-SUFFIX,example.com
+        #       - 'DOMAIN,api.example.com'
+        # 去掉列表短横线与引号后, 剩下的与 Surge/Clash 文本行同形 —— 不这么处理的话
+        # `p[0]` 会是 "- DOMAIN-SUFFIX", 一条都匹配不上, 整个 provider 被判成"没解析出规则"。
+        if line == "payload:" or line.endswith(":"):
+            continue
+        if line.startswith("- "):
+            line = line[2:].strip()
+        elif line.startswith("-") and len(line) > 1 and not line[1].isdigit():
+            line = line[1:].strip()
+        if len(line) >= 2 and line[0] == line[-1] and line[0] in ("'", '"'):
+            line = line[1:-1].strip()
+        if not line:
+            continue
         p = [x.strip() for x in line.split(",")]
         t = p[0].upper()
         if t == "DOMAIN" and len(p) > 1:
@@ -1732,7 +1753,10 @@ def _build_source(url, path):
     json.dump({"version": 1, "rules": [rule]}, open(path, "w"), ensure_ascii=False)
     return len(dom) + len(suf) + len(kw) + len(ip), (len(dom) + len(suf) + len(kw) == 0)
 
-def add_ruleset(url, target, label=""):
+MRS_BEHAVIORS = ("domain", "ipcidr", "classical")
+
+
+def add_ruleset(url, target, label="", behavior=""):
     c = load()
     if target not in exit_tags(c):
         return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))}"
@@ -1746,9 +1770,18 @@ def add_ruleset(url, target, label=""):
     os.makedirs(RS_DIR, exist_ok=True)
     try:
         if low.endswith(".mrs"):
-            # mihomo 原生二进制规则集: 直接存盘, 由 rule-provider 按 mrs 格式加载
+            # mihomo 原生二进制规则集: 直接存盘, 由 rule-provider 按 mrs 格式加载。
+            # behavior 必须**显式声明** —— .mrs 是编译后的二进制, 从文件本身可靠地判不出它是
+            # domain 还是 ipcidr 集; 一律按 domain 猜, 猜错就是"规则看着加了却永不命中"。
+            if behavior not in MRS_BEHAVIORS:
+                return False, (".mrs 需要显式指定规则类型(behavior), 无法从文件可靠判断。\n"
+                               "请在规则集后面补上类型: " + " / ".join(MRS_BEHAVIORS) + "\n"
+                               "例: <code>https://.../geo.mrs hk 名称 domain</code>")
             path = os.path.join(RS_DIR, name + ".mrs"); fmt = "mrs"
-            open(path, "wb").write(_fetch_bytes(url)); count = None; warn = ""
+            data = _fetch_bytes(url)
+            if not data:
+                raise ValueError("下载到空的 .mrs(源站异常?)")
+            open(path, "wb").write(data); count = None; warn = ""
         else:
             path = os.path.join(RS_DIR, name + ".json"); fmt = "source"
             count, ip_only = _build_source(url, path)
@@ -1771,6 +1804,8 @@ def add_ruleset(url, target, label=""):
     prev = _rs_meta()
     m = dict(prev)
     m[name] = {"url": url, "outbound": target, "format": fmt, "path": path, "count": count}
+    if behavior in MRS_BEHAVIORS:
+        m[name]["behavior"] = behavior
     if label.strip():
         m[name]["label"] = label.strip()[:40]
     _save_rs_meta(m)
@@ -1822,15 +1857,20 @@ def del_ruleset(name):
     return False, msg
 
 def refresh_rulesets():
-    """重下并原子替换所有规则集; 内核校验通过才重启, 坏档自动回滚、不断网(供 bot 与每日定时调用)。"""
-    m = _rs_meta(); n = 0; swapped = []   # (path, bak)
+    """重下并原子替换所有规则集; 内核校验通过才重启, 坏档自动回滚、不断网(供 bot 与每日定时调用)。
+
+    返回 (成功刷新数, 失败项列表)。**必须**如实返回失败 —— 旧版只 print 一行然后照返回条数,
+    调用方看不出有规则集没刷上, 用户以为规则库已更新。"""
+    m = _rs_meta(); n = 0; swapped = []; failed = []   # (path, bak)
     for name, info in m.items():
         # 兼容早期缺 format/path 的旧条目 (按 name 回填, 否则刷新会 KeyError)。
         info.setdefault("format", "binary" if str(info.get("path", "")).endswith(".srs") else "source")
         info.setdefault("path", os.path.join(RS_DIR, name + (".srs" if info["format"] == "binary" else ".json")))
         tmp = info["path"] + ".new"
         try:
-            if info["format"] == "binary":
+            if info["format"] in ("binary", "mrs"):
+                # .mrs 是 mihomo 原生**二进制**格式, 绝不能走文本解析(_build_source 会把它当
+                # Surge 规则去 parse, 结果要么报"没解析出规则", 要么写出一份被毁掉的文件)。
                 data = _fetch_bytes(info["url"])
                 if not data:
                     raise ValueError("空响应")
@@ -1839,7 +1879,7 @@ def refresh_rulesets():
                 info["count"] = _build_source(info["url"], tmp)[0]   # 先写临时文件
             n += 1
         except Exception as e:  # noqa: BLE001
-            print("refresh rs", name, e)
+            failed.append("%s(%s: %s)" % (info.get("label") or name, type(e).__name__, e))
             try:
                 os.remove(tmp)
             except OSError:
@@ -1854,22 +1894,22 @@ def refresh_rulesets():
             swapped.append((info["path"], info["path"] + ".bak"))
         os.replace(tmp, info["path"])
     if n == 0:
-        return 0
+        return 0, failed
     # 核心校验+重启(core-aware): sing-box=check SB + restart; mihomo=渲染 + `mihomo -t` + restart(重启即重取 providers)。
     ok, err, _ = _core_apply()
     if not ok:                              # 坏档 → 还原旧规则集 + 用好档回到已知good, 不断网
         for path, bak in swapped:
             shutil.copy(bak, path)
         _core_apply()
-        print("refresh rs: 核心校验/重启失败, 已回滚:", (err or "")[:120])
-        return 0
+        failed.append("内核校验/重启失败, 已回滚到上一份好档: %s" % (err or "")[:160])
+        return 0, failed
     for _, bak in swapped:                  # 成功后清备份
         try:
             os.remove(bak)
         except OSError:
             pass
     _save_rs_meta(m)
-    return n
+    return n, failed
 
 # ── 测出口 (端到端延迟, clash_api; TCP 兜底) ──
 def _test_exits_tcp(c):
@@ -2924,7 +2964,10 @@ def handle_cb(chat, mid, data):
         state[chat] = "add_rs"
         edit(chat, mid, "发「<b>规则集URL 出口 [名称]</b>」(后缀 .list / .txt / .yaml / .mrs)。\n"
              f"出口: {', '.join(exit_tags(load()))}\n名称可留空(之后用「✏️ 改规则集名」改)。\n"
-             "例: <code>https://.../Binance.list tw 币安</code>\n/cancel 取消。", RULE_BACK); return
+             "例: <code>https://.../Binance.list tw 币安</code>\n"
+             "· .mrs 需在末尾补类型: <code>https://.../geo.mrs tw 名称 domain</code>"
+             "(可选 domain / ipcidr / classical —— 二进制规则集判不出来, 猜错会让规则永不命中)\n"
+             "/cancel 取消。", RULE_BACK); return
     if data == "del_rs":
         if not _rs_meta():
             edit(chat, mid, "没有已添加的规则集", RULE_BACK); return
@@ -3128,9 +3171,15 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, f"✅ 已重启 {_core_svc()} + mosdns" if ok else msg, OPS_BACK); return
     if data == "updgeo":
         edit(chat, mid, "正在更新 geosite + 规则集…", OPS_BACK)
-        r = sh(["/bin/bash", UPDATE_SCRIPT]); n = refresh_rulesets()
-        edit(chat, mid, (f"✅ geosite 已更新; 规则集刷新 {n} 个" if r.returncode == 0
-                         else "geosite 更新失败:\n" + (r.stdout + r.stderr)[-300:]), OPS_BACK); return
+        r = sh(["/bin/bash", UPDATE_SCRIPT]); n, rs_failed = refresh_rulesets()
+        if r.returncode != 0:
+            edit(chat, mid, "geosite 更新失败:\n" + (r.stdout + r.stderr)[-300:], OPS_BACK); return
+        # 规则集刷新失败必须说出来 —— 否则用户以为规则库是新的, 实际有几条还停在旧版
+        msg = f"✅ geosite 已更新; 规则集刷新 {n} 个"
+        if rs_failed:
+            msg = (f"⚠️ geosite 已更新; 规则集刷新 {n} 个, 但这些没刷上(仍用上一份好档):\n· "
+                   + "\n· ".join(str(x)[:120] for x in rs_failed[:5]))
+        edit(chat, mid, msg, OPS_BACK); return
     if data.startswith("delx:"):
         tag = data[5:]
         def mod(c):
@@ -3183,7 +3232,8 @@ def handle_text(chat, text, mid=None):
         if cmd == "/delrule":
             state[chat] = "del_rule"; send(chat, "发要删除的域名。/cancel 取消。", BACK); return
         if cmd == "/addrs":
-            state[chat] = "add_rs"; send(chat, "发「<b>规则集URL 出口</b>」（支持 .list / .txt / .yaml / .mrs）。/cancel 取消。", BACK); return
+            state[chat] = "add_rs"; send(chat, "发「<b>规则集URL 出口 [名称] [类型]</b>」（支持 .list / .txt / .yaml / .mrs；"
+                       ".mrs 需补类型 domain/ipcidr/classical）。/cancel 取消。", BACK); return
         if cmd == "/delexit":
             tags = deletable_tags(load())
             send(chat, "选择删除的出口/组：" if tags else "无可删出口", kb_pick("delx", tags) if tags else BACK); return
@@ -3213,8 +3263,11 @@ def handle_text(chat, text, mid=None):
         if cmd == "/restart":
             ok, _ = apply_sb(lambda c: None); sh(["systemctl", "restart", "mosdns"]); send_plain(chat, "✅ 已重启" if ok else "重启失败"); return
         if cmd == "/update":
-            send_plain(chat, "更新中…"); r = sh(["/bin/bash", UPDATE_SCRIPT]); n = refresh_rulesets()
-            send_plain(chat, f"✅ 完成，规则集刷新 {n} 个" if r.returncode == 0 else "更新失败"); return
+            send_plain(chat, "更新中…"); r = sh(["/bin/bash", UPDATE_SCRIPT]); n, rs_failed = refresh_rulesets()
+            if r.returncode != 0:
+                send_plain(chat, "更新失败"); return
+            send_plain(chat, f"✅ 完成，规则集刷新 {n} 个" if not rs_failed
+                       else f"⚠️ 完成，规则集刷新 {n} 个，{len(rs_failed)} 个没刷上(仍用上一份好档)"); return
         send_plain(chat, "未识别命令，发 /start 打开菜单"); return
     act = state.pop(chat, None) or ""   # 无待输入时为 "", 避免下面 act.startswith(...) 在 None 上崩
     if act == "add_exit":
@@ -3267,9 +3320,15 @@ def handle_text(chat, text, mid=None):
     if act == "add_rs":
         p = text.split()
         if len(p) < 2:
-            send_plain(chat, "格式: 规则集URL 出口 [名称]"); return
+            send_plain(chat, "格式: 规则集URL 出口 [名称] [类型(仅 .mrs 需要)]"); return
+        # .mrs 需要显式类型: 末尾若是 domain/ipcidr/classical 就当类型, 其余算名称
+        behavior = ""
+        rest = p[2:]
+        if rest and rest[-1].lower() in MRS_BEHAVIORS:
+            behavior = rest[-1].lower(); rest = rest[:-1]
         send_plain(chat, "正在下载规则集…")
-        ok, msg = add_ruleset(p[0], p[1], " ".join(p[2:])); send_plain(chat, ("✅ " if ok else "") + msg); return
+        ok, msg = add_ruleset(p[0], p[1], " ".join(rest), behavior)
+        send_plain(chat, ("✅ " if ok else "") + msg); return
     if act.startswith("rs_label:"):
         name = act.split(":", 1)[1]
         ok, msg = set_ruleset_label(name, "" if text.strip() == "-" else text)

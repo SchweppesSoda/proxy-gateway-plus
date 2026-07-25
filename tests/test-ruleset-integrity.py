@@ -27,6 +27,11 @@ spec.loader.exec_module(bot)
 
 import sb2mihomo
 
+# 真函数留底: 个别用例会打桩 _build_source/_fetch_bytes, 但那种桩**绝不能泄漏**到后面用
+# 真实 fixture 的用例里(否则等于把被测逻辑 mock 掉了还以为在测)。setup() 每次都复原。
+_REAL_BUILD_SOURCE = bot._build_source
+_REAL_FETCH_BYTES = bot._fetch_bytes
+
 pass_n = 0
 
 
@@ -77,6 +82,8 @@ def setup(tmp):
     fake = FakeSh()
     bot.sh = fake
     bot._svc_active = lambda unit, **k: True
+    bot._build_source = _REAL_BUILD_SOURCE      # 复原, 防止上一个用例的桩泄漏进来
+    bot._fetch_bytes = _REAL_FETCH_BYTES
     return fake
 
 
@@ -125,7 +132,8 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp)
         bot._fetch_bytes = lambda url: b"MRSbinary"
-        okr, msg = bot.add_ruleset("https://example.com/geo.mrs", "hk")
+        # .mrs 的 behavior 判不出来, 必须显式声明(见下方真实 fixture 用例里的"未声明即拒绝")
+        okr, msg = bot.add_ruleset("https://example.com/geo.mrs", "hk", behavior="domain")
         if not okr:
             bad(f".mrs 被拒了(mihomo 原生格式应当可用): {msg}")
         m = json.load(open(bot.RS_META))
@@ -221,3 +229,168 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 真实规则集 fixture 走**本地 HTTP 服务** —— 不 mock _build_source, 完整跑
+# 添加 → 刷新 → 渲染 → 内核校验。
+# ══════════════════════════════════════════════════════════════════════════════
+import http.server
+import shutil
+import subprocess
+import threading
+
+FIXTURES = ROOT / "tests" / "fixtures"
+
+# 真实的 Clash YAML provider(mihomo/Clash 生态最常见的形态)
+YAML_PROVIDER = b"""payload:
+  - DOMAIN-SUFFIX,example.com
+  - DOMAIN,api.example.com
+  - 'DOMAIN-KEYWORD,exam'
+  - IP-CIDR,1.2.3.0/24
+"""
+SURGE_LIST = b"""# comment
+DOMAIN-SUFFIX,surge.example.com
+DOMAIN,x.surge.example.com
+"""
+
+
+class _Serve(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *a):     # 别把请求日志刷进测试输出
+        pass
+
+
+def serve_dir(d):
+    """起一个本地 HTTP 服务伺服目录 d, 返回 (base_url, shutdown)。"""
+    handler = lambda *a, **k: _Serve(*a, directory=d, **k)   # noqa: E731
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return "http://127.0.0.1:%d" % srv.server_address[1], srv.shutdown
+
+
+def mihomo_bin():
+    """有真 mihomo 就用它做内核校验; 没有则返回 None(该断言跳过并说明)。"""
+    return shutil.which("mihomo")
+
+
+def ruleset_main():
+    mrs_fix = FIXTURES / "ruleset-domain.mrs"
+    if not mrs_fix.exists():
+        bad("缺少真实 MRS fixture: %s" % mrs_fix)
+    mrs_bytes = mrs_fix.read_bytes()
+
+    www = tempfile.mkdtemp(prefix="pdgwww")
+    (Path(www) / "cn.yaml").write_bytes(YAML_PROVIDER)
+    (Path(www) / "cn.list").write_bytes(SURGE_LIST)
+    (Path(www) / "geo.mrs").write_bytes(mrs_bytes)
+    base, shutdown = serve_dir(www)
+    try:
+        # ── 真实 YAML provider: 添加 → 解析出规则 → 刷新 → 渲染进运行配置 ──
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            okr, msg = bot.add_ruleset(base + "/cn.yaml", "hk")
+            if not okr:
+                bad(f"真实 Clash YAML provider 添加失败: {msg}")
+            m = json.load(open(bot.RS_META))
+            info = next(iter(m.values()))
+            local = json.load(open(info["path"]))
+            rules = local["rules"][0]
+            if "example.com" not in rules.get("domain_suffix", []):
+                bad(f"YAML provider 的 DOMAIN-SUFFIX 没解析出来: {rules}")
+            if "api.example.com" not in rules.get("domain", []):
+                bad(f"YAML provider 的 DOMAIN 没解析出来: {rules}")
+            if "1.2.3.0/24" not in rules.get("ip_cidr", []):
+                bad(f"YAML provider 的 IP-CIDR 没解析出来: {rules}")
+            ok("真实 Clash YAML provider(payload: 列表)被正确解析并添加")
+
+            cfg = json.load(open(bot.MIHOMO_CFG))
+            if not any(str(r).startswith("RULE-SET,") for r in cfg.get("rules", [])):
+                bad("YAML provider 没进 mihomo 运行配置")
+            ok("YAML provider 已渲染进 mihomo 运行配置(RULE-SET)")
+
+            rr = bot.refresh_rulesets()
+            if not (isinstance(rr, tuple) and len(rr) == 2):
+                bad(f"refresh_rulesets 未返回 (成功数, 失败项) 二元组: {rr!r}")
+            nok, failed = rr
+            if failed or nok < 1:
+                bad(f"刷新真实 YAML provider 失败: {rr!r}")
+            ok("刷新真实 YAML provider 成功, 且返回明确状态 (成功数, 失败项)")
+
+            mh = mihomo_bin()
+            if mh:
+                r = subprocess.run([mh, "-t", "-d", bot.MIHOMO_DIR, "-f", bot.MIHOMO_CFG],
+                                   capture_output=True, text=True)
+                if r.returncode != 0:
+                    bad(f"真 mihomo -t 拒绝了含 YAML provider 的配置: {(r.stdout + r.stderr)[-300:]}")
+                ok("真 mihomo -t 接受含 YAML provider 的运行配置")
+            else:
+                print("[SKIP] 本机无 mihomo, 跳过真内核校验(CI 的 e2e/functional job 会覆盖)")
+
+        # ── .mrs: 必须按二进制下载, 不得进文本解析路径 ──
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            okr, msg = bot.add_ruleset(base + "/geo.mrs", "hk", behavior="domain")
+            if not okr:
+                bad(f"真实 .mrs 添加失败: {msg}")
+            m = json.load(open(bot.RS_META))
+            info = next(iter(m.values()))
+            got = open(info["path"], "rb").read()
+            if got != mrs_bytes:
+                bad(".mrs 落盘内容与源文件不一致(疑似走了文本解析路径)")
+            if info.get("behavior") != "domain":
+                bad(f".mrs 的 behavior 未按显式声明记录: {info}")
+            ok("真实 .mrs 按二进制落盘, 内容逐字节一致, behavior 按显式声明记录")
+
+            rr = bot.refresh_rulesets()
+            nok, failed = rr
+            if failed:
+                bad(f".mrs 刷新失败: {rr!r}")
+            if open(info["path"], "rb").read() != mrs_bytes:
+                bad(".mrs 刷新后内容变了(文本解析把二进制毁了?)")
+            ok("再次刷新 .mrs: 仍按二进制处理, 内容逐字节不变")
+
+            # 源头变成坏档(空响应)→ 刷新必须失败并回滚到上一份好档
+            (Path(www) / "geo.mrs").write_bytes(b"")
+            rr = bot.refresh_rulesets()
+            nok, failed = rr
+            if not failed:
+                bad("坏档(.mrs 空响应)却报刷新成功")
+            if open(info["path"], "rb").read() != mrs_bytes:
+                bad("坏档刷新后没回滚到上一份好档")
+            ok("坏 .mrs → 刷新明确失败并回滚到上一份好档(不断网)")
+            (Path(www) / "geo.mrs").write_bytes(mrs_bytes)
+
+        # ── .mrs 未声明 behavior: 不得静默当成 domain ──
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            okr, msg = bot.add_ruleset(base + "/geo.mrs", "hk")
+            if okr:
+                bad(".mrs 未声明 behavior 却被接受(静默按 domain 处理是错的)")
+            if "behavior" not in msg and "类型" not in msg:
+                bad(f".mrs 拒绝文案没说清要指定类型: {msg}")
+            ok(".mrs 未声明 behavior → 拒绝并要求指定类型(不静默硬编码 domain)")
+
+        # ── 刷新部分失败: 必须如实报出是哪一个 ──
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            bot.add_ruleset(base + "/cn.list", "hk")
+            m = json.load(open(bot.RS_META))
+            name = next(iter(m))
+            m[name]["url"] = base + "/does-not-exist.list"      # 让它刷新时 404
+            json.dump(m, open(bot.RS_META, "w"))
+            nok, failed = bot.refresh_rulesets()
+            if not failed:
+                bad("规则集 404 却报刷新成功")
+            if not any(name in str(f) for f in failed):
+                bad(f"失败项没点名是哪个规则集: {failed}")
+            ok("刷新失败如实返回失败项并点名(不再只 print 却表现为成功)")
+    finally:
+        shutdown()
+        shutil.rmtree(www, ignore_errors=True)
+
+    print(f"通过 {pass_n} 项断言(含真实 fixture)")
+
+
+if __name__ == "__main__":
+    ruleset_main()
+
