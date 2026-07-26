@@ -1082,6 +1082,9 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
         t.warn(w)
     try:
         if model_mod is not None:
+            # 先记下"候选依据的是哪一份 model": 之后 stage 用它当前置条件。
+            # 否则 load() 与 stage() 之间别人提交的修改会被当成前置条件, 最后被我们覆盖(丢更新)。
+            t.read_for_update("model")
             c = load()
             intent = _tfo_intent(c) if tfo_intent is None else tfo_intent
             model_mod(c)

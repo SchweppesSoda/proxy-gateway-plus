@@ -5,6 +5,7 @@
 位置、三个进程同时抢锁、候选校验失败、before-image 存不下、第 N 个文件替换失败 —— 再看现网
 与状态机的真实结果。
 """
+import json
 import os
 import subprocess
 import sys
@@ -348,6 +349,67 @@ def main():
     else:
         bad("legacy 分支不对: rc=%s %s" % (r.returncode, (r.stdout + r.stderr)[:100]))
     _sh.rmtree(hookdir, ignore_errors=True)
+
+    # ── 10. 丢更新窗口(六): 前置条件必须对应"候选所依据的那一份" ──
+    box4 = Box(); tx4 = load_tx(box4.env)
+    box4.up("mihomo"); box4.up("mosdns")
+    model_v1 = json.dumps({"outbounds": [{"type": "direct", "tag": "v1"}],
+                           "route": {"rules": []}, "inbounds": []}).encode()
+    box4.put("/etc/sing-box/config.json", model_v1)
+    # A: 读旧配置(此刻还没 stage)
+    tA = tx4.Tx("bot", "A-read-old")
+    curA, shaA = tA.read_for_update("model")
+    # B: 中途提交了自己的修改
+    model_v2 = json.dumps({"outbounds": [{"type": "direct", "tag": "v2-from-B"}],
+                           "route": {"rules": []}, "inbounds": []}).encode()
+    tB = tx4.Tx("bot", "B-commit")
+    tB.stage("model", model_v2)
+    resB = tB.commit()
+    if resB["state"] != tx4.COMMITTED:
+        bad("B 没能提交: %s" % resB.get("error"))
+    # A: 基于旧内容算出候选再 stage/commit → 必须撞前置条件
+    modelA = json.loads(curA.decode())
+    modelA["outbounds"][0]["tag"] = "v1-modified-by-A"
+    tA.stage("model", json.dumps(modelA).encode())
+    try:
+        tA.commit()
+        bad("A 覆盖了 B 的修改(丢更新)")
+    except tx4.TxRefused as e:
+        if "PRECONDITION_FAILED" in str(e):
+            ok("A 基于旧内容提交 → PRECONDITION_FAILED(不覆盖 B)")
+        else:
+            bad("拒绝原因不是前置条件: %s" % str(e)[:60])
+    if box4.read("/etc/sing-box/config.json") == model_v2:
+        ok("B 的修改完好无损(丢更新窗口已关上)")
+    else:
+        bad("现网不是 B 的内容: %r" % box4.read("/etc/sing-box/config.json")[:60])
+    if tx4.load_meta(tA.dir).get("error_class") == "PRECONDITION_FAILED":
+        ok("事务元数据里错误分类记成 PRECONDITION_FAILED(可审计)")
+    else:
+        bad("错误分类不对: %s" % tx4.load_meta(tA.dir).get("error_class"))
+    # Bash 两段式协议: read 拿 sha → stage --expect <sha>
+    r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/pdgtx.py"), "read",
+                        "--target", "model"], capture_output=True, env=dict(os.environ, **box4.env))
+    sha_line = r.stdout.split(b"\n", 1)[0].decode()
+    txid = subprocess.run([sys.executable, str(ROOT / "deploy/bot/pdgtx.py"), "new",
+                           "--source", "cli", "--op", "stale-bash"], capture_output=True,
+                          text=True, env=dict(os.environ, **box4.env)).stdout.strip()
+    box4.put("/etc/sing-box/config.json", json.dumps(
+        {"outbounds": [{"type": "direct", "tag": "v3"}], "route": {"rules": []},
+         "inbounds": []}).encode())          # 别人又改了
+    cand = os.path.join(box4.root, "cand.json")
+    with open(cand, "wb") as f:
+        f.write(model_v1)
+    subprocess.run([sys.executable, str(ROOT / "deploy/bot/pdgtx.py"), "stage", "--tx", txid,
+                    "--target", "model", "--file", cand, "--expect", sha_line],
+                   capture_output=True, env=dict(os.environ, **box4.env))
+    r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/pdgtx.py"), "apply", "--tx", txid],
+                       capture_output=True, text=True, env=dict(os.environ, **box4.env))
+    if r.returncode == 5 and "PRECONDITION_FAILED" in r.stderr:
+        ok("Bash 两段式: read 的 sha 带进 stage --expect, 中途被改即 PRECONDITION_FAILED")
+    else:
+        bad("Bash 侧前置条件没生效: rc=%s %s" % (r.returncode, r.stderr[:80]))
+    box4.clean()
 
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))

@@ -80,6 +80,9 @@ _ALLOWED = {
 }
 
 
+_UNSET = object()          # 与 expect=None("当时这个文件不存在")区分开
+
+
 class TxBusy(Exception):
     """锁被别人占着 —— 调用方应立即友好返回, 不要排队。"""
 
@@ -661,6 +664,7 @@ class Tx:
         self.source, self.op, self.mode = source, op, mode
         self.state = PREPARING
         self.targets = {}          # name -> {"path","data"(bytes|None),"expect","validators"}
+        self._read_sha = {}        # read_for_update 记下的"候选所依据的源内容" sha
         self.derivers = []         # (target, fn)
         self.actions = []
         self.warnings = []
@@ -692,8 +696,23 @@ class Tx:
         self._save_meta()
 
     # ---- 组装 ----
-    def stage(self, target, data):
-        """登记一个目标的候选内容。data=None 表示"这次要把它删掉"。"""
+    def read_for_update(self, target):
+        """读一份目标内容**并记住它的 sha**, 供随后 stage 当前置条件。返回 (bytes|None, sha|None)。
+
+        为什么必须有这一步: 调用方的典型形态是"先读现网 → 算出新内容 → stage"。如果 stage
+        时才去取当前 sha, 那这中间别人提交的修改就会被当成"前置条件"记下来, 最后被本次候选
+        覆盖 —— 丢更新, 而且事后完全看不出来。前置条件要盯的是**生成候选时看到的那一份**。"""
+        path, _m, _s, _v = resolve_target(target)
+        cur, _st = _read_target(path)
+        sha = _sha(cur) if cur is not None else None
+        self._read_sha[target] = sha
+        return cur, sha
+
+    def stage(self, target, data, expect=_UNSET):
+        """登记一个目标的候选内容。data=None 表示"这次要把它删掉"。
+
+        expect: 生成该候选时所依据的源内容 sha(None = 当时不存在)。不给就用 read_for_update
+        记下的那一份; 都没有才退回"stage 当刻的现网"(适用于内容与旧值无关的整份覆盖)。"""
         if self.state != PREPARING:
             raise TxError("stage 只能在 PREPARING 阶段")
         path, mode, secret, validators = resolve_target(target)
@@ -704,10 +723,16 @@ class Tx:
         cpath = os.path.join(self.dir, "candidate", "%02d-%s" % (idx, _safe_leaf(target)))
         if data is not None:
             atomic_write(cpath, data, 0o600)
+        if expect is not _UNSET:
+            exp = expect
+        elif target in self._read_sha:
+            exp = self._read_sha[target]
+        else:
+            exp = _sha(cur) if cur is not None else None
         self.targets[target] = {
             "path": path, "mode": mode, "secret": secret, "validators": list(validators),
             "data": data, "candidate": cpath if data is not None else None,
-            "expect": _sha(cur) if cur is not None else None,
+            "expect": exp,
             "existed": cur is not None,
         }
         return self
@@ -747,7 +772,9 @@ class Tx:
     def _abort(self, why, cls=""):
         if self.state in (PREPARING, VALIDATED):
             self.meta["error"] = redact(why)
-            self.meta["error_class"] = cls
+            # 已经分好类的(如 PRECONDITION_FAILED)不要被笼统的 REFUSED 盖掉 —— 审计要看得出
+            # 到底是"别人先改了"还是"校验没过"。
+            self.meta["error_class"] = self.meta.get("error_class") or cls
             self.meta["ended_at"] = time.time()
             self.state = ABORTED
             self._save_meta()
@@ -787,7 +814,9 @@ class Tx:
         for name, t in self.targets.items():
             cur, _ = _read_target(t["path"])
             if (_sha(cur) if cur is not None else None) != t["expect"]:
-                raise TxRefused("目标 %s 在准备期间被其它进程改过, 本次不覆盖" % name)
+                self.meta["error_class"] = "PRECONDITION_FAILED"
+                raise TxRefused("PRECONDITION_FAILED: 目标 %s 自本次读取之后被其它进程改过, "
+                                "本次不覆盖(请重新读取现网内容后重试)" % name)
         # 4) 校验全部候选
         for name, t in sorted(self.targets.items()):
             if t["data"] is None:
@@ -1271,15 +1300,30 @@ def _cli_stage(a):
         with open(a.file, "rb") as f:
             data = f.read()
     cur, _ = _read_target(path)
+    exp = a.expect if getattr(a, "expect", None) else (_sha(cur) if cur is not None else None)
+    if getattr(a, "expect", None) == "-":          # "-" = 显式声明"生成候选时它不存在"
+        exp = None
     idx = len(m.get("staged", []))
     cpath = os.path.join(d, "candidate", "%02d-%s" % (idx, _safe_leaf(a.target)))
     if data is not None:
         atomic_write(cpath, data, 0o600)
     m.setdefault("staged", []).append({
         "target": a.target, "candidate": os.path.basename(cpath) if data is not None else None,
-        "expect": _sha(cur) if cur is not None else None, "delete": data is None})
+        "expect": exp, "delete": data is None})
     atomic_write(os.path.join(d, "meta.json"),
                  json.dumps(m, ensure_ascii=False, indent=1).encode(), 0o600)
+    return 0
+
+
+def _cli_read(a):
+    """读目标当前内容与 sha —— Bash 侧的 read-for-update: 先 read 拿 sha, 生成候选后
+    stage --expect <sha>, 前置条件才对应"候选所依据的那一份"。"""
+    path, _m, _s, _v = resolve_target(a.target)
+    cur, _st = _read_target(path)
+    print(_sha(cur) if cur is not None else "-")
+    if cur is not None:
+        sys.stdout.flush()
+        os.write(1, cur)
     return 0
 
 
@@ -1381,7 +1425,11 @@ def main(argv=None):
     p.set_defaults(fn=_cli_new)
     p = sub.add_parser("stage"); p.add_argument("--tx", required=True)
     p.add_argument("--target", required=True); p.add_argument("--file")
-    p.add_argument("--delete", action="store_true"); p.set_defaults(fn=_cli_stage)
+    p.add_argument("--delete", action="store_true")
+    p.add_argument("--expect", help="生成候选时所依据的源内容 sha256; '-' 表示当时不存在")
+    p.set_defaults(fn=_cli_stage)
+    p = sub.add_parser("read"); p.add_argument("--target", required=True)
+    p.set_defaults(fn=_cli_read)
     p = sub.add_parser("service"); p.add_argument("--tx", required=True)
     p.add_argument("--action", required=True); p.set_defaults(fn=_cli_service)
     p = sub.add_parser("apply"); p.add_argument("--tx", required=True)
