@@ -113,7 +113,10 @@ plugins:
       listen: "127.0.0.1:53"
 YAML
 probe(){ # $1=mode $2=conf → 打印 ok/fail
-  python3 - "$TX" "$2" 2>&1 <<'PY' | grep -o 'PROBE|[^\n]*' | tail -1
+  # 注意: 这里必须用 `.*` 而不是 `[^\n]*`——grep 的方括号表达式里 \n 不是换行转义, 而是
+  # "反斜杠或字母 n"。用后者会把 "PROBE|fail|netns 不可用…" 在第一个 n 前截断成 "PROBE|fail|",
+  # 于是"错误原因"这一半断言永远看不到内容(本地 netns 可用时走不到这条分支, 只有 CI 会红)。
+  python3 - "$TX" "$2" 2>&1 <<'PY' | grep -o 'PROBE|.*' | tail -1
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -128,7 +131,10 @@ e2e_fetch_mosdns || true
 if command -v mosdns >/dev/null 2>&1; then
   # netns 要 CAP_SYS_ADMIN: CI 的非特权容器里用不了。用不了不是"跳过", 而是**换一条断言**——
   # 强制 netns 模式必须如实报"不可用"(不能悄悄降级放行), 且 auto 模式要能退到高端口探针。
-  if unshare -n true 2>/dev/null; then
+  # 判据要和产品实际用的命令一致: pdgtx 跑的是 `unshare -n -r`(先建用户命名空间再拿
+  # CAP_SYS_ADMIN)。只试 `unshare -n` 会在"没 CAP_SYS_ADMIN 但允许非特权 userns"的机器上
+  # 选错分支 —— 产品明明能建 netns, 用例却去断言"netns 不可用"。
+  if unshare -n -r true 2>/dev/null; then
     r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$BAD_CONF")"
     grep -q '^PROBE|fail' <<<"$r" && ok "netns 探针: 坏配置被判失败($(cut -d'|' -f3 <<<"$r" | head -c 40))" \
       || bad "netns 探针没判出坏配置: $r"
