@@ -1176,40 +1176,56 @@ def recover(txid, root=None, force=False):
     except Exception:  # noqa: BLE001
         return {"ok": False, "error": "before-image 缺失或损坏, 无法自动恢复(材料保留在 %s)" % d}
     with _Lock():
-        conflicts, restored, failed = [], [], []
-        applied = {t: None for t in m.get("targets", [])}
+        # 两阶段: **先全量预检, 再动手**。边扫边恢复的话, 前一个目标已经被还原、后一个才发现
+        # 有人工漂移 —— 于是既没恢复干净, 也没保住现场, 留下一个谁也说不清的混合状态。
+        conflicts, material_err, plan = [], [], []
         for name in m.get("targets", []):
             try:
                 path, mode, _s, _v = resolve_target(name)
             except TxError as e:
-                failed.append(str(e)); continue
+                material_err.append(str(e)); continue
             rec = bi.get("files", {}).get(name, {})
             cur, _ = _read_target(path)
             cur_sha = _sha(cur) if cur is not None else None
             before_sha = rec.get("sha256") if rec.get("existed") else None
             if cur_sha == before_sha:
-                continue                                   # 已经是 before 的样子: 幂等
+                continue                                   # 已经是 before 的样子: 幂等, 无需动
             if not force and cur_sha != m.get("intended_sha", {}).get(name):
-                # 当前既不是 before(上面已排除), 也不是本事务打算写入的内容 → 事务之外有人动过。
-                # 拿旧备份盖掉别人的现场修复, 比不恢复更糟, 所以默认停手。
-                conflicts.append(name)
+                conflicts.append(name)                     # 事务之外有人改过 → 不覆盖人工修复
                 continue
-            try:
-                if rec.get("existed"):
+            data = None
+            if rec.get("existed"):                         # 恢复材料必须**先确认读得到**
+                try:                                       # (含 --force: 读不到就别开始)
                     with open(os.path.join(d, "before", rec["file"]), "rb") as f:
                         data = f.read()
-                    atomic_write(path, data, rec.get("mode", mode), rec.get("uid"), rec.get("gid"))
-                elif cur is not None:
+                except Exception as e:  # noqa: BLE001
+                    material_err.append("%s(before-image 读不到: %s)" % (name, type(e).__name__))
+                    continue
+                if _sha(data) != before_sha:
+                    material_err.append("%s(before-image 已损坏)" % name)
+                    continue
+            plan.append((name, path, rec, data, cur is not None))
+        if material_err:
+            return {"ok": False, "state": m.get("state"), "error":
+                    "恢复材料有问题, 未做任何改动: %s" % "、".join(redact(x) for x in material_err),
+                    "dir": d}
+        restored, failed = [], []
+        if conflicts and not force:
+            # 预检阶段发现冲突 → **一个目标都没动过**, 现网逐字节保持原样
+            return {"ok": False, "state": m.get("state"), "conflicts": conflicts,
+                    "error": "这些目标在事务之外被改过, 默认不覆盖: %s" % ", ".join(conflicts),
+                    "hint": "确认要用 before-image 盖掉现有内容时, 用 `pdg tx recover %s --force`"
+                            % txid, "dir": d}
+        for name, path, rec, data, exists in plan:         # 预检全过, 才进入恢复阶段
+            try:
+                if rec.get("existed"):
+                    atomic_write(path, data, rec.get("mode", 0o600), rec.get("uid"), rec.get("gid"))
+                elif exists:
                     os.unlink(path)
                     _fsync_dir(os.path.dirname(path))
                 restored.append(name)
             except Exception as e:  # noqa: BLE001
                 failed.append("%s(%s)" % (name, type(e).__name__))
-        if conflicts and not force:
-            return {"ok": False, "state": m.get("state"), "conflicts": conflicts,
-                    "error": "这些目标在事务之外被改过, 默认不覆盖: %s" % ", ".join(conflicts),
-                    "hint": "确认要用 before-image 盖掉现有内容时, 用 `pdg tx recover %s --force`"
-                            % txid}
         for u, s in (bi.get("services") or {}).items():
             if s.get("active"):
                 _run(["systemctl", "reset-failed", u], timeout=30)

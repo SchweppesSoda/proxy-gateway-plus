@@ -235,6 +235,63 @@ def main():
     else:
         bad("schema 不兼容没拦住: %s" % r)
 
+    # ── 9. recover 两阶段: 预检发现任一冲突 → 一个目标都不许先被恢复 ──
+    box3 = Box(); tx3 = load_tx(box3.env)
+    box3.up("mosdns")
+    a = box3.path("/etc/mosdns/rules/a.txt")
+    b = box3.path("/etc/mosdns/rules/b.txt")
+    for pth, val in ((a, b"domain:a-before.com\n"), (b, b"domain:b-before.com\n")):
+        with open(pth, "wb") as f:
+            f.write(val)
+    t = tx3.Tx("cli", "two-phase")
+    t.stage("mosdns_rule:a.txt", b"domain:a-applied.com\n")
+    t.stage("mosdns_rule:b.txt", b"domain:b-applied.com\n")
+    t.meta["targets"] = ["mosdns_rule:a.txt", "mosdns_rule:b.txt"]
+    t._set_state(tx3.VALIDATED); t._save_before(["mosdns"]); t._set_state(tx3.APPLYING)
+    for pth, val in ((a, b"domain:a-applied.com\n"), (b, b"domain:b-applied.com\n")):
+        with open(pth, "wb") as f:                 # 模拟"两个都落盘了, 然后断电"
+            f.write(val)
+    with open(b, "wb") as f:                       # 之后运维手工改了第二个
+        f.write(b"domain:b-hand-fixed.com\n")
+    r = tx3.recover(t.txid, root=tx3.TX_ROOT)
+    if not r.get("ok") and r.get("conflicts") == ["mosdns_rule:b.txt"]:
+        ok("两阶段恢复: 预检就报出第二个目标的冲突")
+    else:
+        bad("冲突没被预检抓到: %s" % r)
+    if open(a, "rb").read() == b"domain:a-applied.com\n":
+        ok("冲突时**第一个目标没有被提前恢复**(现网逐字节不变)")
+    else:
+        bad("第一个目标被提前恢复了: %r" % open(a, "rb").read())
+    if open(b, "rb").read() == b"domain:b-hand-fixed.com\n":
+        ok("人工修复的那个目标同样没被覆盖")
+    else:
+        bad("人工修复被覆盖: %r" % open(b, "rb").read())
+    # before-image 缺失 → 预检阶段就拒绝, 同样不动任何目标
+    import shutil as _sh
+    bdir = os.path.join(t.dir, "before")
+    bak = bdir + ".keep"
+    _sh.copytree(bdir, bak)
+    for f2 in os.listdir(bdir):
+        if f2 != "index.json":
+            os.unlink(os.path.join(bdir, f2))
+    r = tx3.recover(t.txid, root=tx3.TX_ROOT, force=True)
+    if not r.get("ok") and "恢复材料" in (r.get("error") or ""):
+        ok("--force 也要先确认 before-image 可读: 读不到就整体拒绝")
+    else:
+        bad("材料缺失没被预检拦住: %s" % r)
+    if open(a, "rb").read() == b"domain:a-applied.com\n":
+        ok("材料缺失时同样一个目标都没动")
+    else:
+        bad("材料缺失却改了现网")
+    _sh.rmtree(bdir); _sh.move(bak, bdir)
+    r = tx3.recover(t.txid, root=tx3.TX_ROOT, force=True)
+    if r.get("ok") and open(a, "rb").read() == b"domain:a-before.com\n" \
+            and open(b, "rb").read() == b"domain:b-before.com\n":
+        ok("预检全过后 --force 一次性把两个目标都还原")
+    else:
+        bad("force 恢复不完整: %s" % r)
+    box3.clean()
+
     box.clean(); box2.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
