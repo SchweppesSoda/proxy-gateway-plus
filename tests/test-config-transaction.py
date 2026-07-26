@@ -295,6 +295,89 @@ def main():
         bad("证书回滚不完整: %s" % res)
     box6.clean(); box7.clean()
 
+    # ── 14. 规则集刷新的"部分来源成功"语义(5.1 定死)──
+    import importlib.util as _il
+    box8 = Box(); tx8 = load_tx(box8.env)
+    box8.up("mihomo"); box8.up("mosdns")
+    spec = _il.spec_from_file_location("pdg_bot_rs", ROOT / "deploy/bot/pdg-bot.py")
+    b = _il.module_from_spec(spec); spec.loader.exec_module(b)
+    b.RS_DIR = box8.path("/etc/sing-box/rs")
+    b.RS_META = box8.path("/opt/pdg-bot/rulesets.json")
+    b.SB = box8.path("/etc/sing-box/config.json")
+    b.MIHOMO_CFG = box8.path("/etc/mihomo/config.yaml")
+    b.LOCKFILE = box8.env["PDG_LOCKFILE"]
+    os.makedirs(b.RS_DIR, exist_ok=True)
+    box8.put("/etc/sing-box/config.json", MODEL)
+    good_old, bad_old = b"OLD-GOOD\n", b"OLD-BAD\n"
+    box8.put("/etc/sing-box/rs/rs_good.json", good_old, 0o644)
+    box8.put("/etc/sing-box/rs/rs_bad.json", bad_old, 0o644)
+    meta = {"rs_good": {"url": "https://x/good.list", "outbound": "direct", "format": "source",
+                        "path": b.RS_DIR + "/rs_good.json", "label": "好源"},
+            "rs_bad": {"url": "https://x/bad.list", "outbound": "direct", "format": "source",
+                       "path": b.RS_DIR + "/rs_bad.json", "label": "坏源"}}
+    box8.put("/opt/pdg-bot/rulesets.json", json.dumps(meta).encode(), 0o644)
+
+    def _build(url, path):
+        if "bad" in url:
+            raise ValueError("下载失败")
+        with open(path, "wb") as f:
+            f.write(b'{"version": 1, "rules": [{"domain": ["new.example"]}]}')
+        return (1, False)
+    b._build_source = _build
+    n, failed = b.refresh_rulesets()
+    if n == 1 and any("坏源" in x for x in failed):
+        ok("刷新: 下载失败的源不进候选, 成功的照常提交, 失败项如实列出")
+    else:
+        bad("部分成功语义不对: n=%s failed=%s" % (n, failed))
+    if box8.read("/etc/sing-box/rs/rs_bad.json") == bad_old:
+        ok("刷新: 拿不到的源保留旧文件(不被清空/不被半写)")
+    else:
+        bad("失败源的旧文件被动了")
+    if b"new.example" in (box8.read("/etc/sing-box/rs/rs_good.json") or b""):
+        ok("刷新: 成功源已换成新内容")
+    else:
+        bad("成功源没更新")
+
+    # 内核校验不过 → 整批回滚(一个都不换), 且不谎报成功
+    box9 = Box(svc_fail=["mihomo"]); tx9 = load_tx(box9.env)
+    box9.up("mihomo"); box9.up("mosdns")
+    spec = _il.spec_from_file_location("pdg_bot_rs2", ROOT / "deploy/bot/pdg-bot.py")
+    b2 = _il.module_from_spec(spec); spec.loader.exec_module(b2)
+    for attr, val in (("RS_DIR", box9.path("/etc/sing-box/rs")),
+                      ("RS_META", box9.path("/opt/pdg-bot/rulesets.json")),
+                      ("SB", box9.path("/etc/sing-box/config.json")),
+                      ("MIHOMO_CFG", box9.path("/etc/mihomo/config.yaml")),
+                      ("LOCKFILE", box9.env["PDG_LOCKFILE"])):
+        setattr(b2, attr, val)
+    os.makedirs(b2.RS_DIR, exist_ok=True)
+    box9.put("/etc/sing-box/config.json", MODEL)
+    box9.put("/etc/sing-box/rs/rs_good.json", good_old, 0o644)
+    meta2 = {"rs_good": dict(meta["rs_good"], path=b2.RS_DIR + "/rs_good.json")}
+    box9.put("/opt/pdg-bot/rulesets.json", json.dumps(meta2).encode(), 0o644)
+    b2._build_source = _build
+    # mihomo 换上新规则集后起不来(桩里 restart 直接失败)→ 观察期判失败 → 整批回滚
+    n, failed = b2.refresh_rulesets()
+    if n == 0 and box9.read("/etc/sing-box/rs/rs_good.json") == good_old:
+        ok("刷新: 内核换上新规则集起不来 → 整批不换(旧规则集逐字节保留)且返回 0")
+    else:
+        bad("校验失败仍换了规则集: n=%s" % n)
+    if any("整批未更新" in x for x in failed):
+        ok("刷新: 整批未更新时如实说明, 不谎报已更新")
+    else:
+        bad("整批失败没说清楚: %s" % failed)
+
+    # 零成功 → 不提交空事务
+    _txr = box9.env["PDG_TX_ROOT"]
+    before = len(os.listdir(_txr)) if os.path.isdir(_txr) else 0
+    b2._build_source = lambda url, path: (_ for _ in ()).throw(ValueError("全挂"))
+    n, failed = b2.refresh_rulesets()
+    after = len(os.listdir(_txr)) if os.path.isdir(_txr) else 0
+    if n == 0 and after == before:
+        ok("刷新: 一个源都没下来 → 不开空事务, 也不报成功")
+    else:
+        bad("零成功却动了事务: n=%s %d→%d" % (n, before, after))
+    box8.clean(); box9.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

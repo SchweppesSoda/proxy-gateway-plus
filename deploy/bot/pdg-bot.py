@@ -1059,7 +1059,8 @@ def _model_bytes(c):
     return json.dumps(c, ensure_ascii=False, indent=2).encode("utf-8")
 
 
-def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode="normal"):
+def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode="normal",
+             warnings=()):
     """Bot 侧所有生产写入的**唯一**入口: 一笔事务把 model、mosdns 规则、profile 等一起落盘。
 
     以前是"model 走 apply_sb(锁内), mosdns 文件在锁外再补一刀" —— 于是内核里有规则、DNS 侧
@@ -1077,6 +1078,8 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
         t = tx.Tx(source="bot", op=op, mode=mode)
     except Exception as e:  # noqa: BLE001
         return False, "无法开始配置事务(%s)" % type(e).__name__
+    for w in warnings or ():
+        t.warn(w)
     try:
         if model_mod is not None:
             c = load()
@@ -2357,65 +2360,63 @@ def del_ruleset(name):
     return False, msg
 
 def refresh_rulesets():
-    """重下并原子替换所有规则集; 内核校验通过才重启, 坏档自动回滚、不断网(供 bot 与每日定时调用)。
+    """重下全部规则集并**整批**原子提交。返回 (成功刷新数, 失败项列表)。
 
-    返回 (成功刷新数, 失败项列表)。**必须**如实返回失败 —— 旧版只 print 一行然后照返回条数,
-    调用方看不出有规则集没刷上, 用户以为规则库已更新。"""
-    m = _rs_meta(); n = 0; swapped = []; failed = []   # (path, bak)
-    for name, info in m.items():
-        # 兼容早期缺 format/path 的旧条目 (按 name 回填, 否则刷新会 KeyError)。
-        info.setdefault("format", "binary" if str(info.get("path", "")).endswith(".srs") else "source")
-        info.setdefault("path", os.path.join(RS_DIR, name + (".srs" if info["format"] == "binary" else ".json")))
-        tmp = info["path"] + ".new"
-        try:
-            if info["format"] in ("binary", "mrs"):
-                # .mrs 是 mihomo 原生**二进制**格式, 绝不能走文本解析(_build_source 会把它当
-                # Surge 规则去 parse, 结果要么报"没解析出规则", 要么写出一份被毁掉的文件)。
-                data = _fetch_bytes(info["url"])
-                if not data:
-                    raise ValueError("空响应")
-                open(tmp, "wb").write(data)
-                # 顺手把认出来的类型回填进元数据: 老条目本来没有这个字段, 补上之后就不必每次
-                # 渲染都重新嗅探, 也不再因为"没记类型"被跳过(下面 _save_rs_meta 一并落盘)。
-                if info["format"] == "mrs" and info.get("behavior") not in MRS_BEHAVIORS:
-                    bh = mrs_behavior(data)
-                    if bh:
-                        info["behavior"] = bh
-            else:
-                info["count"] = _build_source(info["url"], tmp)[0]   # 先写临时文件
-            n += 1
-        except Exception as e:  # noqa: BLE001
-            failed.append("%s(%s: %s)" % (info.get("label") or name, type(e).__name__, e))
+    语义(5.1 定死, 与用户可见行为一致):
+      · 下载与解析发生在**候选阶段** —— 拿不到的源不进候选, 它的旧文件原样留着继续用;
+      · 所有下载成功的规则集作为**一个集合**提交: 其中任一校验/落盘/内核应用失败, 整批回滚,
+        一个都不换(不会出现"换了一半")；
+      · 成功时事务状态就是 COMMITTED, 未更新的源写进 warnings 如实告知 —— 不新增
+        "带警告的提交"这种中间状态;
+      · **零成功不提交**: 一个源都没下来时直接返回, 不空跑一笔事务, 更不谎报"已更新"。
+    """
+    m = _rs_meta()
+    if not m:
+        return 0, []
+    files, failed, n = {}, [], 0
+    tmpd = tempfile.mkdtemp(prefix="pdgrs-cand.")
+    try:
+        for name, info in m.items():
+            # 兼容早期缺 format/path 的旧条目(按 name 回填, 否则刷新会 KeyError)
+            info.setdefault("format", "binary" if str(info.get("path", "")).endswith(".srs") else "source")
+            info.setdefault("path", os.path.join(RS_DIR, name + (".srs" if info["format"] == "binary" else ".json")))
+            leaf = os.path.basename(info["path"])
+            if leaf.endswith(".srs"):
+                # sing-box 二进制规则集: mihomo 读不了, 早已在入口被拒。老机器上残留的这种
+                # 条目不刷新也不删 —— doctor 会点名让用户换掉。
+                failed.append("%s(.srs 无法进入 mihomo 运行配置, 未刷新)" % (info.get("label") or name))
+                continue
             try:
-                os.remove(tmp)
-            except OSError:
-                pass
-    # 原子替换(留 .bak 以便整体回滚)
-    for name, info in m.items():
-        tmp = info["path"] + ".new"
-        if not os.path.exists(tmp):
-            continue
-        if os.path.exists(info["path"]):
-            shutil.copy(info["path"], info["path"] + ".bak")
-            swapped.append((info["path"], info["path"] + ".bak"))
-        os.replace(tmp, info["path"])
-    if n == 0:
-        return 0, failed
-    # 核心校验+重启(core-aware): sing-box=check SB + restart; mihomo=渲染 + `mihomo -t` + restart(重启即重取 providers)。
-    ok, err, _ = _core_apply()
-    if not ok:                              # 坏档 → 还原旧规则集 + 用好档回到已知good, 不断网
-        for path, bak in swapped:
-            shutil.copy(bak, path)
-        _core_apply()
-        failed.append("内核校验/重启失败, 已回滚到上一份好档: %s" % (err or "")[:160])
-        return 0, failed
-    for _, bak in swapped:                  # 成功后清备份
-        try:
-            os.remove(bak)
-        except OSError:
-            pass
-    _save_rs_meta(m)
-    return n, failed
+                if info["format"] in ("binary", "mrs"):
+                    data = _fetch_bytes(info["url"])
+                    if not data:
+                        raise ValueError("空响应")
+                    if info["format"] == "mrs" and info.get("behavior") not in MRS_BEHAVIORS:
+                        bh = mrs_behavior(data)
+                        if bh:
+                            info["behavior"] = bh
+                else:
+                    tmp = os.path.join(tmpd, leaf)
+                    info["count"] = _build_source(info["url"], tmp)[0]
+                    with open(tmp, "rb") as f:
+                        data = f.read()
+                files["ruleset:" + leaf] = data
+                n += 1
+            except Exception as e:  # noqa: BLE001
+                failed.append("%s(%s: %s)" % (info.get("label") or name, type(e).__name__, e))
+        if n == 0:
+            return 0, failed
+        files["rs_meta"] = json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")
+        # model 不变, 但仍走一遍派生渲染: 规则集进不了 mihomo 运行配置(dropped)这类问题要在
+        # **候选阶段**就被挡下, 与旧 _core_apply 同一判据; 文件真坏则由重启观察期兜住。
+        ok, msg = tx_apply("rulesets_refresh", model_mod=lambda c: None, files=files,
+                           services=("mihomo",), warnings=failed)
+        if not ok:
+            return 0, failed + ["整批未更新(全部保留上一份好档): " + msg]
+        return n, failed
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
 
 # ── 测出口 (端到端延迟, clash_api; TCP 兜底) ──
 def _test_exits_tcp(c):
