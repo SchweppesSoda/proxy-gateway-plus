@@ -58,6 +58,7 @@ if [[ -n "$TX" ]]; then
 fi
 
 # legacy: 只有**事务核心文件完全不存在**(v1.6.2 之前的老机器)才走到这里。
+# 事务路径下的证书目录由 pdgtx 按可信配置(profile.env 的 PDG_CERT_DIR)解析, 与这里同源。
 CERT_DIR="${PDG_CERT_DIR:-/etc/mosdns/certs}"
 echo "[!] legacy 路径: 本机没有事务核心(pdgtx.py), 直接部署证书(无事务保护)"
 mkdir -p "$CERT_DIR"

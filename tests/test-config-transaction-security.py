@@ -292,6 +292,59 @@ def main():
         bad("force 恢复不完整: %s" % r)
     box3.clean()
 
+    # ── 10. 自定义证书目录(五): 只认可信配置, 且恢复按创建时记录的目标 ──
+    box4 = Box(); tx4 = load_tx(box4.env)
+    box4.up("mosdns")
+    if tx4.resolve_target("cert_privkey")[0] == box4.path("/etc/mosdns/certs/privkey.pem"):
+        ok("默认证书目录: /etc/mosdns/certs")
+    else:
+        bad("默认目录不对: %s" % tx4.resolve_target("cert_privkey")[0])
+    # 可信来源 = profile.env(项目自己的配置), 不是调用方传进来的路径
+    box4.put("/etc/privdns-gateway/profile.env", b"PDG_CERT_DIR=/opt/mycerts\n", 0o600)
+    tx4b = load_tx(box4.env)
+    if tx4b.resolve_target("cert_fullchain")[0] == box4.path("/opt/mycerts/fullchain.pem") \
+            and tx4b.resolve_target("cert_privkey")[1] == 0o600:
+        ok("profile.env 指定 /opt/mycerts → 事务目标随之切换, 私钥仍固定 0600")
+    else:
+        bad("自定义目录没生效: %s" % tx4b.resolve_target("cert_fullchain")[0])
+    # 文件名固定: 不能借配置改成别的文件
+    for bad_dir in (b"PDG_CERT_DIR=../evil\n", b"PDG_CERT_DIR=relative/path\n",
+                    b"PDG_CERT_DIR=/opt/mycerts/../../etc\n"):
+        box4.put("/etc/privdns-gateway/profile.env", bad_dir, 0o600)
+        txx = load_tx(box4.env)
+        if txx.resolve_target("cert_privkey")[0] != box4.path("/etc/mosdns/certs/privkey.pem"):
+            bad("可疑配置被采信: %r → %s" % (bad_dir, txx.resolve_target("cert_privkey")[0]))
+            break
+    else:
+        ok("相对路径 / .. / 拼出来的越界目录一律不认, 退回默认目录")
+    # 目录里有软链成分 → 不认
+    os.makedirs(box4.path("/opt/real"), exist_ok=True)
+    os.symlink(box4.path("/opt/real"), box4.path("/opt/linked"))
+    box4.put("/etc/privdns-gateway/profile.env", b"PDG_CERT_DIR=/opt/linked\n", 0o600)
+    txy = load_tx(box4.env)
+    if txy.resolve_target("cert_privkey")[0] == box4.path("/etc/mosdns/certs/privkey.pem"):
+        ok("证书目录路径里有软链成分 → 不认, 退回默认")
+    else:
+        bad("软链目录被采信: %s" % txy.resolve_target("cert_privkey")[0])
+    # 恢复按**事务创建时**记录的目标: 中途改配置也不会还到另一个目录
+    box4.put("/etc/privdns-gateway/profile.env", b"PDG_CERT_DIR=/opt/mycerts\n", 0o600)
+    txz = load_tx(box4.env)
+    os.makedirs(box4.path("/opt/mycerts"), exist_ok=True)
+    box4.put("/opt/mycerts/privkey.pem", b"-----BEGIN PRIVATE KEY-----\nOLD\n-----END PRIVATE KEY-----\n", 0o600)
+    t = txz.Tx("bot", "cert-dir")
+    t.stage("cert_privkey", b"-----BEGIN PRIVATE KEY-----\nNEW\n-----END PRIVATE KEY-----\n")
+    t.meta["targets"] = ["cert_privkey"]
+    t._set_state(txz.VALIDATED); t._save_before(["mosdns"]); t._set_state(txz.APPLYING)
+    box4.put("/opt/mycerts/privkey.pem", b"-----BEGIN PRIVATE KEY-----\nNEW\n-----END PRIVATE KEY-----\n", 0o600)
+    box4.put("/etc/privdns-gateway/profile.env", b"PDG_CERT_DIR=/etc/mosdns/certs\n", 0o600)
+    r = txz.recover(t.txid, root=txz.TX_ROOT)
+    restored = box4.read("/opt/mycerts/privkey.pem")
+    if r.get("ok") and restored and b"OLD" in restored:
+        ok("配置中途改了目录, recover 仍还原到**事务创建时记录的**那个目标")
+    else:
+        bad("恢复去了别的目录: %s / %r" % (r, restored))
+    box4.clean()
+
     box.clean(); box2.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

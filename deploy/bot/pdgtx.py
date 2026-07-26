@@ -133,8 +133,41 @@ _ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
                  ["daemon-reload", "nft:apply", "sysctl:apply"])
 
 
+# 证书目录允许自定义(PDG_CERT_DIR), 但**只认项目自己的可信配置**, 不接受调用方传路径 ——
+# 白名单的意义就在于目标集合由项目决定。取值顺序: profile.env → 环境变量 → 默认。
+# 任何一条不满足"绝对路径 + 无软链成分"就退回默认目录, 而不是照单全收。
+_CERT_DIR_DEFAULT = "/etc/mosdns/certs"
+
+
+def _trusted_cert_dir():
+    val = ""
+    try:
+        with open(FSROOT + "/etc/privdns-gateway/profile.env", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln.startswith("PDG_CERT_DIR="):
+                    val = ln.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    val = val or os.environ.get("PDG_CERT_DIR", "")
+    if not val:
+        return _CERT_DIR_DEFAULT
+    if not val.startswith("/") or val.rstrip("/") != os.path.normpath(val).rstrip("/"):
+        return _CERT_DIR_DEFAULT                      # 相对路径 / 含 .. → 不认
+    real = os.path.realpath(FSROOT + val)
+    if real != os.path.normpath(FSROOT + val):        # 路径里有软链成分 → 不认
+        return _CERT_DIR_DEFAULT
+    return val.rstrip("/")
+
+
 def resolve_target(name):
     """逻辑名 → (绝对路径, mode, secret, 校验器)。越界一律抛错。"""
+    if name in ("cert_fullchain", "cert_privkey"):
+        leaf = "fullchain.pem" if name == "cert_fullchain" else "privkey.pem"
+        mode = 0o644 if name == "cert_fullchain" else 0o600
+        val = ("pem_cert",) if name == "cert_fullchain" else ("pem_key",)
+        return (FSROOT + _trusted_cert_dir() + "/" + leaf, mode,
+                name == "cert_privkey", val)
     if name in _STATIC:
         rel, mode, secret, val = _STATIC[name]
         return FSROOT + rel, mode, secret, val
@@ -798,6 +831,7 @@ class Tx:
             "expect": exp,
             "existed": cur is not None,
         }
+        self.meta.setdefault("target_paths", {})[target] = path
         return self
 
     def derive(self, target, fn):
@@ -1300,6 +1334,9 @@ def recover(txid, root=None, force=False):
                 path, mode, _s, _v = resolve_target(name)
             except TxError as e:
                 material_err.append(str(e)); continue
+            # 用事务**创建时**记下的路径: 证书目录这类可配置目标, 配置后来改了也不能把旧内容
+            # 还到新目录去(那等于往另一份现网里写陈旧数据)。
+            path = (m.get("target_paths") or {}).get(name, path)
             rec = bi.get("files", {}).get(name, {})
             cur, _ = _read_target(path)
             cur_sha = _sha(cur) if cur is not None else None
