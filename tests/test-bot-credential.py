@@ -9,7 +9,9 @@ import base64
 import concurrent.futures
 import importlib.util
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -171,39 +173,63 @@ assert 5 not in bot._busy, "任务异常后 BUSY 必须释放"
 bot.run_bg(5, lambda: None).result(5)
 print("[OK]   任务异常后 BUSY 释放")
 
-# ── apply_sb 事务性: check/restart 超时也还原备份, 不留未验证配置 ────────────
+# ── apply_sb 事务性: 校验阶段异常(如 mihomo -t 超时)也不留未验证配置 ────────
+# 5.1 起 apply_sb 走统一事务: 校验在**候选**上做, 没过就根本不碰现网 —— 比旧的"写了再还原"
+# 更强。这里仍然断言两件事: 返回失败 + 现网 model 逐字节没变, 且异常正文不外泄。
 import json as _json
-sbf = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-# 出站要能被 sb2mihomo 转换(否则渲染阶段就先拒了, 到不了下面模拟的"校验超时")
-_json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, sbf); sbf.close()
-bot.SB = sbf.name
-lf = tempfile.NamedTemporaryFile(delete=False); lf.close(); bot.LOCKFILE = lf.name
-# 渲染出的 mihomo 配置落临时目录(别写真 /etc/mihomo), 好让下面的"校验超时"如期发生在 check 那步
-_mhd = tempfile.mkdtemp(); bot.MIHOMO_DIR = _mhd; bot.MIHOMO_CFG = os.path.join(_mhd, "config.yaml")
+_sbroot = tempfile.mkdtemp()
+for _d in ("/etc/sing-box", "/etc/mihomo", "/run", "/var/lib/privdns-gateway"):
+    os.makedirs(_sbroot + _d, exist_ok=True)
+os.environ["PDG_TX_FSROOT"] = _sbroot
+os.environ["PDG_TX_ROOT"] = _sbroot + "/var/lib/privdns-gateway/tx"
+os.environ["PDG_LOCKFILE"] = _sbroot + "/run/pdg.lock"
+os.environ["PDG_STABLE_SAMPLES"] = "1"
+bot.SB = _sbroot + "/etc/sing-box/config.json"
+bot.MIHOMO_DIR = _sbroot + "/etc/mihomo"; bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
+bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
+_json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, open(bot.SB, "w"))
 bot.apply_sb = _REAL_APPLY_SB
-def boom_sh(cmd, *a, **k):
-    if "check" in cmd or "-t" in cmd:
-        raise subprocess.TimeoutExpired(cmd, 180)   # 模拟内核配置校验超时
-    class R:
-        returncode = 0; stdout = ""; stderr = ""
-    return R()
-bot.sh = boom_sh
+sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+import importlib
+for _m in list(sys.modules):
+    if _m.startswith("pdgtx"):
+        del sys.modules[_m]
+_tx = importlib.import_module("pdgtx")
+_tx.svc_stable = lambda unit, **k: (True, "")
+_tx.health_snapshot = lambda services: {"svc:" + u: True for u in services}
+_tx._run = lambda cmd, timeout=60: (0, "")
+
+
+def _timeout_validator(path, data, ctx):
+    raise subprocess.TimeoutExpired(["mihomo", "-t"], 180)   # 模拟内核配置校验超时
+
+
+_tx.VALIDATORS["mihomo_check"] = _timeout_validator
 ok, msg = bot.apply_sb(lambda c: c["outbounds"].append({"tag": "new", "type": "direct"}))
-assert ok is False and "还原" in msg, ("异常应还原并返回失败", ok, msg)
+assert ok is False, ("校验异常必须返回失败", ok, msg)
 assert SECRET not in msg
 restored = _json.load(open(bot.SB))
 assert [o["tag"] for o in restored["outbounds"]] == ["orig"], ("配置必须回到未改前", restored)
-for p in (sbf.name, sbf.name + ".botbak", lf.name):
-    try:
-        os.unlink(p)
-    except OSError:
-        pass
+print("[OK]   apply_sb 校验阶段异常: 现网 model 零改动且不外泄异常正文")
+shutil.rmtree(_sbroot, ignore_errors=True)
 print("[OK]   apply_sb 异常(超时)事务性还原, 不留未验证配置")
 
 # ── _cfg_guard: 别的进程持 flock → False; 且 _cfg_lock 非阻塞 ────────────────
 bot.apply_sb = _REAL_APPLY_SB
 tmp = tempfile.NamedTemporaryFile(delete=False); tmp.close()
 bot.LOCKFILE = tmp.name
+# 事务核心用的是同一把锁: 沙箱根重建 + 锁指到同一个文件, 才能验"别人持锁 → BUSY"
+_lkroot = tempfile.mkdtemp()
+for _d in ("/etc/sing-box", "/etc/mihomo", "/run", "/var/lib/privdns-gateway"):
+    os.makedirs(_lkroot + _d, exist_ok=True)
+os.environ["PDG_TX_FSROOT"] = _lkroot
+os.environ["PDG_TX_ROOT"] = _lkroot + "/var/lib/privdns-gateway/tx"
+os.environ["PDG_LOCKFILE"] = tmp.name
+bot.SB = _lkroot + "/etc/sing-box/config.json"
+_json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, open(bot.SB, "w"))
+for _m in list(sys.modules):
+    if _m.startswith("pdgtx"):
+        del sys.modules[_m]
 holder = subprocess.Popen(["flock", "-x", tmp.name, "-c", "sleep 3"])
 time.sleep(0.4)
 with bot._cfg_guard() as got:
@@ -213,6 +239,7 @@ assert ok is False and msg == bot.BUSY_MSG, ("flock 冲突应返回 BUSY_MSG", o
 holder.wait()
 with bot._cfg_guard() as got:
     assert got is True, "释放后应 yield True"
+shutil.rmtree(_lkroot, ignore_errors=True)
 # 进程内 _cfg_lock 非阻塞: 已被占 → 立即 False(不卡)
 bot._cfg_lock.acquire()
 t0 = time.time()

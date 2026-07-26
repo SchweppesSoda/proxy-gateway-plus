@@ -40,6 +40,10 @@ def main():
         bot._atomic_write_text(bot.MITM_HIJACK_FILE, "".join("domain:" + d + "\n" for d in doms))
         return True, ""
     bot._mitm_transact = _fake_transact
+    # 5.1 起锁是 fail-closed 的: 锁文件打不开就拒绝写(以前会退化成仅进程内锁继续写)。
+    # 单测跑在普通用户下, 给它一个可写的锁文件。
+    _lk = tempfile.NamedTemporaryFile(delete=False); _lk.close()
+    bot.LOCKFILE = _lk.name
 
     # ── 安卓平台: 拒绝 ──
     bot._platform = lambda: "android"

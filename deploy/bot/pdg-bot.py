@@ -973,8 +973,23 @@ def set_wloc(on, lat=None, lon=None):
         wloc_switch("默认")
     return wloc_enable(on)
 
+def _render_mihomo_bytes(model):
+    """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
+
+    事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
+    一起落盘 —— 否则"model 写进去了、渲染失败"就会留下两份不一致的配置。"""
+    import sb2mihomo
+    tls_ports = [443] if _platform() == "ios" else None
+    cfg, meta = sb2mihomo.singbox_to_mihomo(
+        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(),
+        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, tls_ports=tls_ports,
+        **_panel_render_args(model))
+    return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"), meta
+
+
 def _render_mihomo_file():
-    """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。"""
+    """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。
+    仍供 pdg.sh 的平台切换等 CLI 路径调用(那些路径由 CLI 侧事务覆盖)。"""
     import sb2mihomo
     model = load()
     # iOS: 嗅探端口不含 GMS 5228-5230(iOS 走 APNs); Android 用默认(含 GMS)。两平台 canonical/内核均无 GMS 残留。
@@ -1035,12 +1050,89 @@ def busy_msg():
     """区分"别人正在改"与"锁不可用" —— 后者是环境故障, 让用户知道该去看 /run。"""
     return NOLOCK_MSG if _cfg_lock_err else BUSY_MSG
 
+def _pdgtx():
+    import pdgtx
+    return pdgtx
+
+
+def _model_bytes(c):
+    return json.dumps(c, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode="normal"):
+    """Bot 侧所有生产写入的**唯一**入口: 一笔事务把 model、mosdns 规则、profile 等一起落盘。
+
+    以前是"model 走 apply_sb(锁内), mosdns 文件在锁外再补一刀" —— 于是内核里有规则、DNS 侧
+    没劫持这种半套状态没人拦得住。现在它们要么一起成功, 要么一起回到操作前。
+
+    model_mod:  改 model 的回调(与旧 apply_sb 语义一致)
+    files:      {逻辑目标名: bytes|None} 需要与 model 一起原子落盘的其它目标
+    services:   额外要重启的服务(model 变更会自动带上 mihomo)
+    tfo_intent: 指定本次 TFO 意图(set_tfo 用); None = 沿用 profile.env 里的当前意图
+    返回 (ok, msg)
+    """
+    tx = _pdgtx()
+    svc = set(services or ())
+    try:
+        t = tx.Tx(source="bot", op=op, mode=mode)
+    except Exception as e:  # noqa: BLE001
+        return False, "无法开始配置事务(%s)" % type(e).__name__
+    try:
+        if model_mod is not None:
+            c = load()
+            intent = _tfo_intent(c) if tfo_intent is None else tfo_intent
+            model_mod(c)
+            _tfo_apply(c, intent)                 # 加/改出口不冲掉 TFO 状态(语义与旧实现一致)
+            t.stage("model", _model_bytes(c))
+            svc.add("mihomo")
+
+            def _derive(staged):
+                model = json.loads(staged["model"].decode("utf-8"))
+                data, meta = _render_mihomo_bytes(model)
+                bad = (meta or {}).get("unknown_proxies")
+                if bad:
+                    raise ValueError("有出口 mihomo 无法转换(会被静默丢弃): %s"
+                                     % ", ".join(str(x) for x in bad))
+                dropped = (meta or {}).get("dropped")
+                if dropped:
+                    raise ValueError("有规则/规则集无法进入 mihomo 运行配置(会被静默丢弃): %s"
+                                     % _fmt_dropped(dropped))
+                return data
+            t.derive("mihomo_cfg", _derive)
+        for name, data in (files or {}).items():
+            t.stage(name, data)
+            s2 = tx.target_service(name)
+            if s2:
+                svc.add(s2)
+        for u in sorted(svc):
+            t.service("restart:" + u)
+        if "sysctl_tfo" in (files or {}):
+            t.service("sysctl:apply")
+        res = t.commit()
+    except _PanelOwnershipError:
+        return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
+    except tx.TxBusy:
+        return False, busy_msg()
+    except tx.TxRefused as e:
+        return False, tx.redact(str(e))
+    except tx.TxError as e:
+        return False, "配置事务内部错误: %s" % tx.redact(str(e))
+    except Exception as e:  # noqa: BLE001
+        return False, "配置事务异常(%s)" % type(e).__name__
+    if res["state"] == tx.COMMITTED:
+        note = ("\n⚠️ " + "; ".join(res["warnings"])) if res["warnings"] else ""
+        return True, "事务 %s 已提交%s" % (res["txid"], note)
+    if res["state"] == tx.ROLLBACK_FAILED:
+        return False, ("%s\n⚠️ 回滚未完成, 未恢复项: %s\n事务材料保留在 %s"
+                       % (res["error"], "、".join(res["rollback_failed_items"]) or "(未知)",
+                          res["dir"]))
+    return False, "%s(已回滚到操作前, 事务 %s)" % (res["error"], res["txid"])
+
+
 def apply_sb(modify):
-    # 串行化配置写 + 与 pdg update/rollback 用同一把 flock 协调(拿不到锁友好返回, 不卡死)。
-    with _cfg_guard() as got:
-        if not got:
-            return False, busy_msg()
-        return _apply_sb_inner(modify)
+    """兼容入口: 只改 model 的操作(加删出口/组/默认出口/改名/排序…)。"""
+    ok, msg = tx_apply("apply_sb", model_mod=modify)
+    return ok, ("" if ok else msg)
 
 def _apply_sb_inner(modify):
     """apply_sb 的**不含锁**主体。供 _mitm_transact 事务在同一把 _cfg_guard 内复用 ——
@@ -1332,10 +1424,11 @@ def _read_direct():
     return [l.strip().replace("domain:", "") for l in open(MOSDNS_DIRECT)
             if l.strip() and not l.startswith("#")]
 
-def _write_direct(domains):
-    with open(MOSDNS_DIRECT, "w") as f:
-        f.write("# pdg-bot 自定义直连\n" + "".join("domain:" + d + "\n" for d in sorted(set(domains))))
-    sh(["systemctl", "restart", "mosdns"])
+def _direct_text(domains):
+    """直连表内容(不落盘)。落盘与 mosdns 重启由事务统一做 —— 以前这里自己写自己重启,
+    连 mosdns 有没有起来都不查。"""
+    return ("# pdg-bot 自定义直连\n"
+            + "".join("domain:" + d + "\n" for d in sorted(set(domains)))).encode("utf-8")
 
 def _read_hijack():
     """指到出口的域名劫持表。mosdns 的 hijack_set 只装 geosite 策展分类, 不含任意个人域名 ——
@@ -1345,11 +1438,10 @@ def _read_hijack():
     return [l.strip().replace("domain:", "") for l in open(MOSDNS_HIJACK)
             if l.strip() and not l.startswith("#")]
 
-def _write_hijack(domains):
-    with open(MOSDNS_HIJACK, "w") as f:
-        f.write("# pdg-bot 显式出口域名劫持表(指到出口的域名必须由 mosdns 劫持才会进代理)\n"
-                + "".join("domain:" + d + "\n" for d in sorted(set(domains))))
-    sh(["systemctl", "restart", "mosdns"])   # domain_set 只在启动时加载, 必须重启才生效
+def _hijack_text(domains):
+    """出口域名劫持表内容(不落盘)。domain_set 只在 mosdns 启动时加载, 故事务里必带 restart。"""
+    return ("# pdg-bot 显式出口域名劫持表(指到出口的域名必须由 mosdns 劫持才会进代理)\n"
+            + "".join("domain:" + d + "\n" for d in sorted(set(domains)))).encode("utf-8")
 
 # ── mosdns DNS 上游 (remote=国际 / local=国内; 用于接 DNS 解锁等自定义解析器) ──
 def _upstreams(which):
@@ -1450,50 +1542,37 @@ def _wda_authorized():
     out = sh(["dig", "+short", "+time=3", "+tries=2", "@" + UNLOCK_DNS, "nflxso.net", "A"]).stdout
     return any(ln.strip().startswith(net24) for ln in out.splitlines())
 
-def _write_unlock_file(domains):
-    """把 domains(可空)写进 mosdns unlock.txt(domain: 前缀); 变了才重启 mosdns(失败回滚)。
-    空列表 = 落地模式: 清空文件 → mosdns 解锁支不命中任何域名 = 休眠(本机查询这些域名回落普通上游)。"""
-    path = os.path.join(MOSDNS_RULES, "unlock.txt")
-    want = "".join("domain:%s\n" % d for d in domains)
+def _unlock_text(domains):
+    """WDA 解锁清单内容(不落盘)。空列表 = 落地模式(清空 → mosdns 解锁支休眠)。"""
+    return "".join("domain:%s\n" % d for d in domains).encode("utf-8")
+
+
+def _unlock_precheck(domains):
+    """要写域名时, mosdns 必须已经有解锁支; 否则写了也不会生效。"""
+    if not domains:
+        return True, ""
     try:
-        cur = open(path).read()
-    except OSError:
-        cur = None
-    if cur == want or (want == "" and not cur):
-        return True, ""                       # 已是目标(含: 要清空且本来就空/无文件)
-    if domains:                               # 只有"写域名"才要求 mosdns 已有解锁支
-        try:
-            if "unlock_upstream" not in open(MOSDNS_CONF).read():
-                return False, "mosdns 还没有解锁支(unlock_upstream)。请先在服务器跑  sudo pdg update  补上再切。"
-        except OSError as e:
-            return False, f"读 mosdns 配置失败: {e}"
-    os.makedirs(MOSDNS_RULES, exist_ok=True)
-    if cur is not None:
-        shutil.copy(path, path + ".bak")
-    open(path, "w").write(want)
-    sh(["systemctl", "restart", "mosdns"]); time.sleep(1)
-    if sh(["systemctl", "is-active", "mosdns"]).stdout.strip() != "active":
-        if os.path.exists(path + ".bak"):
-            shutil.copy(path + ".bak", path)
-        sh(["systemctl", "restart", "mosdns"])
-        return False, "mosdns 重启失败, 已回滚 unlock.txt"
+        if "unlock_upstream" not in open(MOSDNS_CONF).read():
+            return False, "mosdns 还没有解锁支(unlock_upstream)。请先在服务器跑  sudo pdg update  补上再切。"
+    except OSError as e:
+        return False, "读 mosdns 配置失败: %s" % type(e).__name__
     return True, ""
 
+
 def set_wda_mode(on):
-    was_on = _wda_on()                          # 记下操作前状态: 回滚要还原到它, 而不是无脑清空
-    if on:
-        if not _wda_authorized():               # 没授权就开 = 流媒体走 jp 直出但拿不到中继, 反而更糟 → 先拦住
-            ip = _server_ip()
-            return False, ("⚠️ 没在解锁 DNS(%s)上测到本机的中继, <b>先别开 WDA</b>(否则解锁服务拿不到中继, 流媒体反而可能挂)。\n"
-                           "常见原因: 没订阅解锁服务 / 没在服务商<b>后台把本机公网 IP <code>%s</code> 加白授权</b> / DNS 不通。\n"
-                           "→ 去服务商后台授权本机 IP <code>%s</code>, 再点 🔓。(未改动, 仍走落地出口)"
-                           % (UNLOCK_DNS, ip, ip))
-        ok, err = _write_unlock_file(WDA_DOMAINS)   # mosdns 侧: 写满解锁清单
-        if not ok:
-            return False, err
-        os.makedirs(RS_DIR, exist_ok=True)
-        json.dump({"version": 1, "rules": [{"domain_suffix": WDA_DOMAINS}]},
-                  open(os.path.join(RS_DIR, "unlock.json"), "w"), ensure_ascii=False)
+    """WDA 解锁 ↔ 落地出口。mosdns 解锁清单、sing-box 规则集文件与 model 现在是**一笔事务**:
+    以前三处分三步写, 任何一步失败都可能留下"内核撤了规则、mosdns 还在走解锁 DNS"的半套状态。"""
+    if on and not _wda_authorized():             # 没授权就开 = 拿不到中继, 反而更糟 → 先拦住
+        ip = _server_ip()
+        return False, ("⚠️ 没在解锁 DNS(%s)上测到本机的中继, <b>先别开 WDA</b>(否则解锁服务拿不到中继, 流媒体反而可能挂)。\n"
+                       "常见原因: 没订阅解锁服务 / 没在服务商<b>后台把本机公网 IP <code>%s</code> 加白授权</b> / DNS 不通。\n"
+                       "→ 去服务商后台授权本机 IP <code>%s</code>, 再点 🔓。(未改动, 仍走落地出口)"
+                       % (UNLOCK_DNS, ip, ip))
+    domains = WDA_DOMAINS if on else []
+    okp, errp = _unlock_precheck(domains)
+    if not okp:
+        return False, errp
+
     def mod(c):
         c["route"].setdefault("rule_set", [])
         c["route"]["rule_set"] = [r for r in c["route"]["rule_set"] if r.get("tag") != "unlock"]
@@ -1503,22 +1582,19 @@ def set_wda_mode(on):
                                            "path": os.path.join(RS_DIR, "unlock.json")})
             idx = 1 if c["route"]["rules"] and c["route"]["rules"][0].get("action") == "reject" else 0
             c["route"]["rules"].insert(idx, {"rule_set": "unlock", "outbound": "jp"})
-    ok, msg = apply_sb(mod)
+
+    files = {"mosdns_rule:unlock.txt": _unlock_text(domains)}
+    if on:
+        files["ruleset:unlock.json"] = json.dumps(
+            {"version": 1, "rules": [{"domain_suffix": WDA_DOMAINS}]}, ensure_ascii=False).encode()
+    ok, msg = tx_apply("wda_" + ("on" if on else "off"), model_mod=mod, files=files)
     if not ok:
-        if on and not was_on:                    # 仅"本来关→这次想开"失败才清回空; 本来就开则 apply_sb 已还原成带规则的旧配置, 保持 unlock.txt
-            okc, errc = _write_unlock_file([])
-            if not okc:                          # 连回滚清空都失败 → 别静默, 明确告知 mosdns 侧可能残留
-                msg += "\n⚠️ 且回滚清空 unlock.txt 也失败(" + errc + "): mosdns 侧可能仍残留解锁清单, 请重试或手动清空。"
         return False, msg
     if on:
         return True, ("✅ 已切到【🔓 WDA 解锁】: %d 个域名走 WDA(jp 直出 + 22.22.22.22 中继)。\n"
                       "其余流量照常分流。哪个服务在 WDA 下不灵, 切回【落地出口】即可。") % len(WDA_DOMAINS)
-    # 关闭: sing-box 规则已撤; 再清空 mosdns unlock.txt, 让解锁支彻底休眠(否则本机解析这些域名仍走解锁 DNS)
-    okc, errc = _write_unlock_file([])
-    if okc:
-        return True, "✅ 已切到【🛬 落地出口】: 解锁域名回落各自出口(hk/tw), mosdns 解锁清单已清空。"
-    return True, ("✅ 已切到【🛬 落地出口】(内核分流规则已撤)。\n"
-                  "⚠️ 但清空 mosdns unlock.txt 失败(" + errc + "): 本机解析这些域名可能仍走解锁 DNS, 可再点一次 🛬 或手动清空。")
+    return True, "✅ 已切到【🛬 落地出口】: 解锁域名回落各自出口(hk/tw), mosdns 解锁清单已清空。"
+
 
 # ── 持久化开关 (profile.env: PDG_LOWMEM / PDG_TFO …) ──
 def _profile_get(key, default=""):
@@ -1530,6 +1606,23 @@ def _profile_get(key, default=""):
     except OSError:
         pass
     return default
+
+def _profile_text_with(key, val):
+    """把 profile.env 改成"key=val"后的完整内容(不落盘)。"""
+    try:
+        lines = open(PROFILE_ENV, encoding="utf-8").read().splitlines()
+    except OSError:
+        lines = []
+    out, found = [], False
+    for line in lines:
+        if line.strip().startswith(key + "="):
+            out.append("%s=%s" % (key, val)); found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append("%s=%s" % (key, val))
+    return ("\n".join(out) + "\n").encode("utf-8")
+
 
 def _profile_set(key, val):
     try:
@@ -1585,21 +1678,19 @@ def _tfo_on(c=None):
     return _tfo_intent(c)
 
 def set_tfo(on):
-    prev = _profile_get("PDG_TFO")
-    _profile_set("PDG_TFO", "1" if on else "0")     # 先持久化意图, apply_sb 的同步据此执行
-    ok, msg = apply_sb(lambda c: None)              # 空 mod: 仅触发 _tfo_apply 同步 + 重启核心
-    if not ok:
-        _profile_set("PDG_TFO", prev)               # 失败回滚意图, 与配置回滚一致
-        return ok, msg
+    """TFO 开关。持久意图(profile.env)、出口/入口标志(model)、sysctl drop-in 现在同属一笔事务 ——
+    以前 drop-in 写失败被 `except: pass` 吞掉, 重启后 TFO 又变回去, 而 Bot 显示"已开启"。"""
+    prof = _profile_text_with("PDG_TFO", "1" if on else "0")
+    files = {"profile_env": prof}
     if on:
-        sh(["sysctl", "-w", "net.ipv4.tcp_fastopen=3"])
-        try:
-            with open("/etc/sysctl.d/99-pdg-tfo.conf", "w") as f:
-                f.write("net.ipv4.tcp_fastopen=3\n")
-        except Exception:  # noqa: BLE001
-            pass
+        files["sysctl_tfo"] = b"net.ipv4.tcp_fastopen=3\n"
+    ok, msg = tx_apply("tfo_" + ("on" if on else "off"),
+                       model_mod=lambda c: None, files=files, tfo_intent=on)
+    if not ok:
+        return False, msg
     return True, (f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口)\n"
                   "新增出口会自动继承此设置。降到落地的握手延迟; 需落地端也支持, 否则自动回落普通握手。")
+
 
 # ── 临时观测/控制面板 (zashboard, 由 sing-box external_ui 托管) ──────────────
 # 默认关闭=零暴露: clash_api 只绑 127.0.0.1、无 secret、防火墙不放行 9090。
@@ -2488,10 +2579,12 @@ def add_rule(domain, target):
     if not re.match(r"^[a-z0-9.-]+$", domain):
         return False, "域名格式不对"
     if target in ("direct", "直连"):
-        _write_direct(_read_direct() + [domain])
+        files = {"mosdns_rule:custom_direct.txt": _direct_text(_read_direct() + [domain])}
         if domain in _read_hijack():                 # 改判直连: 必须同时撤掉劫持, 否则仍被劫进代理
-            _write_hijack([d for d in _read_hijack() if d != domain])
-        return True, f"已把 {domain} 设为直连"
+            files["mosdns_rule:custom_hijack.txt"] = _hijack_text(
+                [d for d in _read_hijack() if d != domain])
+        ok, msg = tx_apply("rule_add_direct", files=files)
+        return ok, (f"已把 {domain} 设为直连" if ok else msg)
     c = load()
     if target not in exit_tags(c):
         return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))} 或 direct"
@@ -2505,9 +2598,11 @@ def add_rule(domain, target):
                 return
         idx = 1 if cc["route"]["rules"] and cc["route"]["rules"][0].get("action") == "reject" else 0
         cc["route"]["rules"].insert(idx, {"domain_suffix": [domain], "outbound": target})
-    ok, msg = apply_sb(mod)
-    if ok and domain not in _read_hijack():          # 让 mosdns 把它劫持到网关, 否则这条规则是死的
-        _write_hijack(_read_hijack() + [domain])
+    # 内核规则与 mosdns 劫持表**同一笔事务**: 少了劫持这条规则就是死的, 分两步写迟早半套
+    files = {}
+    if domain not in _read_hijack():
+        files["mosdns_rule:custom_hijack.txt"] = _hijack_text(_read_hijack() + [domain])
+    ok, msg = tx_apply("rule_add", model_mod=mod, files=files)
     return ok, (f"已把 {domain} → {target}" if ok else msg)
 
 def del_rule(domain):
@@ -2523,11 +2618,25 @@ def del_rule(domain):
                                     if r.get("action") or "outbound" not in r or r.get("rule_set")
                                     or r.get("domain_suffix") or r.get("domain")
                                     or r.get("domain_keyword") or r.get("ip_cidr")]
-        apply_sb(mod); removed.append("出口规则")
+        files = {}
         if domain in _read_hijack():
-            _write_hijack([d for d in _read_hijack() if d != domain])
-    if domain in _read_direct():
-        _write_direct([d for d in _read_direct() if d != domain]); removed.append("直连表")
+            files["mosdns_rule:custom_hijack.txt"] = _hijack_text(
+                [d for d in _read_hijack() if d != domain])
+        if domain in _read_direct():
+            files["mosdns_rule:custom_direct.txt"] = _direct_text(
+                [d for d in _read_direct() if d != domain])
+            removed.append("直连表")
+        ok, msg = tx_apply("rule_del", model_mod=mod, files=files)
+        if not ok:
+            return False, msg
+        removed.append("出口规则")
+    elif domain in _read_direct():
+        ok, msg = tx_apply("rule_del_direct", files={
+            "mosdns_rule:custom_direct.txt": _direct_text(
+                [d for d in _read_direct() if d != domain])})
+        if not ok:
+            return False, msg
+        removed.append("直连表")
     return (bool(removed), f"已删除 {domain} ({'+'.join(removed)})" if removed else f"未找到含 {domain} 的规则")
 
 def deletable_domains():
@@ -2556,15 +2665,16 @@ def del_rules_bulk(domains):
                                 if r.get("action") or "outbound" not in r or r.get("rule_set")
                                 or r.get("domain_suffix") or r.get("domain")
                                 or r.get("domain_keyword") or r.get("ip_cidr")]
-    ok, msg = apply_sb(mod)
+    cur = _read_direct(); hit = [x for x in cur if x in domains]
+    hj = _read_hijack()
+    files = {}
+    if hit:
+        files["mosdns_rule:custom_direct.txt"] = _direct_text([x for x in cur if x not in domains])
+    if any(x in domains for x in hj):
+        files["mosdns_rule:custom_hijack.txt"] = _hijack_text([x for x in hj if x not in domains])
+    ok, msg = tx_apply("rule_del_bulk", model_mod=mod, files=files)
     if not ok:
         return False, msg
-    cur = _read_direct(); hit = [x for x in cur if x in domains]
-    if hit:
-        _write_direct([x for x in cur if x not in domains])
-    hj = _read_hijack()
-    if any(x in domains for x in hj):
-        _write_hijack([x for x in hj if x not in domains])
     return True, f"✅ 已删除 {len(domains)} 个域名" + (f"(含直连 {len(hit)} 个)" if hit else "")
 
 def del_rule_kb(chat, back=RULE_BACK):

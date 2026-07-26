@@ -63,11 +63,23 @@ class FakeSh:
 
 
 def setup(tmp, backend="mihomo", svc_active=True):
-    bot.SB = os.path.join(tmp, "config.json")
-    bot.MIHOMO_DIR = os.path.join(tmp, "mihomo")
-    bot.MIHOMO_CFG = os.path.join(bot.MIHOMO_DIR, "config.yaml")
+    # 5.1 起 apply_sb 走统一事务, 事务的目标白名单是**镜像的 /etc 结构**(根可换, 结构不可换),
+    # 所以这里按镜像树铺路径, 并把事务根/锁一并指进沙箱。
+    for d in ("/etc/sing-box", "/etc/mihomo", "/etc/mosdns/rules", "/run",
+              "/var/lib/privdns-gateway"):
+        os.makedirs(tmp + d, exist_ok=True)
+    os.environ["PDG_TX_FSROOT"] = tmp
+    os.environ["PDG_TX_ROOT"] = tmp + "/var/lib/privdns-gateway/tx"
+    os.environ["PDG_LOCKFILE"] = tmp + "/run/pdg.lock"
+    os.environ["PDG_STABLE_SAMPLES"] = "1"
+    for m in list(sys.modules):
+        if m.startswith("pdgtx"):
+            del sys.modules[m]                       # 让事务核心按新的沙箱根重新加载
+    bot.SB = tmp + "/etc/sing-box/config.json"
+    bot.MIHOMO_DIR = tmp + "/etc/mihomo"
+    bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
     bot.BACKEND_MARKER = os.path.join(tmp, "backend")
-    bot.LOCKFILE = os.path.join(tmp, "lock")
+    bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
     with open(bot.SB, "w") as f:
         json.dump(SAMPLE, f)
     with open(bot.BACKEND_MARKER, "w") as f:
@@ -75,6 +87,19 @@ def setup(tmp, backend="mihomo", svc_active=True):
     fake = FakeSh()
     bot.sh = fake
     bot._svc_active = lambda unit, **k: svc_active
+    # 事务的观察期/基线走真 systemctl 与真探针; 单测里用最小桩顶上(与 FakeSh 同样的取向:
+    # 本文件验的是 backend 分支与渲染, 服务动力学由 test-config-transaction*.py 覆盖)
+    import importlib
+    tx = importlib.import_module("pdgtx") if "pdgtx" in sys.modules else None
+    if tx is None:
+        sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+        tx = importlib.import_module("pdgtx")
+    tx.svc_stable = lambda unit, **k: (svc_active, "" if svc_active else "%s 未稳定" % unit)
+    tx.health_snapshot = lambda services: {"svc:" + u: svc_active for u in services}
+    tx._run = lambda cmd, timeout=60: (0, "")
+    # 候选校验沿用本文件既有的注入口 fake.mihomo_t_rc(=1 表示 mihomo -t 判不过)
+    tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (
+        (False, "mihomo 配置校验失败") if getattr(fake, "mihomo_t_rc", 0) else (True, ""))
     return fake
 
 

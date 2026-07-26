@@ -72,13 +72,25 @@ class FakeSh:
 
 
 def setup(tmp):
-    bot.SB = os.path.join(tmp, "config.json")
-    bot.RS_DIR = os.path.join(tmp, "rs")
-    bot.RS_META = os.path.join(tmp, "rulesets.json")
-    bot.MIHOMO_DIR = os.path.join(tmp, "mihomo")
-    bot.MIHOMO_CFG = os.path.join(bot.MIHOMO_DIR, "config.yaml")
+    # 5.1: 规则集操作经统一事务落盘, 事务的目标白名单是镜像的 /etc 结构 —— 沙箱按镜像树铺,
+    # 并把事务根/锁指进来(锁 fail-closed, 必须给可写路径)。
+    for d in ("/etc/sing-box/rs", "/etc/mihomo", "/etc/mosdns/rules", "/run",
+              "/var/lib/privdns-gateway", "/opt/pdg-bot"):
+        os.makedirs(tmp + d, exist_ok=True)
+    os.environ["PDG_TX_FSROOT"] = tmp
+    os.environ["PDG_TX_ROOT"] = tmp + "/var/lib/privdns-gateway/tx"
+    os.environ["PDG_LOCKFILE"] = tmp + "/run/pdg.lock"
+    os.environ["PDG_STABLE_SAMPLES"] = "1"
+    for m in list(sys.modules):
+        if m.startswith("pdgtx"):
+            del sys.modules[m]
+    bot.SB = tmp + "/etc/sing-box/config.json"
+    bot.RS_DIR = tmp + "/etc/sing-box/rs"
+    bot.RS_META = tmp + "/opt/pdg-bot/rulesets.json"
+    bot.MIHOMO_DIR = tmp + "/etc/mihomo"
+    bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
     bot.BACKEND_MARKER = os.path.join(tmp, "backend")
-    bot.LOCKFILE = os.path.join(tmp, "lock")
+    bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
     os.makedirs(bot.RS_DIR, exist_ok=True)
     with open(bot.SB, "w") as f:
         json.dump(SAMPLE, f)
@@ -86,6 +98,14 @@ def setup(tmp):
         f.write("mihomo")
     fake = FakeSh()
     bot.sh = fake
+    sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+    import importlib
+    tx = importlib.import_module("pdgtx")
+    tx.svc_stable = lambda unit, **k: (True, "")            # 服务动力学由事务专属用例覆盖
+    tx.health_snapshot = lambda services: {"svc:" + u: True for u in services}
+    tx._run = lambda cmd, timeout=60: (0, "")
+    tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (
+        (False, "mihomo 配置校验失败") if getattr(fake, "mihomo_t_rc", 0) else (True, ""))
     bot._svc_active = lambda unit, **k: True
     bot._build_source = _REAL_BUILD_SOURCE      # 复原, 防止上一个用例的桩泄漏进来
     bot._fetch_bytes = _REAL_FETCH_BYTES
