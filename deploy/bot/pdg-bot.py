@@ -2356,30 +2356,35 @@ def set_ruleset_label(name, label):
         m[name]["label"] = label
     else:
         m[name].pop("label", None)
-    _save_rs_meta(m)
-    return True, f"✅ 规则集名称已设为「{label or name}」"
+    ok, msg = tx_apply("ruleset_label", files={
+        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")})
+    return (True, f"✅ 规则集名称已设为「{label or name}」") if ok else (False, msg)
 
 def _rs_items():
     """[(name, 显示文字)] 供选择键盘用。"""
     return [(n, (i.get("label") or n) + f" · {i.get('count', '?')}条") for n, i in _rs_meta().items()]
 
 def del_ruleset(name):
+    """删规则集: model 规则、规则集文件、元数据**一笔事务**。
+
+    旧实现是 apply_sb 成功之后才去删文件与元数据 —— 中间失败就会留下"内核已经不引用它了,
+    文件和元数据还在"的残留, 下次渲染又把它算进来。"""
     m = _rs_meta(); info = m.get(name, {}); path = info.get("path")
     label = info.get("label") or name              # 删前取显示名(删完 meta 就没了)
+
     def mod(cc):
         cc["route"]["rule_set"] = [r for r in cc["route"].get("rule_set", []) if r.get("tag") != name]
         cc["route"]["rules"] = [r for r in cc["route"]["rules"] if r.get("rule_set") != name]
-    ok, msg = apply_sb(mod)
-    if ok:
-        m.pop(name, None); _save_rs_meta(m)
-        for p in (path, os.path.join(RS_DIR, name + ".json"), os.path.join(RS_DIR, name + ".srs")):
-            try:
-                if p:
-                    os.remove(p)
-            except OSError:
-                pass
-        return True, f"已删除规则集 {label}"
-    return False, msg
+
+    files = {}
+    for p_ in {path, os.path.join(RS_DIR, name + ".json"), os.path.join(RS_DIR, name + ".mrs")}:
+        if p_ and os.path.dirname(p_) == RS_DIR and os.path.exists(p_):
+            files["ruleset:" + os.path.basename(p_)] = None      # None = 本次要删掉它
+    m2 = dict(m); m2.pop(name, None)
+    files["rs_meta"] = json.dumps(m2, ensure_ascii=False, indent=2).encode("utf-8")
+    ok, msg = tx_apply("ruleset_del", model_mod=mod, files=files)
+    return (True, f"已删除规则集 {label}") if ok else (False, msg)
+
 
 def refresh_rulesets():
     """重下全部规则集并**整批**原子提交。返回 (成功刷新数, 失败项列表)。
@@ -2799,15 +2804,17 @@ def rename_exit(old, new):
                 r["outbound"] = new
         if cc["route"].get("final") == old:
             cc["route"]["final"] = new
-    ok, msg = apply_sb(mod)
+    # 规则集元数据也记着目标出口 —— 与 model 同一笔事务改, 免得内核改完名、元数据还指着旧的
+    rsm = _rs_meta(); dirty = False
+    for k, v in rsm.items():
+        if v.get("outbound") == old:
+            v["outbound"] = new; dirty = True
+    files = {}
+    if dirty:
+        files["rs_meta"] = json.dumps(rsm, ensure_ascii=False, indent=2).encode("utf-8")
+    ok, msg = tx_apply("exit_rename", model_mod=mod, files=files)
     if not ok:
         return False, msg
-    m = _rs_meta(); dirty = False          # 规则集元数据也记着目标出口, 同步掉, 免得日后误导
-    for info in m.values():
-        if info.get("outbound") == old:
-            info["outbound"] = new; dirty = True
-    if dirty:
-        _save_rs_meta(m)
     return True, f"✅ 出口 <b>{old}</b> 已改名 <b>{new}</b>, 分流规则/故障组/默认出口里的引用已同步。"
 
 def urltest_groups(c):
