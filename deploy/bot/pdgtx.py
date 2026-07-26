@@ -862,6 +862,12 @@ class Tx:
         atomic_write(os.path.join(self.dir, "before", "index.json"),
                      json.dumps(bi, ensure_ascii=False, indent=1).encode(), 0o600)
         self._before = bi
+        # **打算写入什么**要在动手之前就落进 meta: 崩在 APPLYING 时, recover 靠它判断
+        # "现在盘上的内容是本事务写的(可以安全还原)" 还是 "事务之外有人改过(要停手报冲突)"。
+        # 崩溃可能发生在任意一次 replace 前后, 所以这份记录必须**先于**全部落盘写好。
+        self.meta["intended_sha"] = {n: (_sha(t["data"]) if t["data"] is not None else None)
+                                     for n, t in self.targets.items()}
+        self._save_meta()
 
     # ---- 应用 ----
     def _apply_one(self, name, t):
@@ -1165,12 +1171,11 @@ def recover(txid, root=None, force=False):
             before_sha = rec.get("sha256") if rec.get("existed") else None
             if cur_sha == before_sha:
                 continue                                   # 已经是 before 的样子: 幂等
-            if not force and cur_sha is not None and before_sha is not None \
-                    and cur_sha not in (before_sha,):
-                # 当前既不是 before, 也无法证明是本事务写下的(applied 记录可能随崩溃丢失)
-                if m.get("applied_sha", {}).get(name) not in (cur_sha,):
-                    conflicts.append(name)
-                    continue
+            if not force and cur_sha != m.get("intended_sha", {}).get(name):
+                # 当前既不是 before(上面已排除), 也不是本事务打算写入的内容 → 事务之外有人动过。
+                # 拿旧备份盖掉别人的现场修复, 比不恢复更糟, 所以默认停手。
+                conflicts.append(name)
+                continue
             try:
                 if rec.get("existed"):
                     with open(os.path.join(d, "before", rec["file"]), "rb") as f:
