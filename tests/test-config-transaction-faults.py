@@ -1054,6 +1054,155 @@ def main():
         bad("旧格式 meta 恢复失败: %s" % r15)
     box15.clean()
 
+    # ── 16. 候选阶段放弃的事务必须自己收尾(不留 PREPARING + 含凭据的候选) ──────
+    box16 = Box(); tx16 = load_tx(box16.env)
+    box16.up("mosdns")
+    box16.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before16.example\n", 0o644)
+    t16 = tx16.Tx("test", "abandon")
+    t16.stage("mosdns_rule:custom_direct.txt", b"domain:SECRET_SENTINEL.example\n")
+    if t16.abort_unstarted("测试放弃") and tx16.load_meta(t16.dir).get("state") == tx16.ABORTED:
+        ok("abort_unstarted: PREPARING → ABORTED")
+    else:
+        bad("abort_unstarted 没收尾: %s" % tx16.load_meta(t16.dir).get("state"))
+    left = [d for d in ("candidate", "before") if os.path.isdir(os.path.join(t16.dir, d))]
+    if not left:
+        ok("abort_unstarted: 候选与 before 材料已删除(候选里可能带凭据)")
+    else:
+        bad("材料还在: %s" % left)
+    metatxt = open(os.path.join(t16.dir, "meta.json"), encoding="utf-8").read()
+    audit16 = open(tx16.AUDIT, encoding="utf-8").read() if os.path.exists(tx16.AUDIT) else ""
+    if "SECRET_SENTINEL" not in metatxt and "SECRET_SENTINEL" not in audit16:
+        ok("abort_unstarted: 候选正文没有进 meta / 审计")
+    else:
+        bad("候选正文泄露进了 meta 或审计")
+    if json.loads(audit16.strip().split("\n")[-1]).get("state") == "ABORTED":
+        ok("abort_unstarted: 审计里记了一条 ABORTED")
+    else:
+        bad("审计没记 ABORTED")
+    if t16.abort_unstarted() is False:
+        ok("abort_unstarted 幂等: 已是终态时什么都不做且不报错")
+    else:
+        bad("重复调用没有安全返回")
+
+    # APPLYING / OBSERVING 的材料必须留给 recover —— abort_unstarted 不许碰
+    for st in ("APPLYING", "OBSERVING"):
+        t = tx16.Tx("test", "keep_" + st.lower())
+        t.stage("mosdns_rule:custom_direct.txt", b"domain:x16.example\n")
+        t.state = getattr(tx16, st)
+        t._save_meta()
+        if t.abort_unstarted() is False and tx16.load_meta(t.dir)["state"] == st \
+                and os.path.isdir(os.path.join(t.dir, "candidate")):
+            ok("%s 的事务不被 abort_unstarted 收尾(材料留给 recover)" % st)
+        else:
+            bad("%s 竟被当成候选阶段清理了" % st)
+    box16.clean()
+
+    # ── 17. 运行态回滚的严格判据 ────────────────────────────────────────────
+    # 原本 inactive 的服务, 回滚 stop 之后落到 failed/activating/deactivating 都不算停稳。
+    for st in ("failed", "activating", "deactivating"):
+        b17 = Box(); tx17 = load_tx(b17.env)
+        b17.up("mosdns"); b17.down("pdg-mitm")
+        b17.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
+        before17 = b17.read("/etc/privdns-gateway/mitm.json")
+        b17.stop_leaves("pdg-mitm", st)
+        t = tx17.Tx("bot", "rt-strict-" + st, mode="repair")
+        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+        t.service("restart:pdg-mitm")       # 先把它拉起来(原本 inactive)
+        t.service("restart:mosdns")
+        b17._systemctl(["mosdns"], False)   # mosdns 重启失败 → 触发回滚
+        res = t.commit()
+        recovered = b17.read("/etc/privdns-gateway/mitm.json") == before17
+        named = any("pdg-mitm" in x for x in res.get("rollback_failed_items") or [])
+        if res["state"] == tx17.ROLLBACK_FAILED and named and recovered:
+            ok("回滚 stop 后 ActiveState=%s → ROLLBACK_FAILED 并点名, 文件仍逐字节还原" % st)
+        else:
+            bad("ActiveState=%s 被当成停回去了: %s / %s" % (st, res["state"], res.get("rollback_failed_items")))
+        b17.clean()
+
+    # UnitFileState 查不到: before-image 不完整 → 动生产文件之前就拒
+    b17 = Box(); tx17 = load_tx(b17.env)
+    b17.up("mosdns")
+    live17 = b17.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before17.example\n", 0o644)
+    with open(os.path.join(b17.bin, "systemctl"), "r+") as f:
+        stub = f.read()
+    stub = stub.replace('      UnitFileState) cat "$S/$U.ufs" 2>/dev/null || echo enabled;;',
+                        '      UnitFileState) exit 1;;')
+    with open(os.path.join(b17.bin, "systemctl"), "w") as f:
+        f.write(stub)
+    t = tx17.Tx("test", "ufs-unknown")
+    t.stage("mosdns_rule:custom_direct.txt", b"domain:after17.example\n")
+    t.service("restart:mosdns")
+    try:
+        t.commit(); bad("UnitFileState 查不到却照样提交")
+    except tx17.TxRefused as e:
+        if "before-image 不完整" in str(e) and b17.read("/etc/mosdns/rules/custom_direct.txt") \
+                == b"domain:before17.example\n":
+            ok("运行态查不到 → before-image 不完整, 在动生产文件之前拒绝")
+        else:
+            bad("拒绝原因或现网状态不对: %s" % e)
+    b17.clean()
+
+    # ── 18. tx_apply 的候选阶段异常也要自己收尾; SIGKILL 于 PREPARING 仍留证据 ──
+    box18 = Box(); tx18 = load_tx(box18.env)
+    box18.up("mosdns"); box18.up("mihomo")
+    box18.put("/etc/sing-box/config.json", json.dumps(
+        {"outbounds": [{"type": "shadowsocks", "tag": "hk", "server": "1.1.1.1",
+                        "server_port": 1, "method": "aes-256-gcm", "password": "SECRET_SENTINEL"}],
+         "route": {"rules": []}, "inbounds": []}).encode())
+    for _m in list(sys.modules):
+        if _m == "pdgtx":
+            del sys.modules[_m]
+    spec18 = _il3.spec_from_file_location("pdg_bot_abort", ROOT / "deploy/bot/pdg-bot.py")
+    b18 = _il3.module_from_spec(spec18); spec18.loader.exec_module(b18)
+    b18.SB = box18.path("/etc/sing-box/config.json")
+    b18.MIHOMO_CFG = box18.path("/etc/mihomo/config.yaml")
+    b18.LOCKFILE = box18.env["PDG_LOCKFILE"]
+
+    def _boom(c):
+        raise RuntimeError("modify 回调炸了")
+    okr, msg = b18.tx_apply("abort_probe", model_mod=_boom)
+    rows = []
+    for d in sorted(os.listdir(box18.env["PDG_TX_ROOT"])):
+        mp = os.path.join(box18.env["PDG_TX_ROOT"], d, "meta.json")
+        if os.path.isfile(mp):
+            rows.append((d, json.load(open(mp, encoding="utf-8")).get("state"),
+                         os.path.isdir(os.path.join(box18.env["PDG_TX_ROOT"], d, "candidate"))))
+    if okr is False and rows and all(r[1] == "ABORTED" and not r[2] for r in rows):
+        ok("tx_apply 的 model 回调抛异常 → 事务收尾为 ABORTED 且候选材料已删")
+    else:
+        bad("tx_apply 异常后残留: %s" % rows)
+    txt18 = "".join(open(os.path.join(box18.env["PDG_TX_ROOT"], d, "meta.json"),
+                         encoding="utf-8").read() for d, _s, _c in rows)
+    if "SECRET_SENTINEL" not in txt18 and "SECRET_SENTINEL" not in msg:
+        ok("tx_apply 收尾时 meta 与回执都不含出口凭据")
+    else:
+        bad("凭据泄露: %s" % msg[:60])
+
+    # SIGKILL 于 PREPARING: 没有任何 __exit__/finally 会跑 → 证据必须留着给 stale_unstarted
+    kill_src = ("import importlib.util, os, signal, sys\n"
+                "spec = importlib.util.spec_from_file_location('pdgtx', sys.argv[1])\n"
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                "t = m.Tx('cli', 'kill_in_preparing')\n"
+                "t.stage('mosdns_rule:custom_direct.txt', b'domain:killed.example\\n')\n"
+                "print(t.txid, flush=True)\n"
+                "os.kill(os.getpid(), signal.SIGKILL)\n")
+    r18 = subprocess.run([sys.executable, "-c", kill_src, str(ROOT / "deploy/bot/pdgtx.py")],
+                         capture_output=True, text=True,
+                         env=dict(os.environ, **box18.env))
+    killed = (r18.stdout or "").strip().split("\n")[-1]
+    kmeta = os.path.join(box18.env["PDG_TX_ROOT"], killed, "meta.json")
+    if killed and os.path.isfile(kmeta) and json.load(open(kmeta, encoding="utf-8"))["state"] == "PREPARING" \
+            and os.path.isdir(os.path.join(box18.env["PDG_TX_ROOT"], killed, "candidate")):
+        ok("SIGKILL 于 PREPARING: 目录与候选仍在(取证不被自动清理误删)")
+    else:
+        bad("SIGKILL 的 PREPARING 证据被清掉了: %s" % killed)
+    stale = tx18.stale_unstarted(older_than=0)
+    if any(x.get("txid") == killed for x in stale):
+        ok("stale_unstarted 能报出这笔被强杀的 PREPARING(交人工/定时清理)")
+    else:
+        bad("stale_unstarted 没报出来: %s" % stale)
+    box18.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

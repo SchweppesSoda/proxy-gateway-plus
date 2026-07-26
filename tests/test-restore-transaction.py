@@ -391,6 +391,77 @@ def main():
         bad("recover 没能收尾: %s" % r)
     box.clean()
 
+    # ── 10b. 候选阶段被拒的恢复必须自己收尾: ABORTED + 材料删净 + 无凭据残留 ──
+    def tx_rows(box):
+        root = box.env["PDG_TX_ROOT"]
+        rows = []
+        for d in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            mp = os.path.join(root, d, "meta.json")
+            if os.path.isfile(mp):
+                rows.append((d, json.load(open(mp, encoding="utf-8")).get("state"),
+                             os.path.isdir(os.path.join(root, d, "candidate"))))
+        return rows
+
+    bad_json = blob([("etc/sing-box/config.json", b"{ not json at all"),
+                     ("opt/pdg-bot/rulesets.json", b"{}")])
+    bad_meta = blob([("etc/sing-box/config.json", json.dumps(AFTER_SB).encode()),
+                     ("opt/pdg-bot/rulesets.json", b"{ broken")])
+    miss_rs = full_backup(meta={"rs_x": {"url": "https://x/a", "outbound": "new-tw",
+                                         "format": "source",
+                                         "path": "/etc/sing-box/rs/rs_x.json", "count": 1}},
+                          rs=[])
+    for label, data in (("备份 model 不是合法 JSON", bad_json),
+                        ("规则集元数据坏了", bad_meta),
+                        ("元数据引用的规则集文件缺失", miss_rs)):
+        box, bot = make_box()
+        before = snap(box)
+        okr, msg = bot.restore_from(data)
+        rows = tx_rows(box)
+        leftover = [r for r in rows if r[1] in ("PREPARING", "VALIDATED") or r[2]]
+        if okr is False and rows and not leftover and all(r[1] == "ABORTED" for r in rows):
+            ok("%s → 事务收尾为 ABORTED, 候选/before 材料已删" % label)
+        else:
+            bad("%s 之后事务残留: %s" % (label, rows))
+        metas = "".join(open(os.path.join(box.env["PDG_TX_ROOT"], d, "meta.json"),
+                             encoding="utf-8").read() for d, _s, _c in rows)
+        au = open(os.path.join(box.env["PDG_TX_ROOT"], "index.jsonl"), encoding="utf-8").read() \
+            if os.path.exists(os.path.join(box.env["PDG_TX_ROOT"], "index.jsonl")) else ""
+        if "BACKUP-PASSWORD-2" not in metas + au + msg and "OLD-PASSWORD-1" not in metas + au + msg:
+            ok("%s: meta / 审计 / 回执都没有凭据" % label)
+        else:
+            bad("%s: 凭据泄露了" % label)
+        unchanged(box, before, label)
+        box.clean()
+
+    # ── 10c. 规则集路径的各种绕过写法都要拒(且拒在落盘之前) ──
+    for label, path in (("../rs/foo.json", "/etc/sing-box/rs/../rs/foo.json"),
+                        ("别处的绝对路径", "/tmp/rs/foo.json"),
+                        ("双斜杠", "/etc/sing-box//rs/foo.json"),
+                        ("反斜杠", "\\etc\\sing-box\\rs\\foo.json")):
+        box, bot = make_box()
+        before = snap(box)
+        okr, msg = bot.restore_from(full_backup(
+            meta={"rs_p": {"url": "https://x/a", "outbound": "new-tw", "format": "source",
+                           "path": path, "count": 1}},
+            rs=[("foo.json", b'{"rules":[]}')]))
+        if not okr and unchanged(box, before, label):
+            ok("规则集路径 %s → 拒绝且生产零改动" % label)
+        else:
+            bad("规则集路径 %s 被接受了: %s" % (label, msg))
+        box.clean()
+
+    # 同一个 tar 成员出现两次 → 整包拒绝(不采用"后一个覆盖前一个")
+    box, bot = make_box()
+    before = snap(box)
+    dup = blob([("etc/sing-box/config.json", json.dumps(AFTER_SB).encode()),
+                ("etc/sing-box/config.json", json.dumps(BEFORE_SB).encode())])
+    okr, msg = bot.restore_from(dup)
+    if not okr and "两次" in msg and unchanged(box, before, "重复成员"):
+        ok("同一成员在归档里出现两次 → 整包拒绝, 生产零改动")
+    else:
+        bad("重复成员没被拒: %s" % msg)
+    box.clean()
+
     # ── 11. 手写事务的遗留物必须消失 ──
     src = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
     gone = [n for n in ("_stage_restore_targets", "_rollback_restore_targets",

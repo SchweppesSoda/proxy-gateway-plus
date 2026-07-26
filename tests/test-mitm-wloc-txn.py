@@ -340,6 +340,44 @@ def main():
         bad("Android 门控不对: %s / %s / 事务目录 %d→%d" % (okr, msg, n_before, n_after))
     box.clean()
 
+    # ── 10. 候选阶段放弃不留残骸: _WlocAbort / CA 失败 / 预签失败 ──
+    def tx_states(box):
+        root = box.env["PDG_TX_ROOT"]
+        out = []
+        for d in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            mp = os.path.join(root, d, "meta.json")
+            if os.path.isfile(mp):
+                m = json.load(open(mp, encoding="utf-8"))
+                out.append((d, m.get("state"),
+                            os.path.isdir(os.path.join(root, d, "candidate"))))
+        return out
+
+    for label, setup in (("_WlocAbort", None),
+                         ("CA 失败", lambda: setattr(Ctx, "ca_raises", True)),
+                         ("预签失败", lambda: setattr(Ctx, "prewarm_n", 0))):
+        box, bot = make_box()
+        if setup:
+            setup()
+        if label == "_WlocAbort":
+            def _abort(w):
+                raise bot._WlocAbort("没有可用地点")
+            okr, msg = bot._mitm_transact(_abort)
+        else:
+            okr, msg = bot._mitm_transact(NEW_W)
+        sts = tx_states(box)
+        bad_left = [x for x in sts if x[1] in ("PREPARING", "VALIDATED") or x[2]]
+        if okr is False and not bad_left and sts:
+            ok("%s → 事务自己收尾成 %s, 候选材料已删" % (label, sts[-1][1]))
+        else:
+            bad("%s 之后残留: %s" % (label, sts))
+        metas = "".join(open(os.path.join(box.env["PDG_TX_ROOT"], d, "meta.json"),
+                             encoding="utf-8").read() for d, _s, _c in sts)
+        if "BACKUP-PASSWORD" not in metas and "35.6" not in metas:
+            ok("%s: meta 里没有候选正文/坐标" % label)
+        else:
+            bad("%s: meta 泄露了候选内容" % label)
+        box.clean()
+
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
 

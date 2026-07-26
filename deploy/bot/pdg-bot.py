@@ -632,6 +632,11 @@ def _mitm_transact(new_wloc):
         return False, "配置事务内部错误: %s" % tx.redact(str(e))
     except Exception as e:  # noqa: BLE001
         return False, "MITM 应用异常(%s)" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
     if res["state"] == tx.COMMITTED:
         return True, ""
     if res["state"] == tx.ROLLBACK_FAILED:
@@ -1161,6 +1166,11 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
         return False, "配置事务内部错误: %s" % tx.redact(str(e))
     except Exception as e:  # noqa: BLE001
         return False, "配置事务异常(%s)" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
     if res["state"] == tx.COMMITTED:
         note = ("\n⚠️ " + "; ".join(res["warnings"])) if res["warnings"] else ""
         return True, "事务 %s 已提交%s" % (res["txid"], note)
@@ -1480,10 +1490,12 @@ def set_mosdns_upstream(which, addrs):
         return False, "无法开始配置事务(%s)" % type(e).__name__
     cur, _sha = t.read_for_update("mosdns_conf")     # 候选基于这一份算, 前置条件也是它
     if cur is None:
+        t.abort_unstarted("读 mosdns 配置失败: 文件不存在")
         return False, "读 mosdns 配置失败: 文件不存在"
     try:
         lines = cur.decode("utf-8").splitlines()
     except Exception as e:  # noqa: BLE001
+        t.abort_unstarted("mosdns 配置不是 UTF-8")
         return False, f"读 mosdns 配置失败: {e}"
     items = ", ".join('{addr: "%s"}' % a for a in addrs)
     done = False
@@ -1500,6 +1512,7 @@ def set_mosdns_upstream(which, addrs):
         if done:
             break
     if not done:
+        t.abort_unstarted("mosdns 配置里没有 %s 块" % tag)
         return False, f"没在 mosdns 配置里找到 {tag} 块"
     t.stage("mosdns_conf", ("\n".join(lines) + "\n").encode("utf-8"))
     t.service("restart:mosdns")
@@ -1511,6 +1524,11 @@ def set_mosdns_upstream(which, addrs):
         return False, tx.redact(str(e))
     except Exception as e:  # noqa: BLE001
         return False, "配置事务异常(%s)" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
     if res["state"] == tx.COMMITTED:
         return True, f"✅ {which} 上游已设为: {', '.join(addrs)}"
     if res["state"] == tx.ROLLBACK_FAILED:
@@ -3099,6 +3117,7 @@ def _safe_extract(tar, dest):
     declared_total = 0
     written_total = 0
     seen = 0
+    seen_names = set()      # 规范化后的成员名(判重用; written 记的是落地路径, 不是名字)
     written = []          # 本次已落地的文件: 一旦判拒整包, 连它们也要清掉
     try:
         _safe_extract_loop(tar, root, written)
@@ -3118,6 +3137,7 @@ def _safe_extract_loop(tar, root, written):
     declared_total = 0
     written_total = 0
     seen = 0
+    seen_names = set()      # 规范化后的成员名(判重用; written 记的是落地路径, 不是名字)
     while True:
         m = tar.next()
         if m is None:
@@ -3142,6 +3162,11 @@ def _safe_extract_loop(tar, root, written):
             raise ValueError("备份含非普通文件成员, 拒绝整个备份: %s" % raw)
         # 3) 到这里 raw 已确认是"不以 / 开头、不含 .." 的相对路径, 只去掉无害的 ./ 前缀
         name = raw[2:] if raw.startswith("./") else raw
+        # 同一个成员名出现两次: tar 允许, 但"后一个覆盖前一个"是含糊语义 —— 攻击者可以先放一份
+        # 干净的过校验、再放一份真正落地的。整包拒绝, 不猜。
+        if name in seen_names:
+            raise ValueError("备份里同一个成员出现了两次, 拒绝整个备份: %s" % raw)
+        seen_names.add(name)
         if not _restore_member_allowed(name):
             raise ValueError("备份含白名单之外的成员, 拒绝整个备份: %s" % raw)
         # 4) 限额: 声明值先卡一道(便宜), 实际读取再卡一道(声明值是攻击者写的, 不可信)
@@ -3257,11 +3282,22 @@ def _managed_rulesets(meta):
         if not leaf:
             leaf = name + (".mrs" if fmt == "mrs" else ".json")
         raw = str(info.get("path") or "")
-        # 备份里的路径是**那台机器**上的绝对路径, 不能拿本机 RS_DIR 直接比; 但它必须正好落在
-        # 规则集目录下一层 —— 子目录、别的目录、../ 一律拒(恢复只写受管目录里的单个文件)。
-        if raw and (os.path.basename(os.path.dirname(raw)) != os.path.basename(RS_DIR)
+        # 备份里的路径是**那台机器**上的绝对路径, 不能拿本机 RS_DIR 直接比; 但形态必须干净:
+        # 反斜杠、`..`、双斜杠、非规范化写法、以及不是"规则集目录 + 单个文件名"的一律拒。
+        # 落盘用的永远是校验过的 basename + 本机固定目录, **绝不用归档给的路径**。
+        if raw:
+            if "\\" in raw:
+                raise ValueError("规则集 %s 的路径含反斜杠, 拒绝" % name)
+            if any(seg == ".." for seg in raw.split("/")):
+                raise ValueError("规则集 %s 的路径含 .., 拒绝" % name)
+            if "//" in raw or raw != os.path.normpath(raw):
+                raise ValueError("规则集 %s 的路径不是规范化形态(%s), 拒绝" % (name, raw))
+            # 目录部分必须以本项目的规则集相对路径结尾(etc/sing-box/rs), 只比最后一段"rs"
+            # 会放过 /tmp/rs/foo.json 这种别处的同名目录。
+            want = "/".join(RS_DIR.strip("/").split("/")[-3:])
+            if (not os.path.dirname(raw).strip("/").endswith(want)
                     or os.path.basename(raw) != leaf):
-            raise ValueError("规则集 %s 的路径不在规则集目录下一层(不接受子目录/别处/../)" % name)
+                raise ValueError("规则集 %s 的路径不是「规则集目录 + 单个文件名」, 拒绝" % name)
         if not _RS_LEAF_RE.match(leaf):
             raise ValueError("规则集 %s 的文件 %s 不是当前支持的 .json/.mrs" % (name, leaf))
         want = "mrs" if leaf.endswith(".mrs") else "json"
@@ -3423,6 +3459,11 @@ def _restore_commit(tmp):
         return False, "配置事务内部错误: %s" % tx.redact(str(e))
     except Exception as e:  # noqa: BLE001
         return False, "恢复过程出错(%s), 未提交任何改动" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
     tail = ("\n" + "\n".join(notes)) if notes else ""
     if res["state"] == tx.COMMITTED:
         msg = "已恢复: " + ", ".join(restored) + "\n已重启 " + _core_svc() + " + mosdns"
