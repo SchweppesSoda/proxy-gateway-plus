@@ -1,0 +1,1361 @@
+#!/usr/bin/env python3
+"""统一配置事务核心(5.1)—— CLI / Bot / 更新器 / 定时任务共用的**同一套**写入语义。
+
+为什么要有它: v1.6.2 之前每条写路径各自实现"备份→写→重启→出事再还原"。同一台机器上因此
+存在七八套语义不一的局部事务: 有的不上跨进程锁, 有的重启完连 is-active 都不查, 有的把内核
+配置与 mosdns 规则分两步落盘 —— 于是"规则写进去了但 DNS 侧没劫持"这类**看着成功、实际半套**
+的状态没人拦得住, 事后也查不出是谁改的。
+
+本模块把这件事收敛成一条流水线, 任何入口都必须走完:
+
+    BEGIN → 事务 ID → 全局锁 → 基线 → 候选 → 脱敏差异 → 前置检查 → 校验 →
+    before-image → 原子落盘 → 服务动作 → 观察 → COMMIT / ROLLBACK → 审计
+
+硬纪律:
+  · 调用方**只能给逻辑目标名**(白名单), 不能给任意路径; 服务动作与校验器同样是白名单;
+  · 校验没过之前, 现网一个字节都不动;
+  · 回滚要么完整(并**验证**到位), 要么如实报 ROLLBACK_FAILED 并保留恢复材料;
+  · 锁拿不到就退出, 锁不可用就**拒绝写**(fail-closed), 绝不退化成"没锁也写";
+  · 元数据 / 差异 / 审计 / 日志一律脱敏, token、密码、UUID、节点链接、secret 不落盘。
+
+不引入数据库、消息队列、常驻进程或任何第三方依赖 —— 纯标准库。
+"""
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+SCHEMA_VERSION = 1
+
+# 测试用的根前缀: 白名单结构不变, 只是整棵树挂到沙箱里。调用方**不能**用它逃出白名单 ——
+# 它只在进程环境里生效, 且对所有目标一视同仁。
+FSROOT = os.environ.get("PDG_TX_FSROOT", "")
+TX_ROOT = os.environ.get("PDG_TX_ROOT", FSROOT + "/var/lib/privdns-gateway/tx")
+LOCKFILE = os.environ.get("PDG_LOCKFILE", FSROOT + "/run/privdns-gateway.lock")
+AUDIT = os.path.join(TX_ROOT, "index.jsonl")
+AUDIT_MAX_LINES = int(os.environ.get("PDG_TX_AUDIT_LINES", "500"))
+AUDIT_MAX_BYTES = int(os.environ.get("PDG_TX_AUDIT_BYTES", str(512 * 1024)))
+TX_KEEP = int(os.environ.get("PDG_TX_KEEP", "20"))
+# 硬门探针的落点。**判据本身不可关闭**, 只有落点可配 —— 沙箱测试要能起真的 socket 来验证
+# 这条门确实在工作(而不是给测试开一个"跳过健康检查"的后门)。
+DNS_PROBE = os.environ.get("PDG_TX_DNS_PROBE", "127.0.0.1:53")
+REDIR_PROBE = int(os.environ.get("PDG_TX_REDIR_PORT", "7893"))
+
+# ── 状态机 ────────────────────────────────────────────────────────────────────
+# ABORTED = 还没碰现网就结束(前置/校验/基线不过, 或 PREPARING/VALIDATED 阶段被中断)。
+# 它与 ROLLED_BACK 必须分开: 前者"什么都没发生", 后者"改过又还原了", 排障时含义完全不同。
+PREPARING = "PREPARING"
+VALIDATED = "VALIDATED"
+APPLYING = "APPLYING"
+OBSERVING = "OBSERVING"
+COMMITTED = "COMMITTED"
+ROLLING_BACK = "ROLLING_BACK"
+ROLLED_BACK = "ROLLED_BACK"
+ROLLBACK_FAILED = "ROLLBACK_FAILED"
+ABORTED = "ABORTED"
+
+TERMINAL = (COMMITTED, ROLLED_BACK, ROLLBACK_FAILED, ABORTED)
+# 中断在这些状态 = 现网可能被改过一半, 必须先 recover 才允许下一次写
+NEEDS_RECOVERY = (APPLYING, ROLLING_BACK, ROLLBACK_FAILED)
+
+_ALLOWED = {
+    PREPARING: (VALIDATED, ABORTED),
+    VALIDATED: (APPLYING, ABORTED),
+    APPLYING: (OBSERVING, ROLLING_BACK),
+    OBSERVING: (COMMITTED, ROLLING_BACK),
+    ROLLING_BACK: (ROLLED_BACK, ROLLBACK_FAILED),
+    COMMITTED: (), ROLLED_BACK: (), ROLLBACK_FAILED: (), ABORTED: (),
+}
+
+
+class TxBusy(Exception):
+    """锁被别人占着 —— 调用方应立即友好返回, 不要排队。"""
+
+
+class TxRefused(Exception):
+    """还没动现网就拒绝(前置检查/校验/基线)。现网保证零改动。"""
+
+
+class TxError(Exception):
+    """事务内部错误(状态机非法跳转、白名单越界等)。"""
+
+
+# ── 目标白名单 ────────────────────────────────────────────────────────────────
+# 每项: 逻辑名 → (相对路径, mode, 是否含凭据, 默认校验器)
+# 动态名(mosdns_rule:x / ruleset:x / unit:x)另有正则约束, 见 resolve_target。
+_STATIC = {
+    "model":          ("/etc/sing-box/config.json", 0o600, True, ("json_model",)),
+    "mihomo_cfg":     ("/etc/mihomo/config.yaml", 0o600, True, ("mihomo_check",)),
+    "mosdns_conf":    ("/etc/mosdns/config.yaml", 0o644, False, ("mosdns_probe",)),
+    "rs_meta":        ("/opt/pdg-bot/rulesets.json", 0o644, False, ("json_any",)),
+    "profile_env":    ("/etc/privdns-gateway/profile.env", 0o600, False, ("kv_env",)),
+    "nftables_conf":  ("/etc/nftables.conf", 0o644, False, ("nft_check",)),
+    "mitm_json":      ("/etc/privdns-gateway/mitm.json", 0o600, False, ("json_any",)),
+    "mitm_hijack":    ("/etc/mosdns/rules/mitm_hijack.txt", 0o644, False, ("mosdns_lines",)),
+    "sysctl_tfo":     ("/etc/sysctl.d/99-pdg-tfo.conf", 0o644, False, ("kv_env",)),
+    "dot_marker":     ("/opt/pdg-bot/dot-domain", 0o644, False, ("hostname_line",)),
+    "cert_fullchain": ("/etc/mosdns/certs/fullchain.pem", 0o644, False, ("pem_cert",)),
+    "cert_privkey":   ("/etc/mosdns/certs/privkey.pem", 0o600, True, ("pem_key",)),
+}
+_MOSDNS_RULE_RE = re.compile(r"^[A-Za-z0-9_!.-]+\.txt$")
+_RULESET_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
+_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
+
+# 目标 → 该目标牵动哪个服务(决定基线范围、观察范围)
+_TARGET_SVC = {
+    "model": "mihomo", "mihomo_cfg": "mihomo", "rs_meta": "mihomo",
+    "mosdns_conf": "mosdns", "mitm_hijack": "mosdns",
+    "cert_fullchain": "mosdns", "cert_privkey": "mosdns",
+    "mitm_json": "pdg-mitm",
+}
+
+_SERVICE_UNITS = ("mosdns", "mihomo", "pdg-mitm", "pdg-bot", "pdg-probe81")
+_ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
+                 ["daemon-reload", "nft:apply", "sysctl:apply"])
+
+
+def resolve_target(name):
+    """逻辑名 → (绝对路径, mode, secret, 校验器)。越界一律抛错。"""
+    if name in _STATIC:
+        rel, mode, secret, val = _STATIC[name]
+        return FSROOT + rel, mode, secret, val
+    for pfx, rex, base, mode, val in (
+            ("mosdns_rule:", _MOSDNS_RULE_RE, "/etc/mosdns/rules/", 0o644, ("mosdns_lines",)),
+            ("ruleset:", _RULESET_RE, "/etc/sing-box/rs/", 0o644, ("ruleset_format",)),
+            ("unit:", _UNIT_RE, "/etc/systemd/system/", 0o644, ("systemd_unit",))):
+        if name.startswith(pfx):
+            leaf = name[len(pfx):]
+            if not rex.match(leaf) or "/" in leaf or leaf.startswith("."):
+                raise TxError("目标名不合法: %s" % name)
+            return FSROOT + base + leaf, mode, False, val
+    raise TxError("不在白名单里的目标: %s" % name)
+
+
+def target_service(name):
+    if name in _TARGET_SVC:
+        return _TARGET_SVC[name]
+    if name.startswith("mosdns_rule:"):
+        return "mosdns"
+    if name.startswith("ruleset:"):
+        return "mihomo"
+    return None
+
+
+# ── 脱敏 ──────────────────────────────────────────────────────────────────────
+_SECRET_PATTERNS = [
+    (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"), "<token>"),                 # TG bot token
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    (re.compile(r"\b[0-9a-fA-F]{32,}\b"), "<hex>"),                              # secret/hash 串
+    (re.compile(r"(?i)\b(vmess|vless|trojan|ss|ssr|hysteria2?|tuic|anytls)://\S+"), "<link>"),
+    (re.compile(r"(?i)(password|passwd|secret|token|uuid|psk|private[-_]?key)"
+                r"\s*[:=]\s*\"?[^\s\"',}]+"), r"\1=<redacted>"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+     "<private-key>"),
+    (re.compile(r"(?i)https?://[^\s\"']*[?&](secret|token|key)=[^\s\"'&]+"), "<url-with-secret>"),
+]
+
+
+def redact(s):
+    """任何要落盘/回给用户的文本都先过这里。宁可多打码, 也不让凭据进日志。"""
+    if s is None:
+        return ""
+    out = str(s)
+    for rex, rep in _SECRET_PATTERNS:
+        out = rex.sub(rep, out)
+    return out
+
+
+# ── 原子写 ────────────────────────────────────────────────────────────────────
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, data, mode=0o600, uid=None, gid=None):
+    """写临时文件 → fsync → replace → fsync 父目录。断电时要么旧的要么新的, 没有半个。"""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".pdgtx.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        if uid is not None and gid is not None:
+            try:
+                os.chown(tmp, uid, gid)
+            except OSError:
+                pass
+        os.replace(tmp, path)
+        _fsync_dir(d)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_target(path):
+    """读现网文件。返回 (bytes 或 None, stat 或 None)。拒绝符号链接/硬链接目标。"""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None, None
+        if e.errno == errno.ELOOP:
+            raise TxError("目标是符号链接, 拒绝写入: %s" % path)
+        raise
+    try:
+        st = os.fstat(fd)
+        if st.st_nlink > 1:
+            raise TxError("目标是硬链接(nlink=%d), 拒绝写入: %s" % (st.st_nlink, path))
+        with os.fdopen(fd, "rb") as f:
+            return f.read(), st
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+# ── 服务与健康 ────────────────────────────────────────────────────────────────
+def _run(cmd, timeout=60):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=timeout)
+        return p.returncode, p.stdout or ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "%s: %s" % (type(e).__name__, e)
+
+
+def _svc_prop(unit, prop):
+    rc, out = _run(["systemctl", "show", "-p", prop, "--value", unit], timeout=15)
+    return out.strip() if rc == 0 else ""
+
+
+def _svc_active(unit):
+    rc, out = _run(["systemctl", "is-active", unit], timeout=15)
+    return out.strip() == "active"
+
+
+def svc_stable(unit, samples=None, interval=0.6, max_polls=15):
+    """稳定 active 判据 —— **CLI 与 Bot 从此共用这一份**:
+    连续 N 次 is-active 都是 active, 且观察窗口内 NRestarts 没有增长。
+    只看一次 is-active 会把"起来即崩"判成成功: 崩溃循环里总有那么一瞬是 active。"""
+    n = samples if samples is not None else int(os.environ.get("PDG_STABLE_SAMPLES", "3"))
+    r0 = _svc_prop(unit, "NRestarts") or "0"
+    streak = 0
+    for _ in range(max_polls):
+        if _svc_active(unit):
+            streak += 1
+            if streak >= n:
+                break
+        else:
+            streak = 0
+        time.sleep(interval)
+    if streak < n:
+        return False, "%s 没有稳定 active" % unit
+    r1 = _svc_prop(unit, "NRestarts") or "0"
+    try:
+        if int(r1) > int(r0):
+            return False, "%s 在观察窗口内重启了(NRestarts %s→%s), 判为起来即崩" % (unit, r0, r1)
+    except ValueError:
+        pass
+    return True, ""
+
+
+def _dns_answers(host="127.0.0.1", port=53, timeout=2.0):
+    """本机 DNS 是否在应答(不看答案内容, 也不需要公网)。"""
+    q = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+         b"\x07example\x03com\x00\x00\x01\x00\x01")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(q, (host, port))
+        data, _ = s.recvfrom(512)
+        return len(data) >= 12 and data[:2] == b"\x12\x34"
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _tcp_listening(port, host="127.0.0.1", timeout=1.5):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((host, port)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def health_snapshot(services):
+    """本次事务**范围内**的硬门指标。与公网无关 —— 出口探测那类属软门, 不在这里。"""
+    h = {}
+    for u in sorted(set(services)):
+        if u == "pdg-mitm" and not _svc_prop(u, "LoadState") == "loaded":
+            continue
+        h["svc:" + u] = _svc_active(u)
+    if "mosdns" in services:
+        host, _, port = DNS_PROBE.partition(":")
+        h["dns:" + DNS_PROBE] = _dns_answers(host, int(port or 53))
+    if "mihomo" in services:
+        h["port:%d" % REDIR_PROBE] = _tcp_listening(REDIR_PROBE)
+    return h
+
+
+# ── 校验器 ────────────────────────────────────────────────────────────────────
+def _v_json_any(path, data, ctx):
+    try:
+        json.loads(data.decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return False, "不是合法 JSON: %s" % type(e).__name__
+    return True, ""
+
+
+def _v_json_model(path, data, ctx):
+    ok, err = _v_json_any(path, data, ctx)
+    if not ok:
+        return ok, err
+    doc = json.loads(data.decode("utf-8"))
+    if not isinstance(doc, dict) or "outbounds" not in doc or "route" not in doc:
+        return False, "config.json 缺 outbounds/route, 不像本项目的数据模型"
+    return True, ""
+
+
+def _v_mihomo_check(path, data, ctx):
+    """对**候选**文件跑真 mihomo -t(不是对现网)。"""
+    exe = shutil.which("mihomo") or (FSROOT + "/usr/local/bin/mihomo")
+    if not os.access(exe, os.X_OK):
+        return False, "找不到 mihomo, 无法校验候选配置"
+    d = tempfile.mkdtemp(prefix="pdgtx-mihomo.")
+    try:
+        cand = os.path.join(d, "config.yaml")
+        atomic_write(cand, data, 0o600)
+        rc, out = _run([exe, "-t", "-d", FSROOT + "/etc/mihomo", "-f", cand], timeout=60)
+        return (rc == 0), ("" if rc == 0 else redact(out[-400:]))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _v_nft_check(path, data, ctx):
+    d = tempfile.mkdtemp(prefix="pdgtx-nft.")
+    try:
+        cand = os.path.join(d, "nftables.conf")
+        atomic_write(cand, data, 0o644)
+        exe = _nft_bin()
+        if not exe:
+            return False, "机器上找不到 nft, 无法校验防火墙候选配置"
+        rc, out = _run([exe, "-c", "-f", cand], timeout=30)
+        return (rc == 0), ("" if rc == 0 else redact(out[-300:]))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _nft_bin():
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import nftscan
+        return nftscan.nft_bin()
+    except Exception:  # noqa: BLE001
+        return shutil.which("nft") or ""
+
+
+_MOSDNS_LINE = re.compile(r"^(#.*|\s*|(domain|full|keyword|regexp):\S+|[A-Za-z0-9_.*-]+)$")
+
+
+def _v_mosdns_lines(path, data, ctx):
+    """domain/规则文件的严格行级格式校验。
+
+    这**不是** mosdns 完整配置强校验 —— 它只保证这类文件里不会混进 mosdns 加载不了的行;
+    真正的门是落盘后 mosdns 能否稳定起来(见观察期)。事务报告里会如实标成 line-format。"""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "不是 UTF-8 文本"
+    for i, ln in enumerate(text.splitlines(), 1):
+        if not _MOSDNS_LINE.match(ln.strip()):
+            return False, "第 %d 行不是合法的 mosdns 域名条目: %r" % (i, ln[:60])
+    return True, ""
+
+
+def _v_ruleset_format(path, data, ctx):
+    if path.endswith(".mrs"):
+        if not data[:8].startswith(b"MRS") and b"MRS" not in data[:64]:
+            return False, ".mrs 文件头不像 mihomo 原生规则集"
+        return True, ""
+    return _v_json_any(path, data, ctx)
+
+
+def _v_kv_env(path, data, ctx):
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "不是 UTF-8 文本"
+    for i, ln in enumerate(text.splitlines(), 1):
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        if "=" not in s or s.startswith("="):
+            return False, "第 %d 行不是 KEY=VALUE" % i
+    return True, ""
+
+
+def _v_hostname_line(path, data, ctx):
+    s = data.decode("utf-8", "replace").strip()
+    if not re.match(r"^(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,}$", s):
+        return False, "不是合法域名"
+    return True, ""
+
+
+def _v_pem_cert(path, data, ctx):
+    if b"-----BEGIN CERTIFICATE-----" not in data:
+        return False, "不是 PEM 证书"
+    d = tempfile.mkdtemp(prefix="pdgtx-pem.")
+    try:
+        p = os.path.join(d, "c.pem")
+        atomic_write(p, data, 0o600)
+        rc, out = _run(["openssl", "x509", "-noout", "-in", p], timeout=15)
+        if rc == 127:
+            return True, ""                      # 没有 openssl: 退到头部判据, 不假装强校验
+        return (rc == 0), ("" if rc == 0 else "openssl 认为证书不合法")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _v_pem_key(path, data, ctx):
+    if b"PRIVATE KEY-----" not in data:
+        return False, "不是 PEM 私钥"
+    d = tempfile.mkdtemp(prefix="pdgtx-key.")
+    try:
+        p = os.path.join(d, "k.pem")
+        atomic_write(p, data, 0o600)
+        rc, out = _run(["openssl", "pkey", "-noout", "-in", p], timeout=15)
+        if rc == 127:
+            return True, ""
+        return (rc == 0), ("" if rc == 0 else "openssl 认为私钥不合法")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _v_systemd_unit(path, data, ctx):
+    text = data.decode("utf-8", "replace")
+    if "[Unit]" not in text or not ("[Service]" in text or "[Timer]" in text):
+        return False, "unit 缺 [Unit]/[Service]|[Timer] 段"
+    return True, ""
+
+
+# ── mosdns 候选配置的强校验 ────────────────────────────────────────────────────
+# mosdns v5.3.4 **没有** validate/dry-run 子命令(实测: 只有 config gen|conv), 而坏配置
+# `mosdns start` 会立刻 FATAL 退出、好配置会常驻并占用配置里写的端口。所以强校验只能"真起
+# 一个探针":
+#   1) 首选 unshare -n: 独立网络命名空间里起 lo, 端口与生产完全隔离, 配置原样不动;
+#   2) 退而求其次: 把候选**副本**里本项目已知形态的监听地址改到 127.0.0.1 的随机高端口再起;
+#   3) 两条都不可用 → 拒绝应用(不拿结构检查冒充强校验)。
+_LISTEN_RE = re.compile(rb"(?m)^(\s*(?:addr|listen)\s*:\s*)([\"']?)([^\"'\s#]+)\2")
+
+
+def _mosdns_bin():
+    return shutil.which("mosdns") or (FSROOT + "/usr/local/bin/mosdns")
+
+
+def _mosdns_probe_run(cmd, timeout, workdir):
+    """跑探针: 提前退出=配置有问题; 熬过观察窗口=通过。"""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             universal_newlines=True, cwd=workdir)
+    except OSError as e:
+        return None, "探针无法启动: %s" % type(e).__name__
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if p.poll() is not None:
+            out = p.stdout.read() if p.stdout else ""
+            return False, redact((out or "").strip()[-400:]) or "mosdns 提前退出"
+        time.sleep(0.2)
+    p.terminate()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    return True, ""
+
+
+def _v_mosdns_probe(path, data, ctx):
+    exe = _mosdns_bin()
+    if not os.access(exe, os.X_OK):
+        return False, "找不到 mosdns 二进制, 无法对候选配置做强校验"
+    wait = float(os.environ.get("PDG_TX_MOSDNS_PROBE_SECS", "3"))
+    d = tempfile.mkdtemp(prefix="pdgtx-mosdns.")
+    try:
+        # 探针工作目录要能读到 rules/ 等相对资源: 软链现网的 rules 目录(只读用途)
+        cand = os.path.join(d, "config.yaml")
+        atomic_write(cand, data, 0o600)
+        live_rules = FSROOT + "/etc/mosdns/rules"
+        if os.path.isdir(live_rules):
+            try:
+                os.symlink(live_rules, os.path.join(d, "rules"))
+            except OSError:
+                pass
+        mode = os.environ.get("PDG_TX_MOSDNS_PROBE_MODE", "auto")
+        if mode in ("auto", "netns") and shutil.which("unshare"):
+            # `ip link set lo up`(有 iproute2 时)保证 127.0.0.1 可绑; 没有 ip 命令也先试一把
+            inner = "ip link set lo up 2>/dev/null; exec %s start -c %s -d %s" % (exe, cand, d)
+            ok, err = _mosdns_probe_run(["unshare", "-n", "-r", "bash", "-c", inner], wait, d)
+            if ok is not None:
+                return ok, (err and ("netns 探针: " + err))
+            if mode == "netns":
+                return False, "netns 探针不可用且已强制该模式"
+        if mode in ("auto", "port"):
+            # 备用: 只改副本里的监听地址(生产文件不动), 换到随机高端口再起
+            patched, n = _rewrite_listen(data)
+            if n == 0:
+                return False, "无法安全改写候选里的监听地址(非本项目已知形态), 拒绝在生产端口上做探针"
+            cand2 = os.path.join(d, "config-probe.yaml")
+            atomic_write(cand2, patched, 0o600)
+            ok, err = _mosdns_probe_run([exe, "start", "-c", cand2, "-d", d], wait, d)
+            if ok is not None:
+                return ok, (err and ("高端口探针: " + err))
+        return False, "两种强校验方式(netns / 高端口)都不可用 —— 拒绝应用 mosdns 配置"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _rewrite_listen(data):
+    """把候选副本里的监听地址改到 127.0.0.1 随机高端口。返回 (新内容, 改写条数)。"""
+    used = []
+
+    def _pick():
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        used.append(p)
+        return p
+
+    def _sub(m):
+        val = m.group(3).decode()
+        if not re.match(r"^([0-9.]*|\[?::\]?)?:\d+$", val) and not val.startswith(":"):
+            return m.group(0)
+        return b"%s%s127.0.0.1:%d%s" % (m.group(1), m.group(2), _pick(), m.group(2))
+
+    out, n = _LISTEN_RE.subn(_sub, data)
+    return out, n
+
+
+VALIDATORS = {
+    "json_any": _v_json_any, "json_model": _v_json_model, "mihomo_check": _v_mihomo_check,
+    "nft_check": _v_nft_check, "mosdns_lines": _v_mosdns_lines, "mosdns_probe": _v_mosdns_probe,
+    "ruleset_format": _v_ruleset_format, "kv_env": _v_kv_env, "hostname_line": _v_hostname_line,
+    "pem_cert": _v_pem_cert, "pem_key": _v_pem_key, "systemd_unit": _v_systemd_unit,
+}
+# 只做行级格式校验的目标: 报告里要标出来, 不能说成完整配置强校验
+LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line")
+
+
+# ── 全局锁(fail-closed)────────────────────────────────────────────────────────
+class _Lock:
+    """整笔事务持有同一把跨进程锁。拿不到 → TxBusy; **打不开锁文件 → TxRefused**。
+
+    以前 CLI 与 Bot 在锁文件不可用时都会"退化成没有跨进程锁继续写"。那正是最危险的时候:
+    /run 有问题往往意味着系统本身不正常, 而此刻两个进程同时改配置没有任何东西拦得住。"""
+
+    def __init__(self, path=None):
+        self.path = path or LOCKFILE
+        self.f = None
+
+    def __enter__(self):
+        d = os.path.dirname(self.path) or "/"
+        try:
+            os.makedirs(d, exist_ok=True)
+            self.f = open(self.path, "w")
+        except OSError as e:
+            raise TxRefused("锁文件不可用(%s: %s) —— 为避免并发写坏配置, 本次拒绝执行"
+                            % (self.path, e.__class__.__name__))
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.f.close(); self.f = None
+            raise TxBusy("已有配置操作正在执行")
+        return self
+
+    def __exit__(self, *exc):
+        if self.f:
+            try:
+                fcntl.flock(self.f, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self.f.close()
+            self.f = None
+        return False
+
+
+# ── 事务 ──────────────────────────────────────────────────────────────────────
+def new_txid():
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
+
+
+def _runner_sha():
+    try:
+        with open(os.path.abspath(__file__), "rb") as f:
+            return _sha(f.read())
+    except OSError:
+        return ""
+
+
+class Tx:
+    """一笔事务。stage/derive/service 之后 commit()。
+
+    mode='normal'   基线里与本次目标相关的硬门必须**先是好的**, 否则拒绝开始 ——
+                    在已经坏掉的组件上做普通变更, 出了事根本分不清是谁弄坏的。
+    mode='repair'   rollback / restore / recover 这类修复操作: 允许在降级基线上跑,
+                    成功判据收窄为"目标服务能起来且不再比操作前更差"。
+    """
+
+    def __init__(self, source, op, mode="normal", txid=None, root=None):
+        if mode not in ("normal", "repair"):
+            raise TxError("mode 只能是 normal / repair")
+        self.root = root or TX_ROOT
+        self.txid = txid or new_txid()
+        self.dir = os.path.join(self.root, self.txid)
+        self.source, self.op, self.mode = source, op, mode
+        self.state = PREPARING
+        self.targets = {}          # name -> {"path","data"(bytes|None),"expect","validators"}
+        self.derivers = []         # (target, fn)
+        self.actions = []
+        self.warnings = []
+        self.meta = {
+            "schema_version": SCHEMA_VERSION, "runner_sha256": _runner_sha(),
+            "runner_file": os.path.abspath(__file__),
+            "txid": self.txid, "source": source, "op": op, "mode": mode,
+            "state": PREPARING, "started_at": time.time(), "ended_at": None,
+            "targets": [], "services": [], "validations": [], "baseline": {},
+            "observed": {}, "warnings": [], "error": "", "error_class": "",
+            "rollback_complete": None, "diff": [],
+        }
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "candidate"), mode=0o700, exist_ok=True)
+        os.makedirs(os.path.join(self.dir, "before"), mode=0o700, exist_ok=True)
+        self._save_meta()
+
+    # ---- 元数据 ----
+    def _save_meta(self):
+        self.meta["state"] = self.state
+        self.meta["warnings"] = [redact(w) for w in self.warnings]
+        atomic_write(os.path.join(self.dir, "meta.json"),
+                     json.dumps(self.meta, ensure_ascii=False, indent=1).encode(), 0o600)
+
+    def _set_state(self, new):
+        if new not in _ALLOWED.get(self.state, ()):
+            raise TxError("非法状态跳转: %s → %s" % (self.state, new))
+        self.state = new
+        self._save_meta()
+
+    # ---- 组装 ----
+    def stage(self, target, data):
+        """登记一个目标的候选内容。data=None 表示"这次要把它删掉"。"""
+        if self.state != PREPARING:
+            raise TxError("stage 只能在 PREPARING 阶段")
+        path, mode, secret, validators = resolve_target(target)
+        cur, _st = _read_target(path)
+        if data is not None and not isinstance(data, bytes):
+            data = str(data).encode("utf-8")
+        idx = len(self.targets)
+        cpath = os.path.join(self.dir, "candidate", "%02d-%s" % (idx, _safe_leaf(target)))
+        if data is not None:
+            atomic_write(cpath, data, 0o600)
+        self.targets[target] = {
+            "path": path, "mode": mode, "secret": secret, "validators": list(validators),
+            "data": data, "candidate": cpath if data is not None else None,
+            "expect": _sha(cur) if cur is not None else None,
+            "existed": cur is not None,
+        }
+        return self
+
+    def derive(self, target, fn):
+        """由已 stage 的内容派生出另一个目标的候选(如 model → mihomo 渲染)。
+        fn 是**Python 可调用对象**, 不是 shell 字符串 —— 事务核心不接受任何形式的命令串。"""
+        if not callable(fn):
+            raise TxError("deriver 必须是可调用对象")
+        resolve_target(target)
+        self.derivers.append((target, fn))
+        return self
+
+    def service(self, action):
+        if action not in _ACTIONS:
+            raise TxError("不在白名单里的服务动作: %s" % action)
+        if action not in self.actions:
+            self.actions.append(action)
+        return self
+
+    def warn(self, msg):
+        self.warnings.append(redact(msg))
+        return self
+
+    # ---- 提交 ----
+    def commit(self):
+        try:
+            with _Lock():
+                return self._commit_locked()
+        except TxBusy:
+            self._abort("锁被占用", "BUSY")
+            raise
+        except TxRefused as e:
+            self._abort(str(e), "REFUSED")
+            raise
+
+    def _abort(self, why, cls=""):
+        if self.state in (PREPARING, VALIDATED):
+            self.meta["error"] = redact(why)
+            self.meta["error_class"] = cls
+            self.meta["ended_at"] = time.time()
+            self.state = ABORTED
+            self._save_meta()
+            self._cleanup_materials()
+            _audit(self)
+
+    def _commit_locked(self):
+        # 0) 上一笔没跑完的事务必须先处理 —— 不静默删证据, 也不在半套状态上继续写
+        pend = pending_recovery(self.root, exclude=self.txid)
+        if pend:
+            raise TxRefused("上一笔事务 %s 停在 %s, 请先 `sudo pdg tx recover %s`"
+                            % (pend[0]["txid"], pend[0]["state"], pend[0]["txid"]))
+        # 1) 派生候选
+        for tgt, fn in self.derivers:
+            try:
+                data = fn({k: v["data"] for k, v in self.targets.items()})
+            except Exception as e:  # noqa: BLE001
+                raise TxRefused("生成候选失败(%s): %s" % (tgt, type(e).__name__))
+            if data is None:
+                raise TxRefused("生成候选失败(%s): 派生器没有产出内容" % tgt)
+            self.stage_derived(tgt, data)
+        if not self.targets and not self.actions:
+            raise TxRefused("这笔事务没有任何目标或服务动作")
+        services = sorted({s for s in (target_service(t) for t in self.targets) if s} |
+                          {a.split(":", 1)[1] for a in self.actions if a.startswith("restart:")})
+        self.meta["services"] = services
+        self.meta["targets"] = sorted(self.targets)
+        # 2) 基线
+        base = health_snapshot(services)
+        self.meta["baseline"] = base
+        if self.mode == "normal":
+            bad = [k for k, v in base.items() if not v]
+            if bad:
+                raise TxRefused("操作前这些硬门就是坏的: %s —— 普通变更拒绝在已损坏的组件上进行"
+                                "(先修好, 或用修复类命令)" % ", ".join(bad))
+        # 3) 前置检查: 现网内容必须还是 stage 时看到的那份
+        for name, t in self.targets.items():
+            cur, _ = _read_target(t["path"])
+            if (_sha(cur) if cur is not None else None) != t["expect"]:
+                raise TxRefused("目标 %s 在准备期间被其它进程改过, 本次不覆盖" % name)
+        # 4) 校验全部候选
+        for name, t in sorted(self.targets.items()):
+            if t["data"] is None:
+                self.meta["validations"].append({"target": name, "validator": "delete", "ok": True})
+                continue
+            for vname in t["validators"]:
+                fn = VALIDATORS[vname]
+                ok, err = fn(t["path"], t["data"], self)
+                self.meta["validations"].append({
+                    "target": name, "validator": vname, "ok": bool(ok),
+                    "scope": "line-format" if vname in LINE_LEVEL_ONLY else "full",
+                    "detail": redact(err)[:300]})
+                self._save_meta()
+                if not ok:
+                    raise TxRefused("候选校验未过(%s / %s): %s" % (name, vname, redact(err)[:300]))
+        self.meta["diff"] = self._diff()
+        atomic_write(os.path.join(self.dir, "diff.txt"),
+                     ("\n".join(self.meta["diff"]) + "\n").encode(), 0o600)
+        # 5) before-image
+        self._set_state(VALIDATED)
+        try:
+            self._save_before(services)
+        except Exception as e:  # noqa: BLE001
+            raise TxRefused("保存 before-image 失败(%s) —— 没有回退材料就不动现网" % type(e).__name__)
+        # 6) 落盘 + 服务动作 + 观察
+        self._set_state(APPLYING)
+        applied = []
+        try:
+            for name, t in sorted(self.targets.items()):
+                self._apply_one(name, t)
+                applied.append(name)
+            self.meta["applied"] = applied
+            self._save_meta()
+            err = self._do_actions()
+            if err:
+                raise _ApplyFailed(err)
+            self._set_state(OBSERVING)
+            err = self._observe(services, base)
+            if err:
+                raise _ApplyFailed(err)
+        except _ApplyFailed as e:
+            return self._rollback(str(e))
+        except Exception as e:  # noqa: BLE001
+            return self._rollback("应用过程异常(%s)" % type(e).__name__)
+        self._set_state(COMMITTED)
+        self.meta["ended_at"] = time.time()
+        self._save_meta()
+        self._cleanup_materials()
+        _audit(self)
+        _gc(self.root)
+        return self.result()
+
+    def stage_derived(self, target, data):
+        path, mode, secret, validators = resolve_target(target)
+        cur, _ = _read_target(path)
+        idx = len(self.targets)
+        cpath = os.path.join(self.dir, "candidate", "%02d-%s" % (idx, _safe_leaf(target)))
+        atomic_write(cpath, data, 0o600)
+        self.targets[target] = {
+            "path": path, "mode": mode, "secret": secret, "validators": list(validators),
+            "data": data, "candidate": cpath,
+            "expect": _sha(cur) if cur is not None else None, "existed": cur is not None,
+        }
+
+    # ---- before-image ----
+    def _save_before(self, services):
+        bi = {"files": {}, "services": {}, "sysctl": {}, "nft_loaded": None}
+        for name, t in sorted(self.targets.items()):
+            cur, st = _read_target(t["path"])
+            rec = {"existed": cur is not None}
+            if cur is not None:
+                bpath = os.path.join(self.dir, "before", _safe_leaf(name))
+                atomic_write(bpath, cur, 0o600)
+                rec.update({"file": os.path.basename(bpath), "sha256": _sha(cur),
+                            "mode": st.st_mode & 0o7777, "uid": st.st_uid, "gid": st.st_gid})
+            bi["files"][name] = rec
+        for u in services:
+            bi["services"][u] = {
+                "active": _svc_active(u),
+                "enabled": _svc_prop(u, "UnitFileState"),
+                "nrestarts": _svc_prop(u, "NRestarts"),
+            }
+        if "sysctl_tfo" in self.targets or "sysctl:apply" in self.actions:
+            rc, out = _run(["sysctl", "-n", "net.ipv4.tcp_fastopen"], timeout=10)
+            bi["sysctl"]["net.ipv4.tcp_fastopen"] = out.strip() if rc == 0 else ""
+        if "nftables_conf" in self.targets or "nft:apply" in self.actions:
+            exe = _nft_bin()
+            bi["nft_loaded"] = bool(exe) and _run([exe, "list", "table", "inet", "pdg"],
+                                                  timeout=15)[0] == 0
+        atomic_write(os.path.join(self.dir, "before", "index.json"),
+                     json.dumps(bi, ensure_ascii=False, indent=1).encode(), 0o600)
+        self._before = bi
+
+    # ---- 应用 ----
+    def _apply_one(self, name, t):
+        if t["data"] is None:
+            if t["existed"]:
+                os.unlink(t["path"])
+                _fsync_dir(os.path.dirname(t["path"]))
+            return
+        st = self._before["files"].get(name, {})
+        atomic_write(t["path"], t["data"], st.get("mode", t["mode"]),
+                     st.get("uid"), st.get("gid"))
+        t["applied_sha"] = _sha(t["data"])
+
+    def _do_actions(self):
+        for a in self.actions:
+            if a == "daemon-reload":
+                rc, out = _run(["systemctl", "daemon-reload"], timeout=60)
+            elif a == "nft:apply":
+                exe = _nft_bin()
+                if not exe:
+                    return "找不到 nft, 无法应用防火墙配置"
+                rc, out = _run([exe, "-f", FSROOT + "/etc/nftables.conf"], timeout=60)
+            elif a == "sysctl:apply":
+                f = FSROOT + "/etc/sysctl.d/99-pdg-tfo.conf"
+                rc, out = _run(["sysctl", "-p", f], timeout=30) if os.path.exists(f) else (0, "")
+            else:
+                unit = a.split(":", 1)[1]
+                _run(["systemctl", "reset-failed", unit], timeout=30)
+                rc, out = _run(["systemctl", "restart", unit], timeout=120)
+            if rc != 0:
+                return "%s 失败: %s" % (a, redact(out)[-200:])
+        return ""
+
+    def _observe(self, services, base):
+        obs = {}
+        for u in services:
+            ok, why = svc_stable(u)
+            obs["svc:" + u] = ok
+            if not ok:
+                self.meta["observed"] = obs
+                return why
+        after = health_snapshot(services)
+        obs.update(after)
+        self.meta["observed"] = obs
+        self._save_meta()
+        for k, v in after.items():
+            if v:
+                continue
+            if not base.get(k, True):
+                self.warn("%s 在操作前就是坏的, 本次未修复(与本事务无关)" % k)
+                continue
+            if self.mode == "repair":
+                self.warn("修复模式: %s 仍未恢复" % k)
+                continue
+            return "关键链路在本次操作后退化: %s(操作前是好的)" % k
+        return ""
+
+    # ---- 回滚 ----
+    def _rollback(self, why):
+        self.meta["error"] = redact(why)
+        self.meta["error_class"] = "APPLY_FAILED"
+        self._set_state(ROLLING_BACK)
+        failed = []
+        bi = getattr(self, "_before", None) or {}
+        for name in sorted(self.targets):
+            rec = bi.get("files", {}).get(name, {})
+            path = self.targets[name]["path"]
+            try:
+                if rec.get("existed"):
+                    with open(os.path.join(self.dir, "before", rec["file"]), "rb") as f:
+                        data = f.read()
+                    atomic_write(path, data, rec.get("mode", 0o600), rec.get("uid"), rec.get("gid"))
+                elif os.path.exists(path):
+                    os.unlink(path)                 # 本次新建的文件: 还原 = 删掉
+                    _fsync_dir(os.path.dirname(path))
+            except Exception as e:  # noqa: BLE001
+                failed.append("%s(%s)" % (name, type(e).__name__))
+        # 运行时状态: sysctl 原值 / nft 重新载入 / 服务回到原来的 active 状态
+        for key, val in (bi.get("sysctl") or {}).items():
+            if val:
+                _run(["sysctl", "-w", "%s=%s" % (key, val)], timeout=15)
+        if bi.get("nft_loaded"):
+            exe = _nft_bin()
+            if exe:
+                _run([exe, "-f", FSROOT + "/etc/nftables.conf"], timeout=60)
+        for u, s in (bi.get("services") or {}).items():
+            if s.get("active"):
+                _run(["systemctl", "reset-failed", u], timeout=30)
+                _run(["systemctl", "restart", u], timeout=120)
+            else:
+                _run(["systemctl", "stop", u], timeout=60)
+        # 回滚后必须**验证**: 文件逐个比对 + 服务回到原状态
+        for name in sorted(self.targets):
+            rec = bi.get("files", {}).get(name, {})
+            cur, _ = _read_target(self.targets[name]["path"])
+            if rec.get("existed"):
+                if cur is None or _sha(cur) != rec.get("sha256"):
+                    failed.append("%s 内容未还原" % name)
+            elif cur is not None:
+                failed.append("%s 应删除但仍存在" % name)
+        for u, s in (bi.get("services") or {}).items():
+            if s.get("active"):
+                ok, why2 = svc_stable(u)
+                if not ok:
+                    failed.append("%s 未恢复运行(%s)" % (u, why2))
+        self.meta["rollback_complete"] = not failed
+        self.meta["ended_at"] = time.time()
+        if failed:
+            self.meta["rollback_failed_items"] = [redact(x) for x in failed]
+            self._set_state(ROLLBACK_FAILED)
+            _audit(self)
+            return self.result()
+        self._set_state(ROLLED_BACK)
+        self._cleanup_materials()
+        _audit(self)
+        _gc(self.root)
+        return self.result()
+
+    # ---- 收尾 ----
+    def _cleanup_materials(self):
+        """COMMITTED / 已验证的 ROLLED_BACK / ABORTED: 删掉候选与 before 材料。
+
+        它们可能含出口密码、UUID、证书私钥 —— 留在盘上没有意义, 恢复也用不到了。只保留脱敏
+        的 meta.json / diff.txt。注意: 这里只是 unlink, **不承诺安全擦除** —— 底层是 SSD/日志
+        文件系统时, 数据块可能仍残留在介质上, 这一点不做任何夸大。"""
+        if self.state not in (COMMITTED, ROLLED_BACK, ABORTED):
+            return
+        for sub in ("candidate", "before"):
+            shutil.rmtree(os.path.join(self.dir, sub), ignore_errors=True)
+
+    def result(self):
+        return {"txid": self.txid, "state": self.state, "op": self.op, "source": self.source,
+                "warnings": list(self.meta["warnings"]), "error": self.meta.get("error", ""),
+                "targets": sorted(self.targets), "diff": self.meta.get("diff", []),
+                "rollback_complete": self.meta.get("rollback_complete"),
+                "rollback_failed_items": self.meta.get("rollback_failed_items", []),
+                "dir": self.dir}
+
+    def _diff(self):
+        """脱敏差异: 只讲"哪个目标、什么动作、大小/行数怎么变、哪些顶层键变了"。
+        绝不含值 —— 出口密码、UUID、secret 一律不出现。"""
+        out = []
+        for name, t in sorted(self.targets.items()):
+            cur, _ = _read_target(t["path"])
+            if t["data"] is None:
+                out.append("删除 %s" % name)
+                continue
+            if cur is None:
+                out.append("新建 %s (%d 字节)" % (name, len(t["data"])))
+                continue
+            if cur == t["data"]:
+                out.append("%s 无变化" % name)
+                continue
+            d = "%s 修改 (%d→%d 字节, 行 %d→%d)" % (
+                name, len(cur), len(t["data"]),
+                cur.count(b"\n"), t["data"].count(b"\n"))
+            keys = _changed_json_keys(cur, t["data"])
+            if keys:
+                d += " 顶层键变化: " + ", ".join(keys[:8])
+            out.append(d)
+        for a in self.actions:
+            out.append("服务动作 " + a)
+        return [redact(x) for x in out]
+
+
+class _ApplyFailed(Exception):
+    pass
+
+
+def _changed_json_keys(a, b):
+    try:
+        da, db = json.loads(a.decode("utf-8")), json.loads(b.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(da, dict) or not isinstance(db, dict):
+        return []
+    return sorted({k for k in set(da) | set(db) if da.get(k) != db.get(k)})
+
+
+def _safe_leaf(name):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+# ── 审计 / 清理 / 恢复 ────────────────────────────────────────────────────────
+def _audit(tx):
+    rec = {"ts": time.time(), "txid": tx.txid, "source": tx.source, "op": tx.op,
+           "mode": tx.mode, "state": tx.state, "targets": sorted(tx.targets),
+           "services": tx.meta.get("services", []), "error": tx.meta.get("error", ""),
+           "error_class": tx.meta.get("error_class", ""),
+           "rollback_complete": tx.meta.get("rollback_complete"),
+           "warnings": tx.meta.get("warnings", []), "schema_version": SCHEMA_VERSION}
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    try:
+        os.makedirs(os.path.dirname(AUDIT), mode=0o700, exist_ok=True)
+        with open(AUDIT, "a", encoding="utf-8") as f:
+            f.write(line)
+        _rotate_audit()
+    except OSError:
+        pass
+
+
+def _rotate_audit():
+    try:
+        if os.path.getsize(AUDIT) <= AUDIT_MAX_BYTES:
+            with open(AUDIT, encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) <= AUDIT_MAX_LINES:
+                return
+        else:
+            with open(AUDIT, encoding="utf-8") as f:
+                lines = f.readlines()
+        atomic_write(AUDIT, "".join(lines[-AUDIT_MAX_LINES:]).encode(), 0o600)
+    except OSError:
+        pass
+
+
+def load_meta(txdir):
+    try:
+        with open(os.path.join(txdir, "meta.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def list_tx(root=None, limit=20):
+    root = root or TX_ROOT
+    out = []
+    try:
+        names = sorted(os.listdir(root), reverse=True)
+    except OSError:
+        return out
+    for n in names:
+        p = os.path.join(root, n)
+        if not os.path.isdir(p):
+            continue
+        m = load_meta(p)
+        if m:
+            out.append(m)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def pending_recovery(root=None, exclude=None):
+    """需要人工处理的未完成事务(APPLYING / ROLLING_BACK / ROLLBACK_FAILED)。"""
+    return [m for m in list_tx(root, limit=200)
+            if m.get("state") in NEEDS_RECOVERY and m.get("txid") != exclude]
+
+
+def _gc(root=None):
+    """只保留最近 TX_KEEP 笔**终态且已清理材料**的事务目录; 未完成的一律留着。"""
+    root = root or TX_ROOT
+    try:
+        dirs = sorted((d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))),
+                      reverse=True)
+    except OSError:
+        return
+    kept = 0
+    for d in dirs:
+        p = os.path.join(root, d)
+        m = load_meta(p) or {}
+        if m.get("state") in NEEDS_RECOVERY:
+            continue
+        kept += 1
+        if kept > TX_KEEP:
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def recover(txid, root=None, force=False):
+    """把一笔中断的事务还原回 before-image。
+
+    漂移保护: 逐个目标比对"当前内容"与"本事务应用过的内容 / before-image"。两者都不是 →
+    说明事务之外有人动过这个文件(很可能是运维手工救过场), 默认**停手并报告冲突** —— 拿旧
+    备份盖掉别人的修复, 比不恢复更糟。force 只在命令行显式二次确认时可用, 不给 Telegram。"""
+    root = root or TX_ROOT
+    d = os.path.join(root, txid)
+    m = load_meta(d)
+    if not m:
+        return {"ok": False, "error": "找不到事务 %s" % txid}
+    if m.get("schema_version") != SCHEMA_VERSION:
+        return {"ok": False, "error": "事务 schema 版本不兼容(记录 %s, 当前 %s), 拒绝自动恢复"
+                                      % (m.get("schema_version"), SCHEMA_VERSION)}
+    if m.get("state") not in NEEDS_RECOVERY:
+        return {"ok": True, "state": m.get("state"), "note": "该事务已是终态, 无需恢复"}
+    try:
+        with open(os.path.join(d, "before", "index.json"), encoding="utf-8") as f:
+            bi = json.load(f)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": "before-image 缺失或损坏, 无法自动恢复(材料保留在 %s)" % d}
+    with _Lock():
+        conflicts, restored, failed = [], [], []
+        applied = {t: None for t in m.get("targets", [])}
+        for name in m.get("targets", []):
+            try:
+                path, mode, _s, _v = resolve_target(name)
+            except TxError as e:
+                failed.append(str(e)); continue
+            rec = bi.get("files", {}).get(name, {})
+            cur, _ = _read_target(path)
+            cur_sha = _sha(cur) if cur is not None else None
+            before_sha = rec.get("sha256") if rec.get("existed") else None
+            if cur_sha == before_sha:
+                continue                                   # 已经是 before 的样子: 幂等
+            if not force and cur_sha is not None and before_sha is not None \
+                    and cur_sha not in (before_sha,):
+                # 当前既不是 before, 也无法证明是本事务写下的(applied 记录可能随崩溃丢失)
+                if m.get("applied_sha", {}).get(name) not in (cur_sha,):
+                    conflicts.append(name)
+                    continue
+            try:
+                if rec.get("existed"):
+                    with open(os.path.join(d, "before", rec["file"]), "rb") as f:
+                        data = f.read()
+                    atomic_write(path, data, rec.get("mode", mode), rec.get("uid"), rec.get("gid"))
+                elif cur is not None:
+                    os.unlink(path)
+                    _fsync_dir(os.path.dirname(path))
+                restored.append(name)
+            except Exception as e:  # noqa: BLE001
+                failed.append("%s(%s)" % (name, type(e).__name__))
+        if conflicts and not force:
+            return {"ok": False, "state": m.get("state"), "conflicts": conflicts,
+                    "error": "这些目标在事务之外被改过, 默认不覆盖: %s" % ", ".join(conflicts),
+                    "hint": "确认要用 before-image 盖掉现有内容时, 用 `pdg tx recover %s --force`"
+                            % txid}
+        for u, s in (bi.get("services") or {}).items():
+            if s.get("active"):
+                _run(["systemctl", "reset-failed", u], timeout=30)
+                _run(["systemctl", "restart", u], timeout=120)
+        for key, val in (bi.get("sysctl") or {}).items():
+            if val:
+                _run(["sysctl", "-w", "%s=%s" % (key, val)], timeout=15)
+        for u, s in (bi.get("services") or {}).items():
+            if s.get("active"):
+                ok, why = svc_stable(u)
+                if not ok:
+                    failed.append("%s 未恢复运行(%s)" % (u, why))
+        m["state"] = ROLLBACK_FAILED if failed else ROLLED_BACK
+        m["recovered_at"] = time.time()
+        m["rollback_complete"] = not failed
+        if failed:
+            m["rollback_failed_items"] = [redact(x) for x in failed]
+        atomic_write(os.path.join(d, "meta.json"),
+                     json.dumps(m, ensure_ascii=False, indent=1).encode(), 0o600)
+        if not failed:
+            for sub in ("candidate", "before"):
+                shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
+        return {"ok": not failed, "state": m["state"], "restored": restored,
+                "failed": [redact(x) for x in failed], "dir": d}
+
+
+# ── CLI(供 Bash 侧调用; 一笔事务 = 一次 apply 进程, 锁在其内全程持有)────────────
+def _cli_new(a):
+    tx = Tx(source=a.source, op=a.op, mode=a.mode)
+    print(tx.txid)
+    return 0
+
+
+def _cli_stage(a):
+    d = os.path.join(TX_ROOT, a.tx)
+    m = load_meta(d)
+    if not m or m.get("state") != PREPARING:
+        print("事务不存在或不在 PREPARING: %s" % a.tx, file=sys.stderr); return 2
+    path, mode, secret, validators = resolve_target(a.target)
+    if a.delete:
+        data = None
+    else:
+        with open(a.file, "rb") as f:
+            data = f.read()
+    cur, _ = _read_target(path)
+    idx = len(m.get("staged", []))
+    cpath = os.path.join(d, "candidate", "%02d-%s" % (idx, _safe_leaf(a.target)))
+    if data is not None:
+        atomic_write(cpath, data, 0o600)
+    m.setdefault("staged", []).append({
+        "target": a.target, "candidate": os.path.basename(cpath) if data is not None else None,
+        "expect": _sha(cur) if cur is not None else None, "delete": data is None})
+    atomic_write(os.path.join(d, "meta.json"),
+                 json.dumps(m, ensure_ascii=False, indent=1).encode(), 0o600)
+    return 0
+
+
+def _cli_service(a):
+    d = os.path.join(TX_ROOT, a.tx)
+    m = load_meta(d)
+    if not m:
+        print("事务不存在: %s" % a.tx, file=sys.stderr); return 2
+    if a.action not in _ACTIONS:
+        print("不在白名单里的服务动作: %s" % a.action, file=sys.stderr); return 2
+    m.setdefault("staged_actions", [])
+    if a.action not in m["staged_actions"]:
+        m["staged_actions"].append(a.action)
+    atomic_write(os.path.join(d, "meta.json"),
+                 json.dumps(m, ensure_ascii=False, indent=1).encode(), 0o600)
+    return 0
+
+
+def _cli_apply(a):
+    d = os.path.join(TX_ROOT, a.tx)
+    m = load_meta(d)
+    if not m:
+        print("事务不存在: %s" % a.tx, file=sys.stderr); return 2
+    # runner 固定: 一笔事务从头到尾必须由同一份事务核心执行。pdg update 会覆盖 pdgtx.py 本身,
+    # 中途换版本等于用新语义去回滚旧语义写下的东西。
+    if m.get("runner_sha256") and m["runner_sha256"] != _runner_sha() and not a.allow_runner_drift:
+        print("事务由另一版本的事务核心创建(runner 不一致), 拒绝继续。"
+              "更新流程应使用事务私有 runner 副本。", file=sys.stderr)
+        return 3
+    if m.get("schema_version") != SCHEMA_VERSION:
+        print("事务 schema 版本不兼容(记录 %s, 当前 %s)" % (m.get("schema_version"), SCHEMA_VERSION),
+              file=sys.stderr)
+        return 3
+    tx = Tx.__new__(Tx)
+    tx.root, tx.txid, tx.dir = TX_ROOT, a.tx, d
+    tx.source, tx.op, tx.mode = m["source"], m["op"], m.get("mode", "normal")
+    tx.state, tx.meta = PREPARING, m
+    tx.derivers, tx.warnings = [], list(m.get("warnings", []))
+    tx.actions = list(m.get("staged_actions", []))
+    tx.targets = {}
+    for s in m.get("staged", []):
+        path, mode, secret, validators = resolve_target(s["target"])
+        data = None
+        if s.get("candidate"):
+            with open(os.path.join(d, "candidate", s["candidate"]), "rb") as f:
+                data = f.read()
+        cur, _ = _read_target(path)
+        tx.targets[s["target"]] = {
+            "path": path, "mode": mode, "secret": secret, "validators": list(validators),
+            "data": data, "candidate": s.get("candidate"), "expect": s.get("expect"),
+            "existed": cur is not None}
+    try:
+        res = tx.commit()
+    except TxBusy as e:
+        print("BUSY: %s" % e, file=sys.stderr); return 4
+    except TxRefused as e:
+        print("REFUSED: %s" % redact(str(e)), file=sys.stderr); return 5
+    except TxError as e:
+        print("ERROR: %s" % redact(str(e)), file=sys.stderr); return 2
+    print(json.dumps(res, ensure_ascii=False))
+    return 0 if res["state"] == COMMITTED else 1
+
+
+def _cli_list(a):
+    for m in list_tx(limit=a.limit):
+        print("%-28s %-16s %-10s %-22s %s" % (
+            m.get("txid"), m.get("state"), m.get("source"), m.get("op"),
+            redact(m.get("error", ""))[:60]))
+    return 0
+
+
+def _cli_show(a):
+    m = load_meta(os.path.join(TX_ROOT, a.tx))
+    if not m:
+        print("找不到事务", file=sys.stderr); return 2
+    print(json.dumps(m, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cli_recover(a):
+    r = recover(a.tx, force=a.force)
+    print(json.dumps(r, ensure_ascii=False))
+    return 0 if r.get("ok") else 1
+
+
+def _cli_pending(a):
+    p = pending_recovery()
+    for m in p:
+        print("%s %s %s" % (m.get("txid"), m.get("state"), m.get("op")))
+    return 1 if p else 0
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(description="PrivDNS Gateway 配置事务")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("new"); p.add_argument("--source", required=True)
+    p.add_argument("--op", required=True); p.add_argument("--mode", default="normal")
+    p.set_defaults(fn=_cli_new)
+    p = sub.add_parser("stage"); p.add_argument("--tx", required=True)
+    p.add_argument("--target", required=True); p.add_argument("--file")
+    p.add_argument("--delete", action="store_true"); p.set_defaults(fn=_cli_stage)
+    p = sub.add_parser("service"); p.add_argument("--tx", required=True)
+    p.add_argument("--action", required=True); p.set_defaults(fn=_cli_service)
+    p = sub.add_parser("apply"); p.add_argument("--tx", required=True)
+    p.add_argument("--allow-runner-drift", action="store_true"); p.set_defaults(fn=_cli_apply)
+    p = sub.add_parser("list"); p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=_cli_list)
+    p = sub.add_parser("show"); p.add_argument("tx"); p.set_defaults(fn=_cli_show)
+    p = sub.add_parser("recover"); p.add_argument("tx")
+    p.add_argument("--force", action="store_true"); p.set_defaults(fn=_cli_recover)
+    p = sub.add_parser("pending"); p.set_defaults(fn=_cli_pending)
+    a = ap.parse_args(argv)
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
