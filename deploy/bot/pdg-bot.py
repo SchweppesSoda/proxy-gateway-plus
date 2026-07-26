@@ -1706,18 +1706,31 @@ def _tfo_apply(c, on):
 def _tfo_on(c=None):
     return _tfo_intent(c)
 
+# TFO 的内核值在这里定死, 免得"开/关"各处理解不一:
+#   开启 = 3(客户端 + 服务端都启用: 网关既往落地发起连接, 也接手机的连接)
+#   关闭 = 1(Linux 的发行版默认值 —— **只**收回本项目额外打开的服务端那一半;
+#           写 0 会把客户端 TFO 也一起关掉, 那是在替系统上别的程序做决定)
+TFO_ON, TFO_OFF = 3, 1
+
+
 def set_tfo(on):
-    """TFO 开关。持久意图(profile.env)、出口/入口标志(model)、sysctl drop-in 现在同属一笔事务 ——
-    以前 drop-in 写失败被 `except: pass` 吞掉, 重启后 TFO 又变回去, 而 Bot 显示"已开启"。"""
+    """TFO 开关。持久意图(profile.env)、出口/入口标志(model)、sysctl drop-in 与运行时值
+    同属一笔事务。
+
+    关闭时**写"关闭态"的 drop-in 并真的把运行时值改回去** —— 旧实现只改 profile.env 与
+    model, 99-pdg-tfo.conf 原样留着、运行时 net.ipv4.tcp_fastopen 还是 3, 于是 Bot 显示
+    "已关闭", 重启后又是开着的。"""
     prof = _profile_text_with("PDG_TFO", "1" if on else "0")
-    files = {"profile_env": prof}
-    if on:
-        files["sysctl_tfo"] = b"net.ipv4.tcp_fastopen=3\n"
+    files = {
+        "profile_env": prof,
+        "sysctl_tfo": ("net.ipv4.tcp_fastopen=%d\n" % (TFO_ON if on else TFO_OFF)).encode(),
+    }
     ok, msg = tx_apply("tfo_" + ("on" if on else "off"),
                        model_mod=lambda c: None, files=files, tfo_intent=on)
     if not ok:
         return False, msg
-    return True, (f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口)\n"
+    return True, (f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口, 内核值 "
+                  f"net.ipv4.tcp_fastopen={TFO_ON if on else TFO_OFF})\n"
                   "新增出口会自动继承此设置。降到落地的握手延迟; 需落地端也支持, 否则自动回落普通握手。")
 
 

@@ -578,6 +578,86 @@ def main():
         bad("并发添加留下了痕迹: %s / %s" % (okr, sorted(os.listdir(b3.RS_DIR))))
     box8.clean()
 
+    # ── 14. TFO 开/关语义(九): 关闭要真的把 drop-in 与运行时值都改回去 ──
+    import importlib.util as _il3
+    box9 = Box(); tx9 = load_tx(box9.env)
+    box9.up("mosdns"); box9.up("mihomo")
+    box9.put("/etc/sing-box/config.json", json.dumps(
+        {"outbounds": [{"type": "shadowsocks", "tag": "hk", "server": "1.1.1.1",
+                        "server_port": 1, "method": "aes-256-gcm", "password": "p"}],
+         "route": {"rules": []}, "inbounds": [{"type": "direct", "tag": "in"}]}).encode())
+    box9.put("/etc/privdns-gateway/profile.env", b"PDG_TFO=0\n", 0o600)
+    # sysctl 桩: -w/-p 记账并记住当前值, -n 复读它 —— 事务的复读校验才有意义
+    with open(os.path.join(box9.bin, "sysctl"), "w") as f:
+        f.write("#!/bin/bash\nS=%s/sysctl.val\n"
+                "case \"$1\" in\n"
+                "  -n) cat \"$S\" 2>/dev/null || echo 1;;\n"
+                "  -w) echo \"${2#*=}\" > \"$S\";;\n"
+                "  -p) grep -o '[0-9]*$' \"$2\" | tail -1 > \"$S\";;\n"
+                "esac\nexit 0\n" % box9.root)
+    os.chmod(os.path.join(box9.bin, "sysctl"), 0o755)
+    for _m in list(sys.modules):
+        if _m == "pdgtx":
+            del sys.modules[_m]
+    sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+    spec = _il3.spec_from_file_location("pdg_bot_tfo", ROOT / "deploy/bot/pdg-bot.py")
+    b9 = _il3.module_from_spec(spec); spec.loader.exec_module(b9)
+    b9.SB = box9.path("/etc/sing-box/config.json")
+    b9.PROFILE_ENV = box9.path("/etc/privdns-gateway/profile.env")
+    b9.MIHOMO_CFG = box9.path("/etc/mihomo/config.yaml")
+    b9.LOCKFILE = box9.env["PDG_LOCKFILE"]
+    b9._render_mihomo_bytes = lambda model, rs_meta=None: (b'{"proxies": [], "rules": []}', {})
+    bt9 = b9._pdgtx()
+    bt9.svc_stable = lambda unit, **k: (True, "")
+    okr, msg = b9.set_tfo(True)
+    drop = box9.read("/etc/sysctl.d/99-pdg-tfo.conf")
+    val = open(os.path.join(box9.root, "sysctl.val")).read().strip()
+    model = json.loads(box9.read("/etc/sing-box/config.json").decode())
+    if okr and drop == b"net.ipv4.tcp_fastopen=3\n" and val == "3" \
+            and model["outbounds"][0].get("tcp_fast_open"):
+        ok("TFO 开启: drop-in=3 + 运行时=3 + model 出口带标志(同一笔事务)")
+    else:
+        bad("开启不完整: %s drop=%r val=%s" % (okr, drop, val))
+    okr, msg = b9.set_tfo(False)
+    drop = box9.read("/etc/sysctl.d/99-pdg-tfo.conf")
+    val = open(os.path.join(box9.root, "sysctl.val")).read().strip()
+    model = json.loads(box9.read("/etc/sing-box/config.json").decode())
+    prof = box9.read("/etc/privdns-gateway/profile.env").decode()
+    if okr and drop == b"net.ipv4.tcp_fastopen=1\n" and val == "1" \
+            and not model["outbounds"][0].get("tcp_fast_open") and "PDG_TFO=0" in prof:
+        ok("TFO 关闭: drop-in 写成关闭态(1) + 运行时真的改回去 + model 去标志 + 意图持久化")
+    else:
+        bad("关闭没做全(旧实现就停在这): drop=%r val=%s prof=%r" % (drop, val, prof.strip()))
+    # 关闭态持久: 重新读 profile 得到的意图仍是关
+    if b9._tfo_intent() is False:
+        ok("重启后仍是关闭态(意图以 profile.env 为准)")
+    else:
+        bad("持久化意图不对")
+    # sysctl:apply 声明了却没 stage 文件 → 必须失败, 不许空操作报成功
+    t = bt9.Tx("bot", "sysctl-missing", mode="repair")
+    t.stage("profile_env", b"PDG_TFO=1\n")
+    t.service("sysctl:apply")
+    os.remove(box9.path("/etc/sysctl.d/99-pdg-tfo.conf"))
+    res = t.commit()
+    if res["state"] != bt9.COMMITTED and "sysctl:apply" in (res.get("error") or ""):
+        ok("sysctl:apply 找不到 drop-in → 判失败(不再空操作却报成功)")
+    else:
+        bad("空操作被当成成功: %s" % res)
+    # 应用失败 → 三者一起回到操作前(放在最后: 它会留下 ROLLBACK_FAILED, 正确地挡住后续写)
+    box9.put("/etc/sysctl.d/99-pdg-tfo.conf", b"net.ipv4.tcp_fastopen=1\n", 0o644)
+    before_drop = box9.read("/etc/sysctl.d/99-pdg-tfo.conf")
+    before_prof = box9.read("/etc/privdns-gateway/profile.env")
+    before_model = box9.read("/etc/sing-box/config.json")
+    box9._systemctl(["mihomo"], False)          # 重启 mihomo 失败 → 回滚
+    okr, msg = b9.set_tfo(True)
+    if not okr and box9.read("/etc/sysctl.d/99-pdg-tfo.conf") == before_drop \
+            and box9.read("/etc/privdns-gateway/profile.env") == before_prof \
+            and box9.read("/etc/sing-box/config.json") == before_model:
+        ok("应用失败 → profile.env / model / sysctl drop-in 三者一起回到操作前")
+    else:
+        bad("失败回滚不完整: %s" % okr)
+    box9.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

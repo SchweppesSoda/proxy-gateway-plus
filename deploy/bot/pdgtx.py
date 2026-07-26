@@ -1001,8 +1001,24 @@ class Tx:
                     return "找不到 nft, 无法应用防火墙配置"
                 rc, out = _run([exe, "-f", FSROOT + "/etc/nftables.conf"], timeout=60)
             elif a == "sysctl:apply":
+                # 文件不在就"什么也不做还报成功"是假绿: 调用方声明了要应用 sysctl, 文件却没有,
+                # 那就是这笔事务组装错了。应用完还要**复读**确认内核里真是这个值。
                 f = FSROOT + "/etc/sysctl.d/99-pdg-tfo.conf"
-                rc, out = _run(["sysctl", "-p", f], timeout=30) if os.path.exists(f) else (0, "")
+                if not os.path.exists(f):
+                    return "sysctl:apply 找不到 %s(本次事务没有 stage 它?)" % f
+                rc, out = _run(["sysctl", "-p", f], timeout=30)
+                if rc == 0:
+                    want = {}
+                    with open(f, "rb") as fh:
+                        for ln in fh.read().decode("utf-8", "replace").splitlines():
+                            ln = ln.split("#", 1)[0].strip()
+                            if "=" in ln:
+                                k, v = ln.split("=", 1)
+                                want[k.strip()] = v.strip()
+                    for k, v in want.items():
+                        rc2, cur = _run(["sysctl", "-n", k], timeout=15)
+                        if rc2 != 0 or cur.strip() != v:
+                            return "sysctl %s 应用后实际值是 %r(期望 %r)" % (k, cur.strip(), v)
             else:
                 unit = a.split(":", 1)[1]
                 _run(["systemctl", "reset-failed", unit], timeout=30)
