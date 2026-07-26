@@ -51,9 +51,11 @@ class Box:
         self._probes = []
         self.dns_port = self._start_dns() if healthy else 1
         self.redir_port = self._start_tcp() if healthy else 1
+        self.dot_port = self._start_tcp() if healthy else 1
         self.env = {
             "PDG_TX_DNS_PROBE": "127.0.0.1:%d" % self.dns_port,
             "PDG_TX_REDIR_PORT": str(self.redir_port),
+            "PDG_TX_DOT_PORT": str(self.dot_port),
             "PDG_TX_FSROOT": self.root,
             "PDG_TX_ROOT": self.root + "/var/lib/privdns-gateway/tx",
             "PDG_LOCKFILE": self.root + "/run/privdns-gateway.lock",

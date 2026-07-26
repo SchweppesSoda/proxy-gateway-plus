@@ -50,6 +50,7 @@ TX_KEEP = int(os.environ.get("PDG_TX_KEEP", "20"))
 # 这条门确实在工作(而不是给测试开一个"跳过健康检查"的后门)。
 DNS_PROBE = os.environ.get("PDG_TX_DNS_PROBE", "127.0.0.1:53")
 REDIR_PROBE = int(os.environ.get("PDG_TX_REDIR_PORT", "7893"))
+DOT_PROBE = int(os.environ.get("PDG_TX_DOT_PORT", "853"))      # DoT 入口: 手机就靠它进来
 
 # ── 状态机 ────────────────────────────────────────────────────────────────────
 # ABORTED = 还没碰现网就结束(前置/校验/基线不过, 或 PREPARING/VALIDATED 阶段被中断)。
@@ -330,6 +331,9 @@ def health_snapshot(services):
     if "mosdns" in services:
         host, _, port = DNS_PROBE.partition(":")
         h["dns:" + DNS_PROBE] = _dns_answers(host, int(port or 53))
+        # DoT(853)是手机端唯一的入口: mosdns 起来了但 853 没在听, 对用户等于全断 ——
+        # 这条必须进硬门。仍是本机端口检查, 与公网连通性无关(那类只做软门)。
+        h["port:%d" % DOT_PROBE] = _tcp_listening(DOT_PROBE)
     if "mihomo" in services:
         h["port:%d" % REDIR_PROBE] = _tcp_listening(REDIR_PROBE)
     return h

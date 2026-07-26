@@ -493,6 +493,48 @@ def main():
         bad("recover 没留审计")
     boxB.clean()
 
+    # ── 17. 853(DoT)进硬门(十一): 它是手机唯一的入口 ──
+    boxC = Box(); txC = load_tx(boxC.env)
+    boxC.up("mosdns")
+    h = txC.health_snapshot(["mosdns"])
+    if any(k.startswith("port:") and k.endswith(str(boxC.dot_port)) for k in h):
+        ok("mosdns 相关事务的硬门里包含 853(DoT)监听检查")
+    else:
+        bad("硬门没有 853: %s" % list(h))
+    # 证书部署后要确认 mosdns stable + 53 应答 + 853 监听 —— 把 853 停掉再提交必须被判退化
+    boxC.put("/etc/mosdns/certs/fullchain.pem", b"-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\n", 0o644)
+    t = txC.Tx("bot", "dot_cert_deploy")
+    t.stage("cert_fullchain", b"-----BEGIN CERTIFICATE-----\nB\n-----END CERTIFICATE-----\n")
+    t.service("restart:mosdns")
+    real_obs = txC.Tx._observe
+
+    real_listen = txC._tcp_listening
+
+    def kill_dot(self, services, base):
+        # 模拟"重启后 853 不再监听"(证书装坏的典型后果)。这里换掉的是端口探测的结果, 而不是
+        # 退化判据本身 —— 基线里 853 是好的, 观察期变坏, 事务必须据此回滚。
+        # (直接 close() 监听 socket 不行: 线程仍阻塞在 accept, 端口不会立刻释放。)
+        txC._tcp_listening = lambda port, host="127.0.0.1", timeout=1.5: (
+            False if port == boxC.dot_port else real_listen(port, host, timeout))
+        try:
+            return real_obs(self, services, base)
+        finally:
+            txC._tcp_listening = real_listen
+    txC.Tx._observe = kill_dot
+    res = t.commit()
+    txC.Tx._observe = real_obs
+    if res["state"] in (txC.ROLLED_BACK, txC.ROLLBACK_FAILED) \
+            and boxC.read("/etc/mosdns/certs/fullchain.pem").endswith(b"A\n-----END CERTIFICATE-----\n"):
+        ok("证书部署后 853 不再监听 → 判为关键链路退化并回滚到旧证书")
+    else:
+        bad("853 掉了却提交了: %s" % res["state"])
+    # 公网连通性不在硬门里(基线只看本机端口与服务)
+    if not any("http" in k or "公网" in k for k in txC.health_snapshot(["mosdns", "mihomo"])):
+        ok("硬门只看本机服务与端口, 公网连通性不在其中")
+    else:
+        bad("硬门里混进了公网检查")
+    boxC.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

@@ -122,8 +122,11 @@ e2e_tx_probes(){
 import os, socket, sys, threading
 u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 0))
 t = socket.socket(); t.bind(("127.0.0.1", 0)); t.listen(16)
+d = socket.socket(); d.bind(("127.0.0.1", 0)); d.listen(16)      # DoT(853)替身
 with open(sys.argv[1], "w") as f:
-    f.write("%d %d\n" % (u.getsockname()[1], t.getsockname()[1]))
+    f.write("%d %d %d\n" % (u.getsockname()[1], t.getsockname()[1], d.getsockname()[1]))
+threading.Thread(target=lambda: [d.accept()[0].close() for _ in iter(int, 1)],
+                 daemon=True).start()
 def dns():
     while True:
         try:
@@ -142,8 +145,11 @@ PY
   while [[ ! -s "$pf" && "$n" -lt 40 ]]; do sleep 0.1; n=$((n+1)); done
   [[ -s "$pf" ]] || return 1
   local ports; ports="$(cat "$pf")"
-  export PDG_TX_DNS_PROBE="127.0.0.1:${ports%% *}"
-  export PDG_TX_REDIR_PORT="${ports##* }"
+  # shellcheck disable=SC2086
+  set -- $ports
+  export PDG_TX_DNS_PROBE="127.0.0.1:$1"
+  export PDG_TX_REDIR_PORT="$2"
+  export PDG_TX_DOT_PORT="$3"
 }
 
 e2e_stub_system(){
