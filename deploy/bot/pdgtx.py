@@ -64,6 +64,9 @@ ROLLED_BACK = "ROLLED_BACK"
 ROLLBACK_FAILED = "ROLLBACK_FAILED"
 ABORTED = "ABORTED"
 
+# 可以被 GC 回收的**明确终态**: 事情已经了结, 材料也清过了。
+# ROLLBACK_FAILED 不在其中 —— 它的恢复材料还留着给人工修复用。
+GC_TERMINAL = (COMMITTED, ROLLED_BACK, ABORTED)
 TERMINAL = (COMMITTED, ROLLED_BACK, ROLLBACK_FAILED, ABORTED)
 # 中断在这些状态 = 现网**已经**被改过, 必须先 recover 才允许下一次写。
 # OBSERVING 同样在内: 那时文件已全部落盘、服务动作也做完了, 只是还没判定成不成功 ——
@@ -634,6 +637,17 @@ class _Lock:
 
 
 # ── 事务 ──────────────────────────────────────────────────────────────────────
+def _ensure_root(root):
+    """事务根目录本身也要 0700 —— 只把 txid 子目录收紧, 上层仍是 755 的话, 目录名(操作类型、
+    时间)照样是公开的。"""
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        if (os.stat(root).st_mode & 0o777) != 0o700:
+            os.chmod(root, 0o700)
+    except OSError:
+        pass
+
+
 def new_txid():
     return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
 
@@ -721,6 +735,7 @@ class Tx:
             "observed": {}, "warnings": [], "error": "", "error_class": "",
             "rollback_complete": None, "diff": [],
         }
+        _ensure_root(self.root)                      # TX_ROOT 自身也必须 0700
         os.makedirs(self.dir, mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(self.dir, "candidate"), mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(self.dir, "before"), mode=0o700, exist_ok=True)
@@ -1125,6 +1140,17 @@ def _safe_leaf(name):
 
 
 # ── 审计 / 清理 / 恢复 ────────────────────────────────────────────────────────
+def _audit_rec(rec):
+    """把一条已经组装好的脱敏记录写进审计(recover 等非 Tx 路径共用)。"""
+    try:
+        _ensure_root(os.path.dirname(AUDIT))
+        with open(AUDIT, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _rotate_audit()
+    except OSError:
+        pass
+
+
 def _audit(tx):
     rec = {"ts": time.time(), "txid": tx.txid, "source": tx.source, "op": tx.op,
            "mode": tx.mode, "state": tx.state, "targets": sorted(tx.targets),
@@ -1166,6 +1192,7 @@ def load_meta(txdir):
 
 
 def list_tx(root=None, limit=20):
+    """limit=None = 全部(pending 扫描用)。"""
     root = root or TX_ROOT
     out = []
     try:
@@ -1179,19 +1206,33 @@ def list_tx(root=None, limit=20):
         m = load_meta(p)
         if m:
             out.append(m)
-        if len(out) >= limit:
+        if limit is not None and len(out) >= limit:
             break
     return out
 
 
 def pending_recovery(root=None, exclude=None):
-    """需要人工处理的未完成事务(APPLYING / ROLLING_BACK / ROLLBACK_FAILED)。"""
-    return [m for m in list_tx(root, limit=200)
+    """需要人工处理的未完成事务。**扫全部事务目录**, 不设条数上限 ——
+    只看最近 N 笔的话, 一台机器攒够 N 笔新事务之后, 那笔真正卡住的就再也不会被报出来了。"""
+    return [m for m in list_tx(root, limit=None)
             if m.get("state") in NEEDS_RECOVERY and m.get("txid") != exclude]
 
 
+def stale_unstarted(root=None, older_than=86400):
+    """长期遗留的 PREPARING / VALIDATED: 现网没被碰过, 但目录一直占着。
+    只**报告**, 由 `pdg tx abort <id>` 显式收掉 —— 普通 GC 不许静默删。"""
+    now = time.time()
+    return [m for m in list_tx(root, limit=None)
+            if m.get("state") in (PREPARING, VALIDATED)
+            and now - float(m.get("started_at") or 0) > older_than]
+
+
 def _gc(root=None):
-    """只保留最近 TX_KEEP 笔**终态且已清理材料**的事务目录; 未完成的一律留着。"""
+    """只回收**明确终态**(COMMITTED / ROLLED_BACK / ABORTED)且超出 TX_KEEP 的目录。
+
+    其余状态一律保留: APPLYING/OBSERVING/ROLLING_BACK/ROLLBACK_FAILED 是恢复材料,
+    PREPARING/VALIDATED 是"还没动过现网但没收尾"的证据 —— 静默删掉它们等于毁掉排障线索,
+    所以只由 `pdg tx abort` 显式收。"""
     root = root or TX_ROOT
     try:
         dirs = sorted((d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))),
@@ -1202,8 +1243,8 @@ def _gc(root=None):
     for d in dirs:
         p = os.path.join(root, d)
         m = load_meta(p) or {}
-        if m.get("state") in NEEDS_RECOVERY:
-            continue
+        if m.get("state") not in GC_TERMINAL:
+            continue                      # 未完成 / 回滚失败: 一律保留
         kept += 1
         if kept > TX_KEEP:
             shutil.rmtree(p, ignore_errors=True)
@@ -1292,6 +1333,13 @@ def recover(txid, root=None, force=False):
         if not failed:
             for sub in ("candidate", "before"):
                 shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
+        _audit_rec({"ts": time.time(), "txid": txid, "source": m.get("source"),
+                    "op": "recover:" + str(m.get("op")), "mode": "repair", "state": m["state"],
+                    "targets": m.get("targets", []), "services": m.get("services", []),
+                    "error": "", "rollback_complete": not failed,
+                    "restored": restored, "failed": [redact(x) for x in failed],
+                    "schema_version": SCHEMA_VERSION})
+        _gc(root)
         return {"ok": not failed, "state": m["state"], "restored": restored,
                 "failed": [redact(x) for x in failed], "dir": d}
 
@@ -1424,10 +1472,39 @@ def _cli_recover(a):
     return 0 if r.get("ok") else 1
 
 
+def _cli_abort(a):
+    """把一笔**还没碰过现网**的事务(PREPARING/VALIDATED)显式收掉。
+    动过现网的状态一律拒绝 —— 那种要走 recover, 不能一 abort 了之。"""
+    d = os.path.join(TX_ROOT, a.tx)
+    m = load_meta(d)
+    if not m:
+        print("找不到事务", file=sys.stderr); return 2
+    if m.get("state") not in (PREPARING, VALIDATED):
+        print("事务处于 %s: 现网可能已被改动, 请用 `pdg tx recover %s`" % (m.get("state"), a.tx),
+              file=sys.stderr)
+        return 2
+    m["state"] = ABORTED
+    m["ended_at"] = time.time()
+    m["error"] = m.get("error") or "人工 abort(未开始应用)"
+    atomic_write(os.path.join(d, "meta.json"),
+                 json.dumps(m, ensure_ascii=False, indent=1).encode(), 0o600)
+    for sub in ("candidate", "before"):
+        shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
+    _audit_rec({"ts": time.time(), "txid": a.tx, "source": m.get("source"),
+                "op": "abort:" + str(m.get("op")), "mode": m.get("mode", "normal"),
+                "state": ABORTED, "targets": m.get("targets", []), "services": [],
+                "error": "", "schema_version": SCHEMA_VERSION})
+    print(json.dumps({"ok": True, "txid": a.tx, "state": ABORTED}, ensure_ascii=False))
+    return 0
+
+
 def _cli_pending(a):
     p = pending_recovery()
     for m in p:
         print("%s %s %s" % (m.get("txid"), m.get("state"), m.get("op")))
+    for m in stale_unstarted():          # 只报告, 不动手(要收得显式 abort)
+        print("%s %s %s (未开始应用, 可 `pdg tx abort` 收掉)"
+              % (m.get("txid"), m.get("state"), m.get("op")))
     return 1 if p else 0
 
 
@@ -1455,6 +1532,7 @@ def main(argv=None):
     p = sub.add_parser("recover"); p.add_argument("tx")
     p.add_argument("--force", action="store_true"); p.set_defaults(fn=_cli_recover)
     p = sub.add_parser("pending"); p.set_defaults(fn=_cli_pending)
+    p = sub.add_parser("abort"); p.add_argument("tx"); p.set_defaults(fn=_cli_abort)
     a = ap.parse_args(argv)
     return a.fn(a)
 

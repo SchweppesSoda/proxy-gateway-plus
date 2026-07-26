@@ -430,6 +430,69 @@ def main():
         bad("OBSERVING 事务恢复失败: %s" % r)
     boxA.clean()
 
+    # ── 16. 事务目录治理(十): 扫全部 / 只回收明确终态 / TX_ROOT 0700 ──
+    boxB = Box(); txB = load_tx(dict(boxB.env, PDG_TX_KEEP="1"))
+    boxB.up("mosdns")
+    liveB = boxB.path("/etc/mosdns/rules/custom_direct.txt")
+    with open(liveB, "wb") as f:
+        f.write(b"domain:gc.com\n")
+    # 一笔停在 APPLYING 的(待恢复), 之后再造 220 笔终态事务把它挤到很后面
+    tstuck = txB.Tx("cli", "stuck")
+    tstuck.stage("mosdns_rule:custom_direct.txt", b"domain:stuck.com\n")
+    tstuck.meta["targets"] = ["mosdns_rule:custom_direct.txt"]
+    tstuck._set_state(txB.VALIDATED); tstuck._save_before(["mosdns"])
+    tstuck._set_state(txB.APPLYING)
+    tprep = txB.Tx("cli", "never-finished")          # 停在 PREPARING(没碰过现网)
+    tprep.stage("mosdns_rule:custom_hijack.txt", b"domain:p.com\n")
+    for i in range(220):
+        t = txB.Tx("cli", "filler%d" % i)
+        t.meta["state"] = txB.COMMITTED; t.state = txB.COMMITTED; t._save_meta()
+    pend = txB.pending_recovery(txB.TX_ROOT)
+    if [x for x in pend if x["txid"] == tstuck.txid]:
+        ok("超过 200 笔之后, 那笔卡住的事务仍能被 pending_recovery 找到(扫全部目录)")
+    else:
+        bad("卡住的事务被扫描上限漏掉了(共 %d 笔待恢复)" % len(pend))
+    txB._gc(txB.TX_ROOT)
+    if os.path.isdir(tstuck.dir):
+        ok("TX_KEEP=1 的 GC 不删待恢复事务")
+    else:
+        bad("GC 把待恢复事务删了")
+    if os.path.isdir(tprep.dir):
+        ok("GC 也不删 PREPARING(没碰过现网, 但要留作排障线索)")
+    else:
+        bad("GC 静默删了 PREPARING")
+    stale = txB.stale_unstarted(txB.TX_ROOT, older_than=-1)
+    if [x for x in stale if x["txid"] == tprep.txid]:
+        ok("长期遗留的 PREPARING 由 stale_unstarted 报告(交给显式 abort)")
+    else:
+        bad("stale_unstarted 没报出来")
+    r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/pdgtx.py"), "abort", tprep.txid],
+                       capture_output=True, text=True, env=dict(os.environ, **boxB.env))
+    st = (txB.load_meta(tprep.dir) or {}).get("state")
+    if r.returncode == 0 and st == txB.ABORTED:
+        ok("pdg tx abort 显式收掉未开始的事务(状态 → ABORTED)")
+    else:
+        bad("abort 失败: rc=%s state=%s" % (r.returncode, st))
+    r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/pdgtx.py"), "abort", tstuck.txid],
+                       capture_output=True, text=True, env=dict(os.environ, **boxB.env))
+    if r.returncode != 0 and "recover" in r.stderr:
+        ok("abort 拒绝处理已动过现网的事务, 指向 recover")
+    else:
+        bad("abort 把 APPLYING 也收了: rc=%s" % r.returncode)
+    if (os.stat(txB.TX_ROOT).st_mode & 0o777) == 0o700:
+        ok("TX_ROOT 本身是 0700(目录名里的操作类型与时间不外泄)")
+    else:
+        bad("TX_ROOT 权限是 %o" % (os.stat(txB.TX_ROOT).st_mode & 0o777))
+    # recover 成功后要补审计
+    n_before = sum(1 for _ in open(os.path.join(txB.TX_ROOT, "index.jsonl"), encoding="utf-8"))
+    txB.recover(tstuck.txid, root=txB.TX_ROOT)
+    n_after = sum(1 for _ in open(os.path.join(txB.TX_ROOT, "index.jsonl"), encoding="utf-8"))
+    if n_after > n_before:
+        ok("recover 成功后补写了脱敏审计")
+    else:
+        bad("recover 没留审计")
+    boxB.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
