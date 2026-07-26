@@ -658,6 +658,65 @@ def main():
         bad("失败回滚不完整: %s" % okr)
     box9.clean()
 
+    # ── 10. 并发: "锁文件坏了"的原因不能被另一个线程擦掉 ──────────────────────
+    # 真实并发下复现过的竞态: _cfg_lock_err 是**进程级**全局 ——
+    #   A 拿到进程内锁 → 打不开 LOCKFILE, 记下原因 → yield False;
+    #   A 还没来得及 busy_msg(), B 进 _cfg_guard() 先把那个全局清空, 再因进程锁被占 yield False;
+    #   结果 A 也只能回"已有配置操作正在执行" —— /run 真坏了却被说成"有人在改", 环境故障被掩盖。
+    # 不用 sleep 赌时序: 两个 Event 把顺序钉死, 旧实现必红、新实现必绿。
+    import threading                                            # noqa: PLC0415
+    box10 = Box()
+    for _m in list(sys.modules):
+        if _m == "pdgtx":
+            del sys.modules[_m]
+    spec10 = _il3.spec_from_file_location("pdg_bot_lockrace", ROOT / "deploy/bot/pdg-bot.py")
+    b10 = _il3.module_from_spec(spec10); spec10.loader.exec_module(b10)
+    b10.SB = box10.path("/etc/sing-box/config.json")
+    box10.put("/etc/sing-box/config.json", b'{"outbounds": []}\n')
+    box10.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before10.example\n")
+    live10 = {p: box10.read(p) for p in ("/etc/sing-box/config.json",
+                                         "/etc/mosdns/rules/custom_direct.txt")}
+    # 锁文件指向一个**目录** → open(…, "w") 必然失败(IsADirectoryError), 不靠权限碰运气
+    b10.LOCKFILE = box10.path("/run/lock-is-a-dir")
+    os.makedirs(b10.LOCKFILE, exist_ok=True)
+
+    a_inside, b_done = threading.Event(), threading.Event()
+    res = {}
+
+    def worker_a():
+        with b10._cfg_guard() as got:            # 用真的 _cfg_guard, 不打桩
+            res["a_got"] = got
+            a_inside.set()                       # A 已在锁内且已记下"锁文件不可用"
+            b_done.wait(20)                      # 等 B 整轮跑完, 再去取自己的结论
+            res["a_msg"] = b10.busy_msg()
+
+    def worker_b():
+        a_inside.wait(20)
+        with b10._cfg_guard() as got:            # 进程内锁被 A 占着 → 必然 got=False
+            res["b_got"] = got
+            res["b_msg"] = b10.busy_msg()
+        b_done.set()
+
+    ta, tb = threading.Thread(target=worker_a), threading.Thread(target=worker_b)
+    ta.start(); tb.start(); ta.join(30); tb.join(30)
+    if res.get("a_got") is False and res.get("b_got") is False:
+        ok("并发取锁: 两个线程都 fail-closed(got=False), 没有谁被放进去写")
+    else:
+        bad("got 不对: %r" % res)
+    if res.get("b_msg") == b10.BUSY_MSG:
+        ok("并发取锁: 后来的线程如实报「已有配置操作正在执行」")
+    else:
+        bad("B 应回 BUSY_MSG, 实际: %r" % res.get("b_msg"))
+    if res.get("a_msg") == b10.NOLOCK_MSG:
+        ok("并发取锁: 先来的线程仍报「锁文件不可用」—— 环境故障没被另一个线程擦成'忙'")
+    else:
+        bad("A 的失败原因被覆盖了(旧的进程级 _cfg_lock_err 竞态): %r" % res.get("a_msg"))
+    if all(box10.read(p) == v for p, v in live10.items()):
+        ok("并发取锁: model 与 mosdns 规则一个字节都没被写")
+    else:
+        bad("拿不到锁却动了生产文件")
+    box10.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

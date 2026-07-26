@@ -91,7 +91,14 @@ LOCKFILE = os.environ.get("PDG_LOCKFILE", "/run/privdns-gateway.lock")   # 与 p
 BUSY_MSG = "已有配置操作正在执行,请稍候再试。"   # apply_sb 拿不到锁(进程内或跨进程)时的安全返回
 NOLOCK_MSG = ("⛔ 锁文件不可用(/run 写不了?) —— 为避免并发写坏配置, 本次拒绝执行。\n"
               "请在服务器上检查 /run 是否可写, 修好后重试。")
-_cfg_lock_err = ""                               # 上一次取锁失败的原因: "" = 忙, 非空 = 锁不可用
+# 上一次取锁失败的原因: "" = 忙, 非空 = 锁不可用。**按线程存**: 进程级全局会被并发覆盖 ——
+# A 线程刚记下"锁文件打不开"、还没来得及 busy_msg(), B 线程进 _cfg_guard() 就把它清空了,
+# 于是 A 把环境故障说成"已有配置操作正在执行", 真正的 /run 坏掉被掩盖。
+_cfg_lock_state = threading.local()
+
+
+def _cfg_lock_error():
+    return getattr(_cfg_lock_state, "err", "")
 
 class _PanelOwnershipError(Exception):
     pass
@@ -131,10 +138,9 @@ def _cfg_guard():
     """进程内串行(_cfg_lock, 非阻塞)+ 跨进程 flock(与 pdg update/rollback 协调)。
 
     两把锁任一被占 → yield False(立即友好返回, 绝不阻塞主轮询);
-    **锁文件不可用同样 yield False**(fail-closed), 并把原因记进 _cfg_lock_err 供调用方区分
-    "有人正在改" 与 "锁坏了"。"""
-    global _cfg_lock_err
-    _cfg_lock_err = ""
+    **锁文件不可用同样 yield False**(fail-closed), 并把原因记进本线程的 _cfg_lock_state
+    供调用方区分 "有人正在改" 与 "锁坏了"。"""
+    _cfg_lock_state.err = ""                     # 只清本线程的, 别踩别人正要读的那份
     if not _cfg_lock.acquire(blocking=False):    # 非阻塞: 本进程已有配置操作在跑 → 立刻让路, 不卡主循环
         yield False
         return
@@ -144,7 +150,7 @@ def _cfg_guard():
         except OSError as e:
             # fail-closed: 打不开锁文件就**不写**。旧实现退化成"只做进程内串行"继续写 ——
             # 那时 CLI/定时任务照样能同时改同一份配置, 谁也拦不住。
-            _cfg_lock_err = "%s: %s" % (LOCKFILE, type(e).__name__)
+            _cfg_lock_state.err = "%s: %s" % (LOCKFILE, type(e).__name__)
             yield False
             return
         locked = False
@@ -1048,7 +1054,7 @@ def _core_sync_file():
 
 def busy_msg():
     """区分"别人正在改"与"锁不可用" —— 后者是环境故障, 让用户知道该去看 /run。"""
-    return NOLOCK_MSG if _cfg_lock_err else BUSY_MSG
+    return NOLOCK_MSG if _cfg_lock_error() else BUSY_MSG
 
 def _pdgtx():
     import pdgtx
