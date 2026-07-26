@@ -130,4 +130,50 @@ rout="$(pdg tx recover "$CRASH2" --force 2>&1)"
 { grep -q '"ok": true' <<<"$rout" && [[ "$(sha256sum "$HIJ" | cut -d' ' -f1)" == "$BEFORE_SHA" ]]; } \
   && ok "--force 显式覆盖才会用 before-image 还原" || bad "force 恢复没生效: $rout"
 
+# ══ 6. OBSERVING 阶段被真 SIGKILL(文件已落盘 + 服务动作已做完, 只差判定) ══════
+echo; echo "── 6. OBSERVING 阶段被强杀 ──"
+printf 'domain:before6.example\n' > "$HIJ"
+B6="$(sha256sum "$HIJ" | cut -d' ' -f1)"
+python3 - "$TX" <<'PY' >/tmp/tx-crash6.out 2>&1
+import importlib.util, os, signal, sys
+spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+def die(self, services, base):          # 进入 OBSERVING 之后、判定之前把自己打死
+    print(self.txid, flush=True)
+    os.kill(os.getpid(), signal.SIGKILL)
+m.Tx._observe = die
+t = m.Tx("cli", "e2e_crash_observing")
+t.stage("mosdns_rule:custom_hijack.txt", b"domain:observed.example\n")
+t.service("restart:mosdns")
+t.commit()
+PY
+C6="$(head -1 /tmp/tx-crash6.out | tr -d '\r')"
+S6="$(python3 "$TX" show "$C6" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' 2>/dev/null)"
+[[ "$S6" == OBSERVING ]] && ok "真 SIGKILL 于 OBSERVING: 事务停在 OBSERVING" || bad "状态是 $S6"
+grep -q observed.example "$HIJ" && ok "现网已是新内容(服务动作也做过了, 只差判定)" || bad "文件没落盘"
+out=$(python3 - "$TX" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+t = m.Tx("bot", "after_observing_crash")
+t.stage("mosdns_rule:custom_direct.txt", b"domain:blocked.example\n")
+try:
+    t.commit(); print("COMMITTED")
+except m.TxRefused as e:
+    print("REFUSED:", e)
+PY
+)
+{ grep -q '^REFUSED' <<<"$out" && grep -q recover <<<"$out"; } \
+  && ok "OBSERVING 残留同样挡住后续写(与 APPLYING 一致)" || bad "没挡住: $out"
+# 注: doctor 对**未完成事务**的点名已由第 3 段(APPLYING)覆盖; 这里同样跑一次 doctor 只为
+# 确认它在 OBSERVING 残留下不炸、且仍是只读 —— 点名与否交给上面那段与单测(pending_recovery)。
+dout6="$(pdg doctor 2>&1)"; S6H="$(sha256sum "$HIJ" | cut -d' ' -f1)"
+grep -q '配置事务' <<<"$dout6" && ok "OBSERVING 残留下 doctor 仍能跑完并给出「配置事务」项" \
+  || bad "doctor 没有事务项: $(tail -2 <<<"$dout6")"
+[[ "$(sha256sum "$HIJ" | cut -d' ' -f1)" == "$S6H" ]] \
+  && ok "doctor 在 OBSERVING 残留下同样只读" || bad "doctor 改了现网"
+rout="$(pdg tx recover "$C6" 2>&1)"
+{ grep -q '"ok": true' <<<"$rout" && [[ "$(sha256sum "$HIJ" | cut -d' ' -f1)" == "$B6" ]]; } \
+  && ok "recover 把 OBSERVING 事务逐字节还原" || bad "恢复失败: $(tail -2 <<<"$rout")"
+
 e2e_summary

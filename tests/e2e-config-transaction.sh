@@ -89,7 +89,29 @@ echo; echo "── 3. mosdns 候选强校验(netns / 高端口 / 都不可用) �
 BAD_CONF=/tmp/bad-mosdns.yaml
 printf 'log:\n  level: info\nplugins:\n  - tag: x\n    type: no_such_plugin_type\n' > "$BAD_CONF"
 GOOD_CONF=/tmp/good-mosdns.yaml
-printf 'log:\n  level: info\nplugins: []\n' > "$GOOD_CONF"
+# 好配置必须**带监听项**: 高端口探针要把监听地址改写到随机端口才能在不碰生产端口的前提下起来。
+# 用 plugins: [] 这种无监听夹具, 高端口那条路径永远走不通(改写 0 处 → 拒绝), 等于给自己
+# 造了一个在无 netns 环境里必红的假用例。
+cat > "$GOOD_CONF" <<'YAML'
+log:
+  level: info
+plugins:
+  - tag: fwd
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - addr: "udp://127.0.0.1:65353"
+  - tag: entry
+    type: sequence
+    args:
+      - exec: $fwd
+  - tag: srv
+    type: udp_server
+    args:
+      entry: entry
+      listen: "127.0.0.1:53"
+YAML
 probe(){ # $1=mode $2=conf → 打印 ok/fail
   python3 - "$TX" "$2" 2>&1 <<'PY' | grep -o 'PROBE|[^\n]*' | tail -1
 import importlib.util, sys
