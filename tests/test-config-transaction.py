@@ -173,10 +173,15 @@ def main():
     t.stage("mosdns_rule:custom_direct.txt", b"domain:new.com\n")
     t.service("restart:mosdns")
     res = t.commit()
-    if res["state"] == tx3.ROLLED_BACK and box3.read("/etc/mosdns/rules/custom_direct.txt") == b"domain:old.com\n":
+    # 桩里的 mosdns 永远起不来 → 文件能回滚, 但运行时确实没恢复: 诚实结论是 ROLLBACK_FAILED
+    if res["state"] == tx3.ROLLBACK_FAILED and box3.read("/etc/mosdns/rules/custom_direct.txt") == b"domain:old.com\n":
         ok("服务重启失败 → 文件回滚到操作前内容")
     else:
         bad("重启失败没回滚: %s / %r" % (res["state"], box3.read("/etc/mosdns/rules/custom_direct.txt")))
+    if any("mosdns" in x for x in res["rollback_failed_items"]):
+        ok("运行时没恢复被如实点名(不再假装 ROLLED_BACK)")
+    else:
+        bad("没点名未恢复的运行时项: %s" % res["rollback_failed_items"])
     box3.clean()
 
     # ── 8. 新建文件的回滚 = 删除 ──
@@ -186,7 +191,8 @@ def main():
     t.stage("mosdns_rule:brand_new.txt", b"domain:x.com\n")
     t.service("restart:mosdns")
     res = t.commit()
-    if res["state"] == tx4.ROLLED_BACK and box4.read("/etc/mosdns/rules/brand_new.txt") is None:
+    if res["state"] in (tx4.ROLLED_BACK, tx4.ROLLBACK_FAILED) \
+            and box4.read("/etc/mosdns/rules/brand_new.txt") is None:
         ok("原本不存在的目标: 回滚 = 删掉本次新建的文件(absent 标记生效)")
     else:
         bad("新建文件没被回滚删除")
@@ -287,7 +293,8 @@ def main():
     t.stage("cert_fullchain", new_chain); t.stage("cert_privkey", new_key)
     t.stage("dot_marker", b"new.example.com\n"); t.service("restart:mosdns")
     res = t.commit()
-    if res["state"] == tx7.ROLLED_BACK and box7.read("/etc/mosdns/certs/fullchain.pem") == old_chain \
+    if res["state"] in (tx7.ROLLED_BACK, tx7.ROLLBACK_FAILED) \
+            and box7.read("/etc/mosdns/certs/fullchain.pem") == old_chain \
             and box7.read("/etc/mosdns/certs/privkey.pem") == old_key \
             and box7.read("/opt/pdg-bot/dot-domain") == b"old.example.com\n":
         ok("部署后 mosdns 起不来 → 证书/私钥/域名标记全部回到旧的(DoT 继续可用)")

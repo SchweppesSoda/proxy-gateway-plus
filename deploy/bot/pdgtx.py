@@ -646,6 +646,50 @@ def _runner_sha():
         return ""
 
 
+def _restore_runtime(bi):
+    """把运行时状态按 before-image 还原, 并**逐项验证到位**。返回未恢复项列表(空=全好)。
+
+    以前这几步的返回码一律不看: sysctl -w 失败、nft -f 报错、systemctl stop 没停下来, 都会
+    被当成"已还原", 最后打上 ROLLED_BACK —— 文件是回去了, 运行时却没有, 而用户以为全好了。
+    普通回滚与 recover 现在共用这一份判据, 免得两条路各说各话。"""
+    failed = []
+    for key, val in (bi.get("sysctl") or {}).items():
+        if not val:
+            continue
+        rc, out = _run(["sysctl", "-w", "%s=%s" % (key, val)], timeout=15)
+        if rc != 0:
+            failed.append("sysctl %s 写回失败(%s)" % (key, redact(out)[-60:])); continue
+        rc2, cur = _run(["sysctl", "-n", key], timeout=15)          # 复读比对, 不信写入回执
+        if rc2 != 0 or cur.strip() != str(val).strip():
+            failed.append("sysctl %s 实际值是 %r(期望 %r)" % (key, cur.strip(), val))
+    if bi.get("nft_loaded"):
+        exe = _nft_bin()
+        if not exe:
+            failed.append("找不到 nft, 无法确认防火墙已还原")
+        else:
+            rc, out = _run([exe, "-f", FSROOT + "/etc/nftables.conf"], timeout=60)
+            if rc != 0:
+                failed.append("nft -f 还原失败(%s)" % redact(out)[-60:])
+            elif _run([exe, "list", "table", "inet", "pdg"], timeout=15)[0] != 0:
+                failed.append("inet pdg 表没有回到内核")
+    for u, st in (bi.get("services") or {}).items():
+        if st.get("active"):
+            _run(["systemctl", "reset-failed", u], timeout=30)
+            rc, out = _run(["systemctl", "restart", u], timeout=120)
+            if rc != 0:
+                failed.append("%s 重启失败(%s)" % (u, redact(out)[-60:])); continue
+            ok, why = svc_stable(u)
+            if not ok:
+                failed.append(why)
+        else:
+            rc, out = _run(["systemctl", "stop", u], timeout=60)     # 原来没在跑的必须仍不在跑
+            if rc != 0:
+                failed.append("%s 停止失败(%s)" % (u, redact(out)[-60:]))
+            elif _svc_active(u):
+                failed.append("%s 本应保持 inactive, 现在却是 active" % u)
+    return failed
+
+
 class Tx:
     """一笔事务。stage/derive/service 之后 commit()。
 
@@ -992,20 +1036,7 @@ class Tx:
                     _fsync_dir(os.path.dirname(path))
             except Exception as e:  # noqa: BLE001
                 failed.append("%s(%s)" % (name, type(e).__name__))
-        # 运行时状态: sysctl 原值 / nft 重新载入 / 服务回到原来的 active 状态
-        for key, val in (bi.get("sysctl") or {}).items():
-            if val:
-                _run(["sysctl", "-w", "%s=%s" % (key, val)], timeout=15)
-        if bi.get("nft_loaded"):
-            exe = _nft_bin()
-            if exe:
-                _run([exe, "-f", FSROOT + "/etc/nftables.conf"], timeout=60)
-        for u, s in (bi.get("services") or {}).items():
-            if s.get("active"):
-                _run(["systemctl", "reset-failed", u], timeout=30)
-                _run(["systemctl", "restart", u], timeout=120)
-            else:
-                _run(["systemctl", "stop", u], timeout=60)
+        failed += _restore_runtime(bi)     # 运行时: sysctl / nft / 服务, 逐项验证过才算数
         # 回滚后必须**验证**: 文件逐个比对 + 服务回到原状态
         for name in sorted(self.targets):
             rec = bi.get("files", {}).get(name, {})
@@ -1015,11 +1046,6 @@ class Tx:
                     failed.append("%s 内容未还原" % name)
             elif cur is not None:
                 failed.append("%s 应删除但仍存在" % name)
-        for u, s in (bi.get("services") or {}).items():
-            if s.get("active"):
-                ok, why2 = svc_stable(u)
-                if not ok:
-                    failed.append("%s 未恢复运行(%s)" % (u, why2))
         self.meta["rollback_complete"] = not failed
         self.meta["ended_at"] = time.time()
         if failed:
@@ -1255,18 +1281,7 @@ def recover(txid, root=None, force=False):
                 restored.append(name)
             except Exception as e:  # noqa: BLE001
                 failed.append("%s(%s)" % (name, type(e).__name__))
-        for u, s in (bi.get("services") or {}).items():
-            if s.get("active"):
-                _run(["systemctl", "reset-failed", u], timeout=30)
-                _run(["systemctl", "restart", u], timeout=120)
-        for key, val in (bi.get("sysctl") or {}).items():
-            if val:
-                _run(["sysctl", "-w", "%s=%s" % (key, val)], timeout=15)
-        for u, s in (bi.get("services") or {}).items():
-            if s.get("active"):
-                ok, why = svc_stable(u)
-                if not ok:
-                    failed.append("%s 未恢复运行(%s)" % (u, why))
+        failed += _restore_runtime(bi)     # 与普通回滚同一份判据(不再各说各话)
         m["state"] = ROLLBACK_FAILED if failed else ROLLED_BACK
         m["recovered_at"] = time.time()
         m["rollback_complete"] = not failed

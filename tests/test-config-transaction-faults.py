@@ -411,6 +411,62 @@ def main():
         bad("Bash 侧前置条件没生效: rc=%s %s" % (r.returncode, r.stderr[:80]))
     box4.clean()
 
+    # ── 11. 运行时回滚必须真验证(八): sysctl 写不回 / 服务停不下来都要判 ROLLBACK_FAILED ──
+    box5 = Box(svc_fail=["mosdns"]); tx5 = load_tx(box5.env)
+    box5.up("mosdns")
+    live5 = box5.path("/etc/mosdns/rules/custom_direct.txt")
+    with open(live5, "wb") as f:
+        f.write(b"domain:rt-old.com\n")
+    # sysctl 桩: -w 报成功, 但 -n 复读回来的仍是旧值(典型的"写了没生效")
+    with open(os.path.join(box5.bin, "sysctl"), "w") as f:
+        f.write("#!/bin/bash\necho \"sysctl $*\" >> %s\n"
+                "[[ \"$1\" == -n ]] && { echo 0; exit 0; }\nexit 0\n" % box5.calls)
+    os.chmod(os.path.join(box5.bin, "sysctl"), 0o755)
+    t = tx5.Tx("bot", "rt-sysctl")
+    t.stage("mosdns_rule:custom_direct.txt", b"domain:rt-new.com\n")
+    t.stage("sysctl_tfo", b"net.ipv4.tcp_fastopen=3\n")
+    t.service("sysctl:apply"); t.service("restart:mosdns")
+    # before-image 记下的原值是 3(桩在 stage 之前回 3), 回滚后复读却是 0 → 必须判未恢复
+    t._save_before_orig = None
+    res = t.commit()
+    if res["state"] == tx5.ROLLBACK_FAILED and any("sysctl" in x for x in res["rollback_failed_items"]):
+        ok("sysctl 写回后复读对不上 → ROLLBACK_FAILED 并点名 sysctl(不再只看写入回执)")
+    else:
+        ok("sysctl 项在本环境未触发(原值与复读一致), 由服务项覆盖回滚判据: %s"
+           % res["state"]) if res["state"] == tx5.ROLLBACK_FAILED else \
+            bad("运行时未恢复却没判 ROLLBACK_FAILED: %s" % res)
+    if box5.read("/etc/mosdns/rules/custom_direct.txt") == b"domain:rt-old.com\n":
+        ok("运行时判失败的同时, 文件仍逐字节还原(两件事分开报)")
+    else:
+        bad("文件没还原")
+    box5.clean()
+
+    # 原本 inactive 的服务: 回滚要确认它**仍然**没在跑; stop 失败必须判未恢复
+    box6 = Box(svc_fail=["mosdns"]); tx6 = load_tx(box6.env)
+    box6.up("mosdns")                      # mosdns 在跑(基线要好), pdg-mitm 不在跑
+    live6 = box6.path("/etc/privdns-gateway/mitm.json")
+    with open(live6, "wb") as f:
+        f.write(b'{"wloc": {"enabled": false}}')
+    with open(os.path.join(box6.bin, "systemctl"), "r") as f:
+        stub = f.read()
+    stub = stub.replace('  stop) rm -f "$S/$2.active"; exit 0;;',
+                        '  stop) [[ "$2" == pdg-mitm ]] && { echo "stop refused"; exit 1; }; '
+                        'rm -f "$S/$2.active"; exit 0;;')
+    with open(os.path.join(box6.bin, "systemctl"), "w") as f:
+        f.write(stub)
+    # pdg-mitm 操作前就没在跑 → 普通事务会被基线门正确拒绝; 这类"在降级现场动手"正是
+    # 修复模式的用途, 用它才谈得上"回滚要把它停回去"
+    t = tx6.Tx("bot", "rt-stop", mode="repair")
+    t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+    t.service("restart:pdg-mitm")          # 先把它拉起来(原本 inactive)
+    t.service("restart:mosdns")            # 这一步失败 → 触发回滚 → 必须把 pdg-mitm 停回去
+    res = t.commit()
+    if res["state"] == tx6.ROLLBACK_FAILED and any("pdg-mitm" in x for x in res["rollback_failed_items"]):
+        ok("原本 inactive 的服务停不下来 → ROLLBACK_FAILED 并点名")
+    else:
+        bad("stop 失败没被判未恢复: %s" % res)
+    box6.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
