@@ -1470,8 +1470,18 @@ def set_mosdns_upstream(which, addrs):
     if not addrs:
         return False, "至少给一个 DNS 地址 (udp://1.2.3.4:53 / tcp://.. / https://x/dns-query / tls://..)"
     tag = which + "_upstream"
+    # 走统一事务: 候选先过 mosdns 强校验(netns/高端口真起一次), 通过才原子落盘 + 重启观察。
+    # 旧实现是"直接覆盖现网 → 重启 → 看 is-active", 坏配置要等 mosdns 起不来才发现。
+    tx = _pdgtx()
     try:
-        lines = open(MOSDNS_CONF).read().splitlines()
+        t = tx.Tx(source="bot", op="mosdns_upstream")
+    except Exception as e:  # noqa: BLE001
+        return False, "无法开始配置事务(%s)" % type(e).__name__
+    cur, _sha = t.read_for_update("mosdns_conf")     # 候选基于这一份算, 前置条件也是它
+    if cur is None:
+        return False, "读 mosdns 配置失败: 文件不存在"
+    try:
+        lines = cur.decode("utf-8").splitlines()
     except Exception as e:  # noqa: BLE001
         return False, f"读 mosdns 配置失败: {e}"
     items = ", ".join('{addr: "%s"}' % a for a in addrs)
@@ -1490,14 +1500,23 @@ def set_mosdns_upstream(which, addrs):
             break
     if not done:
         return False, f"没在 mosdns 配置里找到 {tag} 块"
-    shutil.copy(MOSDNS_CONF, MOSDNS_CONF + ".botbak")
-    with open(MOSDNS_CONF, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    sh(["systemctl", "restart", "mosdns"])
-    if sh(["systemctl", "is-active", "mosdns"]).stdout.strip() != "active":
-        shutil.copy(MOSDNS_CONF + ".botbak", MOSDNS_CONF); sh(["systemctl", "restart", "mosdns"])
-        return False, "mosdns 重启失败(配置可能不合法), 已回滚"
-    return True, f"✅ {which} 上游已设为: {', '.join(addrs)}"
+    t.stage("mosdns_conf", ("\n".join(lines) + "\n").encode("utf-8"))
+    t.service("restart:mosdns")
+    try:
+        res = t.commit()
+    except tx.TxBusy:
+        return False, busy_msg()
+    except tx.TxRefused as e:
+        return False, tx.redact(str(e))
+    except Exception as e:  # noqa: BLE001
+        return False, "配置事务异常(%s)" % type(e).__name__
+    if res["state"] == tx.COMMITTED:
+        return True, f"✅ {which} 上游已设为: {', '.join(addrs)}"
+    if res["state"] == tx.ROLLBACK_FAILED:
+        return False, ("%s\n⚠️ 回滚未完成: %s\n事务材料: %s"
+                       % (res["error"], "、".join(res["rollback_failed_items"]) or "(未知)",
+                          res["dir"]))
+    return False, "%s(已回滚到操作前, 事务 %s)" % (res["error"], res["txid"])
 
 # ── 流媒体/服务解锁: 在「落地出口」与「WDA 解锁」之间整体切换 ──
 # WDA 模式: 这些域名 → jp 直出 + 经 mosdns 用解锁 DNS(22.22.22.22)解析到中继(从本机授权 IP 出)。

@@ -467,6 +467,52 @@ def main():
         bad("stop 失败没被判未恢复: %s" % res)
     box6.clean()
 
+    # ── 12. set_mosdns_upstream 进事务(七的第 1 条) ──
+    import importlib.util as _il
+    box7 = Box(); tx7 = load_tx(box7.env)
+    box7.up("mosdns"); box7.up("mihomo")
+    conf = box7.path("/etc/mosdns/config.yaml")
+    ORIG = ("log:\n  level: info\nplugins:\n  - tag: remote_upstream\n    type: forward\n"
+            "    args: { concurrent: 1, upstreams: [ {addr: \"udp://1.1.1.1\"} ] }\n")
+    with open(conf, "w") as f:
+        f.write(ORIG)
+    spec = _il.spec_from_file_location("pdg_bot_up", ROOT / "deploy/bot/pdg-bot.py")
+    b = _il.module_from_spec(spec); spec.loader.exec_module(b)
+    b.MOSDNS_CONF = conf
+    b.LOCKFILE = box7.env["PDG_LOCKFILE"]
+    # bot 内部 `import pdgtx` 用的是 sys.modules 里那一份 —— 必须按当前沙箱重新导入,
+    # 并在**它**身上换校验器(换 tx7 的没用, 那是另一个模块实例)
+    for _m in list(sys.modules):
+        if _m == "pdgtx":
+            del sys.modules[_m]
+    sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+    bt = b._pdgtx()
+    bt.svc_stable = tx7.svc_stable
+    bt.VALIDATORS["mosdns_probe"] = lambda path, data, ctx: (True, "")
+    okr, msg = b.set_mosdns_upstream("remote", ["udp://9.9.9.9"])
+    got = open(conf).read()
+    if okr and "9.9.9.9" in got:
+        ok("set_mosdns_upstream: 走事务提交并真的落盘")
+    else:
+        bad("上游没设上: %s / %s" % (okr, msg))
+    # 候选过不了强校验 → 现网逐字节不变
+    before = got
+    bt.VALIDATORS["mosdns_probe"] = lambda path, data, ctx: (False, "候选起不来")
+    okr, msg = b.set_mosdns_upstream("remote", ["udp://8.8.8.8"])
+    if not okr and open(conf).read() == before:
+        ok("候选强校验不过 → 现网 mosdns 配置零改动(旧实现是先覆盖再看能不能起来)")
+    else:
+        bad("校验失败仍改了现网: %s" % okr)
+    # 重启失败 → 回到操作前
+    bt.VALIDATORS["mosdns_probe"] = lambda path, data, ctx: (True, "")
+    box7._systemctl(["mosdns"], False)
+    okr, msg = b.set_mosdns_upstream("remote", ["udp://7.7.7.7"])
+    if not okr and open(conf).read() == before:
+        ok("重启失败 → mosdns 配置回到操作前(逐字节)")
+    else:
+        bad("重启失败没回滚: %s / %s" % (okr, open(conf).read()[-40:]))
+    box7.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
