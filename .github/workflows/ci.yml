@@ -175,6 +175,18 @@ jobs:
       - name: "nft input 链冲突判据 (单一来源 + 读不到≠没有 + platform 守卫不靠 PATH 找 nft)"
         run: python3 tests/test-nft-input-scan.py
 
+      - name: "配置事务核心 (状态机/白名单/前置检查/观察期/回滚/审计/runner 固定)"
+        run: python3 tests/test-config-transaction.py
+
+      - name: "配置事务安全边界 (路径穿越/软硬链接/权限/凭据脱敏/恢复漂移保护)"
+        run: python3 tests/test-config-transaction-security.py
+
+      - name: "配置事务故障注入 (锁 fail-closed/并发/before-image/部分替换/回滚失败)"
+        run: python3 tests/test-config-transaction-faults.py
+
+      - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
+        run: bash tests/test-migration-timing.sh
+
       - name: "分流规则→mosdns 劫持同步回归 (指到出口的域名必须被 mosdns 劫持, 否则规则是死的)"
         run: python3 tests/test-rule-hijack-sync.py
 

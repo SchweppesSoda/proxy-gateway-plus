@@ -795,10 +795,37 @@ def check_nft_input_chains():
     return ("ok", "input 链冲突", "只有 table inet pdg 挂在 hook input 上")
 
 
+def check_transactions():
+    """未完成的配置事务 —— 停在 APPLYING/ROLLING_BACK 的那种。
+
+    doctor 只**报告**, 绝不代为恢复: 恢复要写现网、要拿写锁, 那是 `pdg tx recover` 的事;
+    自检必须保持只读, 否则"跑个 doctor 顺手改了配置"就是下一个惊喜。"""
+    try:
+        import pdgtx
+    except Exception:  # noqa: BLE001
+        return None                      # 老机器还没有事务核心: 不显示这一项
+    try:
+        pend = pdgtx.pending_recovery()
+    except Exception:  # noqa: BLE001
+        return ("warn", "配置事务", "读不到事务目录, 无法确认是否有未完成事务")
+    if not pend:
+        recent = pdgtx.list_tx(limit=1)
+        note = ("最近一笔: %s %s" % (recent[0].get("op"), recent[0].get("state"))) if recent \
+            else "暂无记录"
+        return ("ok", "配置事务", "没有未完成的事务(" + note + ")")
+    worst = "fail" if any(m.get("state") == "ROLLBACK_FAILED" for m in pend) else "warn"
+    items = "; ".join("%s(%s, %s)" % (m.get("txid"), m.get("op"), m.get("state")) for m in pend[:3])
+    return (worst, "配置事务",
+            "有 %d 笔未完成的配置事务: %s —— 在处理之前, 新的写操作会被拒绝。"
+            "请运行 <code>sudo pdg tx show &lt;id&gt;</code> 查看, 再用 "
+            "<code>sudo pdg tx recover &lt;id&gt;</code> 恢复。" % (len(pend), items))
+
+
 ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mem,
-       check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm]
+       check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
+       check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加
