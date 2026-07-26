@@ -104,11 +104,23 @@ PY
 # 取不到就如实判失败(不 SKIP 冒充通过)。
 e2e_fetch_mosdns || true
 if command -v mosdns >/dev/null 2>&1; then
-  r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$BAD_CONF")"
-  grep -q '^PROBE|fail' <<<"$r" && ok "netns 探针: 坏配置被判失败($(cut -d'|' -f3 <<<"$r" | head -c 40))" \
-    || bad "netns 探针没判出坏配置: $r"
-  r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$GOOD_CONF")"
-  grep -q '^PROBE|ok' <<<"$r" && ok "netns 探针: 现网配置判通过(不误杀)" || bad "netns 误判好配置: $r"
+  # netns 要 CAP_SYS_ADMIN: CI 的非特权容器里用不了。用不了不是"跳过", 而是**换一条断言**——
+  # 强制 netns 模式必须如实报"不可用"(不能悄悄降级放行), 且 auto 模式要能退到高端口探针。
+  if unshare -n true 2>/dev/null; then
+    r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$BAD_CONF")"
+    grep -q '^PROBE|fail' <<<"$r" && ok "netns 探针: 坏配置被判失败($(cut -d'|' -f3 <<<"$r" | head -c 40))" \
+      || bad "netns 探针没判出坏配置: $r"
+    r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$GOOD_CONF")"
+    grep -q '^PROBE|ok' <<<"$r" && ok "netns 探针: 好配置判通过(不误杀)" || bad "netns 误判好配置: $r"
+  else
+    r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$GOOD_CONF")"
+    { grep -q '^PROBE|fail' <<<"$r" && grep -q '不可用' <<<"$r"; } \
+      && ok "本环境没有 netns 能力: 强制 netns 模式如实报不可用(不降级放行)" \
+      || bad "netns 不可用时的行为不对: $r"
+    r="$(PDG_TX_MOSDNS_PROBE_MODE=auto probe auto "$GOOD_CONF")"
+    grep -q '^PROBE|ok' <<<"$r" && ok "auto 模式退到高端口探针并判好配置通过" \
+      || bad "auto 没能退到高端口探针: $r"
+  fi
   r="$(PDG_TX_MOSDNS_PROBE_MODE=port probe port "$BAD_CONF")"
   grep -q '^PROBE|fail' <<<"$r" && ok "高端口探针: 坏配置被判失败" || bad "高端口探针没判出坏配置: $r"
   # 两条都不可用: 直接把 mosdns 二进制藏起来(裁剪 PATH 会把 tail 之类也弄丢, 反而测不出东西)
