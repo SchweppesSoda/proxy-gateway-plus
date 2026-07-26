@@ -243,5 +243,3 @@ exit 0
     def clean(self):
         self.stop_probes()
         shutil.rmtree(self.root, ignore_errors=True)
-
-
