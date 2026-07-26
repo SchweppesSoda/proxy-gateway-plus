@@ -2904,18 +2904,23 @@ def set_dot_domain(domain):
         return False, f"certbot 执行异常: {e}"
     if r.returncode != 0:
         return False, "证书签发失败:\n" + (r.stdout + r.stderr)[-500:]
+    # 签发是**外部动作**(ACME/CA 说了算, 不可回滚), 部署到生产才是本项目的事务:
+    # 证书两个文件 + 活动域名标记 + mosdns 重启要么一起成, 要么一起回到旧证书 ——
+    # 旧实现是逐个 copy 后直接 restart, 中途失败就可能留下"新证书配旧域名"甚至 DoT 直接不可用。
     live = f"/etc/letsencrypt/live/{domain}"
     try:
-        os.makedirs(CERT_DIR, exist_ok=True)
-        shutil.copy(f"{live}/fullchain.pem", os.path.join(CERT_DIR, "fullchain.pem"))
-        shutil.copy(f"{live}/privkey.pem", os.path.join(CERT_DIR, "privkey.pem"))
-        os.chmod(os.path.join(CERT_DIR, "fullchain.pem"), 0o644)
-        os.chmod(os.path.join(CERT_DIR, "privkey.pem"), 0o600)
-        with open("/opt/pdg-bot/dot-domain", "w") as f:
-            f.write(domain + "\n")
-    except Exception as e:  # noqa: BLE001
-        return False, f"证书已签发但部署失败: {e}"
-    sh(["systemctl", "restart", "mosdns"])
+        with open(f"{live}/fullchain.pem", "rb") as f:
+            chain = f.read()
+        with open(f"{live}/privkey.pem", "rb") as f:
+            key = f.read()
+    except OSError as e:
+        return False, "证书已签发但读取失败(%s), 生产仍在用原来的证书。" % type(e).__name__
+    ok, msg = tx_apply("dot_cert_deploy", files={
+        "cert_fullchain": chain, "cert_privkey": key,
+        "dot_marker": (domain + "\n").encode("utf-8")})
+    if not ok:
+        return False, ("证书已签发, 但部署到生产失败 —— **仍在使用原来的证书**, DoT 未受影响。\n"
+                       + msg)
     global _DOT_HOST
     _DOT_HOST = None  # 让 _dot_host() 重新读新证书 CN
     _renew = ("• iOS: 重新生成一次「📱 iOS 描述文件」即可(自动用新域名)" if _platform() == "ios"

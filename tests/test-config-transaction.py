@@ -251,6 +251,50 @@ def main():
     else:
         bad("runner 漂移没被拒绝: rc=%s %s" % (r.returncode, r.stderr[:120]))
 
+    # ── 13. DoT 证书部署: 三个目标一起提交; 任一步失败继续用旧证书 ──
+    box6 = Box(); tx6 = load_tx(box6.env)
+    box6.up("mosdns")
+    old_chain = b"-----BEGIN CERTIFICATE-----\nOLD\n-----END CERTIFICATE-----\n"
+    old_key = b"-----BEGIN PRIVATE KEY-----\nOLD\n-----END PRIVATE KEY-----\n"
+    box6.put("/etc/mosdns/certs/fullchain.pem", old_chain, 0o644)
+    box6.put("/etc/mosdns/certs/privkey.pem", old_key, 0o600)
+    box6.put("/opt/pdg-bot/dot-domain", b"old.example.com\n", 0o644)
+    new_chain = b"-----BEGIN CERTIFICATE-----\nNEW\n-----END CERTIFICATE-----\n"
+    new_key = b"-----BEGIN PRIVATE KEY-----\nNEW\n-----END PRIVATE KEY-----\n"
+    t = tx6.Tx("bot", "dot_cert_deploy")
+    t.stage("cert_fullchain", new_chain)
+    t.stage("cert_privkey", new_key)
+    t.stage("dot_marker", b"new.example.com\n")
+    t.service("restart:mosdns")
+    res = t.commit()
+    if res["state"] == tx6.COMMITTED and box6.read("/etc/mosdns/certs/privkey.pem") == new_key \
+            and box6.read("/opt/pdg-bot/dot-domain") == b"new.example.com\n":
+        ok("证书部署: 证书 + 私钥 + 活动域名标记一笔事务提交")
+    else:
+        bad("证书部署失败: %s" % res)
+    st = os.stat(box6.path("/etc/mosdns/certs/privkey.pem"))
+    if st.st_mode & 0o777 == 0o600:
+        ok("私钥保持 0600(权限随 before-image 还原, 不被候选带偏)")
+    else:
+        bad("私钥权限变成 %o" % (st.st_mode & 0o777))
+    # mosdns 起不来 → 全部回到旧证书
+    box7 = Box(svc_fail=["mosdns"]); tx7 = load_tx(box7.env)
+    box7.up("mosdns")
+    box7.put("/etc/mosdns/certs/fullchain.pem", old_chain, 0o644)
+    box7.put("/etc/mosdns/certs/privkey.pem", old_key, 0o600)
+    box7.put("/opt/pdg-bot/dot-domain", b"old.example.com\n", 0o644)
+    t = tx7.Tx("bot", "dot_cert_deploy")
+    t.stage("cert_fullchain", new_chain); t.stage("cert_privkey", new_key)
+    t.stage("dot_marker", b"new.example.com\n"); t.service("restart:mosdns")
+    res = t.commit()
+    if res["state"] == tx7.ROLLED_BACK and box7.read("/etc/mosdns/certs/fullchain.pem") == old_chain \
+            and box7.read("/etc/mosdns/certs/privkey.pem") == old_key \
+            and box7.read("/opt/pdg-bot/dot-domain") == b"old.example.com\n":
+        ok("部署后 mosdns 起不来 → 证书/私钥/域名标记全部回到旧的(DoT 继续可用)")
+    else:
+        bad("证书回滚不完整: %s" % res)
+    box6.clean(); box7.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

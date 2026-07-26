@@ -19,6 +19,29 @@ fi
 
 # DoT 证书目录 (mosdns dot_server 读这里)。默认 /etc/mosdns/certs; 旧机可用 PDG_CERT_DIR 覆盖。
 CERT_DIR="${PDG_CERT_DIR:-/etc/mosdns/certs}"
+
+# 续期后把新证书部署到生产: 走统一配置事务(与 Bot 的 set_dot_domain 同一条路径)——
+# 两个文件 + mosdns 重启要么一起成, 要么一起回到旧证书。事务核心不在(极老的机器/半装状态)
+# 时退回旧的直接 cp, 但会明确说出来, 不假装做了事务。
+TX=""
+for m in /opt/privdns-gateway/deploy/bot/pdgtx.py /opt/pdg-bot/pdgtx.py; do
+    [[ -f "$m" ]] && { TX="$m"; break; }
+done
+if [[ -n "$TX" ]] && command -v python3 >/dev/null 2>&1; then
+    ID="$(python3 "$TX" new --source certbot --op cert_renew 2>/dev/null)"
+    if [[ -n "$ID" ]] \
+       && python3 "$TX" stage --tx "$ID" --target cert_fullchain --file "$LIVE_DIR/fullchain.pem" \
+       && python3 "$TX" stage --tx "$ID" --target cert_privkey  --file "$LIVE_DIR/privkey.pem" \
+       && python3 "$TX" service --tx "$ID" --action restart:mosdns; then
+        if python3 "$TX" apply --tx "$ID"; then
+            exit 0
+        fi
+        echo "[!] 新证书部署失败, 生产仍在使用原来的证书(事务 $ID)"
+        exit 1
+    fi
+    echo "[!] 事务准备失败, 回退到直接部署"
+fi
+
 mkdir -p "$CERT_DIR"
 cp "$LIVE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
 cp "$LIVE_DIR/privkey.pem"   "$CERT_DIR/privkey.pem"

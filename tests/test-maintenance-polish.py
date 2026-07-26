@@ -67,9 +67,14 @@ assert "bash /usr/local/bin/pdg __migrate" in cmd_update, (
     "cmd_update must re-invoke the freshly-installed script for migrations, not call old in-memory funcs"
 )
 assert "__migrate)" in pdg and "run_all_migrations" in pdg, "hidden __migrate subcommand + run_all_migrations must exist"
-assert "status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm|__migrate)" in pdg, (
-    "__migrate must be excluded from the pre-dispatch auto-migrate block to avoid double-running"
+# 5.1: 分派前的隐藏迁移整块取消了 —— 断言反过来: 分派段里不能再有 run_all_migrations,
+# 迁移只经 `pdg __migrate`(update 内部, 快照之后)或显式 `pdg migrate`(先锁先快照)发生。
+_disp = pdg.split("case \"${1:-menu}\" in", 1)[0].rsplit("cmd_tx(){", 1)[-1]
+assert "run_all_migrations" not in "\n".join(
+    l for l in _disp.splitlines() if not l.strip().startswith("#")), (
+    "命令分派前不得再有隐藏迁移(菜单/restart 会在用户不知情时改配置)"
 )
+assert "migrate)       cmd_migrate;;" in pdg, "必须提供显式的事务化迁移命令 pdg migrate"
 
 # P2-2: snapshot 包含 journald drop-in(正确+历史错路径), rollback 重启 journald
 snapshot = block_after(pdg, "cmd_snapshot()", window=2600)   # cand 扩到含已装脚本 + 全部 unit 后更长
