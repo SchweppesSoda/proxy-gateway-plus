@@ -89,11 +89,17 @@ _pdg_nft_strip_gms(){
 
 # 串行化"会写配置/重启服务"的操作(update/rollback/snapshot), 防 bot 更新按钮与命令行并发。
 # 嵌套调用(update→snapshot)只锁一次。read-only 操作(status/doctor/report/log)不加锁。
-LOCK="/run/privdns-gateway.lock"
+LOCK="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
 PDG_LOCKED=""
 _lock(){
   [[ -n "$PDG_LOCKED" ]] && return 0
-  exec 9>"$LOCK" 2>/dev/null || return 0
+  # 打不开锁文件 → **拒绝执行**(fail-closed)。以前这里 `|| return 0` 继续往下写: 而
+  # /run 出问题往往正意味着系统不正常, 恰恰是最不该让两个进程同时改配置的时候。
+  if ! exec 9>"$LOCK" 2>/dev/null; then
+    echo "⛔ 锁文件不可用($LOCK) —— 为避免并发写坏配置, 本次拒绝执行。"
+    echo "   请检查 /run 是否可写(磁盘满/只读挂载/权限), 修好后重试。"
+    exit 1
+  fi
   flock -n 9 || { echo "⛔ 已有 pdg 操作在运行, 请稍后再试 (锁: $LOCK)"; exit 1; }
   PDG_LOCKED=1
 }
@@ -129,7 +135,7 @@ _journald_set_key(){
 }
 
 # 原子 upsert: 只更新 profile.env 里的 key=val 这一行, 其余键/注释/未知项原样保留。
-# 语义与 pdg-bot.py 的 _profile_set 一致(去前导空白后以 key= 开头才算命中; #key= 注释不算)。
+# 语义与 pdg-bot.py 的 _profile_text_with 一致(去前导空白后以 key= 开头才算命中; #key= 注释不算)。
 # 重复(多行同键)规范为一个有效值(保首个位置, 丢后续); 缺失则追加; 文件不存在则创建。
 # 临时文件 + mv 原子替换: 失败不留半截/空文件。返回非 0 表示写入失败。
 _profile_set(){
@@ -950,6 +956,7 @@ cmd_update(){
     || ! install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py       /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/checks.py            /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py             /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/doctor.py            /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/ \
@@ -1542,53 +1549,244 @@ PY
 # 只删 tag=in-gms-5228/5229/5230 的入站 + 从原装端口集/ mihomo REDIRECT 移除 5228-5230。
 # 改前备份, sing-box/nft 均校验, 失败自动还原; 自定义配置不动。$1/$2 供测试注入。
 # shellcheck disable=SC2120
+# iOS GMS 残留清理 —— **CLI 侧的精确事务**(不复用 Python pdgtx: 这里已经在 pdg.sh 的 _lock
+# 里, 再让 pdgtx 去抢同一把 flock 会自锁; 而"释放锁/跳过锁/信任调用方已锁"三种绕法都会把并发
+# 保护弄没)。它按事务的规矩来: 候选先行 → 全部校验通过才落盘 → 固定顺序应用 → 任一步失败按
+# before-image 完整回滚并复核 → 结果如实传播(非 0)。三个目标: canonical model、渲染出的内核
+# 配置、nftables 配置(含运行态)。
 migrate_ios_gms_cleanup(){
   [[ "$(_pdg_platform)" == ios ]] || return 0
   local sb="${1:-/etc/sing-box/config.json}" nf="${2:-/etc/nftables.conf}"
-  # 1) sing-box canonical model: 删 in-gms-* 入站
-  # 不再硬要求 sing-box 二进制: mihomo-only 机器上根本没有它, 整步会被静默跳过 → 残留
-  # 永远清不掉(例如从 Android 备份恢复之后)。校验改用**当前内核**, 见下。
-  if [[ -f "$sb" ]] && grep -q '"in-gms-5228"' "$sb"; then
-    local bak; bak="$sb.preiosgms.$(date +%s)"
-    if cp -a "$sb" "$bak" 2>/dev/null && cmp -s "$sb" "$bak"; then
-      if python3 - "$sb" <<'PY'
+  # 内核配置 / 工作目录根 / bot 模块位置都可用 env 覆盖 —— 生产是默认值, 沙箱用例据此在
+  # 临时树里跑真实现(不打桩被测逻辑)。
+  local mh="${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}"
+  local statedir="${PDG_STATE_DIR:-/var/lib/privdns-gateway}"
+  local botpy="${PDG_BOT_PY:-/opt/pdg-bot/bot.py}"
+  # nft 位置用项目统一判据(_pdg_nft_bin): `command -v nft` 只看 PATH, 而 nft 常在 /usr/sbin ——
+  # PATH 里没有 sbin 时会"跳过校验与应用却照样写配置并报成功", 那正是要避免的。
+  local nftexe; nftexe="$(_pdg_nft_bin)"
+  local need_sb=0 need_nf=0
+  [[ -f "$sb" ]] && grep -q '"in-gms-5228"' "$sb" && need_sb=1
+  [[ -f "$nf" ]] && grep -qE 'tcp dport [{][^}]*5228' "$nf" && need_nf=1
+  # 幂等: 没有残留就一个字节都不改、一个服务都不重启
+  [[ "$need_sb" == 1 || "$need_nf" == 1 ]] || return 0
+
+  # 工作目录放 /var/lib(0700), 不放 /tmp —— before-image 里的 model 带出口凭据
+  local wd rc=0 applied=() step=""
+  mkdir -p "$statedir" 2>/dev/null
+  wd="$(mktemp -d "$statedir/iosgms.XXXXXX" 2>/dev/null)" || {
+    c_y "  iOS GMS 清理: 建不出工作目录 → 跳过本次(未改动任何文件)"; return 1; }
+  chmod 700 "$wd"
+
+  # ── 1) before-image: 逐个文件记"原本存在/不存在 + 权限", 内容留在 0600 的副本里 ──
+  # ① 形态守卫: 事务目标必须是**受控普通文件**。软链会让 `cp -a` 把链接原样搬进候选目录,
+  #    随后的 chmod / python 写入 / sed -i 就直接改到现网(甚至改到链接指向的别处), 而 before-image
+  #    也不再是真正的旧内容; 硬链接则会让"只改这一个文件"波及另一个名字。
+  #    这一步必须在任何 cp / chmod / stat / python / sed 之前完成, 拒绝时现网、链接目标、权限
+  #    与服务状态都还没被碰过。
+  local f name g
+  for g in "$sb:config.json" "$mh:config.yaml" "$nf:nftables.conf"; do
+    f="${g%%:*}"
+    if [[ -L "$f" ]]; then
+      c_y "  iOS GMS 清理: $f 是符号链接, 事务目标只接受普通文件 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+    [[ -e "$f" ]] || continue                     # 不存在: absent 语义, 下面照旧
+    if [[ ! -f "$f" ]]; then
+      c_y "  iOS GMS 清理: $f 不是普通文件 → 未改动任何文件"; rm -rf "$wd"; return 1
+    fi
+    local _nl; _nl="$(stat -c '%h' "$f" 2>/dev/null)"
+    if [[ -z "$_nl" ]]; then
+      c_y "  iOS GMS 清理: 取不到 $f 的 stat 信息 → 未改动任何文件"; rm -rf "$wd"; return 1
+    fi
+    if [[ "$_nl" != 1 ]]; then
+      c_y "  iOS GMS 清理: $f 是硬链接(nlink=$_nl), 改它会波及另一个名字 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+  done
+  # ② before-image: 逻辑名固定为 config.json / config.yaml / nftables.conf —— 与落盘、回滚共用
+  #    同一套键名(用 basename 当键会在路径被 env 换过时对不上)。**内容用读写复制**而不是 cp -a,
+  #    这样材料一定是工作目录里的独立普通文件。mode/uid/gid 取不到就拒(不许猜 600 / 0:0 —— 那会
+  #    在成功提交时悄悄改掉属主)。
+  for g in "$sb:config.json" "$mh:config.yaml" "$nf:nftables.conf"; do
+    f="${g%%:*}"; name="${g##*:}"
+    if [[ -f "$f" ]]; then
+      local _m _o
+      _m="$(stat -c '%a' "$f" 2>/dev/null)"; _o="$(stat -c '%u:%g' "$f" 2>/dev/null)"
+      if [[ -z "$_m" || -z "$_o" ]]; then
+        c_y "  iOS GMS 清理: 取不到 $name 的权限/归属 → 未改动任何文件"; rm -rf "$wd"; return 1
+      fi
+      ( umask 177; cat "$f" > "$wd/before-$name" ) 2>/dev/null \
+        || { c_y "  iOS GMS 清理: 存 before-image 失败($name) → 未改动任何文件"; rm -rf "$wd"; return 1; }
+      chmod 600 "$wd/before-$name"
+      printf '%s\n' "$_m" > "$wd/mode-$name"
+      printf '%s\n' "$_o" > "$wd/own-$name"
+      echo 1 > "$wd/existed-$name"
+    else
+      echo 0 > "$wd/existed-$name"
+    fi
+  done
+
+  # ── 2) 候选: 全部在工作目录里生成, 生产文件此刻一个字节都没动 ──
+  if [[ "$need_sb" == 1 ]]; then
+    ( umask 177; cat "$sb" > "$wd/cand-config.json" ) 2>/dev/null \
+      && chmod 600 "$wd/cand-config.json" || rc=1
+    if [[ $rc == 0 ]] && ! python3 - "$wd/cand-config.json" <<'PY'
 import json, sys
-f = sys.argv[1]; c = json.load(open(f))
-c["inbounds"] = [i for i in c.get("inbounds", []) if i.get("tag") not in ("in-gms-5228", "in-gms-5229", "in-gms-5230")]
-json.dump(c, open(f, "w"), ensure_ascii=False, indent=2)
+f = sys.argv[1]
+c = json.load(open(f))
+c["inbounds"] = [i for i in c.get("inbounds", [])
+                 if i.get("tag") not in ("in-gms-5228", "in-gms-5229", "in-gms-5230")]
+with open(f, "w") as fh:
+    json.dump(c, fh, ensure_ascii=False, indent=2)
 PY
-      then
-        # 用内核校验: canonical model 是渲染源, 得重渲染再 `mihomo -t`;
-        # 内核不可用时(装到一半/沙盒), JSON 解析通过即接受(model 本身不被直接执行)。
-        local _vok=0
-        if command -v mihomo >/dev/null 2>&1; then
-          if ( cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1 \
-             && mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then _vok=1; fi
-        else
-          _vok=1
-        fi
-        if [[ "$_vok" == 1 ]]; then
-          systemctl restart "$(_pdg_core_svc)" 2>/dev/null; sleep 1
-          if [[ "$(systemctl is-active "$(_pdg_core_svc)" 2>/dev/null)" == active ]]; then
-            rm -f "$bak"; c_g "  iOS: 已移除 sing-box GMS 入站(in-gms-5228/5229/5230)。"
-          else c_y "  内核重启失败 → 还原。"; cp -a "$bak" "$sb"; systemctl restart "$(_pdg_core_svc)" 2>/dev/null; fi
-        else c_y "  内核校验未过 → 还原。"; cp -a "$bak" "$sb"; fi
-      else c_y "  生成失败 → 还原。"; cp -a "$bak" "$sb"; fi
-    else rm -f "$bak" 2>/dev/null; fi
-  fi
-  # 2) nft: 只从**端口集**精确移除 5228-5230(复用 _pdg_nft_strip_gms, 保留整条 { 80, 443 } redirect),
-  #    绝不按行删 redirect。仅当端口集(非注释)真含 5228 才动; 剥完仍残留=自定义形态 → 还原不破坏(交 doctor warn)。
-  if [[ -f "$nf" ]] && grep -qE 'tcp dport [{][^}]*5228' "$nf"; then
-    local bak; bak="$nf.preiosgms.$(date +%s)"
-    if cp -a "$nf" "$bak" 2>/dev/null; then
-      _pdg_nft_strip_gms "$nf"
-      if grep -qE 'tcp dport [{][^}]*5228' "$nf"; then
-        c_y "  防火墙 5228-5230 非原装形态, 未自动改(交 doctor); 已还原。"; cp -a "$bak" "$nf" 2>/dev/null; rm -f "$bak"
-      elif nft -c -f "$nf" >/dev/null 2>&1; then
-        nft -f "$nf" 2>/dev/null || true; rm -f "$bak"; c_g "  iOS: 已从防火墙端口集移除 GMS 5228-5230(保留 80/443 redirect)。"
-      else c_y "  nft 校验失败 → 还原。"; cp -a "$bak" "$nf" 2>/dev/null; nft -f "$nf" 2>/dev/null || true; rm -f "$bak"; fi
+    then rc=1; fi
+    [[ $rc == 0 ]] || { c_y "  iOS GMS 清理: 生成候选 model 失败 → 未改动任何文件"; rm -rf "$wd"; return 1; }
+    # 候选 mihomo 配置: 从**候选 model** 渲染(不写生产文件), 顺带用与 Bot 相同的判据拦
+    # unknown_proxies / dropped —— 那两类是"静默丢出口/丢分流", 必须在落盘前拒。
+    if ! PDG_BOT_PY="$botpy" python3 - "$wd/cand-config.json" "$wd/cand-mihomo.yaml" <<'PY' 2>"$wd/render.err"
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("bot", os.environ["PDG_BOT_PY"])
+bot = importlib.util.module_from_spec(spec); spec.loader.exec_module(bot)
+data = open(sys.argv[1], "rb").read()
+out = bot._mihomo_derive({"model": data})       # dropped / 无法转换的出口在这里被拒
+open(sys.argv[2], "wb").write(out)
+PY
+    then
+      c_y "  iOS GMS 清理: 候选内核配置渲染/校验未过 → 未改动任何文件"
+      sed -n '$p' "$wd/render.err" 2>/dev/null | sed 's/^/    /'
+      rm -rf "$wd"; return 1
+    fi
+    chmod 600 "$wd/cand-mihomo.yaml"
+    if command -v mihomo >/dev/null 2>&1; then
+      if ! mihomo -t -d /etc/mihomo -f "$wd/cand-mihomo.yaml" >/dev/null 2>&1; then
+        c_y "  iOS GMS 清理: 候选内核配置 mihomo -t 未过 → 未改动任何文件"; rm -rf "$wd"; return 1
+      fi
     fi
   fi
+  if [[ "$need_nf" == 1 ]]; then
+    # 这一步要改防火墙 → 没有可用的 nft 就**不许往下走**(以前会静默跳过校验与应用)
+    if [[ -z "$nftexe" || ! -x "$nftexe" ]]; then
+      c_y "  iOS GMS 清理: 找不到可执行的 nft, 无法校验/应用防火墙 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+    # 旧配置文件必须在: 回滚运行态要靠"用旧配置再 nft -f 一次"。不在就别开始改运行态。
+    if [[ ! -f "$nf" ]]; then
+      c_y "  iOS GMS 清理: $nf 不存在, 无法保证运行态可回滚 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+    ( umask 177; cat "$nf" > "$wd/cand-nftables.conf" ) 2>/dev/null \
+      || { c_y "  iOS GMS 清理: 复制 nft 配置失败 → 未改动任何文件"; rm -rf "$wd"; return 1; }
+    _pdg_nft_strip_gms "$wd/cand-nftables.conf"
+    if grep -qE 'tcp dport [{][^}]*5228' "$wd/cand-nftables.conf"; then
+      # 剥完还在 = 自定义形态, 不猜也不动(交 doctor warn), 但这不是失败
+      c_y "  防火墙 5228-5230 非原装形态, 未自动改(交 doctor)"; need_nf=0
+    elif ! "$nftexe" -c -f "$wd/cand-nftables.conf" >/dev/null 2>&1; then
+      c_y "  iOS GMS 清理: 候选防火墙 nft -c 未过 → 未改动任何文件"; rm -rf "$wd"; return 1
+    fi
+  fi
+  [[ "$need_sb" == 1 || "$need_nf" == 1 ]] || { rm -rf "$wd"; return 0; }
+
+  # ── 3) 回滚: 逐文件按 before-image 还原 + 复核 SHA + nft 运行态 + 内核稳定 ──
+  _iosgms_restore(){
+    local bad=() g name src
+    for g in "$sb:config.json" "$mh:config.yaml" "$nf:nftables.conf"; do
+      f="${g%%:*}"; name="${g##*:}"
+      [[ " ${applied[*]} " == *" $name "* ]] || continue
+      if [[ "$(cat "$wd/existed-$name" 2>/dev/null)" == 1 ]]; then
+        local want_mode want_own
+        want_mode="$(cat "$wd/mode-$name")"; want_own="$(cat "$wd/own-$name" 2>/dev/null || echo 0:0)"
+        install -m "$want_mode" "$wd/before-$name" "$f" 2>/dev/null || bad+=("$name 写回失败")
+        # 回滚阶段允许尽力执行(非 root 环境 chown 必失败), 但**最终以下面的逐项复核为准** ——
+        # 复核不过就是 rollback incomplete, 不存在"chown 失败却算还原成功"。
+        chown "$want_own" "$f" 2>/dev/null || true
+        cmp -s "$wd/before-$name" "$f" || bad+=("$name 内容未还原")
+        [[ "$(stat -c '%a' "$f" 2>/dev/null)" == "$want_mode" ]] || bad+=("$name 权限未还原")
+        [[ "$(stat -c '%u:%g' "$f" 2>/dev/null)" == "$want_own" ]] || bad+=("$name 归属未还原")
+      else
+        # 原本不存在的必须回到"不存在", 不许留下我们造出来的文件
+        rm -f "$f" 2>/dev/null
+        [[ -e "$f" ]] && bad+=("$name 本应不存在却还在")
+      fi
+    done
+    # 只要 apply **被尝试过**就必须重放旧配置: 磁盘文件在上面已经还原, 这里用它把内核里的
+    # 规则也拉回操作前, 并检查返回码 —— 第二次也失败就必须如实说"回滚不完整"。
+    if [[ " ${applied[*]} " == *" nft-apply "* ]]; then
+      if [[ -z "$nftexe" || ! -x "$nftexe" ]]; then
+        bad+=("找不到 nft, 无法确认防火墙运行态已还原")
+      elif ! "$nftexe" -f "$nf" >/dev/null 2>&1; then
+        bad+=("nft 运行态未还原(用旧配置重新加载失败)")
+      fi
+    fi
+    if [[ " ${applied[*]} " == *" core-restart "* ]]; then
+      systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 || bad+=("内核重启失败")
+      _core_kernel_stable "$(_pdg_core_svc)" >/dev/null 2>&1 || bad+=("内核未稳定运行")
+    fi
+    if [[ ${#bad[@]} -gt 0 ]]; then
+      c_r "  ⚠️ iOS GMS 清理失败, 而且**回滚不完整**: ${bad[*]}"
+      c_y "     回滚材料保留在 $wd —— 请据此人工修复(内含恢复前的原文件)"
+      return 1
+    fi
+    c_y "  已回滚: model / 内核配置 / 防火墙 均还原到清理前, 内核稳定运行。"
+    rm -rf "$wd"; return 0
+  }
+
+  # ── 4) 落盘: 固定顺序 + 同目录临时文件 + 原子替换(绝不截断生产文件后再写) ──
+  _iosgms_put(){  # $1=候选 $2=目标 $3=记账名
+    # 原本存在的目标: 临时文件在 mv **之前**就设成原 mode/uid/gid —— 以 root 跑时, 只保 mode
+    # 会把非 root:root 的文件悄悄换成 root:root。chmod/chown 任一步失败就不许覆盖生产。
+    # 原本不存在的: 用该目标的明确默认 mode, owner 就是当前执行用户(生产由 need_root 保证是
+    # root), 不伪造"恢复旧 owner"。
+    local d t want_mode want_own
+    d="$(dirname "$2")"; t="$d/.pdg-iosgms.$$"
+    if [[ "$(cat "$wd/existed-$3" 2>/dev/null)" == 1 ]]; then
+      want_mode="$(cat "$wd/mode-$3")"; want_own="$(cat "$wd/own-$3")"
+    else
+      case "$3" in nftables.conf) want_mode=644;; *) want_mode=600;; esac
+      want_own="$(id -u):$(id -g)"
+    fi
+    cp -f "$1" "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+    chmod "$want_mode" "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+    chown "$want_own" "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+    mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; return 1; }
+    applied+=("$3")
+    # 落盘后复核: 内容 + 权限 + 归属都必须是期望值(不复核就等于"写了就算成功")
+    cmp -s "$1" "$2" || return 1
+    [[ "$(stat -c '%a' "$2" 2>/dev/null)" == "$want_mode" ]] || return 1
+    [[ "$(stat -c '%u:%g' "$2" 2>/dev/null)" == "$want_own" ]] || return 1
+    return 0
+  }
+  if [[ "$need_sb" == 1 ]]; then
+    step="model";        _iosgms_put "$wd/cand-config.json"    "$sb" config.json  || rc=1
+    [[ $rc == 0 ]] && { step="内核配置"; _iosgms_put "$wd/cand-mihomo.yaml" "$mh" config.yaml || rc=1; }
+  fi
+  if [[ $rc == 0 && "$need_nf" == 1 ]]; then
+    step="防火墙配置"; _iosgms_put "$wd/cand-nftables.conf" "$nf" nftables.conf || rc=1
+    if [[ $rc == 0 ]]; then
+      # **先记账再执行**: nft -f 可能改了一部分内核状态之后才返回非 0, 那时运行态已经不是
+      # 操作前的样子了 —— 只在成功后记账会让回滚只还原磁盘文件, 内核里留着半套规则。
+      step="nft apply"; applied+=("nft-apply")
+      "$nftexe" -f "$nf" >/dev/null 2>&1 || rc=1
+    fi
+  fi
+  if [[ $rc == 0 && "$need_sb" == 1 ]]; then
+    step="重启内核"
+    systemctl reset-failed "$(_pdg_core_svc)" >/dev/null 2>&1
+    if systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1; then
+      applied+=("core-restart")
+      _core_kernel_stable "$(_pdg_core_svc)" >/dev/null 2>&1 || { step="内核稳定观察"; rc=1; }
+    else
+      applied+=("core-restart"); rc=1
+    fi
+  fi
+  if [[ $rc != 0 ]]; then
+    c_y "  iOS GMS 清理在「$step」失败 → 回滚"
+    _iosgms_restore || return 1
+    return 1
+  fi
+  [[ "$need_sb" == 1 ]] && c_g "  iOS: 已移除 GMS 入站(in-gms-5228/5229/5230)并同步内核配置。"
+  [[ "$need_nf" == 1 ]] && c_g "  iOS: 已从防火墙端口集移除 GMS 5228-5230(保留 80/443 redirect)。"
+  rm -rf "$wd"
   return 0
 }
 
@@ -1701,7 +1899,11 @@ run_all_migrations(){
   migrate_mosdns_hijack_shape || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
-  migrate_android_cleanup || true; migrate_ios_gms_cleanup || true   # 平台隔离清理(各自平台内幂等)
+  migrate_android_cleanup || true
+  # iOS GMS 清理**失败必须传出**: 它会动 model + 内核配置 + 防火墙三样, 失败即现网可能与
+  # 期望形态不一致(它自己会完整回滚, 但回滚不完整时更要让上层知道)。以前是 `|| true`,
+  # 于是 cmd_update / cmd_migrate / cmd_platform 全都收不到这条失败。
+  migrate_ios_gms_cleanup || rc=1
   # 内核迁移放最后: 上面的 config.json / mosdns / 防火墙 迁移都先按老路子跑完(它们只动数据模型
   # 与 nft, 与内核无关), 这里再把**最终形态的** config.json 转 mihomo 并移除 sing-box 运行时。
   # 唯一"失败必须传出"的迁移 —— 失败即让 __migrate 返回非0,
@@ -2196,8 +2398,14 @@ cmd_platform(){
   if ! _plat_verify "$p"; then
     _plat_rollback; rm -rf "$wd"; return 1
   fi
+  # 关键迁移必须在**删掉回滚材料、宣布成功之前**跑完: 它失败就走 _plat_rollback,
+  # 而 _plat_rollback 依赖 $wd 里的材料 —— 顺序颠倒的话就只能 best-effort 了。
+  if ! migrate_ios_gms_cleanup; then
+    echo "❌ iOS GMS 残留清理失败(详见上方), 平台切换回退"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
   rm -rf "$wd"
-  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑
+  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(GMS 那步已单独跑过)
   c_g "平台已确认: $cur → $p"
   if [[ -x /opt/pdg-bot/doctor.py ]] || [[ -f /opt/pdg-bot/doctor.py ]]; then
     python3 /opt/pdg-bot/doctor.py || c_y "自检有未通过项(见上), 平台切换本身已完成。"
@@ -2254,23 +2462,76 @@ cmd_hijack_mode(){
   echo "✅ 劫持模式 → $mode"
 }
 
-# 下一次以 root 运行"管理类"命令(update/restart/menu/…)时幂等自动迁移防火墙(已迁移则首个 grep 秒退)。
-# 只读命令(status/doctor/log/traffic/report)与卸载不触发, 以保持"只读命令不写任何东西"的语义;
-# 只跑只读命令的用户可显式 `sudo pdg migrate-fw` 迁移(且证书 hook/doctor 已兼容旧 inet filter, 不迁也能用)。
-if [[ $EUID -eq 0 ]]; then
-  case "${1:-menu}" in
-    status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm|__migrate) : ;;   # 只读/卸载/内部迁移: 不重复迁移
-    update|up)
-      # `update --dry-run` 是**查看**命令: 不该在"只是看看有没有新版"时就把迁移跑了
-      # (迁移会改 unit / nft / mosdns 配置)。真正的 update 仍照旧先迁移。
-      [[ "${2:-}" == "--dry-run" ]] || run_all_migrations ;;
-    *) run_all_migrations ;;   # 管理类命令才迁移(idempotent)
-  esac
-fi
+# 显式迁移: 先上锁、先快照, 再跑幂等迁移, 并记一笔审计(source=cli, op=migrate)。
+# 边界说明(不夸大): 迁移内部仍是各自的就地改写 + 局部还原, 尚未逐文件走事务核心的
+# before-image —— 那属于 5.1B。这里保证的是"迁移前一定有可回滚的快照, 且不会在用户
+# 不知情时发生", 失败时明确指出用哪一份快照回退。
+cmd_migrate(){
+  need_root migrate; _lock
+  c_g "迁移前留快照…"
+  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
+    c_y "❌ 快照失败, 拒绝在无法回滚的前提下迁移。"; return 1
+  fi
+  local snap="$_PDG_SNAP_CREATED" rc=0
+  run_all_migrations || rc=$?
+  if [[ $rc == 0 ]]; then
+    _tx_audit cli migrate COMMITTED "snapshot=$snap"
+    c_g "✅ 迁移完成(快照: $snap)"
+    return 0
+  fi
+  _tx_audit cli migrate ROLLBACK_FAILED "snapshot=$snap"
+  c_y "❌ 迁移失败。快照仍在: $snap"
+  c_y "   需要回退时: sudo pdg rollback --dir $snap"
+  return 1
+}
+
+# 往事务审计里补一条记录 —— CLI 侧那些尚未逐文件事务化的操作, 至少要记在同一本账上。
+_tx_audit(){
+  local m
+  for m in "$REPO_DIR/deploy/bot/pdgtx.py" /opt/pdg-bot/pdgtx.py; do
+    [[ -f "$m" ]] || continue
+    python3 - "$m" "$1" "$2" "$3" "${4:-}" <<'TXAUDIT' 2>/dev/null || true
+import importlib.util, json, os, sys, time
+spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
+tx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tx)
+rec = {"ts": time.time(), "txid": tx.new_txid(), "source": sys.argv[2], "op": sys.argv[3],
+       "mode": "normal", "state": sys.argv[4], "targets": [], "services": [], "error": "",
+       "note": tx.redact(sys.argv[5]), "schema_version": tx.SCHEMA_VERSION}
+try:
+    os.makedirs(os.path.dirname(tx.AUDIT), mode=0o700, exist_ok=True)
+    with open(tx.AUDIT, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+except OSError:
+    pass
+TXAUDIT
+    return 0
+  done
+}
+
+# pdg tx: 查看/恢复事务。list/show 是只读的(不取写锁); recover 自己在核心里取同一把锁。
+cmd_tx(){
+  need_root tx
+  local m
+  for m in "$REPO_DIR/deploy/bot/pdgtx.py" /opt/pdg-bot/pdgtx.py; do
+    [[ -f "$m" ]] && { python3 "$m" "$@"; return $?; }
+  done
+  echo "❌ 找不到 pdgtx.py(事务核心缺失)"; return 1
+}
+
+# 5.1: **取消命令分派前的隐藏迁移**。
+# 以前这里对所有管理类命令(含 update)先跑一遍 run_all_migrations —— 那发生在 _lock 之前、
+# 也在 cmd_update 打快照之前: 迁移会改 unit / nft / mosdns, 于是"更新失败回滚"只能回到
+# **已经被迁移改过**的现网, 而用户以为回到了操作前。菜单、restart 这类命令更不该在用户
+# 不知情时改配置。
+# 现在迁移只有两个入口, 都在锁与快照之后: cmd_update 装好新脚本后调用的 `pdg __migrate`,
+# 以及用户显式运行的 `sudo pdg migrate`(先上锁、先快照, 并记一笔审计)。
 
 case "${1:-menu}" in
   menu|"")       menu;;
   __migrate)     need_root __migrate; run_all_migrations;;   # 内部: cmd_update 装好新脚本后据此跑"新版"迁移
+  migrate)       cmd_migrate;;
+  tx)            shift || true; cmd_tx "$@";;
   status|st)     cmd_status;;
   doctor|dr)     shift || true; cmd_doctor "${1:-}";;
   update|up)     shift || true; cmd_update "${1:-}";;
@@ -2287,5 +2548,5 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate-fw|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
 esac

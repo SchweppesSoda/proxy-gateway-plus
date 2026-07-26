@@ -110,8 +110,142 @@ e2e_enter(){
 }
 
 # ── 打桩: 沙盒里没有 systemd / netlink ──────────────────────────────────────
+# 配置事务的硬门探针落点(本地 DNS 应答 + 内核 redir 端口)。沙箱里 mosdns/mihomo 是桩,
+# 真端口上没人听, 而事务的基线门要求"本次要动的组件操作前是好的" —— 那条判据**不该为了测试
+# 而关掉**, 所以这里起真的 socket 顶上, 并把探针落点告诉事务核心(判据本身一行没改)。
+# 端口动态选取: 多个 E2E 在同一台机器上先后跑, 写死端口会互相占用。
+# ── 退出清理 hook(最小实现) ──────────────────────────────────────────────────
+# 各 E2E 脚本自己也要注册清理(e2e-install.sh 的 restore_resolv 就是)。如果谁都直接
+# `trap ... EXIT`, 后设置的会把前面的顶掉。这里只做够用的那一点: 注册**已定义的函数名**,
+# 由统一的 EXIT/INT/TERM/HUP 处理器逐个尽力执行, 且保持原退出码。
+E2E_EXIT_HOOKS=""
+E2E_HOOKS_RUNNING=""
+
+e2e_add_exit_hook(){
+  local fn="$1"
+  declare -F "$fn" >/dev/null || { echo "[!] e2e_add_exit_hook: 没有这个函数: $fn" >&2; return 1; }
+  case " $E2E_EXIT_HOOKS " in *" $fn "*) return 0;; esac      # 幂等
+  E2E_EXIT_HOOKS="${E2E_EXIT_HOOKS:+$E2E_EXIT_HOOKS }$fn"
+  trap 'e2e_run_exit_hooks $?' EXIT
+  trap 'e2e_run_exit_hooks 130; exit 130' INT
+  trap 'e2e_run_exit_hooks 143; exit 143' TERM
+  trap 'e2e_run_exit_hooks 129; exit 129' HUP
+  return 0
+}
+
+e2e_run_exit_hooks(){
+  local rc="${1:-0}" fn
+  [[ -n "$E2E_HOOKS_RUNNING" ]] && return "$rc"               # 不递归
+  E2E_HOOKS_RUNNING=1
+  for fn in $E2E_EXIT_HOOKS; do
+    declare -F "$fn" >/dev/null && { "$fn" || true; }          # 清理失败不掩盖原始失败
+  done
+  return "$rc"
+}
+
+# ── 事务硬门探针的生命周期 ──────────────────────────────────────────────────
+# 旧实现 `setsid python3 /tmp/e2e-tx-probe.py … &` 既不记 PID 也不清理: 每个 E2E 都留一个
+# PPID=1 的孤儿(e2e-install.sh 里多次 e2e_stub_system 就留多个), 它们还持有已删除的 overlay
+# 文件 —— 跑几轮就把磁盘占满, 只能人工 kill 才能继续。
+E2E_TX_PROBE_PID=""
+E2E_TX_PROBE_SCRIPT=""
+E2E_TX_PROBE_PORTS=""
+
+# 这个 PID 现在还是"本实例的探针"吗(PID 复用后别误杀别的进程)
+_e2e_probe_is_mine(){
+  local pid="$1" cl
+  [[ -n "$pid" && -n "$E2E_TX_PROBE_SCRIPT" && -r "/proc/$pid/cmdline" ]] || return 1
+  cl="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+  [[ "$cl" == *"$E2E_TX_PROBE_SCRIPT"* && "$cl" == *"$E2E_TX_PROBE_PORTS"* ]]
+}
+
+e2e_tx_probe_stop(){
+  local pid="$E2E_TX_PROBE_PID" n=0
+  if [[ -n "$pid" ]] && _e2e_probe_is_mine "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && [[ "$n" -lt 30 ]]; do sleep 0.1; n=$((n+1)); done
+    if kill -0 "$pid" 2>/dev/null && _e2e_probe_is_mine "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  # 不管上面走没走到, 都要 wait 回收(它是本 shell 的子进程; 已退出/已回收时 wait 直接返回)
+  [[ -n "$pid" ]] && { wait "$pid" 2>/dev/null || true; }
+  [[ -n "$E2E_TX_PROBE_SCRIPT" ]] && rm -f "$E2E_TX_PROBE_SCRIPT"
+  [[ -n "$E2E_TX_PROBE_PORTS" ]] && rm -f "$E2E_TX_PROBE_PORTS"
+  E2E_TX_PROBE_PID=""; E2E_TX_PROBE_SCRIPT=""; E2E_TX_PROBE_PORTS=""
+  return 0
+}
+
+e2e_tx_probes(){
+  e2e_tx_probe_stop                       # 同一脚本里重复初始化: 先收掉上一个, 不累计
+  e2e_add_exit_hook e2e_tx_probe_stop     # 正常/失败/信号退出都会清
+  local ps pf
+  # 临时文件跟随 TMPDIR: 并发 E2E 各自一份, 用例也能把它们圈进自己的目录里精确计数
+  local tdir="${TMPDIR:-/tmp}"
+  ps="$(mktemp "$tdir/e2e-tx-probe.XXXXXX.py")" || return 1
+  pf="$(mktemp "$tdir/e2e-tx-probe.XXXXXX.ports")" || { rm -f "$ps"; return 1; }
+  E2E_TX_PROBE_SCRIPT="$ps"; E2E_TX_PROBE_PORTS="$pf"
+  : > "$pf"
+  # 脚本先落盘再起 —— `python3 - <<EOF &` 拿不到 stdin(会被脱开), 探针根本跑不起来。
+  # 不再 setsid: 探针只有一个进程, 留在本 shell 的进程组里才能被 wait 回收。
+  cat > "$ps" <<'PY'
+import os, socket, sys, threading
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 0))
+t = socket.socket(); t.bind(("127.0.0.1", 0)); t.listen(16)
+d = socket.socket(); d.bind(("127.0.0.1", 0)); d.listen(16)      # DoT(853)替身
+# 端口文件**原子写**: 父脚本靠"非空且三个合法端口"判就绪, 半行内容会让它误判
+tmp = sys.argv[1] + ".tmp"
+with open(tmp, "w") as f:
+    f.write("%d %d %d\n" % (u.getsockname()[1], t.getsockname()[1], d.getsockname()[1]))
+    f.flush(); os.fsync(f.fileno())
+os.replace(tmp, sys.argv[1])
+threading.Thread(target=lambda: [d.accept()[0].close() for _ in iter(int, 1)],
+                 daemon=True).start()
+def dns():
+    while True:
+        try:
+            data, a = u.recvfrom(512); u.sendto(data[:2] + b"\x81\x83" + data[4:12], a)
+        except OSError:
+            return
+threading.Thread(target=dns, daemon=True).start()
+while True:
+    try:
+        c, _ = t.accept(); c.close()
+    except OSError:
+        break
+PY
+  python3 "$ps" "$pf" >/dev/null 2>&1 &
+  E2E_TX_PROBE_PID=$!
+  local n=0 ports=""
+  while [[ "$n" -lt 40 ]]; do
+    if [[ -s "$pf" ]]; then
+      ports="$(cat "$pf")"
+      # 三个十进制端口才算就绪(挡住"文件已建、内容没写完"的中间态)
+      [[ "$ports" =~ ^[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+$ ]] && break
+      ports=""
+    fi
+    kill -0 "$E2E_TX_PROBE_PID" 2>/dev/null || break         # 探针自己死了, 不白等
+    sleep 0.1; n=$((n+1))
+  done
+  if [[ -z "$ports" ]]; then
+    e2e_tx_probe_stop                     # 超时/启动失败: 停 + wait + 删临时文件, 不留残骸
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  set -- $ports
+  export PDG_TX_DNS_PROBE="127.0.0.1:$1"
+  export PDG_TX_REDIR_PORT="$2"
+  export PDG_TX_DOT_PORT="$3"
+  return 0
+}
+
 e2e_stub_system(){
   mkdir -p /tmp/e2e-svc
+  e2e_tx_probes || echo "[!] 事务硬门探针没起来, 相关用例会如实失败"
+  # 真机上做变更时 mosdns/mihomo 本来就在跑; 沙箱的假 systemd 默认全 inactive, 会让事务的
+  # 基线门(操作前组件必须是好的)正确地拒掉一切普通变更。这里把它们置为 active, 让沙箱与
+  # 真机同形态 —— 判据没动, 只是把"现场"补齐。
+  printf 1 > /tmp/e2e-svc/mosdns.ac; printf 1 > /tmp/e2e-svc/mihomo.ac
   # 有状态的假 systemd: 记录每个 unit 的 active/enabled。切核纪律(旧核必须真的 inactive
   # 且 disabled)只有靠状态机才验得出来 —— 无脑回 active 的桩会把 activate 判成失败。
   cat > /usr/local/bin/systemctl <<'S'
@@ -140,7 +274,20 @@ case "$verb" in
       u="$1"; v=$(cat "$D/${u}.en" 2>/dev/null)
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       [ "$v" = 1 ] && { echo enabled; exit 0; }; echo disabled; exit 1;;
-  show)   echo 0; exit 0;;
+  show)
+      # show -p PROP --value UNIT。ActiveState 是"停稳"判据要看的东西(failed/activating 都不算
+      # inactive), 其余属性沿用原来的 0(NRestarts 那类数值)。
+      u=""; prop=""
+      for a in "$@"; do
+        case "$a" in -p) ;; --value) ;; ActiveState|NRestarts|UnitFileState|LoadState) prop="$a";; *) u="$a";; esac
+      done
+      if [ "$prop" = ActiveState ]; then
+        v=$(cat "$D/${u}.ac" 2>/dev/null)
+        [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+        [ "$v" = 1 ] && echo active || echo inactive
+        exit 0
+      fi
+      echo 0; exit 0;;
 esac
 exit 0
 S

@@ -162,7 +162,53 @@ run_ok "migrate_fw_gms(自定义)" migrate_fw_gms "$WORK/nfcust"
 rm -f "$WORK"/nf.pregms.* "$WORK"/nfcust.pregms.*
 
 # ── C. migrate_ios_gms_cleanup: 删 in-gms-* + nft 移除 5228-5230 ────────────────
-use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms; _pdg_core_svc(){ echo sing-box; }
+use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms _pdg_nft_bin; _pdg_core_svc(){ echo mihomo; }
+# 沙箱化真实现: 内核配置/工作目录/bot 模块都用 env 指进 $WORK, 服务动作与着色输出打桩。
+# 被测的是 migrate_ios_gms_cleanup 本身(候选→校验→落盘→回滚), 不是 systemd。
+export PDG_MIHOMO_CFG="$WORK/mihomo.yaml" PDG_STATE_DIR="$WORK/state" \
+       PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py"
+c_g(){ echo "  $*"; }; c_y(){ echo "  $*"; }; c_r(){ echo "  $*"; }
+GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""; GMS_NFT_F_FAIL=""
+systemctl(){
+  echo "systemctl $*" >> "$WORK/gms-calls"
+  [[ "${GMS_RESTART_FAIL:-}" == 1 && "$1" == restart ]] && return 1
+  return 0
+}
+_core_kernel_stable(){ [[ "${GMS_CORE_UNSTABLE:-}" != 1 ]]; }
+# 假 nft **可执行文件**(不是 shell 函数): 迁移现在用 _pdg_nft_bin 解析出的绝对路径调用它,
+# 函数桩根本不会被用到 —— 而这正是"PATH 没有 sbin 也不能跳过 nft"那条修复的关键。
+# 它同时模拟运行态: 每次 `-f <file>` 都把该文件的 SHA 写进 $WORK/nft-runtime, 于是"回滚有没有
+# 用旧配置重放一次"可以被真实断言, 而不是只看磁盘文件。
+mkdir -p "$WORK/sbin"
+cat > "$WORK/sbin/nft" <<'NFT'
+#!/usr/bin/env bash
+echo "nft $*" >> "$GMS_NFT_CALLS"
+if [[ "$1" == -c ]]; then [[ "${GMS_NFT_C_FAIL:-}" != 1 ]]; exit $?; fi
+if [[ "$1" == -f ]]; then
+  f="$2"          # 调用形态是 `nft -f <file>`
+  n=$(( $(cat "$GMS_NFT_FCOUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GMS_NFT_FCOUNT"
+  # 先改"内核运行态"再决定返回码: 模拟"部分生效之后才失败"
+  sha256sum "$f" | cut -d" " -f1 > "$GMS_NFT_RUNTIME"
+  if [[ "${GMS_NFT_F_FAIL:-}" == 1 && "$n" == 1 ]]; then exit 1; fi
+  if [[ "${GMS_NFT_F_FAIL_ALL:-}" == 1 ]]; then exit 1; fi
+  exit 0
+fi
+exit 0
+NFT
+chmod 755 "$WORK/sbin/nft"
+export GMS_NFT_CALLS="$WORK/nft-calls" GMS_NFT_FCOUNT="$WORK/nftf" GMS_NFT_RUNTIME="$WORK/nft-runtime"
+export GMS_NFT_C_FAIL="" GMS_NFT_F_FAIL="" GMS_NFT_F_FAIL_ALL=""
+# 默认让定位器找到它(单独的用例会换成真 _pdg_nft_bin 去验 PATH 盲区)
+_pdg_nft_bin(){ printf '%s\n' "$WORK/sbin/nft"; }
+# 内核配置的基线内容 = 用当前 model 渲染出来的那一份 —— 这样"回滚后的内核配置对应回滚后的
+# model"才是可验证的, 而不是拿一个手写字符串充数。
+_gms_render(){ PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py" python3 - "$1" "$2" <<'RPY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("bot", os.environ["PDG_BOT_PY"])
+bot = importlib.util.module_from_spec(spec); spec.loader.exec_module(bot)
+open(sys.argv[2], "wb").write(bot._mihomo_derive({"model": open(sys.argv[1], "rb").read()}))
+RPY
+}
 cat > "$WORK/sbg.json" <<'JSON'
 {"inbounds":[{"type":"direct","tag":"in-https","listen_port":443},
              {"type":"direct","tag":"in-gms-5228","listen_port":5228},
@@ -171,6 +217,7 @@ cat > "$WORK/sbg.json" <<'JSON'
 JSON
 printf 'table inet pdg {\n  chain input { ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept }\n}\n' > "$WORK/nfg"
 _pdg_platform(){ echo ios; }
+_gms_render "$WORK/sbg.json" "$WORK/mihomo.yaml" || bad "渲染基线内核配置失败"
 run_ok "migrate_ios_gms_cleanup(iOS)" migrate_ios_gms_cleanup "$WORK/sbg.json" "$WORK/nfg"
 { ! grep -q 'in-gms-5228' "$WORK/sbg.json" && ! grep -q 'in-gms-5230' "$WORK/sbg.json"; } \
   && ok "iOS 清理: sing-box 删掉 in-gms-5228/5229/5230 入站" || bad "in-gms-* 未删净"
@@ -215,6 +262,303 @@ printf 'table inet pdg {\n\tchain prerouting { ip saddr X tcp dport { 80, 443, 5
 snapc="$(cat "$WORK/nfcustom")"
 run_ok "migrate_ios_gms_cleanup(自定义)" migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfcustom"
 [[ "$(cat "$WORK/nfcustom")" == "$snapc" ]] && ok "自定义 5228 形态无法安全识别 → 还原不破坏配置" || bad "破坏了自定义配置"
+
+# ── C4. 事务性: 候选先行 / 校验不过零改动 / 落盘失败完整回滚 / 失败必须传播 ─────────
+# 这一段盯的是"迁移会不会把现网留在半套状态", 以及"失败有没有被上层收到"。
+_gms_fixture(){                                   # 造一套干净现场, 返回三个文件的 SHA
+  cat > "$WORK/g-sb.json" <<'JSON'
+{"inbounds":[{"type":"direct","tag":"in-https","listen_port":443},
+             {"type":"direct","tag":"in-gms-5228","listen_port":5228},
+             {"type":"direct","tag":"in-gms-5229","listen_port":5229}],
+ "outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}}
+JSON
+  printf 'table inet pdg {\n\tchain prerouting { ip saddr 172.22.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893 }\n}\n' > "$WORK/g-nf"
+  _gms_render "$WORK/g-sb.json" "$WORK/mihomo.yaml"
+  rm -f "$WORK/nftf" "$WORK/gms-calls" "$WORK/nft-calls"
+  sha256sum "$WORK/g-nf" | cut -d" " -f1 > "$WORK/nft-runtime"   # 运行态 = 当前(旧)配置
+  GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""; GMS_NFT_F_FAIL=""; GMS_NFT_C_FAIL=""
+  GMS_NFT_F_FAIL_ALL=""
+  export PDG_MIHOMO_CFG="$WORK/mihomo.yaml" PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py"
+  _G_SB="$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)"
+  _G_MH="$(sha256sum "$WORK/mihomo.yaml" | cut -d" " -f1)"
+  _G_NF="$(sha256sum "$WORK/g-nf" | cut -d" " -f1)"
+}
+_gms_unchanged(){                                 # 三个生产文件必须一个字节都没变
+  local what="$1" bad3=()
+  [[ "$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)" == "$_G_SB" ]] || bad3+=(model)
+  [[ "$(sha256sum "$WORK/mihomo.yaml" | cut -d" " -f1)" == "$_G_MH" ]] || bad3+=(内核配置)
+  [[ "$(sha256sum "$WORK/g-nf" | cut -d" " -f1)" == "$_G_NF" ]] || bad3+=(防火墙)
+  [[ ${#bad3[@]} -eq 0 ]] && ok "$what" || bad "$what —— 这些文件被动了: ${bad3[*]}"
+}
+_pdg_platform(){ echo ios; }
+
+# 1) 候选渲染失败(bot 侧判 dropped/无法转换那一类)→ 三个文件零改动
+_gms_fixture
+cat > "$WORK/badbot.py" <<'PYB'
+def _mihomo_derive(staged):
+    raise ValueError("渲染失败(测试注入)")
+PYB
+PDG_BOT_PY="$WORK/badbot.py" migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "候选渲染失败却返回 0" || ok "候选渲染失败 → 返回非 0"
+_gms_unchanged "候选渲染失败: 三个生产文件零修改"
+
+# 2) mihomo -t 校验失败 → 零改动
+_gms_fixture
+mihomo(){ [[ "$1" == -t ]] && return 1; return 0; }
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "mihomo -t 失败却返回 0" || ok "候选 mihomo -t 失败 → 返回非 0"
+_gms_unchanged "mihomo -t 失败: 三个生产文件零修改"
+unset -f mihomo
+
+# 3) nft -c 校验失败 → 零改动
+_gms_fixture; GMS_NFT_C_FAIL=1
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "nft -c 失败却返回 0" || ok "候选 nft -c 失败 → 返回非 0"
+_gms_unchanged "nft -c 失败: 三个生产文件零修改"
+GMS_NFT_C_FAIL=""
+
+# 4) 第 2 个文件(内核配置)落盘失败 → 第 1 个(model)必须已还原
+_gms_fixture
+: > "$WORK/blocker"                                  # 父目录是个**文件** → install 必失败
+PDG_MIHOMO_CFG="$WORK/blocker/config.yaml" migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "内核配置落盘失败却返回 0" || ok "第 N 个文件落盘失败 → 返回非 0"
+[[ "$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)" == "$_G_SB" ]] \
+  && ok "落盘中途失败: 先落的 model 已还原(不留半套)" || bad "model 没还原"
+
+# 5) nft apply 失败(第一次 -f 失败, 回滚时的 -f 成功)→ 配置与运行态都恢复
+_gms_fixture; GMS_NFT_F_FAIL=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+[[ $rc != 0 ]] && ok "nft apply 失败 → 返回非 0" || bad "nft apply 失败却返回 0"
+grep -q "已回滚" <<<"$out" && ok "nft apply 失败: 明确报告已回滚" || bad "没报告回滚: $out"
+_gms_unchanged "nft apply 失败: 三个生产文件都回到清理前"
+GMS_NFT_F_FAIL=""
+
+# 6) 内核重启失败 → model 与内核配置必须**一起**还原, 且内核配置对应还原后的 model
+_gms_fixture; GMS_RESTART_FAIL=1
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "内核重启失败却返回 0" || ok "内核重启失败 → 返回非 0"
+_gms_unchanged "内核重启失败: model / 内核配置 / 防火墙 全部还原"
+_gms_render "$WORK/g-sb.json" "$WORK/expect-mh.yaml"
+cmp -s "$WORK/expect-mh.yaml" "$WORK/mihomo.yaml" \
+  && ok "还原后的内核配置确实对应还原后的 model(不是旧的错位副本)" \
+  || bad "内核配置与 model 不对应"
+GMS_RESTART_FAIL=""
+
+# 7) 回滚里的服务也起不来 → 必须明确报"回滚不完整"并保留材料, 不许打印"已还原"
+_gms_fixture; GMS_RESTART_FAIL=1; GMS_CORE_UNSTABLE=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+{ [[ $rc != 0 ]] && grep -q "回滚不完整" <<<"$out" && ! grep -q "已回滚:" <<<"$out"; } \
+  && ok "回滚阶段服务失败 → 返回非 0 且明说回滚不完整(不谎称已还原)" \
+  || bad "回滚失败的报告不对: rc=$rc | $(tr '\n' ' ' <<<"$out" | head -c 120)"
+grep -q "$WORK/state" <<<"$out" && ok "回滚不完整时给出保留的材料目录路径" || bad "没给材料路径"
+rm -rf "$WORK/state"/iosgms.* 2>/dev/null
+GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""
+
+# 8) 失败必须被这些调用方收到 —— 用真函数体 + 注入一个必失败的迁移
+_rams="$(xt run_all_migrations)"
+[[ -n "$_rams" ]] || bad "抽不到 run_all_migrations"
+( eval "$_rams"
+  for f in migrate_platform_marker migrate_backend_marker migrate_botenv migrate_firewall_to_pdg \
+           migrate_mosdns_concurrent migrate_mosdns_unlock migrate_fw_gms migrate_mosdns_ratelimit \
+           migrate_lowmem migrate_mihomo_safepaths migrate_deploy_botfiles migrate_deploy_units \
+           migrate_mosdns_hijack_shape migrate_custom_hijack migrate_mosdns_mitm \
+           migrate_pdg_mitm_service migrate_android_cleanup migrate_drop_singbox; do
+    eval "$f(){ return 0; }"
+  done
+  migrate_ios_gms_cleanup(){ return 1; }
+  run_all_migrations >/dev/null 2>&1 ) \
+  && bad "run_all_migrations 吞掉了 iOS GMS 清理的失败" \
+  || ok "run_all_migrations 把 iOS GMS 清理的失败传出(cmd_update/cmd_migrate 据此回滚/点名快照)"
+grep -q 'migrate_ios_gms_cleanup || true' "$ROOT/deploy/bot/pdg.sh" \
+  && bad "pdg.sh 里还有 `migrate_ios_gms_cleanup || true`" \
+  || ok "pdg.sh 里不再用 || true 吞掉这条关键迁移"
+_cp="$(xt cmd_platform)"
+grep -q 'migrate_ios_gms_cleanup' <<<"$_cp" && grep -q '_plat_rollback' <<<"$_cp" \
+  && ok "cmd_platform 会跑这条关键迁移, 失败走 _plat_rollback" || bad "cmd_platform 没接这条迁移"
+awk '/migrate_ios_gms_cleanup/{m=NR} /rm -rf "\$wd"/{if(m && NR>m){print "AFTER"; exit}}' <<<"$_cp" \
+  | grep -q AFTER && ok "cmd_platform 里这条迁移排在删除回滚材料之前" \
+  || bad "迁移跑在 rm -rf \$wd 之后(那时已经没有回滚材料了)"
+
+# ── C5. nft 部分生效后失败 → 必须用旧配置重放一次, 把运行态也拉回去 ──────────────
+_gms_fixture
+_before_nf_sha="$(sha256sum "$WORK/g-nf" | cut -d" " -f1)"
+GMS_NFT_F_FAIL=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+[[ $rc != 0 ]] && ok "nft apply 部分生效后失败 → 返回非 0" || bad "nft apply 失败却返回 0"
+_nf_loads="$(grep -c '^nft -f' "$WORK/nft-calls" 2>/dev/null || echo 0)"
+[[ "$_nf_loads" == 2 ]] \
+  && ok "回滚**又调了一次 nft -f**(第 1 次应用 + 第 2 次用旧配置恢复运行态), 共 2 次" \
+  || bad "nft -f 调用次数是 $_nf_loads(期望 2: 应用 + 回滚重放)"
+[[ "$(cat "$WORK/nft-runtime")" == "$_before_nf_sha" ]] \
+  && ok "模拟的内核运行态已回到操作前那份配置(不是只还原了磁盘文件)" \
+  || bad "运行态没回到旧配置: $(cat "$WORK/nft-runtime") != $_before_nf_sha"
+_second="$(grep '^nft -f' "$WORK/nft-calls" | sed -n '2p' | awk '{print $NF}')"
+[[ "$(sha256sum "$_second" | cut -d" " -f1)" == "$_before_nf_sha" ]] \
+  && ok "第 2 次加载的确实是**旧配置文件**" || bad "第 2 次加载的不是旧配置: $_second"
+_gms_unchanged "nft apply 失败后: 三个生产文件回到清理前"
+GMS_NFT_F_FAIL=""
+
+# 回滚里的 nft -f 也失败 → 必须明说回滚不完整, 不许报"已回滚"
+_gms_fixture; GMS_NFT_F_FAIL_ALL=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+{ [[ $rc != 0 ]] && grep -q "回滚不完整" <<<"$out" && grep -q "运行态未还原" <<<"$out"; } \
+  && ok "回滚重放 nft -f 也失败 → 明确报「回滚不完整 + 运行态未还原」" \
+  || bad "回滚失败没被如实报告: rc=$rc | $(tr '\n' ' ' <<<"$out" | head -c 140)"
+GMS_NFT_F_FAIL_ALL=""; rm -rf "$WORK/state"/iosgms.* 2>/dev/null
+
+# ── C6. nft 定位: PATH 里没有 sbin 也必须找到(不许跳过校验/应用) ────────────────
+_gms_fixture
+mkdir -p "$WORK/fakerepo/deploy/bot"
+cat > "$WORK/fakerepo/deploy/bot/nftscan.py" <<'SCAN'
+import sys
+NFT_CANDIDATES = ("/does/not/matter",)
+if "--nft-path" in sys.argv:
+    import os
+    print(os.environ.get("GMS_FAKE_NFT", ""))
+SCAN
+cp "$ROOT/lib/nftbin.sh" "$WORK/fakerepo/lib.sh" 2>/dev/null || mkdir -p "$WORK/fakerepo/lib"
+mkdir -p "$WORK/fakerepo/lib"; cp "$ROOT/lib/nftbin.sh" "$WORK/fakerepo/lib/nftbin.sh"
+unset -f _pdg_nft_bin; use_fn _pdg_nft_bin || bad "抽不到 _pdg_nft_bin"
+( export REPO_DIR="$WORK/fakerepo" GMS_FAKE_NFT="$WORK/sbin/nft" PATH="/usr/bin:/bin"
+  _found="$(_pdg_nft_bin)"
+  [[ "$_found" == "$WORK/sbin/nft" ]] ) \
+  && ok "PATH 不含 sbin 时, _pdg_nft_bin 仍能定位到 nft(GMS 迁移复用同一判据)" \
+  || bad "PATH 不含 sbin 时定位失败"
+_pdg_nft_bin(){ printf ''; }                      # 完全找不到 nft
+_gms_fixture
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "找不到 nft 却返回 0" || ok "完全找不到 nft → 返回非 0(fail-closed)"
+_gms_unchanged "找不到 nft: 三个生产文件零改动"
+_pdg_nft_bin(){ printf '%s\n' "$WORK/sbin/nft"; }
+
+# ── C7. before-image 连 mode/uid/gid 一起复核 ────────────────────────────────
+_gms_fixture
+chmod 640 "$WORK/g-sb.json"
+GMS_RESTART_FAIL=1
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "重启失败却返回 0" || ok "重启失败 → 返回非 0"
+[[ "$(stat -c '%a' "$WORK/g-sb.json")" == 640 ]] \
+  && ok "回滚把权限也还原成 640(不是默认 600)" || bad "权限没还原: $(stat -c '%a' "$WORK/g-sb.json")"
+[[ "$(stat -c '%u:%g' "$WORK/g-sb.json")" == "$(id -u):$(id -g)" ]] \
+  && ok "回滚后归属(uid:gid)与操作前一致" || bad "归属变了"
+GMS_RESTART_FAIL=""
+skip "chown 到别的 uid 需要 root: 本环境只验「归属未被改变」, 复核逻辑本身由上面的断言覆盖"
+
+# ── C8. 形态守卫: 软链/硬链目标必须在候选阶段之前就被拒(不能经链接写穿现网) ────────
+# 回归: `cp -a` 会把源符号链接原样搬进候选目录, 于是 chmod / python 写入 / sed -i 直接改到
+# 现网(甚至改到链接指向的别处), before-image 也不再是旧内容。
+_gms_symlink_case(){                       # $1=哪个目标做成软链(config.json/config.yaml/nftables.conf)
+  _gms_fixture
+  rm -f "$WORK/gms-calls" "$WORK/nft-calls"
+  printf 'SENTINEL-CONTENT\n' > "$WORK/sentinel"
+  chmod 640 "$WORK/sentinel"
+  local _sent_sha _sent_mode target
+  _sent_sha="$(sha256sum "$WORK/sentinel" | cut -d" " -f1)"; _sent_mode="$(stat -c '%a' "$WORK/sentinel")"
+  case "$1" in
+    config.json)    target="$WORK/g-sb.json";;
+    config.yaml)    target="$WORK/mihomo.yaml";;
+    nftables.conf)  target="$WORK/g-nf";;
+  esac
+  rm -f "$target"; ln -s "$WORK/sentinel" "$target"
+  migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+    && bad "$1 是软链却返回 0(可能已经写穿到 sentinel)" || ok "$1 是软链 → 返回非 0"
+  [[ "$(sha256sum "$WORK/sentinel" | cut -d" " -f1)" == "$_sent_sha" ]] \
+    && ok "$1 软链: sentinel 内容一个字节都没变" || bad "$1 软链: sentinel 被改了!"
+  [[ "$(stat -c '%a' "$WORK/sentinel")" == "$_sent_mode" ]] \
+    && ok "$1 软链: sentinel 权限没被改" || bad "$1 软链: sentinel 权限被改成 $(stat -c '%a' "$WORK/sentinel")"
+  [[ -L "$target" ]] && ok "$1 软链: 链接本身仍在(没被替换成普通文件)" || bad "$1 软链被替换掉了"
+  [[ ! -s "$WORK/gms-calls" && ! -s "$WORK/nft-calls" ]] \
+    && ok "$1 软链: systemctl / nft 零调用(拒绝发生在任何服务动作之前)" \
+    || bad "$1 软链却动了服务: $(cat "$WORK/gms-calls" "$WORK/nft-calls" 2>/dev/null | tr '\n' ' ')"
+  rm -f "$target"
+}
+_gms_symlink_case config.json
+_gms_symlink_case nftables.conf
+_gms_symlink_case config.yaml
+
+# 硬链接目标: 改它会波及另一个名字 → 落盘前拒, 两个名字内容都不变
+_gms_fixture
+ln -f "$WORK/g-sb.json" "$WORK/g-sb.hard"
+_hard_sha="$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)"
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "硬链接目标却返回 0" || ok "目标是硬链接(nlink>1) → 返回非 0"
+{ [[ "$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)" == "$_hard_sha" ]] \
+  && [[ "$(sha256sum "$WORK/g-sb.hard" | cut -d" " -f1)" == "$_hard_sha" ]]; } \
+  && ok "硬链接: 两个名字的内容都没变" || bad "硬链接目标被改了"
+rm -f "$WORK/g-sb.hard"
+
+# 正常文件: before / candidate 必须是工作目录里的独立普通文件(不是软链, nlink=1)
+_gms_fixture
+GMS_RESTART_FAIL=1                          # 让它在落盘后失败 → 工作目录保留下来可供检查
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1
+GMS_RESTART_FAIL=""
+_wdir="$(find "$WORK/state" -maxdepth 1 -name 'iosgms.*' -type d | head -1)"
+if [[ -n "$_wdir" ]]; then
+  _bad_mat=()
+  for _m in "$_wdir"/before-* "$_wdir"/cand-*; do
+    [[ -e "$_m" ]] || continue
+    [[ -L "$_m" ]] && _bad_mat+=("$(basename "$_m"):软链")
+    [[ "$(stat -c '%h' "$_m")" == 1 ]] || _bad_mat+=("$(basename "$_m"):nlink>1")
+  done
+  [[ ${#_bad_mat[@]} -eq 0 ]] \
+    && ok "before/candidate 都是独立普通文件(非软链, nlink=1)" \
+    || bad "材料形态不对: ${_bad_mat[*]}"
+  [[ "$(stat -c '%a' "$_wdir/cand-config.json" 2>/dev/null)" == 600 ]] \
+    && ok "候选文件固定 0600" || bad "候选权限是 $(stat -c '%a' "$_wdir/cand-config.json" 2>/dev/null)"
+else
+  bad "没找到工作目录, 无法检查材料形态"
+fi
+rm -rf "$WORK/state"/iosgms.* 2>/dev/null
+
+# ── C9. 成功提交也要保住 mode/uid/gid ────────────────────────────────────────
+_gms_fixture
+chmod 640 "$WORK/g-sb.json"; chmod 600 "$WORK/mihomo.yaml"; chmod 644 "$WORK/g-nf"
+_own_before="$(stat -c '%u:%g' "$WORK/g-sb.json")"
+run_ok "migrate_ios_gms_cleanup(成功路径)" migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf"
+grep -q 'in-gms-5228' "$WORK/g-sb.json" && bad "成功路径没清掉 GMS 入站" || ok "成功路径: GMS 入站已清掉"
+[[ "$(stat -c '%a' "$WORK/g-sb.json")" == 640 ]] \
+  && ok "成功提交后 model 的 mode 仍是 640(不是默认 600)" \
+  || bad "成功提交改了 mode: $(stat -c '%a' "$WORK/g-sb.json")"
+[[ "$(stat -c '%u:%g' "$WORK/g-sb.json")" == "$_own_before" ]] \
+  && ok "成功提交后 model 的 uid:gid 未变" || bad "成功提交改了属主"
+[[ "$(stat -c '%a' "$WORK/g-nf")" == 644 ]] \
+  && ok "成功提交后 nftables.conf 的 mode 仍是 644" || bad "nft 配置 mode 被改成 $(stat -c '%a' "$WORK/g-nf")"
+# 用受控 chown/stat 桩验证"mv 之前就把旧 uid:gid 设上去了"(本机没法真切到别的 uid)
+_gms_fixture
+printf '%s\n' "4242:4243" > /dev/null    # 期望值由桩注入
+cat > "$WORK/sbin/chown" <<'CH'
+#!/usr/bin/env bash
+echo "chown $*" >> "$GMS_CHOWN_CALLS"
+exit 0
+CH
+chmod 755 "$WORK/sbin/chown"
+export GMS_CHOWN_CALLS="$WORK/chown-calls"; : > "$GMS_CHOWN_CALLS"
+( PATH="$WORK/sbin:$PATH"; migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 )
+if grep -qE "chown $(stat -c '%u:%g' "$WORK/g-sb.json") .*\.pdg-iosgms\." "$GMS_CHOWN_CALLS"; then
+  ok "落盘前对**临时文件**执行了 chown <原 uid:gid>(mv 之后才成为生产文件)"
+else
+  bad "没看到对临时文件的 chown: $(tr '\n' ' ' < "$GMS_CHOWN_CALLS" | head -c 160)"
+fi
+rm -f "$WORK/sbin/chown"
+skip "切换到另一个 uid/gid 需要 root: 已用受控 chown 桩验证「mv 前设置旧属主」这一步, 未伪造成功"
+
+# ── C10. nftables.conf 不存在: 只清 model, 唯一预期(不再"成功或失败都算 OK") ────────
+_gms_fixture
+rm -f "$WORK/g-nf" "$WORK/nft-calls"
+_mh_before="$(sha256sum "$WORK/mihomo.yaml" | cut -d" " -f1)"
+run_ok "migrate_ios_gms_cleanup(无 nftables.conf)" migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf"
+grep -q 'in-gms-5228' "$WORK/g-sb.json" && bad "无 nft 配置时没清 model" || ok "无 nftables.conf: model 里的 GMS 入站已清掉"
+[[ ! -e "$WORK/g-nf" ]] && ok "无 nftables.conf: 没有被凭空创建" || bad "凭空创建了 nftables.conf"
+[[ ! -s "$WORK/nft-calls" ]] && ok "无 nftables.conf: nft 一次都没被调用" || bad "还是调了 nft: $(cat "$WORK/nft-calls")"
+_gms_render "$WORK/g-sb.json" "$WORK/expect-mh2.yaml"
+cmp -s "$WORK/expect-mh2.yaml" "$WORK/mihomo.yaml" \
+  && ok "无 nftables.conf: 内核配置与清理后的 model 同步" || bad "内核配置与 model 不同步"
+# 注: iOS 的 GMS 入站不进 mihomo 渲染产物, 所以"渲染结果字节变了"不是可靠判据; 真正要保证的是
+# **落盘的内核配置对应清理后的 model**(上一条已逐字节断言), 外加 model 自身确实被改过。
+[[ "$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)" != "$_G_SB" ]] \
+  && ok "无 nftables.conf: model 确实被改过(GMS 入站已移除)" || bad "model 没被改"
+grep -q "restart mihomo" "$WORK/gms-calls" \
+  && ok "无 nftables.conf: 仍重启内核并做稳定性验证" || bad "没重启内核: $(cat "$WORK/gms-calls" 2>/dev/null)"
 
 # ── C2. _pdg_nft_strip_gms: iOS 渲染后剥掉 GMS(装机/切核共用)──────────────────
 printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept\n  ip saddr 10.0.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n}\n' > "$WORK/nfr"

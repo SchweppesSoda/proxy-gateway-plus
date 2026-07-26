@@ -16,49 +16,78 @@ custom_direct.txt, 所以"设直连"一直是好的 —— 正是这个不对称
 import importlib.util
 import json
 import os
-import tempfile
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("pdg_bot", ROOT / "deploy/bot/pdg-bot.py")
-bot = importlib.util.module_from_spec(spec); spec.loader.exec_module(bot)
+sys.path.insert(0, str(ROOT / "tests"))
+from txbox import Box  # noqa: E402
 
 pass_n = 0
 def ok(m):
     global pass_n; print("[OK]  ", m); pass_n += 1
 
-TMP = tempfile.mkdtemp()
-bot.MOSDNS_DIRECT = os.path.join(TMP, "custom_direct.txt")
-bot.MOSDNS_HIJACK = os.path.join(TMP, "custom_hijack.txt")
-restarts = []
-bot.sh = lambda cmd, **k: restarts.append(" ".join(cmd)) or type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+# 5.1 起, 规则与 mosdns 劫持表是**同一笔事务**落盘的 —— 所以这里不再打桩 apply_sb, 而是让
+# 真事务跑在沙箱文件树上(镜像的 /etc 结构 + 假 systemctl), 断言的仍是"内核规则与劫持表是否
+# 同步", 但顺带验证了它们确实一起提交、一起回滚。
+BOX = Box()
+for k, v in BOX.env.items():
+    os.environ[k] = v
+BOX.up("mosdns"); BOX.up("mihomo")
+spec = importlib.util.spec_from_file_location("pdg_bot", ROOT / "deploy/bot/pdg-bot.py")
+bot = importlib.util.module_from_spec(spec); spec.loader.exec_module(bot)
+bot.MOSDNS_DIRECT = BOX.path("/etc/mosdns/rules/custom_direct.txt")
+bot.MOSDNS_HIJACK = BOX.path("/etc/mosdns/rules/custom_hijack.txt")
 
 CFG = {
     "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "shadowsocks", "tag": "jp",
                   "server": "203.0.113.9", "server_port": 1}],
     "route": {"rules": [{"action": "reject", "ip_cidr": ["203.0.113.1/32"]}], "final": "direct"},
+    "inbounds": [],
 }
 state = {"cfg": json.loads(json.dumps(CFG))}
 bot.load = lambda: json.loads(json.dumps(state["cfg"]))
 bot.exit_tags = lambda c=None: ["jp"]
+# model 落盘后回读进 state(事务真的写了文件, 这里只是让后续断言看得到最新 model)
+BOX.put("/etc/sing-box/config.json", json.dumps(CFG).encode())
 
-def _apply(mod):
-    c = json.loads(json.dumps(state["cfg"])); mod(c); state["cfg"] = c
-    return True, ""
-bot.apply_sb = _apply
+
+def _sync_state():
+    state["cfg"] = json.loads(BOX.read("/etc/sing-box/config.json").decode())
+
+
+_orig_tx_apply = bot.tx_apply
+
+
+def _tx_apply(op, **kw):
+    r = _orig_tx_apply(op, **kw)
+    _sync_state()
+    return r
+
+
+bot.tx_apply = _tx_apply
+# mihomo 渲染在本用例里不是被测对象(出口是假的), 用最小合法配置代替渲染结果
+bot._render_mihomo_bytes = lambda model, rs_meta=None: (b'{"proxies": [], "rules": []}', {})
+
+
+def restarts_of(unit):
+    try:
+        return [l for l in open(BOX.calls) if "restart %s" % unit in l]
+    except OSError:
+        return []
+
 
 def hijacked():
-    return set(bot._read_hijack()) if hasattr(bot, "_read_hijack") else set()
+    return set(bot._read_hijack())
 
 
 def main():
     # ── 指到出口 → 必须进劫持表, 且 mosdns 被重启(domain_set 只在启动时加载) ──
-    restarts.clear()
     okr, msg = bot.add_rule("ip.skk.moe", "jp")
     assert okr, msg
     assert "ip.skk.moe" in hijacked(), "指到出口后域名未进 mosdns 劫持表 → mosdns 仍返真实 IP"
     ok("指到出口: 域名写入 mosdns 劫持表")
-    assert any("restart" in r and "mosdns" in r for r in restarts), "改了 domain_set 文件却没重启 mosdns"
+    assert restarts_of("mosdns"), "改了 domain_set 文件却没重启 mosdns"
     ok("指到出口: 重启 mosdns 让 domain_set 重新加载")
     assert any("ip.skk.moe" in r.get("domain_suffix", []) for r in state["cfg"]["route"]["rules"]), "内核规则未写入"
     ok("指到出口: 内核 route 规则同时写入(原有行为不变)")
@@ -131,11 +160,13 @@ def main():
         ok("恢复净化: Android 不动 GMS 入站(它需要 5228-5230)")
     finally:
         bot._platform = _op
-    # 净化必须发生在校验/落盘之前
+    # 净化必须发生在**进候选**之前(校验与落盘都在那之后, 由事务负责)。
+    # 端到端的行为覆盖在 test-restore-transaction.py: 备份里带 GMS 入站的 iOS 恢复, 落盘的
+    # model 里不能有 5228-5230。这里守的是顺序本身。
     src = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
-    body = src[src.index("def restore_from("):]
-    assert body.index("_platform_sanitize_model") < body.index("MIHOMO_BIN"), "净化晚于校验"
-    ok("恢复净化: 排在配置校验之前")
+    body = src[src.index("def _restore_commit("):]
+    assert body.index("_platform_sanitize_model") < body.index('t.stage("model"'), "净化晚于入候选"
+    ok("恢复净化: 排在候选 stage 之前(校验/落盘都在其后)")
 
     print(f"\n通过 {pass_n} 项断言")
 

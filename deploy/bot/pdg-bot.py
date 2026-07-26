@@ -87,8 +87,18 @@ _EXEC = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix=
 _busy: dict[int, bool] = {}
 _busy_lock = threading.Lock()
 _cfg_lock = threading.Lock()                     # 进程内串行化"写 sing-box 配置"
-LOCKFILE = "/run/privdns-gateway.lock"           # 与 pdg update/rollback 共用, 防跨进程并发改配置
+LOCKFILE = os.environ.get("PDG_LOCKFILE", "/run/privdns-gateway.lock")   # 与 pdg update/rollback 共用
 BUSY_MSG = "已有配置操作正在执行,请稍候再试。"   # apply_sb 拿不到锁(进程内或跨进程)时的安全返回
+NOLOCK_MSG = ("⛔ 锁文件不可用(/run 写不了?) —— 为避免并发写坏配置, 本次拒绝执行。\n"
+              "请在服务器上检查 /run 是否可写, 修好后重试。")
+# 上一次取锁失败的原因: "" = 忙, 非空 = 锁不可用。**按线程存**: 进程级全局会被并发覆盖 ——
+# A 线程刚记下"锁文件打不开"、还没来得及 busy_msg(), B 线程进 _cfg_guard() 就把它清空了,
+# 于是 A 把环境故障说成"已有配置操作正在执行", 真正的 /run 坏掉被掩盖。
+_cfg_lock_state = threading.local()
+
+
+def _cfg_lock_error():
+    return getattr(_cfg_lock_state, "err", "")
 
 class _PanelOwnershipError(Exception):
     pass
@@ -126,15 +136,22 @@ def run_bg(chat, fn):
 @contextlib.contextmanager
 def _cfg_guard():
     """进程内串行(_cfg_lock, 非阻塞)+ 跨进程 flock(与 pdg update/rollback 协调)。
-    两把锁任一被占 → yield False(立即友好返回, 绝不阻塞主轮询); 锁文件不可用 → 退化为仅进程内串行。"""
+
+    两把锁任一被占 → yield False(立即友好返回, 绝不阻塞主轮询);
+    **锁文件不可用同样 yield False**(fail-closed), 并把原因记进本线程的 _cfg_lock_state
+    供调用方区分 "有人正在改" 与 "锁坏了"。"""
+    _cfg_lock_state.err = ""                     # 只清本线程的, 别踩别人正要读的那份
     if not _cfg_lock.acquire(blocking=False):    # 非阻塞: 本进程已有配置操作在跑 → 立刻让路, 不卡主循环
         yield False
         return
     try:
         try:
             f = open(LOCKFILE, "w")
-        except OSError:
-            yield True                           # 无法打开锁文件(权限/路径) → 只做进程内串行
+        except OSError as e:
+            # fail-closed: 打不开锁文件就**不写**。旧实现退化成"只做进程内串行"继续写 ——
+            # 那时 CLI/定时任务照样能同时改同一份配置, 谁也拦不住。
+            _cfg_lock_state.err = "%s: %s" % (LOCKFILE, type(e).__name__)
+            yield False
             return
         locked = False
         try:
@@ -357,13 +374,6 @@ def clash_up():
 def load():
     return json.load(open(SB))
 
-def _write(c):
-    t = SB + ".tmp"
-    with open(t, "w") as f:
-        json.dump(c, f, ensure_ascii=False, indent=2)
-    os.chmod(t, 0o600)        # config.json 含出口密码/uuid, 收紧到 600
-    os.replace(t, SB)
-
 def _svc_active(unit, need=3, delay=0.6, max_polls=15):
     """确认服务"稳定" active: 要求连续 need 次观测都是 active。
     systemd 默认 Type=simple, restart 返 0 只代表 exec 成功; 起来又崩(flapping)时单看一次会误判 ——
@@ -441,13 +451,13 @@ def _write_mihomo(cfg):
     os.chmod(t, 0o600)                                     # 含出口密码/uuid + 面板 secret, 收紧 600
     os.replace(t, MIHOMO_CFG)
 
-def _mihomo_rulesets():
+def _mihomo_rulesets(meta=None):
     """从 RS_META 构造 mihomo rule-providers 入参: rule-provider 指向原始 url, mihomo 原生抓取解析。
     收文本/yaml/mrs 类。历史遗留的 sing-box 二进制 .srs mihomo 读不了 → 跳过, 于是渲染器会把
-    它记进 meta['dropped'], 由 _core_apply/迁移据此判失败并点名(不再静默丢弃)。"""
+    它记进 meta['dropped'], 由 _mihomo_derive/迁移据此判失败并点名(不再静默丢弃)。"""
     out = {}
     try:
-        meta = _rs_meta()
+        meta = _rs_meta() if meta is None else meta
     except Exception:  # noqa: BLE001
         return out
     for name, info in meta.items():
@@ -522,107 +532,138 @@ def _mitm_ca_pem():
     except Exception:  # noqa: BLE001
         return ""
 
-def _read_bytes(path):
+def _mitm_hijack_bytes(domains):
+    """接管域名 → mosdns 强制劫持集的文件内容(纯函数, 供事务派生用)。"""
+    return "".join("domain:" + d + "\n" for d in domains).encode("utf-8")
+
+
+def _mitm_domains_from(mitm_json_bytes):
+    """从**候选** mitm.json 推导接管域名(不读生产文件)。非 iOS 一律为空。"""
+    if _platform() != "ios":
+        return []
     try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return None            # 文件本不存在 → 回滚时应删除(而非写空)
+        cfg = json.loads((mitm_json_bytes or b"{}").decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    doms = []
+    for name, dl in MITM_PLUGIN_DOMAINS.items():
+        if isinstance(cfg, dict) and (cfg.get(name) or {}).get("enabled"):
+            doms += dl
+    return doms
 
-def _restore_bytes(path, data):
-    """把 path 还原成 data(None=删除)。原子: 临时文件 + os.replace。"""
-    if data is None:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    t = path + ".tmp"
-    with open(t, "wb") as f:
-        f.write(data)
-    os.replace(t, path)
 
-def _atomic_write_text(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    t = path + ".tmp"
-    with open(t, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(t, path)
+def _mitm_json_bytes(cur, w):
+    """把 WLOC 目标态并进现有 mitm.json, 返回候选字节(纯函数, 不落盘)。
+
+    只改 wloc 这一段 —— 别的插件段(以后有)原样保留, 这与 _wloc_save 的语义一致。"""
+    try:
+        cfg = json.loads((cur or b"{}").decode("utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    cfg["wloc"] = _wloc_doc(w)
+    return (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
 
 def _mitm_transact(new_wloc):
-    """事务化落地 WLOC/MITM 目标态。单锁内完成, 任一步失败全量回滚。
+    """落地 WLOC/MITM 目标态 —— **一笔 pdgtx 事务**: mitm.json + mitm_hijack + mihomo 配置
+    一起校验、一起落盘, 服务动作与观察期、回滚、崩溃恢复全交给事务核心。
 
-    new_wloc 可以是算好的目标态(dict), 也可以是**在锁内**跑的 mutate(w) —— 后者用于
-    开/关 WLOC 这类"要先看当前状态再决定目标"的操作: 锁外读状态、锁内拿它当真, 中间被别人
-    改掉就会把过期状态写回去。mutate 里 raise _WlocAbort(msg) = 现场一动未动地放弃。
-    顺序: 备份旧 mitm.json+hijack → 写新 mitm.json → CA(有域名)→ 写 hijack → 渲染内核+校验+稳定active
-          → pdg-mitm 稳定active(有域名)/停(无) → mosdns 重启+稳定active。
-    保证: 绝不『返回失败但新态(含 enabled)已持久化』, 也绝不『服务失败却返回成功』。返回 (ok, msg)。"""
-    if _platform() != "ios":         # 平台硬门控: Android 不生成 CA / 不写 hijack / 不重启 pdg-mitm / 不改核心 MITM 路由
+    new_wloc 可以是算好的目标态(dict), 也可以是 mutate(w) —— 后者用于开/关 WLOC 这类
+    "要先看当前状态再决定目标"的操作: 目标态基于 read_for_update 读到的那一份算, 并把它的 sha
+    当前置条件, 中途被别人改掉就 PRECONDITION_FAILED 而不是把过期状态写回去。
+    mutate 里 raise _WlocAbort(msg) = 现场一动未动地放弃。
+
+    CA 与叶子证书预签属于**缓存准备**: 在 stage 之前做完, 失败就直接返回, 这时生产配置一个字节
+    都还没动; 失败事务残留的证书不被任何配置引用(enabled 没落盘), 下次开启命中缓存而已。
+
+    动作顺序固定 —— 开启: 落盘 → restart:mihomo → restart:mosdns → start:pdg-mitm;
+    关闭: 落盘 → stop:pdg-mitm → restart:mihomo → restart:mosdns。返回 (ok, msg)。"""
+    if _platform() != "ios":         # 平台硬门控: Android 连事务都不开(不生成 CA / 不写任何文件)
         return False, "MITM/WLOC 仅 iOS 平台可用。"
-    with _cfg_guard() as got:
-        if not got:
-            return False, BUSY_MSG
-        if callable(new_wloc):                                       # 目标态在锁内算, 不用过期状态
-            _w = _wloc_state()
+    tx = _pdgtx()
+    try:
+        t = tx.Tx(source="bot", op="wloc_apply")
+    except Exception as e:  # noqa: BLE001
+        return False, "无法开始配置事务(%s)" % type(e).__name__
+    try:
+        cur, sha = t.read_for_update("mitm_json")
+        if callable(new_wloc):
+            w = _wloc_state_from(cur)
             try:
-                new_wloc(_w)
+                new_wloc(w)
             except _WlocAbort as e:
                 return False, str(e)                                 # 还没动任何东西
-            new_wloc = _w
-        old_mitm = _read_bytes(MITM_CONFIG)
-        old_hijack = _read_bytes(MITM_HIJACK_FILE)
-
-        def _restore():
-            _restore_bytes(MITM_CONFIG, old_mitm)                     # 回滚 mitm.json(含 enabled)
-            _restore_bytes(MITM_HIJACK_FILE, old_hijack if old_hijack is not None else b"")
+        else:
+            w = new_wloc
+        cand_mitm = _mitm_json_bytes(cur, w)
+        doms = _mitm_domains_from(cand_mitm)
+        if doms:                                                     # 缓存准备: 事务之外, 失败零改动
             try:
-                _apply_sb_inner(lambda c: None)                      # 用还原后的 hijack 重渲染内核回旧态
-            except Exception:  # noqa: BLE001
-                pass
-            if _mitm_enabled_domains():                              # 恢复 pdg-mitm 到旧态
-                sh(["systemctl", "reset-failed", "pdg-mitm"]); sh(["systemctl", "restart", "pdg-mitm"])
-            else:
-                sh(["systemctl", "stop", "pdg-mitm"])
-            sh(["systemctl", "reset-failed", "mosdns"]); sh(["systemctl", "restart", "mosdns"])
-
-        try:
-            _wloc_save(new_wloc)                                     # 1. 写新 mitm.json(原子, 内部 os.replace)
-            doms = _mitm_enabled_domains()
-            if doms:                                                # 2. CA + 叶子证书(有域名才需)
-                try:
-                    import mitm_ca
-                    mitm_ca.ensure_ca()
-                    warmed = mitm_ca.prewarm(doms, strict=True)     # 严格预签: 少一张就抛, 不容"半套证书"上线
-                except Exception as e:  # noqa: BLE001
-                    _restore(); return False, "MITM 根 CA 生成失败(%s), 已回滚。" % type(e).__name__
-                if warmed != len(doms):                             # 不吞返回值: 张数对不上同样整体回滚
-                    _restore()
-                    return False, "MITM 叶子证书预签不完整(%d/%d), 已回滚。" % (warmed, len(doms))
-            _atomic_write_text(MITM_HIJACK_FILE,                    # 3. 写 hijack(原子)
-                               "".join("domain:" + d + "\n" for d in doms))
-            ok, err = _apply_sb_inner(lambda c: None)               # 4. 渲染内核 + 校验 + 稳定 active
-            if not ok:
-                _restore(); return False, "内核应用失败(%s), 已回滚。" % (err or "")
-            if doms:                                                # 5. pdg-mitm 稳定 active
-                sh(["systemctl", "reset-failed", "pdg-mitm"])
-                r = sh(["systemctl", "restart", "pdg-mitm"])
-                if r.returncode != 0 or not _svc_active("pdg-mitm"):
-                    _restore(); return False, "pdg-mitm 未稳定运行, 已回滚。"
-            else:
-                sh(["systemctl", "stop", "pdg-mitm"])
-            sh(["systemctl", "reset-failed", "mosdns"])             # 6. mosdns 重启 + 稳定 active
-            r = sh(["systemctl", "restart", "mosdns"])
-            if r.returncode != 0 or not _svc_active("mosdns"):
-                _restore(); return False, "mosdns 未稳定运行, 已回滚。"
-            return True, ""
-        except Exception as e:  # noqa: BLE001
-            _restore(); return False, "MITM 应用异常(%s), 已回滚。" % type(e).__name__
+                import mitm_ca
+                mitm_ca.ensure_ca()
+                warmed = mitm_ca.prewarm(doms, strict=True)          # 严格预签: 少一张就抛
+            except Exception as e:  # noqa: BLE001
+                return False, "MITM 根 CA 生成失败(%s), 未改动任何配置。" % type(e).__name__
+            if warmed != len(doms):
+                return False, ("MITM 叶子证书预签不完整(%d/%d), 未改动任何配置。"
+                               % (warmed, len(doms)))
+        # 内核配置由 model + rs_meta + **候选**接管域名渲染。model/rs_meta 本次不改 → 只 watch:
+        # 它们变了说明候选已过期, 提交前就该拒, 而不是把按旧 model 渲染的配置写下去。
+        model_raw = t.watch("model")
+        meta_raw = t.watch("rs_meta", optional=True)
+        model = json.loads((model_raw or b"{}").decode("utf-8"))
+        rs_meta = json.loads(meta_raw.decode("utf-8")) if meta_raw else None
+        t.stage("mitm_json", cand_mitm, expect=sha)
+        t.derive("mitm_hijack", lambda c: _mitm_hijack_bytes(_mitm_domains_from(c["mitm_json"])))
+        t.derive("mihomo_cfg", lambda c: _render_mihomo_bytes(
+            model, rs_meta, mitm_domains=_mitm_domains_from(c["mitm_json"]))[0])
+        if doms:
+            t.service("restart:mihomo"); t.service("restart:mosdns"); t.service("start:pdg-mitm")
+        else:
+            t.service("stop:pdg-mitm"); t.service("restart:mihomo"); t.service("restart:mosdns")
+        res = t.commit()
+    except tx.TxBusy:
+        return False, BUSY_MSG
+    except tx.TxRefused as e:
+        return False, tx.redact(str(e))
+    except tx.TxError as e:
+        return False, "配置事务内部错误: %s" % tx.redact(str(e))
+    except Exception as e:  # noqa: BLE001
+        return False, "MITM 应用异常(%s)" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
+    if res["state"] == tx.COMMITTED:
+        return True, ""
+    if res["state"] == tx.ROLLBACK_FAILED:
+        return False, ("应用失败(%s)\n⚠️ 回滚未完成: %s\n事务材料已保留, 请运行 "
+                       "<code>sudo pdg tx recover %s</code>"
+                       % (res.get("error", ""), "、".join(res.get("rollback_failed_items") or []),
+                          res["txid"]))
+    return False, "应用失败(%s), 已回滚到操作前。" % res.get("error", "")
 
 def _wloc_state():
     """归一化 WLOC 配置(迁移老单坐标格式)→ {enabled, accuracy, active, generation, locations:[…]}。"""
-    w = dict(_mitm_config().get("wloc") or {})
+    return _wloc_state_from_cfg(_mitm_config())
+
+
+def _wloc_state_from(mitm_json_bytes):
+    """同 _wloc_state, 但基于**给定的 mitm.json 字节**(事务候选阶段用: 读到的那一份才算数)。"""
+    try:
+        cfg = json.loads((mitm_json_bytes or b"{}").decode("utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    return _wloc_state_from_cfg(cfg)
+
+
+def _wloc_state_from_cfg(cfg):
+    w = dict((cfg or {}).get("wloc") or {})
     locs = w.get("locations")
     if locs is None:                              # 迁移老格式 {lat,lon} → 一个"默认"地点
         locs = [{"name": "默认", "lat": w["lat"], "lon": w["lon"]}] if "lat" in w and "lon" in w else []
@@ -644,11 +685,16 @@ def _wloc_active(w=None):
             return l
     return None
 
+def _wloc_doc(w):
+    """WLOC 目标态 → 写进 mitm.json 的那一段(纯函数, 事务候选与热路径共用同一份形态)。"""
+    return {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
+            "active": w.get("active"), "generation": int(w.get("generation") or 0),
+            "locations": w.get("locations", [])}
+
+
 def _wloc_save(w):
     cfg = _mitm_config()
-    cfg["wloc"] = {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
-                   "active": w.get("active"), "generation": int(w.get("generation") or 0),
-                   "locations": w.get("locations", [])}
+    cfg["wloc"] = _wloc_doc(w)
     _save_mitm_config(cfg)
 
 class _WlocAbort(Exception):
@@ -664,15 +710,34 @@ def _wloc_edit_locked(mutate):
     切地点走这里而不是 _mitm_transact: 接管域名只由 enabled 决定, 换坐标既不影响 CA、也不
     影响 hijack 表和内核路由, 而 pdg-mitm 会在下一次 WLOC 请求开始时读取当前 mitm.json —— 那一整套
     (预热证书/重渲内核/重启 pdg-mitm/重启 mosdns)对"只换经纬度"是纯粹的浪费, 还会断一次
-    DNS。返回改后的 w; 锁忙返回 None。"""
+    DNS。返回改后的 w; 锁忙返回 None。
+
+    **这是受控的 hot-path 例外, 不走 pdgtx**: 单文件、单次原子替换、零服务动作 —— 没有
+    "多组件半成功"可言(写失败 = 旧文件完好), 而完整事务的观察期光稳定性采样就够把 1 秒的
+    目标击穿。例外不等于不留痕: 成功/失败都在同一把锁内写一条脱敏审计(与事务同一份日志、
+    同一种格式), 只记代号与 generation 变化, 不记地点名、经纬度、chat id 之类。"""
     with _cfg_guard() as got:
         if not got:
             return None
         w = _wloc_state()
+        gen_before = int(w.get("generation") or 0)
         if mutate(w) is False:
+            _wloc_hot_audit("wloc_hot_noop", "NOCHANGE", gen_before, gen_before)
             return w
         _wloc_save(w)
+        _wloc_hot_audit("wloc_hot_edit", "APPLIED", gen_before, int(w.get("generation") or 0))
         return w
+
+
+def _wloc_hot_audit(op, result, gen_before, gen_after):
+    """给热路径写一条审计。**审计失败绝不能让已经成功的切换报失败** —— 坐标已经落盘了,
+    这时回一句"失败"会让用户以为没生效而反复重试。只把脱敏后的异常类型记进日志。"""
+    try:
+        _pdgtx().audit_event("bot", op, result,
+                             extra={"generation_before": gen_before, "generation_after": gen_after,
+                                    "generation_changed": gen_after != gen_before})
+    except Exception as e:  # noqa: BLE001
+        print("[wloc] 审计写入失败(%s), 切换本身已生效" % type(e).__name__, file=sys.stderr)
 
 def _wloc_bump(w):
     """generation +1 —— bot 靠它认出"这次 WLOC 命中对应的是我刚才那次切换"。"""
@@ -706,7 +771,7 @@ def wloc_add_gen(name, lat, lon):
         st["enabled"] = bool(w.get("enabled"))
     w = _wloc_edit_locked(_mut)
     if w is None:
-        return False, BUSY_MSG, 0
+        return False, busy_msg(), 0
     if st["hot"]:
         return True, (f"✅ 当前目标坐标已更新：<b>{name}</b>（{lat}, {lon}）\n"
                       "WLOC 已热加载，无需重启网关服务，也不用再去列表里点一次。\n\n"
@@ -749,7 +814,7 @@ def wloc_del(name):
         st["next"] = w.get("active")
     w = _wloc_edit_locked(_mut)
     if w is None:
-        return False, BUSY_MSG
+        return False, busy_msg()
     if not st.get("exists"):
         return False, "没有这个地点"
     if st.get("needs_txn"):
@@ -785,7 +850,7 @@ def wloc_switch_gen(name):
         _wloc_bump(ww)
     w = _wloc_edit_locked(_mut)
     if w is None:
-        return False, BUSY_MSG, 0
+        return False, busy_msg(), 0
     if not st.get("exists"):
         return False, "没有这个地点", 0
     loc = _wloc_active(w)
@@ -962,8 +1027,27 @@ def set_wloc(on, lat=None, lon=None):
         wloc_switch("默认")
     return wloc_enable(on)
 
+def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
+    """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
+
+    事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
+    一起落盘 —— 否则"model 写进去了、渲染失败"就会留下两份不一致的配置。
+
+    mitm_domains: 显式给出接管域名(WLOC 事务用**候选** mitm.json 推出来的那一份)。不给就读
+    生产的 mitm_hijack.txt —— 那是"这次不改 MITM"的路径才成立的默认值。"""
+    import sb2mihomo
+    tls_ports = [443] if _platform() == "ios" else None
+    cfg, meta = sb2mihomo.singbox_to_mihomo(
+        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(rs_meta),
+        mitm_domains=_mitm_domains() if mitm_domains is None else mitm_domains,
+        mitm_port=MITM_PORT, tls_ports=tls_ports,
+        **_panel_render_args(model))
+    return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"), meta
+
+
 def _render_mihomo_file():
-    """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。"""
+    """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。
+    仍供 pdg.sh 的平台切换等 CLI 路径调用(那些路径由 CLI 侧事务覆盖)。"""
     import sb2mihomo
     model = load()
     # iOS: 嗅探端口不含 GMS 5228-5230(iOS 走 APNs); Android 用默认(含 GMS)。两平台 canonical/内核均无 GMS 残留。
@@ -987,80 +1071,120 @@ def _fmt_dropped(dropped):
     return ", ".join(out[:8]) + ("…" if len(out) > 8 else "")
 
 
-def _core_apply():
-    """校验 model 渲染出的 mihomo 配置并重启 mihomo。不改 model 文件本身。
-    返回 (ok, errtext, restarted): restarted 标明核心是否已被重启(决定回滚要不要再重启)。"""
-    try:
-        meta = _render_mihomo_file()
-    except Exception as e:  # noqa: BLE001  渲染失败(未知协议/写盘): 视为校验失败, 核心未动
-        return False, "渲染 mihomo 配置失败(%s)" % type(e).__name__, False
-    # 有出口 mihomo 无法无损转换 → 拒绝(否则会被静默丢弃, mihomo -t 仍会通过而出口凭空消失)
+def busy_msg():
+    """区分"别人正在改"与"锁不可用" —— 后者是环境故障, 让用户知道该去看 /run。"""
+    return NOLOCK_MSG if _cfg_lock_error() else BUSY_MSG
+
+def _pdgtx():
+    import pdgtx
+    return pdgtx
+
+
+def _model_bytes(c):
+    return json.dumps(c, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _mihomo_derive(staged):
+    """由**候选** model(+候选 rs_meta)派生 mihomo 配置。dropped / 无法转换的出口一律判失败。
+
+    tx_apply 与恢复备份共用这一份 —— 判据只有一处, 免得两条路一个拦一个不拦。"""
+    model = json.loads(staged["model"].decode("utf-8"))
+    # 规则集元数据如果也在本次候选里, 渲染必须按**候选**来 —— 读现网旧文件会让新增的规则集
+    # "翻译不了"被丢掉, 或者已删的又冒出来。
+    staged_meta = staged.get("rs_meta")
+    data, meta = _render_mihomo_bytes(
+        model, rs_meta=json.loads(staged_meta.decode("utf-8")) if staged_meta else None)
+    # 用 TxRefused 而不是 ValueError: 事务对普通异常只报类型名(怕异常正文带出凭据), 而这两条
+    # 恰恰必须**点名**是哪个出口/哪条规则被丢了, 否则用户根本不知道该改什么。
+    refused = _pdgtx().TxRefused
     bad = (meta or {}).get("unknown_proxies")
     if bad:
-        return False, "有出口 mihomo 无法转换(会被静默丢弃): %s" % ", ".join(str(x) for x in bad), False
-    # 同理: 没能翻译进运行配置的规则/规则集也必须拒。mihomo -t 照样会过 —— 它只看渲染出来的
-    # 那份, 根本不知道有东西被丢了; 用户则以为分流已生效, 实际那条规则压根不存在。
+        raise refused("有出口 mihomo 无法转换(会被静默丢弃): %s"
+                      % ", ".join(str(x) for x in bad))
     dropped = (meta or {}).get("dropped")
     if dropped:
-        return False, "有规则/规则集无法进入 mihomo 运行配置(会被静默丢弃): %s" % _fmt_dropped(dropped), False
-    chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", MIHOMO_CFG])
-    if chk.returncode != 0:
-        return False, "mihomo 配置校验失败:\n" + (chk.stdout + chk.stderr)[-400:], False
-    sh(["systemctl", "reset-failed", "mihomo"])
-    r = sh(["systemctl", "restart", "mihomo"])
-    if r.returncode != 0 or not _svc_active("mihomo"):
-        return False, "重启 mihomo 失败:\n" + (r.stdout + r.stderr)[-300:], True
-    return True, "", True
+        raise refused("有规则/规则集无法进入 mihomo 运行配置(会被静默丢弃): %s"
+                      % _fmt_dropped(dropped))
+    return data
 
-def _core_sync_file():
-    """校验失败回滚后: 把 good model 重新渲染落盘(免得磁盘上留着坏 mihomo 配置), 但不重启
-    (运行中的 mihomo 未受影响)。"""
+
+def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode="normal",
+             warnings=()):
+    """Bot 侧所有生产写入的**唯一**入口: 一笔事务把 model、mosdns 规则、profile 等一起落盘。
+
+    以前是"model 走 apply_sb(锁内), mosdns 文件在锁外再补一刀" —— 于是内核里有规则、DNS 侧
+    没劫持这种半套状态没人拦得住。现在它们要么一起成功, 要么一起回到操作前。
+
+    model_mod:  改 model 的回调(与旧 apply_sb 语义一致)
+    files:      {逻辑目标名: bytes|None} 需要与 model 一起原子落盘的其它目标
+    services:   额外要重启的服务(model 变更会自动带上 mihomo)
+    tfo_intent: 指定本次 TFO 意图(set_tfo 用); None = 沿用 profile.env 里的当前意图
+    返回 (ok, msg)
+    """
+    tx = _pdgtx()
+    svc = set(services or ())
     try:
-        _render_mihomo_file()
-    except Exception:  # noqa: BLE001
-        pass
+        t = tx.Tx(source="bot", op=op, mode=mode)
+    except Exception as e:  # noqa: BLE001
+        return False, "无法开始配置事务(%s)" % type(e).__name__
+    for w in warnings or ():
+        t.warn(w)
+    try:
+        if model_mod is not None:
+            # 先记下"候选依据的是哪一份 model": 之后 stage 用它当前置条件。
+            # 否则 load() 与 stage() 之间别人提交的修改会被当成前置条件, 最后被我们覆盖(丢更新)。
+            t.read_for_update("model")
+            c = load()
+            intent = _tfo_intent(c) if tfo_intent is None else tfo_intent
+            model_mod(c)
+            _tfo_apply(c, intent)                 # 加/改出口不冲掉 TFO 状态(语义与旧实现一致)
+            t.stage("model", _model_bytes(c))
+            svc.add("mihomo")
+
+            t.derive("mihomo_cfg", _mihomo_derive)
+        for name, data in (files or {}).items():
+            t.stage(name, data)
+            s2 = tx.target_service(name)
+            if s2:
+                svc.add(s2)
+        for u in sorted(svc):
+            t.service("restart:" + u)
+        if "sysctl_tfo" in (files or {}):
+            t.service("sysctl:apply")
+        res = t.commit()
+    except _PanelOwnershipError:
+        return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
+    except tx.TxBusy:
+        # 直接用 BUSY_MSG, **不要**走 busy_msg(): 后者看的是本线程上一次 _cfg_guard() 的结果,
+        # 而这里的失败来自 pdgtx 自己的锁。线程池会复用线程 —— 同一个工作线程先前若碰上过
+        # "锁文件不可用"(比如一次 WLOC 操作), 那份状态还在, TxBusy 就会被错报成 NOLOCK。
+        # pdgtx._Lock 已经把两件事分开了: 打不开锁文件 → TxRefused, 锁被占 → TxBusy。
+        return False, BUSY_MSG
+    except tx.TxRefused as e:
+        return False, tx.redact(str(e))
+    except tx.TxError as e:
+        return False, "配置事务内部错误: %s" % tx.redact(str(e))
+    except Exception as e:  # noqa: BLE001
+        return False, "配置事务异常(%s)" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
+    if res["state"] == tx.COMMITTED:
+        note = ("\n⚠️ " + "; ".join(res["warnings"])) if res["warnings"] else ""
+        return True, "事务 %s 已提交%s" % (res["txid"], note)
+    if res["state"] == tx.ROLLBACK_FAILED:
+        return False, ("%s\n⚠️ 回滚未完成, 未恢复项: %s\n事务材料保留在 %s"
+                       % (res["error"], "、".join(res["rollback_failed_items"]) or "(未知)",
+                          res["dir"]))
+    return False, "%s(已回滚到操作前, 事务 %s)" % (res["error"], res["txid"])
+
 
 def apply_sb(modify):
-    # 串行化配置写 + 与 pdg update/rollback 用同一把 flock 协调(拿不到锁友好返回, 不卡死)。
-    with _cfg_guard() as got:
-        if not got:
-            return False, BUSY_MSG
-        return _apply_sb_inner(modify)
-
-def _apply_sb_inner(modify):
-    """apply_sb 的**不含锁**主体。供 _mitm_transact 事务在同一把 _cfg_guard 内复用 ——
-    _cfg_guard 非可重入(非阻塞 threading.Lock + 非阻塞 flock), 事务里再调 apply_sb 会 BUSY,
-    故事务先持锁一次, 内核步走这里。"""
-    if True:
-        shutil.copy(SB, SB + ".botbak"); os.chmod(SB + ".botbak", 0o600)
-        wrote = False
-        try:
-            c = load()
-            tfo = _tfo_intent(c)                     # 改动前判定 TFO 意图(持久标志优先, 老装回退推断)
-            modify(c)
-            _tfo_apply(c, tfo)                        # 同步到(含新增的)所有出口 → 加/改出口不冲掉 TFO 状态
-            _write(c); wrote = True                   # 写了新配置后, 任何异常都必须还原
-            ok, err, restarted = _core_apply()
-            if not ok:
-                shutil.copy(SB + ".botbak", SB)              # 还原 model
-                if restarted:
-                    _core_apply()                            # 重启失败: 用 good model 再渲染+重启回已知good
-                else:
-                    _core_sync_file()                        # 校验失败: 只同步渲染文件, 不重启(核心没动过)
-                return False, err
-            return True, ""
-        except _PanelOwnershipError:
-            return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
-        except Exception as e:  # noqa: BLE001
-            # check/restart 超时(TimeoutExpired)、modify/写盘等异常: 绝不留未验证的新配置。
-            # 已写过新配置就还原备份并尽力重启回已知good; 返回失败(TG Bot 会据此提示), 不外泄异常正文。
-            if wrote:
-                try:
-                    shutil.copy(SB + ".botbak", SB)
-                    _core_apply()
-                except Exception:  # noqa: BLE001
-                    pass
-            return False, "应用配置异常(%s),已还原上一份配置。" % type(e).__name__
+    """兼容入口: 只改 model 的操作(加删出口/组/默认出口/改名/排序…)。"""
+    ok, msg = tx_apply("apply_sb", model_mod=modify)
+    return ok, ("" if ok else msg)
 
 # 可作出口的代理协议(决定哪些出站算"出口": 可选默认/故障组成员/测出口/删除)。sing-box 支持的都列上。
 PROXY_TYPES = ("shadowsocks", "vmess", "trojan", "vless", "hysteria", "hysteria2",
@@ -1317,10 +1441,11 @@ def _read_direct():
     return [l.strip().replace("domain:", "") for l in open(MOSDNS_DIRECT)
             if l.strip() and not l.startswith("#")]
 
-def _write_direct(domains):
-    with open(MOSDNS_DIRECT, "w") as f:
-        f.write("# pdg-bot 自定义直连\n" + "".join("domain:" + d + "\n" for d in sorted(set(domains))))
-    sh(["systemctl", "restart", "mosdns"])
+def _direct_text(domains):
+    """直连表内容(不落盘)。落盘与 mosdns 重启由事务统一做 —— 以前这里自己写自己重启,
+    连 mosdns 有没有起来都不查。"""
+    return ("# pdg-bot 自定义直连\n"
+            + "".join("domain:" + d + "\n" for d in sorted(set(domains)))).encode("utf-8")
 
 def _read_hijack():
     """指到出口的域名劫持表。mosdns 的 hijack_set 只装 geosite 策展分类, 不含任意个人域名 ——
@@ -1330,11 +1455,10 @@ def _read_hijack():
     return [l.strip().replace("domain:", "") for l in open(MOSDNS_HIJACK)
             if l.strip() and not l.startswith("#")]
 
-def _write_hijack(domains):
-    with open(MOSDNS_HIJACK, "w") as f:
-        f.write("# pdg-bot 显式出口域名劫持表(指到出口的域名必须由 mosdns 劫持才会进代理)\n"
-                + "".join("domain:" + d + "\n" for d in sorted(set(domains))))
-    sh(["systemctl", "restart", "mosdns"])   # domain_set 只在启动时加载, 必须重启才生效
+def _hijack_text(domains):
+    """出口域名劫持表内容(不落盘)。domain_set 只在 mosdns 启动时加载, 故事务里必带 restart。"""
+    return ("# pdg-bot 显式出口域名劫持表(指到出口的域名必须由 mosdns 劫持才会进代理)\n"
+            + "".join("domain:" + d + "\n" for d in sorted(set(domains)))).encode("utf-8")
 
 # ── mosdns DNS 上游 (remote=国际 / local=国内; 用于接 DNS 解锁等自定义解析器) ──
 def _upstreams(which):
@@ -1357,9 +1481,21 @@ def set_mosdns_upstream(which, addrs):
     if not addrs:
         return False, "至少给一个 DNS 地址 (udp://1.2.3.4:53 / tcp://.. / https://x/dns-query / tls://..)"
     tag = which + "_upstream"
+    # 走统一事务: 候选先过 mosdns 强校验(netns/高端口真起一次), 通过才原子落盘 + 重启观察。
+    # 旧实现是"直接覆盖现网 → 重启 → 看 is-active", 坏配置要等 mosdns 起不来才发现。
+    tx = _pdgtx()
     try:
-        lines = open(MOSDNS_CONF).read().splitlines()
+        t = tx.Tx(source="bot", op="mosdns_upstream")
     except Exception as e:  # noqa: BLE001
+        return False, "无法开始配置事务(%s)" % type(e).__name__
+    cur, _sha = t.read_for_update("mosdns_conf")     # 候选基于这一份算, 前置条件也是它
+    if cur is None:
+        t.abort_unstarted("读 mosdns 配置失败: 文件不存在")
+        return False, "读 mosdns 配置失败: 文件不存在"
+    try:
+        lines = cur.decode("utf-8").splitlines()
+    except Exception as e:  # noqa: BLE001
+        t.abort_unstarted("mosdns 配置不是 UTF-8")
         return False, f"读 mosdns 配置失败: {e}"
     items = ", ".join('{addr: "%s"}' % a for a in addrs)
     done = False
@@ -1376,15 +1512,30 @@ def set_mosdns_upstream(which, addrs):
         if done:
             break
     if not done:
+        t.abort_unstarted("mosdns 配置里没有 %s 块" % tag)
         return False, f"没在 mosdns 配置里找到 {tag} 块"
-    shutil.copy(MOSDNS_CONF, MOSDNS_CONF + ".botbak")
-    with open(MOSDNS_CONF, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    sh(["systemctl", "restart", "mosdns"])
-    if sh(["systemctl", "is-active", "mosdns"]).stdout.strip() != "active":
-        shutil.copy(MOSDNS_CONF + ".botbak", MOSDNS_CONF); sh(["systemctl", "restart", "mosdns"])
-        return False, "mosdns 重启失败(配置可能不合法), 已回滚"
-    return True, f"✅ {which} 上游已设为: {', '.join(addrs)}"
+    t.stage("mosdns_conf", ("\n".join(lines) + "\n").encode("utf-8"))
+    t.service("restart:mosdns")
+    try:
+        res = t.commit()
+    except tx.TxBusy:
+        return False, BUSY_MSG          # 同上: 锁被占是 pdgtx 报的, 与 _cfg_guard 的历史无关
+    except tx.TxRefused as e:
+        return False, tx.redact(str(e))
+    except Exception as e:  # noqa: BLE001
+        return False, "配置事务异常(%s)" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
+    if res["state"] == tx.COMMITTED:
+        return True, f"✅ {which} 上游已设为: {', '.join(addrs)}"
+    if res["state"] == tx.ROLLBACK_FAILED:
+        return False, ("%s\n⚠️ 回滚未完成: %s\n事务材料: %s"
+                       % (res["error"], "、".join(res["rollback_failed_items"]) or "(未知)",
+                          res["dir"]))
+    return False, "%s(已回滚到操作前, 事务 %s)" % (res["error"], res["txid"])
 
 # ── 流媒体/服务解锁: 在「落地出口」与「WDA 解锁」之间整体切换 ──
 # WDA 模式: 这些域名 → jp 直出 + 经 mosdns 用解锁 DNS(22.22.22.22)解析到中继(从本机授权 IP 出)。
@@ -1435,50 +1586,37 @@ def _wda_authorized():
     out = sh(["dig", "+short", "+time=3", "+tries=2", "@" + UNLOCK_DNS, "nflxso.net", "A"]).stdout
     return any(ln.strip().startswith(net24) for ln in out.splitlines())
 
-def _write_unlock_file(domains):
-    """把 domains(可空)写进 mosdns unlock.txt(domain: 前缀); 变了才重启 mosdns(失败回滚)。
-    空列表 = 落地模式: 清空文件 → mosdns 解锁支不命中任何域名 = 休眠(本机查询这些域名回落普通上游)。"""
-    path = os.path.join(MOSDNS_RULES, "unlock.txt")
-    want = "".join("domain:%s\n" % d for d in domains)
+def _unlock_text(domains):
+    """WDA 解锁清单内容(不落盘)。空列表 = 落地模式(清空 → mosdns 解锁支休眠)。"""
+    return "".join("domain:%s\n" % d for d in domains).encode("utf-8")
+
+
+def _unlock_precheck(domains):
+    """要写域名时, mosdns 必须已经有解锁支; 否则写了也不会生效。"""
+    if not domains:
+        return True, ""
     try:
-        cur = open(path).read()
-    except OSError:
-        cur = None
-    if cur == want or (want == "" and not cur):
-        return True, ""                       # 已是目标(含: 要清空且本来就空/无文件)
-    if domains:                               # 只有"写域名"才要求 mosdns 已有解锁支
-        try:
-            if "unlock_upstream" not in open(MOSDNS_CONF).read():
-                return False, "mosdns 还没有解锁支(unlock_upstream)。请先在服务器跑  sudo pdg update  补上再切。"
-        except OSError as e:
-            return False, f"读 mosdns 配置失败: {e}"
-    os.makedirs(MOSDNS_RULES, exist_ok=True)
-    if cur is not None:
-        shutil.copy(path, path + ".bak")
-    open(path, "w").write(want)
-    sh(["systemctl", "restart", "mosdns"]); time.sleep(1)
-    if sh(["systemctl", "is-active", "mosdns"]).stdout.strip() != "active":
-        if os.path.exists(path + ".bak"):
-            shutil.copy(path + ".bak", path)
-        sh(["systemctl", "restart", "mosdns"])
-        return False, "mosdns 重启失败, 已回滚 unlock.txt"
+        if "unlock_upstream" not in open(MOSDNS_CONF).read():
+            return False, "mosdns 还没有解锁支(unlock_upstream)。请先在服务器跑  sudo pdg update  补上再切。"
+    except OSError as e:
+        return False, "读 mosdns 配置失败: %s" % type(e).__name__
     return True, ""
 
+
 def set_wda_mode(on):
-    was_on = _wda_on()                          # 记下操作前状态: 回滚要还原到它, 而不是无脑清空
-    if on:
-        if not _wda_authorized():               # 没授权就开 = 流媒体走 jp 直出但拿不到中继, 反而更糟 → 先拦住
-            ip = _server_ip()
-            return False, ("⚠️ 没在解锁 DNS(%s)上测到本机的中继, <b>先别开 WDA</b>(否则解锁服务拿不到中继, 流媒体反而可能挂)。\n"
-                           "常见原因: 没订阅解锁服务 / 没在服务商<b>后台把本机公网 IP <code>%s</code> 加白授权</b> / DNS 不通。\n"
-                           "→ 去服务商后台授权本机 IP <code>%s</code>, 再点 🔓。(未改动, 仍走落地出口)"
-                           % (UNLOCK_DNS, ip, ip))
-        ok, err = _write_unlock_file(WDA_DOMAINS)   # mosdns 侧: 写满解锁清单
-        if not ok:
-            return False, err
-        os.makedirs(RS_DIR, exist_ok=True)
-        json.dump({"version": 1, "rules": [{"domain_suffix": WDA_DOMAINS}]},
-                  open(os.path.join(RS_DIR, "unlock.json"), "w"), ensure_ascii=False)
+    """WDA 解锁 ↔ 落地出口。mosdns 解锁清单、sing-box 规则集文件与 model 现在是**一笔事务**:
+    以前三处分三步写, 任何一步失败都可能留下"内核撤了规则、mosdns 还在走解锁 DNS"的半套状态。"""
+    if on and not _wda_authorized():             # 没授权就开 = 拿不到中继, 反而更糟 → 先拦住
+        ip = _server_ip()
+        return False, ("⚠️ 没在解锁 DNS(%s)上测到本机的中继, <b>先别开 WDA</b>(否则解锁服务拿不到中继, 流媒体反而可能挂)。\n"
+                       "常见原因: 没订阅解锁服务 / 没在服务商<b>后台把本机公网 IP <code>%s</code> 加白授权</b> / DNS 不通。\n"
+                       "→ 去服务商后台授权本机 IP <code>%s</code>, 再点 🔓。(未改动, 仍走落地出口)"
+                       % (UNLOCK_DNS, ip, ip))
+    domains = WDA_DOMAINS if on else []
+    okp, errp = _unlock_precheck(domains)
+    if not okp:
+        return False, errp
+
     def mod(c):
         c["route"].setdefault("rule_set", [])
         c["route"]["rule_set"] = [r for r in c["route"]["rule_set"] if r.get("tag") != "unlock"]
@@ -1488,22 +1626,19 @@ def set_wda_mode(on):
                                            "path": os.path.join(RS_DIR, "unlock.json")})
             idx = 1 if c["route"]["rules"] and c["route"]["rules"][0].get("action") == "reject" else 0
             c["route"]["rules"].insert(idx, {"rule_set": "unlock", "outbound": "jp"})
-    ok, msg = apply_sb(mod)
+
+    files = {"mosdns_rule:unlock.txt": _unlock_text(domains)}
+    if on:
+        files["ruleset:unlock.json"] = json.dumps(
+            {"version": 1, "rules": [{"domain_suffix": WDA_DOMAINS}]}, ensure_ascii=False).encode()
+    ok, msg = tx_apply("wda_" + ("on" if on else "off"), model_mod=mod, files=files)
     if not ok:
-        if on and not was_on:                    # 仅"本来关→这次想开"失败才清回空; 本来就开则 apply_sb 已还原成带规则的旧配置, 保持 unlock.txt
-            okc, errc = _write_unlock_file([])
-            if not okc:                          # 连回滚清空都失败 → 别静默, 明确告知 mosdns 侧可能残留
-                msg += "\n⚠️ 且回滚清空 unlock.txt 也失败(" + errc + "): mosdns 侧可能仍残留解锁清单, 请重试或手动清空。"
         return False, msg
     if on:
         return True, ("✅ 已切到【🔓 WDA 解锁】: %d 个域名走 WDA(jp 直出 + 22.22.22.22 中继)。\n"
                       "其余流量照常分流。哪个服务在 WDA 下不灵, 切回【落地出口】即可。") % len(WDA_DOMAINS)
-    # 关闭: sing-box 规则已撤; 再清空 mosdns unlock.txt, 让解锁支彻底休眠(否则本机解析这些域名仍走解锁 DNS)
-    okc, errc = _write_unlock_file([])
-    if okc:
-        return True, "✅ 已切到【🛬 落地出口】: 解锁域名回落各自出口(hk/tw), mosdns 解锁清单已清空。"
-    return True, ("✅ 已切到【🛬 落地出口】(内核分流规则已撤)。\n"
-                  "⚠️ 但清空 mosdns unlock.txt 失败(" + errc + "): 本机解析这些域名可能仍走解锁 DNS, 可再点一次 🛬 或手动清空。")
+    return True, "✅ 已切到【🛬 落地出口】: 解锁域名回落各自出口(hk/tw), mosdns 解锁清单已清空。"
+
 
 # ── 持久化开关 (profile.env: PDG_LOWMEM / PDG_TFO …) ──
 def _profile_get(key, default=""):
@@ -1516,7 +1651,8 @@ def _profile_get(key, default=""):
         pass
     return default
 
-def _profile_set(key, val):
+def _profile_text_with(key, val):
+    """把 profile.env 改成"key=val"后的完整内容(不落盘)。"""
     try:
         lines = open(PROFILE_ENV, encoding="utf-8").read().splitlines()
     except OSError:
@@ -1524,21 +1660,14 @@ def _profile_set(key, val):
     out, found = [], False
     for line in lines:
         if line.strip().startswith(key + "="):
-            out.append(f"{key}={val}"); found = True
+            out.append("%s=%s" % (key, val)); found = True
         else:
             out.append(line)
     if not found:
-        out.append(f"{key}={val}")
-    os.makedirs(os.path.dirname(PROFILE_ENV), exist_ok=True)
-    tmp = PROFILE_ENV + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
-    os.replace(tmp, PROFILE_ENV)
+        out.append("%s=%s" % (key, val))
+    return ("\n".join(out) + "\n").encode("utf-8")
 
-# ── TCP Fast Open ──
-# 状态以持久化意图(PDG_TFO)为准, 不再靠"所有出口都带 tcp_fast_open"推断 —— 否则加一个新出口
-# (parse_link 出来的不带标志)就把 all(...) 打成假, 表现为"开了 TFO 却显示关闭、新出口也没享受到"。
-# apply_sb 每次改配置都会把意图同步到(含新增的)所有出口, 状态不再被冲掉。
+
 def _tfo_intent(c=None):
     v = _profile_get("PDG_TFO")
     if v in ("0", "1"):
@@ -1569,22 +1698,33 @@ def _tfo_apply(c, on):
 def _tfo_on(c=None):
     return _tfo_intent(c)
 
+# TFO 的内核值在这里定死, 免得"开/关"各处理解不一:
+#   开启 = 3(客户端 + 服务端都启用: 网关既往落地发起连接, 也接手机的连接)
+#   关闭 = 1(Linux 的发行版默认值 —— **只**收回本项目额外打开的服务端那一半;
+#           写 0 会把客户端 TFO 也一起关掉, 那是在替系统上别的程序做决定)
+TFO_ON, TFO_OFF = 3, 1
+
+
 def set_tfo(on):
-    prev = _profile_get("PDG_TFO")
-    _profile_set("PDG_TFO", "1" if on else "0")     # 先持久化意图, apply_sb 的同步据此执行
-    ok, msg = apply_sb(lambda c: None)              # 空 mod: 仅触发 _tfo_apply 同步 + 重启核心
+    """TFO 开关。持久意图(profile.env)、出口/入口标志(model)、sysctl drop-in 与运行时值
+    同属一笔事务。
+
+    关闭时**写"关闭态"的 drop-in 并真的把运行时值改回去** —— 旧实现只改 profile.env 与
+    model, 99-pdg-tfo.conf 原样留着、运行时 net.ipv4.tcp_fastopen 还是 3, 于是 Bot 显示
+    "已关闭", 重启后又是开着的。"""
+    prof = _profile_text_with("PDG_TFO", "1" if on else "0")
+    files = {
+        "profile_env": prof,
+        "sysctl_tfo": ("net.ipv4.tcp_fastopen=%d\n" % (TFO_ON if on else TFO_OFF)).encode(),
+    }
+    ok, msg = tx_apply("tfo_" + ("on" if on else "off"),
+                       model_mod=lambda c: None, files=files, tfo_intent=on)
     if not ok:
-        _profile_set("PDG_TFO", prev)               # 失败回滚意图, 与配置回滚一致
-        return ok, msg
-    if on:
-        sh(["sysctl", "-w", "net.ipv4.tcp_fastopen=3"])
-        try:
-            with open("/etc/sysctl.d/99-pdg-tfo.conf", "w") as f:
-                f.write("net.ipv4.tcp_fastopen=3\n")
-        except Exception:  # noqa: BLE001
-            pass
-    return True, (f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口)\n"
+        return False, msg
+    return True, (f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口, 内核值 "
+                  f"net.ipv4.tcp_fastopen={TFO_ON if on else TFO_OFF})\n"
                   "新增出口会自动继承此设置。降到落地的握手延迟; 需落地端也支持, 否则自动回落普通握手。")
+
 
 # ── 临时观测/控制面板 (zashboard, 由 sing-box external_ui 托管) ──────────────
 # 默认关闭=零暴露: clash_api 只绑 127.0.0.1、无 secret、防火墙不放行 9090。
@@ -1975,10 +2115,6 @@ def _rs_meta():
         return json.load(open(RS_META))
     return {}
 
-def _save_rs_meta(m):
-    os.makedirs(os.path.dirname(RS_META), exist_ok=True)
-    json.dump(m, open(RS_META, "w"), ensure_ascii=False, indent=2)
-
 def _fetch_surge(url):
     req = urllib.request.Request(url, headers={"User-Agent": "pdg-bot"})
     with urllib.request.urlopen(req, timeout=30) as r:
@@ -2153,7 +2289,8 @@ def add_ruleset(url, target, label="", behavior=""):
         return False, (".srs 是 sing-box 二进制规则集, mihomo 无法读取(收下也不会进运行配置)。\n"
                        "请改用 .list / .txt 文本规则、.yaml provider, 或 mihomo 原生 .mrs。")
     name = "rs_" + hashlib.sha1(url.encode()).hexdigest()[:8]
-    os.makedirs(RS_DIR, exist_ok=True)
+    # 下载与解析全在**候选**阶段: 提交之前一个字节都不写进 RS_DIR。旧实现先落盘再 apply_sb,
+    # 失败还要自己回退文件与元数据 —— 中间任何异常都会留下半截。
     try:
         if low.endswith(".mrs"):
             # mihomo 原生二进制规则集: 直接存盘, 由 rule-provider 按 mrs 格式加载。
@@ -2175,10 +2312,22 @@ def add_ruleset(url, target, label="", behavior=""):
                                "请在规则集后面补上类型: " + " / ".join(MRS_BEHAVIORS) + "\n"
                                "例: <code>https://.../geo.mrs hk 名称 domain</code>"
                                + _mrs_unreadable_hint())
-            open(path, "wb").write(data); count = None
+            count = None
         else:
             path = os.path.join(RS_DIR, name + ".json"); fmt = "source"
-            count, ip_only = _build_source(url, path)
+            _tmpd = tempfile.mkdtemp(prefix="pdgrs-add.")
+            try:
+                _tmp = os.path.join(_tmpd, name + ".json")
+                count, ip_only = _build_source(url, _tmp)
+                try:
+                    with open(_tmp, "rb") as _f:
+                        data = _f.read()
+                except OSError:
+                    # _build_source 没写出文件(异常形态/被打桩)→ 用它解析出的计数信息也不可信,
+                    # 但仍要给候选一个**合法的空规则集**, 由内核校验门去判要不要收
+                    data = json.dumps({"version": 1, "rules": []}, ensure_ascii=False).encode()
+            finally:
+                shutil.rmtree(_tmpd, ignore_errors=True)
             warn = ("\n⚠️ 纯 IP 规则集: 本网关按域名(SNI)分流, IP 规则基本不会命中 "
                     "(Telegram App 等也走不了)。" if ip_only else "")
     except Exception as e:  # noqa: BLE001
@@ -2195,24 +2344,20 @@ def add_ruleset(url, target, label="", behavior=""):
     # 元数据必须**先**落地: mihomo 的 rule-providers 是从 RS_META 生成的, 后写就意味着本次
     # 渲染看不到这个规则集 —— 规则会被当成"翻译不了"丢掉, 而用户已经收到"已添加"。
     # 失败则把元数据与下载的文件一并回退, 不留半截。
-    prev = _rs_meta()
-    m = dict(prev)
+    m = dict(_rs_meta())
     m[name] = {"url": url, "outbound": target, "format": fmt, "path": path, "count": count}
     if behavior in MRS_BEHAVIORS:
         m[name]["behavior"] = behavior
     if label.strip():
         m[name]["label"] = label.strip()[:40]
-    _save_rs_meta(m)
-    ok, msg = apply_sb(mod)
+    # model / 规则集文件 / 元数据 一次提交: 渲染派生时读的是**这份 staged 元数据**, 所以
+    # 不再需要"元数据必须先落地"那种取巧, 也不会出现"文件在、元数据不在"的中间态。
+    ok, msg = tx_apply("ruleset_add", model_mod=mod, files={
+        "ruleset:" + os.path.basename(path): data,
+        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")})
     if ok:
         cntdesc = f"{count} 条" if count is not None else "mihomo .mrs"
         return True, f"规则集已添加 → {target}（{cntdesc}，{label.strip() or name}）" + warn
-    _save_rs_meta(prev)                     # 回退元数据
-    if name not in prev:
-        try:
-            os.remove(path)                 # 回退这次下载的规则集文件
-        except OSError:
-            pass
     return False, msg
 
 def set_ruleset_label(name, label):
@@ -2225,91 +2370,94 @@ def set_ruleset_label(name, label):
         m[name]["label"] = label
     else:
         m[name].pop("label", None)
-    _save_rs_meta(m)
-    return True, f"✅ 规则集名称已设为「{label or name}」"
+    ok, msg = tx_apply("ruleset_label", files={
+        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")})
+    return (True, f"✅ 规则集名称已设为「{label or name}」") if ok else (False, msg)
 
 def _rs_items():
     """[(name, 显示文字)] 供选择键盘用。"""
     return [(n, (i.get("label") or n) + f" · {i.get('count', '?')}条") for n, i in _rs_meta().items()]
 
 def del_ruleset(name):
+    """删规则集: model 规则、规则集文件、元数据**一笔事务**。
+
+    旧实现是 apply_sb 成功之后才去删文件与元数据 —— 中间失败就会留下"内核已经不引用它了,
+    文件和元数据还在"的残留, 下次渲染又把它算进来。"""
     m = _rs_meta(); info = m.get(name, {}); path = info.get("path")
     label = info.get("label") or name              # 删前取显示名(删完 meta 就没了)
+
     def mod(cc):
         cc["route"]["rule_set"] = [r for r in cc["route"].get("rule_set", []) if r.get("tag") != name]
         cc["route"]["rules"] = [r for r in cc["route"]["rules"] if r.get("rule_set") != name]
-    ok, msg = apply_sb(mod)
-    if ok:
-        m.pop(name, None); _save_rs_meta(m)
-        for p in (path, os.path.join(RS_DIR, name + ".json"), os.path.join(RS_DIR, name + ".srs")):
-            try:
-                if p:
-                    os.remove(p)
-            except OSError:
-                pass
-        return True, f"已删除规则集 {label}"
-    return False, msg
+
+    files = {}
+    for p_ in {path, os.path.join(RS_DIR, name + ".json"), os.path.join(RS_DIR, name + ".mrs")}:
+        if p_ and os.path.dirname(p_) == RS_DIR and os.path.exists(p_):
+            files["ruleset:" + os.path.basename(p_)] = None      # None = 本次要删掉它
+    m2 = dict(m); m2.pop(name, None)
+    files["rs_meta"] = json.dumps(m2, ensure_ascii=False, indent=2).encode("utf-8")
+    ok, msg = tx_apply("ruleset_del", model_mod=mod, files=files)
+    return (True, f"已删除规则集 {label}") if ok else (False, msg)
+
 
 def refresh_rulesets():
-    """重下并原子替换所有规则集; 内核校验通过才重启, 坏档自动回滚、不断网(供 bot 与每日定时调用)。
+    """重下全部规则集并**整批**原子提交。返回 (成功刷新数, 失败项列表)。
 
-    返回 (成功刷新数, 失败项列表)。**必须**如实返回失败 —— 旧版只 print 一行然后照返回条数,
-    调用方看不出有规则集没刷上, 用户以为规则库已更新。"""
-    m = _rs_meta(); n = 0; swapped = []; failed = []   # (path, bak)
-    for name, info in m.items():
-        # 兼容早期缺 format/path 的旧条目 (按 name 回填, 否则刷新会 KeyError)。
-        info.setdefault("format", "binary" if str(info.get("path", "")).endswith(".srs") else "source")
-        info.setdefault("path", os.path.join(RS_DIR, name + (".srs" if info["format"] == "binary" else ".json")))
-        tmp = info["path"] + ".new"
-        try:
-            if info["format"] in ("binary", "mrs"):
-                # .mrs 是 mihomo 原生**二进制**格式, 绝不能走文本解析(_build_source 会把它当
-                # Surge 规则去 parse, 结果要么报"没解析出规则", 要么写出一份被毁掉的文件)。
-                data = _fetch_bytes(info["url"])
-                if not data:
-                    raise ValueError("空响应")
-                open(tmp, "wb").write(data)
-                # 顺手把认出来的类型回填进元数据: 老条目本来没有这个字段, 补上之后就不必每次
-                # 渲染都重新嗅探, 也不再因为"没记类型"被跳过(下面 _save_rs_meta 一并落盘)。
-                if info["format"] == "mrs" and info.get("behavior") not in MRS_BEHAVIORS:
-                    bh = mrs_behavior(data)
-                    if bh:
-                        info["behavior"] = bh
-            else:
-                info["count"] = _build_source(info["url"], tmp)[0]   # 先写临时文件
-            n += 1
-        except Exception as e:  # noqa: BLE001
-            failed.append("%s(%s: %s)" % (info.get("label") or name, type(e).__name__, e))
+    语义(5.1 定死, 与用户可见行为一致):
+      · 下载与解析发生在**候选阶段** —— 拿不到的源不进候选, 它的旧文件原样留着继续用;
+      · 所有下载成功的规则集作为**一个集合**提交: 其中任一校验/落盘/内核应用失败, 整批回滚,
+        一个都不换(不会出现"换了一半")；
+      · 成功时事务状态就是 COMMITTED, 未更新的源写进 warnings 如实告知 —— 不新增
+        "带警告的提交"这种中间状态;
+      · **零成功不提交**: 一个源都没下来时直接返回, 不空跑一笔事务, 更不谎报"已更新"。
+    """
+    m = _rs_meta()
+    if not m:
+        return 0, []
+    files, failed, n = {}, [], 0
+    tmpd = tempfile.mkdtemp(prefix="pdgrs-cand.")
+    try:
+        for name, info in m.items():
+            # 兼容早期缺 format/path 的旧条目(按 name 回填, 否则刷新会 KeyError)
+            info.setdefault("format", "binary" if str(info.get("path", "")).endswith(".srs") else "source")
+            info.setdefault("path", os.path.join(RS_DIR, name + (".srs" if info["format"] == "binary" else ".json")))
+            leaf = os.path.basename(info["path"])
+            if leaf.endswith(".srs"):
+                # sing-box 二进制规则集: mihomo 读不了, 早已在入口被拒。老机器上残留的这种
+                # 条目不刷新也不删 —— doctor 会点名让用户换掉。
+                failed.append("%s(.srs 无法进入 mihomo 运行配置, 未刷新)" % (info.get("label") or name))
+                continue
             try:
-                os.remove(tmp)
-            except OSError:
-                pass
-    # 原子替换(留 .bak 以便整体回滚)
-    for name, info in m.items():
-        tmp = info["path"] + ".new"
-        if not os.path.exists(tmp):
-            continue
-        if os.path.exists(info["path"]):
-            shutil.copy(info["path"], info["path"] + ".bak")
-            swapped.append((info["path"], info["path"] + ".bak"))
-        os.replace(tmp, info["path"])
-    if n == 0:
-        return 0, failed
-    # 核心校验+重启(core-aware): sing-box=check SB + restart; mihomo=渲染 + `mihomo -t` + restart(重启即重取 providers)。
-    ok, err, _ = _core_apply()
-    if not ok:                              # 坏档 → 还原旧规则集 + 用好档回到已知good, 不断网
-        for path, bak in swapped:
-            shutil.copy(bak, path)
-        _core_apply()
-        failed.append("内核校验/重启失败, 已回滚到上一份好档: %s" % (err or "")[:160])
-        return 0, failed
-    for _, bak in swapped:                  # 成功后清备份
-        try:
-            os.remove(bak)
-        except OSError:
-            pass
-    _save_rs_meta(m)
-    return n, failed
+                if info["format"] in ("binary", "mrs"):
+                    data = _fetch_bytes(info["url"])
+                    if not data:
+                        raise ValueError("空响应")
+                    if info["format"] == "mrs" and info.get("behavior") not in MRS_BEHAVIORS:
+                        bh = mrs_behavior(data)
+                        if bh:
+                            info["behavior"] = bh
+                else:
+                    tmp = os.path.join(tmpd, leaf)
+                    info["count"] = _build_source(info["url"], tmp)[0]
+                    with open(tmp, "rb") as f:
+                        data = f.read()
+                files["ruleset:" + leaf] = data
+                n += 1
+            except Exception as e:  # noqa: BLE001
+                failed.append("%s(%s: %s)" % (info.get("label") or name, type(e).__name__, e))
+        if n == 0:
+            return 0, failed
+        files["rs_meta"] = json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")
+        # model 不变, 但仍走一遍派生渲染: 规则集进不了 mihomo 运行配置(dropped)这类问题要在
+        # **候选阶段**就被挡下, 与 _mihomo_derive 同一判据; 文件真坏则由重启观察期兜住。
+        ok, msg = tx_apply("rulesets_refresh", model_mod=lambda c: None, files=files,
+                           services=("mihomo",), warnings=failed)
+        if not ok:
+            return 0, failed + ["整批未更新(全部保留上一份好档): " + msg]
+        return n, failed
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+
 
 # ── 测出口 (端到端延迟, clash_api; TCP 兜底) ──
 def _test_exits_tcp(c):
@@ -2473,10 +2621,12 @@ def add_rule(domain, target):
     if not re.match(r"^[a-z0-9.-]+$", domain):
         return False, "域名格式不对"
     if target in ("direct", "直连"):
-        _write_direct(_read_direct() + [domain])
+        files = {"mosdns_rule:custom_direct.txt": _direct_text(_read_direct() + [domain])}
         if domain in _read_hijack():                 # 改判直连: 必须同时撤掉劫持, 否则仍被劫进代理
-            _write_hijack([d for d in _read_hijack() if d != domain])
-        return True, f"已把 {domain} 设为直连"
+            files["mosdns_rule:custom_hijack.txt"] = _hijack_text(
+                [d for d in _read_hijack() if d != domain])
+        ok, msg = tx_apply("rule_add_direct", files=files)
+        return ok, (f"已把 {domain} 设为直连" if ok else msg)
     c = load()
     if target not in exit_tags(c):
         return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))} 或 direct"
@@ -2490,9 +2640,11 @@ def add_rule(domain, target):
                 return
         idx = 1 if cc["route"]["rules"] and cc["route"]["rules"][0].get("action") == "reject" else 0
         cc["route"]["rules"].insert(idx, {"domain_suffix": [domain], "outbound": target})
-    ok, msg = apply_sb(mod)
-    if ok and domain not in _read_hijack():          # 让 mosdns 把它劫持到网关, 否则这条规则是死的
-        _write_hijack(_read_hijack() + [domain])
+    # 内核规则与 mosdns 劫持表**同一笔事务**: 少了劫持这条规则就是死的, 分两步写迟早半套
+    files = {}
+    if domain not in _read_hijack():
+        files["mosdns_rule:custom_hijack.txt"] = _hijack_text(_read_hijack() + [domain])
+    ok, msg = tx_apply("rule_add", model_mod=mod, files=files)
     return ok, (f"已把 {domain} → {target}" if ok else msg)
 
 def del_rule(domain):
@@ -2508,11 +2660,25 @@ def del_rule(domain):
                                     if r.get("action") or "outbound" not in r or r.get("rule_set")
                                     or r.get("domain_suffix") or r.get("domain")
                                     or r.get("domain_keyword") or r.get("ip_cidr")]
-        apply_sb(mod); removed.append("出口规则")
+        files = {}
         if domain in _read_hijack():
-            _write_hijack([d for d in _read_hijack() if d != domain])
-    if domain in _read_direct():
-        _write_direct([d for d in _read_direct() if d != domain]); removed.append("直连表")
+            files["mosdns_rule:custom_hijack.txt"] = _hijack_text(
+                [d for d in _read_hijack() if d != domain])
+        if domain in _read_direct():
+            files["mosdns_rule:custom_direct.txt"] = _direct_text(
+                [d for d in _read_direct() if d != domain])
+            removed.append("直连表")
+        ok, msg = tx_apply("rule_del", model_mod=mod, files=files)
+        if not ok:
+            return False, msg
+        removed.append("出口规则")
+    elif domain in _read_direct():
+        ok, msg = tx_apply("rule_del_direct", files={
+            "mosdns_rule:custom_direct.txt": _direct_text(
+                [d for d in _read_direct() if d != domain])})
+        if not ok:
+            return False, msg
+        removed.append("直连表")
     return (bool(removed), f"已删除 {domain} ({'+'.join(removed)})" if removed else f"未找到含 {domain} 的规则")
 
 def deletable_domains():
@@ -2541,15 +2707,16 @@ def del_rules_bulk(domains):
                                 if r.get("action") or "outbound" not in r or r.get("rule_set")
                                 or r.get("domain_suffix") or r.get("domain")
                                 or r.get("domain_keyword") or r.get("ip_cidr")]
-    ok, msg = apply_sb(mod)
+    cur = _read_direct(); hit = [x for x in cur if x in domains]
+    hj = _read_hijack()
+    files = {}
+    if hit:
+        files["mosdns_rule:custom_direct.txt"] = _direct_text([x for x in cur if x not in domains])
+    if any(x in domains for x in hj):
+        files["mosdns_rule:custom_hijack.txt"] = _hijack_text([x for x in hj if x not in domains])
+    ok, msg = tx_apply("rule_del_bulk", model_mod=mod, files=files)
     if not ok:
         return False, msg
-    cur = _read_direct(); hit = [x for x in cur if x in domains]
-    if hit:
-        _write_direct([x for x in cur if x not in domains])
-    hj = _read_hijack()
-    if any(x in domains for x in hj):
-        _write_hijack([x for x in hj if x not in domains])
     return True, f"✅ 已删除 {len(domains)} 个域名" + (f"(含直连 {len(hit)} 个)" if hit else "")
 
 def del_rule_kb(chat, back=RULE_BACK):
@@ -2651,15 +2818,17 @@ def rename_exit(old, new):
                 r["outbound"] = new
         if cc["route"].get("final") == old:
             cc["route"]["final"] = new
-    ok, msg = apply_sb(mod)
+    # 规则集元数据也记着目标出口 —— 与 model 同一笔事务改, 免得内核改完名、元数据还指着旧的
+    rsm = _rs_meta(); dirty = False
+    for k, v in rsm.items():
+        if v.get("outbound") == old:
+            v["outbound"] = new; dirty = True
+    files = {}
+    if dirty:
+        files["rs_meta"] = json.dumps(rsm, ensure_ascii=False, indent=2).encode("utf-8")
+    ok, msg = tx_apply("exit_rename", model_mod=mod, files=files)
     if not ok:
         return False, msg
-    m = _rs_meta(); dirty = False          # 规则集元数据也记着目标出口, 同步掉, 免得日后误导
-    for info in m.values():
-        if info.get("outbound") == old:
-            info["outbound"] = new; dirty = True
-    if dirty:
-        _save_rs_meta(m)
     return True, f"✅ 出口 <b>{old}</b> 已改名 <b>{new}</b>, 分流规则/故障组/默认出口里的引用已同步。"
 
 def urltest_groups(c):
@@ -2779,18 +2948,23 @@ def set_dot_domain(domain):
         return False, f"certbot 执行异常: {e}"
     if r.returncode != 0:
         return False, "证书签发失败:\n" + (r.stdout + r.stderr)[-500:]
+    # 签发是**外部动作**(ACME/CA 说了算, 不可回滚), 部署到生产才是本项目的事务:
+    # 证书两个文件 + 活动域名标记 + mosdns 重启要么一起成, 要么一起回到旧证书 ——
+    # 旧实现是逐个 copy 后直接 restart, 中途失败就可能留下"新证书配旧域名"甚至 DoT 直接不可用。
     live = f"/etc/letsencrypt/live/{domain}"
     try:
-        os.makedirs(CERT_DIR, exist_ok=True)
-        shutil.copy(f"{live}/fullchain.pem", os.path.join(CERT_DIR, "fullchain.pem"))
-        shutil.copy(f"{live}/privkey.pem", os.path.join(CERT_DIR, "privkey.pem"))
-        os.chmod(os.path.join(CERT_DIR, "fullchain.pem"), 0o644)
-        os.chmod(os.path.join(CERT_DIR, "privkey.pem"), 0o600)
-        with open("/opt/pdg-bot/dot-domain", "w") as f:
-            f.write(domain + "\n")
-    except Exception as e:  # noqa: BLE001
-        return False, f"证书已签发但部署失败: {e}"
-    sh(["systemctl", "restart", "mosdns"])
+        with open(f"{live}/fullchain.pem", "rb") as f:
+            chain = f.read()
+        with open(f"{live}/privkey.pem", "rb") as f:
+            key = f.read()
+    except OSError as e:
+        return False, "证书已签发但读取失败(%s), 生产仍在用原来的证书。" % type(e).__name__
+    ok, msg = tx_apply("dot_cert_deploy", files={
+        "cert_fullchain": chain, "cert_privkey": key,
+        "dot_marker": (domain + "\n").encode("utf-8")})
+    if not ok:
+        return False, ("证书已签发, 但部署到生产失败 —— **仍在使用原来的证书**, DoT 未受影响。\n"
+                       + msg)
     global _DOT_HOST
     _DOT_HOST = None  # 让 _dot_host() 重新读新证书 CN
     _renew = ("• iOS: 重新生成一次「📱 iOS 描述文件」即可(自动用新域名)" if _platform() == "ios"
@@ -2854,7 +3028,14 @@ RESTORE_MAP = {
     "opt/pdg-bot/rulesets.json": RS_META,
 }
 # 备份包是**外部输入**(bot 从 Telegram 收文件, 谁都能发一个) → 解包必须按白名单来。
-RESTORE_RS_PREFIX = RS_DIR.lstrip("/") + "/"          # etc/sing-box/rs/ 下的规则集
+RESTORE_RS_PREFIX = RS_DIR.lstrip("/") + "/"
+# 受管规则集的文件名白名单: 与 pdgtx 的 ruleset:<name> 目标同形(只认单个文件名 + 当前支持的
+# 两种扩展名)。历史遗留的 .srs 是 sing-box 二进制格式, mihomo 读不了 → 明确拒绝, 不隐式转换。
+_RS_LEAF_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
+# 备份里的路径是**导出那台机器**上的路径, 只可能是生产规范目录; 而镜像沙箱(用例/E2E)把整棵树
+# 挪了根, 所以也接受本机 RS_DIR。两者都是精确相等, 不做 endswith —— 否则
+# /evil/etc/sing-box/rs/foo.json 会被当成合法。
+_RS_DIR_CANON = "/etc/sing-box/rs"          # etc/sing-box/rs/ 下的规则集
 
 def _restore_limit(name, default, lo, hi):
     """解包限额: 可用 bot.env 里的 PDG_RESTORE_* 调整, 但**只在安全区间内**。
@@ -2912,62 +3093,6 @@ RESTORE_MAX_TOTAL_BYTES = _restore_limit(             # 解出总量上限(压�
 RESTORE_MAX_TOTAL_BYTES = max(RESTORE_MAX_TOTAL_BYTES, RESTORE_MAX_FILE_BYTES)
 
 
-class _RestoreAbort(Exception):
-    """恢复过程中止 → 触发整体回滚(不是给用户看的堆栈, 消息就是给用户的说明)。"""
-
-
-def _restore_targets():
-    """恢复会覆盖的**全部**目标: 模型/mosdns 配置/自定义直连·劫持/规则集元数据/rs 目录/
-    渲染出的 mihomo 配置。回滚必须覆盖同一组, 少一个就会留下互相错位的半恢复状态。"""
-    t = list(RESTORE_MAP.values()) + [RS_DIR, MIHOMO_CFG]
-    seen, out = set(), []
-    for p in t:
-        if p and p not in seen:
-            seen.add(p); out.append(p)
-    return out
-
-
-def _stage_restore_targets(bakdir):
-    """把每个目标暂存到 bakdir。返回 [(目标, 暂存路径或 None)] —— None 表示"原本不存在",
-    回滚时要把它删掉而不是还原。"""
-    staged = []
-    for i, p in enumerate(_restore_targets()):
-        slot = os.path.join(bakdir, str(i))
-        if os.path.isdir(p):
-            shutil.copytree(p, slot)
-            staged.append((p, slot))
-        elif os.path.exists(p):
-            shutil.copy2(p, slot)
-            staged.append((p, slot))
-        else:
-            staged.append((p, None))
-    return staged
-
-
-def _rollback_restore_targets(bakdir, staged):
-    """把所有目标还原回暂存时的样子。逐项独立处理(单项失败不挡住其余还原), 但**必须如实
-    报告**: 返回 (是否全部成功, 未恢复项列表)。静默吞掉异常会让调用方照报"全部还原",
-    而现网其实还停在半恢复态 —— 那比直接说失败危险得多。"""
-    failed = []
-    for p, slot in staged:
-        try:
-            if slot is None:                      # 原本不存在 → 删掉恢复过程创建的
-                if os.path.isdir(p):
-                    shutil.rmtree(p)
-                elif os.path.exists(p):
-                    os.remove(p)
-            elif os.path.isdir(slot):
-                if os.path.isdir(p):
-                    shutil.rmtree(p)
-                shutil.copytree(slot, p)
-            else:
-                os.makedirs(os.path.dirname(p), exist_ok=True)
-                shutil.copy2(slot, p)
-        except Exception as e:  # noqa: BLE001  单项失败不中断其余还原, 但要记账
-            failed.append("%s(%s)" % (p, type(e).__name__))
-    return (not failed), failed
-
-
 def _restore_member_allowed(name):
     """成员是否在恢复白名单内: RESTORE_MAP 的键, 或 rs/ 下的规则集文件。"""
     if name in RESTORE_MAP:
@@ -2996,6 +3121,7 @@ def _safe_extract(tar, dest):
     declared_total = 0
     written_total = 0
     seen = 0
+    seen_names = set()      # 规范化后的成员名(判重用; written 记的是落地路径, 不是名字)
     written = []          # 本次已落地的文件: 一旦判拒整包, 连它们也要清掉
     try:
         _safe_extract_loop(tar, root, written)
@@ -3015,6 +3141,7 @@ def _safe_extract_loop(tar, root, written):
     declared_total = 0
     written_total = 0
     seen = 0
+    seen_names = set()      # 规范化后的成员名(判重用; written 记的是落地路径, 不是名字)
     while True:
         m = tar.next()
         if m is None:
@@ -3039,6 +3166,11 @@ def _safe_extract_loop(tar, root, written):
             raise ValueError("备份含非普通文件成员, 拒绝整个备份: %s" % raw)
         # 3) 到这里 raw 已确认是"不以 / 开头、不含 .." 的相对路径, 只去掉无害的 ./ 前缀
         name = raw[2:] if raw.startswith("./") else raw
+        # 同一个成员名出现两次: tar 允许, 但"后一个覆盖前一个"是含糊语义 —— 攻击者可以先放一份
+        # 干净的过校验、再放一份真正落地的。整包拒绝, 不猜。
+        if name in seen_names:
+            raise ValueError("备份里同一个成员出现了两次, 拒绝整个备份: %s" % raw)
+        seen_names.add(name)
         if not _restore_member_allowed(name):
             raise ValueError("备份含白名单之外的成员, 拒绝整个备份: %s" % raw)
         # 4) 限额: 声明值先卡一道(便宜), 实际读取再卡一道(声明值是攻击者写的, 不可信)
@@ -3090,10 +3222,24 @@ def backup_blob():
     return buf.getvalue()
 
 def _machine_id(sb_path, mos_path):
-    """取一对 sing-box/mosdns 配置里的「本机身份」: (server_ip, internal_cidr, cert_dir)。"""
+    """取一对 sing-box/mosdns 配置**文件**里的「本机身份」(备份包那边用: 内容在盘上)。"""
+    def _rd(p):
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+    return _machine_id_from(_rd(sb_path), _rd(mos_path))
+
+
+def _machine_id_from(sb_data, mos_data):
+    """同上, 但基于**内容字节**: (server_ip, internal_cidr, cert_dir)。
+
+    事务里现网那一份必须走这个 —— 内容来自 read_for_update(带前置 sha), 再去读一次文件就等于
+    绕过前置条件(读到的可能已经是别人改过的了)。"""
     ip = cidr = certdir = None
     try:
-        c = json.load(open(sb_path))
+        c = json.loads((sb_data or b"").decode("utf-8"))
         for r in c.get("route", {}).get("rules", []):
             if r.get("action") == "reject":
                 for x in r.get("ip_cidr", []):
@@ -3102,7 +3248,7 @@ def _machine_id(sb_path, mos_path):
     except Exception:  # noqa: BLE001
         pass
     try:
-        t = open(mos_path).read()
+        t = (mos_data or b"").decode("utf-8")
         m = re.search(r'ips:\s*\[\s*"([^"]+)"', t); cidr = m.group(1) if m else None
         m = re.search(r'cert:\s*"([^"]+)"', t); certdir = os.path.dirname(m.group(1)) if m else None
         if not ip:
@@ -3125,7 +3271,92 @@ def _platform_sanitize_model(cfg):
     return True
 
 
+def _managed_rulesets(meta):
+    """从 rs_meta 解析"受管规则集" → {规则集名: 文件名}。
+
+    文件名只认 basename, 且只接受当前支持的 .json / .mrs —— 目录、绝对路径、../、重复
+    basename、以及格式与扩展名对不上的一律抛错(调用方据此整包拒绝)。历史遗留的 .srs 属于
+    sing-box 时代的二进制格式, mihomo 读不了, 这里明确拒绝而不做隐式转换。"""
+    out, seen = {}, {}
+    for name, info in sorted((meta or {}).items()):
+        if not isinstance(info, dict):
+            raise ValueError("规则集 %s 的元数据不是对象" % name)
+        fmt = str(info.get("format") or "")
+        leaf = os.path.basename(str(info.get("path") or ""))
+        if not leaf:
+            leaf = name + (".mrs" if fmt == "mrs" else ".json")
+        raw = str(info.get("path") or "")
+        # 备份里的路径是**那台机器**上的绝对路径, 不能拿本机 RS_DIR 直接比; 但形态必须干净:
+        # 反斜杠、`..`、双斜杠、非规范化写法、以及不是"规则集目录 + 单个文件名"的一律拒。
+        # 落盘用的永远是校验过的 basename + 本机固定目录, **绝不用归档给的路径**。
+        if raw:
+            if "\\" in raw:
+                raise ValueError("规则集 %s 的路径含反斜杠, 拒绝" % name)
+            if any(seg == ".." for seg in raw.split("/")):
+                raise ValueError("规则集 %s 的路径含 .., 拒绝" % name)
+            if "//" in raw or raw != os.path.normpath(raw):
+                raise ValueError("规则集 %s 的路径不是规范化形态(%s), 拒绝" % (name, raw))
+            # 目录部分必须**正好**是生产规范目录, 或本机 RS_DIR(测试/镜像沙箱把整棵树挪了根)。
+            # 只用 endswith 会放过 /evil/etc/sing-box/rs/foo.json 这种"看起来像"的路径。
+            d = os.path.dirname(raw)
+            if d not in (_RS_DIR_CANON, RS_DIR.rstrip("/")) or os.path.basename(raw) != leaf:
+                raise ValueError("规则集 %s 的路径不是「规则集目录 + 单个文件名」, 拒绝" % name)
+        if not _RS_LEAF_RE.match(leaf):
+            raise ValueError("规则集 %s 的文件 %s 不是当前支持的 .json/.mrs" % (name, leaf))
+        want = "mrs" if leaf.endswith(".mrs") else "json"
+        if want == "mrs" and fmt != "mrs":
+            raise ValueError("规则集 %s: 扩展名是 .mrs 但格式记的是 %s" % (name, fmt or "空"))
+        if want == "json" and fmt not in ("source", "classical", "text", ""):
+            raise ValueError("规则集 %s: 扩展名是 .json 但格式记的是 %s" % (name, fmt))
+        if leaf in seen:
+            raise ValueError("规则集 %s 与 %s 用了同一个文件名 %s" % (name, seen[leaf], leaf))
+        seen[leaf] = name
+        out[name] = leaf
+    return out
+
+
+def _restore_ruleset_plan(tmp, cur_meta, bak_meta):
+    """算出规则集的落盘计划: {文件名: bytes|None}(None = 删除), 外加给用户看的提示。
+
+    受管集合 = 现网 rs_meta ∪ 备份 rs_meta:
+      · 备份里有内容的 → 写入;
+      · 只有现网元数据管着、备份的目标状态里没有的 → 删除(才叫"恢复到备份那一刻");
+      · 两份元数据都不管的文件(用户自己丢进 rs/ 的)→ **不动**。
+    整个 rs 目录不再 rmtree + copytree —— 那会连用户自己的文件一起毁掉, 也没法逐文件回滚。"""
+    cur_files = _managed_rulesets(cur_meta)
+    bak_files = _managed_rulesets(bak_meta)
+    plan, notes = {}, []
+    src_dir = os.path.join(tmp, RESTORE_RS_PREFIX.rstrip("/"))
+    for name, leaf in sorted(bak_files.items()):
+        src = os.path.join(src_dir, leaf)
+        if not os.path.isfile(src) or os.path.islink(src):
+            raise ValueError("备份的元数据里有规则集 %s, 但归档里没有对应文件 %s" % (name, leaf))
+        with open(src, "rb") as f:
+            plan[leaf] = f.read()
+    for name, leaf in sorted(cur_files.items()):
+        if leaf not in plan:
+            plan[leaf] = None                     # 备份那一刻已经没有它了 → 删除
+    if os.path.isdir(src_dir):
+        extra = sorted(x for x in os.listdir(src_dir)
+                       if x not in plan and os.path.isfile(os.path.join(src_dir, x)))
+        if extra:
+            notes.append("备份里有 %d 个不在元数据里的规则集文件, 已忽略(元数据与文件必须一致)"
+                         % len(extra))
+    return plan, notes
+
+
 def restore_from(data):
+    """从 Telegram 收到的备份包恢复配置。
+
+    分两段:
+      ① 锁外: 安全解包 + 白名单/限额/类型校验 + **组装候选**(含身份替换、面板与平台净化、
+         规则集并集计划)。这一段一个生产文件都不碰, 任何问题都在动手之前退出;
+      ② 一笔 pdgtx 事务(mode=repair): model / mosdns 配置 / direct·hijack / rs_meta /
+         受管规则集 / 派生的 mihomo 配置一起校验、一起落盘, 再 restart mihomo + mosdns,
+         失败整体回滚, 崩溃可 `pdg tx recover` 收尾。
+
+    repair 模式的含义(本轮已收紧): 允许"操作前就坏的硬门"保持原状并告警 —— 恢复的典型场景
+    正是现在坏着; 但**操作前好、操作后坏一律回滚**, 修复模式没有制造新故障的权力。"""
     try:
         tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
     except Exception:  # noqa: BLE001
@@ -3138,129 +3369,120 @@ def restore_from(data):
             _safe_extract(tar, tmp)
         except Exception as e:  # noqa: BLE001
             return False, "备份包不安全或已损坏, 拒绝恢复: %s" % e
-        newsb = os.path.join(tmp, "etc/sing-box/config.json")
-        newmos = os.path.join(tmp, "etc/mosdns/config.yaml")
-        if not os.path.exists(newsb):
-            return False, "备份里没有网关配置(config.json), 拒绝恢复"
-        # 机器感知: 用「本机」身份覆盖备份带来的 server_ip / 内网卡段 / 证书路径。
-        # 这样跨机导入(如把 .153 的备份导到 .200)只搬出口+分流+规则集, 不会把别人的 IP/证书路径搬来搞错位。
-        cur = _machine_id(SB, MOSDNS_CONF)
-        bak = _machine_id(newsb, newmos)
-        kept = []
-        subs = [(bak[i], cur[i]) for i in range(3) if bak[i] and cur[i] and bak[i] != cur[i]]
-        if subs:
-            kept = [cur[i] for i in range(3) if bak[i] and cur[i] and bak[i] != cur[i]]
-            for f in (newsb, newmos):
-                if os.path.exists(f):
-                    s = open(f).read()
-                    for old, new in subs:
-                        s = s.replace(old, new)
-                    open(f, "w").write(s)
-        # 面板是临时运行态，不随备份恢复。只净化本项目受管形态，自定义 clash_api 保持原样。
-        cfg = json.load(open(newsb))
-        _dirty = _panel_sanitize_config(cfg)
-        _dirty = _platform_sanitize_model(cfg) or _dirty   # 平台净化要赶在校验/落盘之前
-        if _dirty:
-            json.dump(cfg, open(newsb, "w"), ensure_ascii=False, indent=2)
-        # 校验前把 rule_set 的绝对路径临时指向解包出来的 rs/ —— 否则 check 会去找真实位置
-        # (备份里带着这些 rs 文件, 但此刻还没恢复到 /etc/sing-box/rs/, 直接 check 会 "no such file")。
-        checksb = newsb
-        try:
-            cfg = json.load(open(newsb))
-            changed = False
-            for rs in cfg.get("route", {}).get("rule_set", []):
-                p = rs.get("path", "")
-                cand = os.path.join(tmp, p.lstrip("/")) if p.startswith("/") else ""
-                if cand and os.path.exists(cand):
-                    rs["path"] = cand; changed = True
-            if changed:
-                checksb = newsb + ".check"
-                json.dump(cfg, open(checksb, "w"), ensure_ascii=False)
-        except Exception:  # noqa: BLE001
-            pass
-        # 校验备份的 model: 从 SB(sing-box JSON)数据模型渲染临时 mihomo 配置 + `mihomo -t`
-        try:
-            import sb2mihomo
-            mcfg, _ = sb2mihomo.singbox_to_mihomo(json.load(open(checksb)),
-                                                  redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets())
-            mtmp = checksb + ".mihomo"
-            json.dump(mcfg, open(mtmp, "w"), ensure_ascii=False)
-            chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", mtmp])
-        except Exception as e:  # noqa: BLE001
-            return False, "备份配置渲染 mihomo 失败(%s)" % type(e).__name__
-        if chk.returncode != 0:
-            return False, "备份的配置(mihomo)校验失败:\n" + (chk.stdout + chk.stderr)[-300:]
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        shutil.copy(SB, SB + ".pre-restore-" + ts)      # 给用户留一份看得见的旧 model
-        # ── 事务化落盘 ──────────────────────────────────────────────────────
-        # 恢复会覆盖一整组目标(model / mosdns 配置 / direct·hijack / 规则集元数据 / rs 目录 /
-        # 渲染出的 mihomo 配置)。旧实现只备份了 model, 校验一失败就只把 model 换回去, 其余全部
-        # 停在"半恢复"状态: model 与 mosdns、规则集互相错位, 而界面只说一句"已回滚"。
-        # 这里先把**全部目标**暂存, 任一步失败就整体还原。
-        bak = tempfile.mkdtemp(prefix="pdgrsbak")
-        # 暂存阶段单独兜: 这时现网**一个字节都还没改**, 失败就干净退出并清掉临时目录 ——
-        # 没必要留备份, 也不该把异常抛给调用方当"未知错误"。
-        try:
-            staged = _stage_restore_targets(bak)
-        except Exception as e:  # noqa: BLE001
-            shutil.rmtree(bak, ignore_errors=True)
-            return False, "恢复前暂存现网配置失败(%s), 未改动任何文件。" % type(e).__name__
-        keep_bak = False
-        try:
-            restored = []
-            for arc, dst in RESTORE_MAP.items():
-                src = os.path.join(tmp, arc)
-                if os.path.exists(src):
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.copy(src, dst); restored.append(os.path.basename(dst))
-            src_rs = os.path.join(tmp, RESTORE_RS_PREFIX.rstrip("/"))   # 归档内路径, 非本机路径
-            if os.path.isdir(src_rs):
-                shutil.rmtree(RS_DIR, ignore_errors=True); shutil.copytree(src_rs, RS_DIR)
-                restored.append("rs/")
-            # 内核: 渲染 + 校验(含 dropped 检查) + 重启 + 确认 active, 全在 _core_apply 里
-            ok, err, _ = _core_apply()
-            if not ok:
-                raise _RestoreAbort("恢复后内核配置校验/启动失败:\n%s" % (err or "")[-300:])
-            # mosdns: 重启结果必须确认 —— 旧实现 restart 完就报成功, 起不来也照说"已恢复"
-            sh(["systemctl", "reset-failed", "mosdns"])
-            r = sh(["systemctl", "restart", "mosdns"])
-            if r.returncode != 0 or not _svc_active("mosdns"):
-                raise _RestoreAbort("恢复后 mosdns 启动失败:\n%s" % (r.stdout + r.stderr)[-300:])
-            msg = "已恢复: " + ", ".join(restored) + "\n已重启 " + _core_svc() + " + mosdns"
-            if subs:
-                msg += "\n(跨机导入: 已保留本机身份 " + "、".join(kept) + ", 只搬了出口+分流+规则集)"
-            return True, msg
-        except Exception as e:  # noqa: BLE001
-            # 捕获**普通异常**而不只是 _RestoreAbort: copy/copytree/磁盘满/权限错误一样会让
-            # 现网停在半恢复态。KeyboardInterrupt/SystemExit 继承 BaseException, 不在此列 ——
-            # 用户按 Ctrl-C 或进程被要求退出时不该被这里吞掉。
-            why = str(e) if isinstance(e, _RestoreAbort) else \
-                "恢复过程出错: %s: %s" % (type(e).__name__, e)
-            rb_ok, rb_failed = _rollback_restore_targets(bak, staged)
-            # 回滚后必须**验证**到位, 而不是假定成功: 文件回到原样 + 内核能起 + 两个服务 active
-            if rb_ok:
-                capp_ok, capp_err, _ = _core_apply()      # 用还原回来的 model 重回已知 good
-                if not capp_ok:
-                    rb_ok = False
-                    rb_failed.append("内核未能用还原后的配置启动(%s)" % (capp_err or "")[-120:])
-                else:
-                    r2 = sh(["systemctl", "restart", "mosdns"])
-                    if r2.returncode != 0 or not _svc_active("mosdns"):
-                        rb_ok = False
-                        rb_failed.append("mosdns 未能重新启动")
-            if rb_ok:
-                return False, "%s\n已回滚: model / mosdns / 规则集 / rs 目录 全部还原, 服务已恢复。" % why
-            # 回滚不完整: 绝不谎称"全部还原"; 保留事务备份目录, 并把路径与未恢复项交给用户
-            keep_bak = True
-            return False, ("%s\n⚠️ 回滚未完成, 现网可能处于半恢复状态。\n"
-                           "未恢复项: %s\n"
-                           "事务备份已保留(内含恢复前的原文件, 请据此人工修复): %s"
-                           % (why, "、".join(rb_failed) or "(未知)", bak))
-        finally:
-            if not keep_bak:
-                shutil.rmtree(bak, ignore_errors=True)
+        return _restore_commit(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _restore_commit(tmp):
+    """把解包出来的内容组装成候选并提交一笔事务。返回 (ok, msg)。"""
+    newsb = os.path.join(tmp, "etc/sing-box/config.json")
+    newmos = os.path.join(tmp, "etc/mosdns/config.yaml")
+    if not os.path.exists(newsb):
+        return False, "备份里没有网关配置(config.json), 拒绝恢复"
+    tx = _pdgtx()
+    try:
+        t = tx.Tx(source="bot", op="restore", mode="repair")
+    except Exception as e:  # noqa: BLE001
+        return False, "无法开始配置事务(%s)" % type(e).__name__
+    notes = []
+    try:
+        cur_sb, sb_sha = t.read_for_update("model")
+        cur_mos, mos_sha = t.read_for_update("mosdns_conf")
+        cur_meta_raw, meta_sha = t.read_for_update("rs_meta")
+        # 机器感知: 用「本机」身份覆盖备份带来的 server_ip / 内网卡段 / 证书路径。这样跨机导入
+        # 只搬出口+分流+规则集, 不会把别人的 IP/证书路径搬来搞错位。现网那一份取自
+        # read_for_update 的内容(带前置 sha), 不再单独读文件。
+        cur_id = _machine_id_from(cur_sb, cur_mos)
+        bak_id = _machine_id(newsb, newmos)
+        subs = [(bak_id[i], cur_id[i]) for i in range(3)
+                if bak_id[i] and cur_id[i] and bak_id[i] != cur_id[i]]
+        kept = [cur_id[i] for i in range(3)
+                if bak_id[i] and cur_id[i] and bak_id[i] != cur_id[i]]
+
+        def _subbed(path):
+            try:
+                with open(path, "rb") as f:
+                    txt = f.read().decode("utf-8")
+            except OSError:
+                return None
+            for old, new in subs:
+                txt = txt.replace(old, new)
+            return txt.encode("utf-8")
+
+        sb_new = _subbed(newsb)
+        try:
+            cfg = json.loads(sb_new.decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            return False, "备份里的网关配置不是合法 JSON(%s)" % type(e).__name__
+        # 面板是临时运行态, 不随备份恢复; 平台净化要赶在校验/落盘之前
+        _panel_sanitize_config(cfg)
+        _platform_sanitize_model(cfg)
+        t.stage("model", _model_bytes(cfg), expect=sb_sha)
+        restored = ["config.json"]
+        mos_new = _subbed(newmos) if os.path.exists(newmos) else None
+        if mos_new is not None:
+            t.stage("mosdns_conf", mos_new, expect=mos_sha)
+            restored.append("mosdns/config.yaml")
+        # 可选文件: **备份里有才恢复**, 缺了就保持现网(绝不擅自清空)
+        for arc, target in (("etc/mosdns/rules/custom_direct.txt", "mosdns_rule:custom_direct.txt"),
+                            ("etc/mosdns/rules/custom_hijack.txt", "mosdns_rule:custom_hijack.txt")):
+            src = os.path.join(tmp, arc)
+            if os.path.isfile(src):
+                with open(src, "rb") as f:
+                    t.stage(target, f.read())
+                restored.append(os.path.basename(arc))
+        bak_meta_path = os.path.join(tmp, "opt/pdg-bot/rulesets.json")
+        if os.path.isfile(bak_meta_path):
+            with open(bak_meta_path, "rb") as f:
+                bak_meta_raw = f.read()
+            try:
+                bak_meta = json.loads(bak_meta_raw.decode("utf-8"))
+                cur_meta = json.loads(cur_meta_raw.decode("utf-8")) if cur_meta_raw else {}
+                plan, notes = _restore_ruleset_plan(tmp, cur_meta, bak_meta)
+            except ValueError as e:
+                return False, "备份里的规则集不能恢复: %s" % e
+            except Exception as e:  # noqa: BLE001
+                return False, "备份里的规则集元数据无法解析(%s)" % type(e).__name__
+            t.stage("rs_meta", bak_meta_raw, expect=meta_sha)
+            restored.append("rulesets.json")
+            for leaf, blob in sorted(plan.items()):
+                t.stage("ruleset:" + leaf, blob)
+            n_del = sum(1 for v in plan.values() if v is None)
+            restored.append("规则集 %d 个(删除 %d 个)" % (len(plan) - n_del, n_del))
+        t.derive("mihomo_cfg", _mihomo_derive)
+        t.service("restart:mihomo")
+        t.service("restart:mosdns")
+        res = t.commit()
+    except tx.TxBusy:
+        return False, BUSY_MSG
+    except tx.TxRefused as e:
+        return False, tx.redact(str(e))
+    except tx.TxError as e:
+        return False, "配置事务内部错误: %s" % tx.redact(str(e))
+    except Exception as e:  # noqa: BLE001
+        return False, "恢复过程出错(%s), 未提交任何改动" % type(e).__name__
+    finally:
+        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
+        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
+        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
+        t.abort_unstarted()
+    tail = ("\n" + "\n".join(notes)) if notes else ""
+    if res["state"] == tx.COMMITTED:
+        msg = "已恢复: " + ", ".join(restored) + "\n已重启 " + _core_svc() + " + mosdns"
+        if subs:
+            msg += "\n(跨机导入: 已保留本机身份 " + "、".join(kept) + ", 只搬了出口+分流+规则集)"
+        if res.get("warnings"):
+            msg += "\n⚠️ " + "; ".join(res["warnings"])
+        return True, msg + tail
+    if res["state"] == tx.ROLLBACK_FAILED:
+        return False, ("恢复失败(%s)\n⚠️ 回滚未完成, 未恢复项: %s\n事务材料已保留, 请运行 "
+                       "<code>sudo pdg tx recover %s</code>"
+                       % (res.get("error", ""), "、".join(res.get("rollback_failed_items") or []) or "(未知)",
+                          res["txid"])) + tail
+    return False, ("恢复失败(%s)\n已整体回滚: model / mosdns / 规则集 全部还原, 服务已恢复。"
+                   % res.get("error", "")) + tail
+
 
 # ── 文案 ──
 _DOT_HOST = None
@@ -3817,7 +4039,7 @@ def handle_text(chat, text, mid=None):
             link = ob = None                         # 尽力减少凭据在内存驻留(非安全擦除, Python 无法保证)
             if ok:
                 send_plain(chat, f"✅ 已添加出口 <b>{tag}</b>")
-            elif msg == BUSY_MSG:                    # 锁冲突: 安全且准确, 原样回显(不是校验失败)
+            elif msg in (BUSY_MSG, NOLOCK_MSG):       # 锁冲突/锁不可用: 原样回显(不是校验失败)
                 send_plain(chat, "❌ " + msg)
             else:                                    # 校验/重启失败: 正文可能含凭据 → 通用提示
                 send_plain(chat, "❌ 添加失败: 配置校验未过, 已回滚(详情见服务器日志, 未回显链接内容)")

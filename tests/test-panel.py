@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -374,22 +375,55 @@ with tempfile.TemporaryDirectory() as td:
     assert backed["experimental"]["clash_api"] == {"external_controller": "127.0.0.1:9090"}
 
 with tempfile.TemporaryDirectory() as td:
-    sb = os.path.join(td, "current.json")
-    mos = os.path.join(td, "mosdns.yaml")
+    # 恢复现在是一笔 pdgtx 事务, 目标是**镜像的 /etc 结构**(根可换, 结构不可换) —— 按镜像树铺路,
+    # 并把事务根/锁指进沙箱。测的仍是"恢复会不会把受管面板配置搬过来"。
+    for d in ("/etc/sing-box", "/etc/mihomo", "/etc/mosdns/rules", "/opt/pdg-bot",
+              "/run", "/var/lib/privdns-gateway"):
+        os.makedirs(td + d, exist_ok=True)
+    os.environ["PDG_TX_FSROOT"] = td
+    os.environ["PDG_TX_ROOT"] = td + "/var/lib/privdns-gateway/tx"
+    os.environ["PDG_LOCKFILE"] = td + "/run/pdg.lock"
+    os.environ["PDG_STABLE_SAMPLES"] = "1"
+    for m in list(sys.modules):
+        if m.startswith("pdgtx"):
+            del sys.modules[m]
+    sb = td + "/etc/sing-box/config.json"
+    mos = td + "/etc/mosdns/config.yaml"
     Path(sb).write_text(json.dumps({"experimental": {"clash_api": {
-        "external_controller": "127.0.0.1:9090"}}, "route": {"rules": []}}), encoding="utf-8")
-    Path(mos).write_text("", encoding="utf-8")
+        "external_controller": "127.0.0.1:9090"}}, "route": {"rules": []},
+        "outbounds": [{"type": "direct", "tag": "direct"}]}), encoding="utf-8")
+    Path(mos).write_text("log: {level: info}\n", encoding="utf-8")
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w:gz") as tar:
-        data = json.dumps(managed).encode()
+        # 备份里的 model 现在要过事务的 json_model 校验(缺 outbounds/route 直接判不是本项目
+        # 的数据模型), 所以补上最小骨架 —— 本用例关心的仍是 clash_api 那一段。
+        data = json.dumps({**managed, "outbounds": [{"type": "direct", "tag": "direct"}],
+                           "route": {"rules": [], "final": "direct"}}).encode()
         info = tarfile.TarInfo("etc/sing-box/config.json"); info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
-    bot.SB = sb; bot.MOSDNS_CONF = mos; bot.RS_DIR = os.path.join(td, "rs")
-    bot.RESTORE_MAP = {"etc/sing-box/config.json": sb}
-    # restore 走 _core_apply → 渲染 mihomo 配置, 落在临时目录(别写真 /etc/mihomo)
-    bot.MIHOMO_DIR = os.path.join(td, "mihomo"); bot.MIHOMO_CFG = os.path.join(bot.MIHOMO_DIR, "config.yaml")
+    bot.SB = sb; bot.MOSDNS_CONF = mos; bot.RS_DIR = td + "/etc/sing-box/rs"
+    bot.RS_META = td + "/opt/pdg-bot/rulesets.json"
+    bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
+    bot.MIHOMO_DIR = td + "/etc/mihomo"; bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
     bot.sh = lambda cmd: _R()
-    bot._svc_active = lambda *a, **k: True   # restore 现走 core-aware _core_apply(会验服务 active)
+    bot._svc_active = lambda *a, **k: True
+    # 沙箱里没有真 systemd: 给事务一个假的 systemctl(它是直接 subprocess 调的, 换 bot.sh 没用)
+    _bin = td + "/bin"
+    os.makedirs(_bin, exist_ok=True)
+    with open(_bin + "/systemctl", "w") as f:
+        f.write("#!/bin/sh\ncase \"$1\" in is-active) echo active;; show) echo 0;; esac\nexit 0\n")
+    os.chmod(_bin + "/systemctl", 0o755)
+    os.environ["PATH"] = _bin + os.pathsep + os.environ["PATH"]
+    _tx = bot._pdgtx()
+    _tx.svc_stable = lambda unit, **k: (True, "")            # 沙箱里没有真 systemd
+    _tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
+    # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。
+    # 这些用例本来就不测 systemd, 沙箱里也没有真 unit —— 给它一份确定的应答, 免得"查不到"
+    # 触发 fail-closed(那条判据本身由 test-config-transaction-faults.py 专门验)。
+    _tx._svc_prop_ex = lambda unit, prop: (
+        {"ActiveState": "active", "UnitFileState": "enabled", "NRestarts": "0"}.get(prop, ""), True)
+    _tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (True, "")
+    _tx.VALIDATORS["mosdns_probe"] = lambda path, data, ctx: (True, "")
     ok, err = bot.restore_from(raw.getvalue())
     assert ok, err
     restored = json.loads(Path(sb).read_text(encoding="utf-8"))

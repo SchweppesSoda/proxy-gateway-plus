@@ -72,13 +72,25 @@ class FakeSh:
 
 
 def setup(tmp):
-    bot.SB = os.path.join(tmp, "config.json")
-    bot.RS_DIR = os.path.join(tmp, "rs")
-    bot.RS_META = os.path.join(tmp, "rulesets.json")
-    bot.MIHOMO_DIR = os.path.join(tmp, "mihomo")
-    bot.MIHOMO_CFG = os.path.join(bot.MIHOMO_DIR, "config.yaml")
+    # 5.1: 规则集操作经统一事务落盘, 事务的目标白名单是镜像的 /etc 结构 —— 沙箱按镜像树铺,
+    # 并把事务根/锁指进来(锁 fail-closed, 必须给可写路径)。
+    for d in ("/etc/sing-box/rs", "/etc/mihomo", "/etc/mosdns/rules", "/run",
+              "/var/lib/privdns-gateway", "/opt/pdg-bot"):
+        os.makedirs(tmp + d, exist_ok=True)
+    os.environ["PDG_TX_FSROOT"] = tmp
+    os.environ["PDG_TX_ROOT"] = tmp + "/var/lib/privdns-gateway/tx"
+    os.environ["PDG_LOCKFILE"] = tmp + "/run/pdg.lock"
+    os.environ["PDG_STABLE_SAMPLES"] = "1"
+    for m in list(sys.modules):
+        if m.startswith("pdgtx"):
+            del sys.modules[m]
+    bot.SB = tmp + "/etc/sing-box/config.json"
+    bot.RS_DIR = tmp + "/etc/sing-box/rs"
+    bot.RS_META = tmp + "/opt/pdg-bot/rulesets.json"
+    bot.MIHOMO_DIR = tmp + "/etc/mihomo"
+    bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
     bot.BACKEND_MARKER = os.path.join(tmp, "backend")
-    bot.LOCKFILE = os.path.join(tmp, "lock")
+    bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
     os.makedirs(bot.RS_DIR, exist_ok=True)
     with open(bot.SB, "w") as f:
         json.dump(SAMPLE, f)
@@ -86,6 +98,19 @@ def setup(tmp):
         f.write("mihomo")
     fake = FakeSh()
     bot.sh = fake
+    sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+    import importlib
+    tx = importlib.import_module("pdgtx")
+    tx.svc_stable = lambda unit, **k: (True, "")            # 服务动力学由事务专属用例覆盖
+    tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
+    # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。
+    # 这些用例本来就不测 systemd, 沙箱里也没有真 unit —— 给它一份确定的应答, 免得"查不到"
+    # 触发 fail-closed(那条判据本身由 test-config-transaction-faults.py 专门验)。
+    tx._svc_prop_ex = lambda unit, prop: (
+        {"ActiveState": "active", "UnitFileState": "enabled", "NRestarts": "0"}.get(prop, ""), True)
+    tx._run = lambda cmd, timeout=60: (0, "")
+    tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (
+        (False, "mihomo 配置校验失败") if getattr(fake, "mihomo_t_rc", 0) else (True, ""))
     bot._svc_active = lambda unit, **k: True
     bot._build_source = _REAL_BUILD_SOURCE      # 复原, 防止上一个用例的桩泄漏进来
     bot._fetch_bytes = _REAL_FETCH_BYTES
@@ -101,20 +126,24 @@ def main():
         bad("规则集未进 rule-providers 却没被记进 dropped")
     ok("渲染层: 未能翻译的规则集被记进 meta['dropped']")
 
-    # ── 2. _core_apply: dropped 非空必须判失败并点名(而不是静默应用) ──
+    # ── 2. 候选派生器: dropped 非空必须判失败并点名(而不是静默应用) ──
+    #    这一判据现在只有 _mihomo_derive 一处 —— tx_apply 与恢复备份共用它, 事务因此拿不到
+    #    候选、更不会落盘(以前是 _core_apply 在写完 model 之后才发现)。
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp)
         c = json.load(open(bot.SB))
         c["route"]["rules"].append({"rule_set": "rs_deadbeef", "outbound": "hk"})
-        json.dump(c, open(bot.SB, "w"))
-        okr, err, restarted = bot._core_apply()
-        if okr:
-            bad("dropped 非空却应用成功了(规则集被静默丢弃)")
-        if "rs_deadbeef" not in err:
-            bad(f"失败信息没点名被丢弃的规则集: {err}")
-        if restarted:
-            bad("校验没过却重启了内核")
-        ok("_core_apply: dropped 非空 → 判失败 + 点名被丢弃的规则集 + 不重启")
+        before = open(bot.MIHOMO_CFG, "rb").read() if os.path.exists(bot.MIHOMO_CFG) else None
+        try:
+            bot._mihomo_derive({"model": json.dumps(c).encode()})
+            bad("dropped 非空却派生成功了(规则集被静默丢弃)")
+        except Exception as e:  # noqa: BLE001  事务用 TxRefused 把"点名"的理由带给用户
+            if "rs_deadbeef" not in str(e):
+                bad(f"失败信息没点名被丢弃的规则集: {e}")
+            now = open(bot.MIHOMO_CFG, "rb").read() if os.path.exists(bot.MIHOMO_CFG) else None
+            if now != before:
+                bad("派生失败却动了现网 mihomo 配置")
+            ok("候选派生: dropped 非空 → 抛错并点名被丢弃的规则集, 现网零改动")
 
     # ── 3. .srs 在入口就被拒(mihomo 消费不了), 且给出替换指引 ──
     with tempfile.TemporaryDirectory() as tmp:
@@ -185,12 +214,13 @@ def main():
         meta = bot._render_mihomo_file()
         if not (meta or {}).get("dropped"):
             bad("老机器遗留 .srs 未被记进 dropped(迁移会静默丢掉这条分流)")
-        okr, err, _ = bot._core_apply()
-        if okr:
-            bad("遗留 .srs 仍让配置照常应用")
-        if "rs_legacy" not in err:
-            bad(f"未点名遗留的 .srs 规则集: {err}")
-        ok("老机器遗留 .srs → 判失败并点名(迁移据此中止, 保留 sing-box 运行)")
+        try:
+            bot._mihomo_derive({"model": json.dumps(c).encode()})
+            bad("遗留 .srs 仍让候选照常生成")
+        except Exception as e:  # noqa: BLE001
+            if "rs_legacy" not in str(e):
+                bad(f"未点名遗留的 .srs 规则集: {e}")
+            ok("老机器遗留 .srs → 候选阶段判失败并点名(事务据此中止, 现网不动)")
 
     # ── 8. 正常规则集(有 rule-provider)不受影响 ──
     with tempfile.TemporaryDirectory() as tmp:

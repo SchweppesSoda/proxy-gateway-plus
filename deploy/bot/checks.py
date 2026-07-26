@@ -795,10 +795,56 @@ def check_nft_input_chains():
     return ("ok", "input 链冲突", "只有 table inet pdg 挂在 hook input 上")
 
 
+def check_transactions():
+    """未完成的配置事务 —— pdgtx.NEEDS_RECOVERY 的四个状态全算:
+    APPLYING / OBSERVING / ROLLING_BACK / ROLLBACK_FAILED。
+
+    OBSERVING 尤其容易被漏掉: 那时文件已经落盘、服务动作也做完了, 只差最后判定, 现网却已经
+    是新内容 —— 崩在这里和崩在 APPLYING 一样需要人工收尾, 所以必须报出来, 并**点名 txid**
+    (只说"有未完成事务"等于让人自己去猜是哪一笔, 而 recover 命令要的正是那个 id)。
+
+    doctor 只**报告**, 绝不代为恢复: 恢复要写现网、要拿写锁, 那是 `pdg tx recover` 的事;
+    自检必须保持只读, 否则"跑个 doctor 顺手改了配置"就是下一个惊喜。"""
+    try:
+        import pdgtx
+    except Exception:  # noqa: BLE001
+        return None                      # 老机器还没有事务核心: 不显示这一项
+    try:
+        pend = pdgtx.pending_recovery()
+    except Exception:  # noqa: BLE001
+        return ("warn", "配置事务", "读不到事务目录, 无法确认是否有未完成事务")
+    # 终态事务却仍留着 candidate/before: 事务本身收尾了, 但那些目录里可能有出口密码、UUID、
+    # 证书私钥 —— 清理失败不会再被 pending/stale 提起, 必须单独报出来(只报 txid 与材料类型)。
+    try:
+        left = pdgtx.leftover_materials()
+    except Exception:  # noqa: BLE001  老机器的核心还没有这个函数
+        left = []
+    if left:
+        items = "; ".join("%s(%s: %s)" % (x.get("txid"), x.get("state"),
+                                          "、".join(x.get("materials") or []))
+                          for x in left[:3])
+        note = ("有 %d 笔已收尾的事务仍留着敏感材料: %s —— 里面可能有出口密码/证书私钥, "
+                "确认无需排查后请删除对应事务目录下的这些子目录。" % (len(left), items))
+        if not pend:
+            return ("warn", "配置事务", note)
+    if not pend:
+        recent = pdgtx.list_tx(limit=1)
+        note = ("最近一笔: %s %s" % (recent[0].get("op"), recent[0].get("state"))) if recent \
+            else "暂无记录"
+        return ("ok", "配置事务", "没有未完成的事务(" + note + ")")
+    worst = "fail" if any(m.get("state") == "ROLLBACK_FAILED" for m in pend) else "warn"
+    items = "; ".join("%s(%s, %s)" % (m.get("txid"), m.get("op"), m.get("state")) for m in pend[:3])
+    return (worst, "配置事务",
+            "有 %d 笔未完成的配置事务: %s —— 在处理之前, 新的写操作会被拒绝。"
+            "请运行 <code>sudo pdg tx show &lt;id&gt;</code> 查看, 再用 "
+            "<code>sudo pdg tx recover &lt;id&gt;</code> 恢复。" % (len(pend), items))
+
+
 ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mem,
-       check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm]
+       check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
+       check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加

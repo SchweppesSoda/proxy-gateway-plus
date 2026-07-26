@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression: rename_exit 真改名并级联更新所有引用(规则/故障组/final/TG/规则集元数据)."""
 import copy
+import json
 import importlib.util
 from pathlib import Path
 
@@ -34,12 +35,19 @@ cfg = {
 
 bot.load = lambda: copy.deepcopy(cfg)
 
-def fake_apply(mod):
-    cc = copy.deepcopy(cfg)
-    mod(cc)
-    cfg.clear(); cfg.update(cc)
+# 5.1: rename_exit 的 model 改动与 rulesets.json 级联现在是同一笔事务。按新契约打桩:
+# model_mod 作用到内存里的 cfg, files 里的 rs_meta 直接落到 meta —— 断言的仍是级联是否完整。
+def fake_tx(op, model_mod=None, files=None, **kw):
+    if model_mod is not None:
+        cc = copy.deepcopy(cfg)
+        model_mod(cc)
+        cfg.clear(); cfg.update(cc)
+    for name, data in (files or {}).items():
+        if name == "rs_meta":
+            meta.clear(); meta.update(json.loads(data.decode()))
     return True, ""
-bot.apply_sb = fake_apply
+bot.tx_apply = fake_tx
+bot.apply_sb = lambda mod: fake_tx("apply_sb", model_mod=mod)
 
 meta = {"rs_11111111": {"url": "http://example.com/x.list", "outbound": "hk", "label": "币安"}}
 bot._rs_meta = lambda: copy.deepcopy(meta)
@@ -85,8 +93,8 @@ ok, msg = bot.rename_exit("tw", "direct")                    # 保留字
 assert not ok, msg
 snap = copy.deepcopy(cfg)
 
-# ── apply_sb 失败 → 原样返回错误, 元数据不动 ──
-bot.apply_sb = lambda mod: (False, "boom")
+# ── 事务失败 → 原样返回错误, 元数据不动(同一笔事务, 不会只落一半) ──
+bot.tx_apply = lambda op, **kw: (False, "boom")
 ok, msg = bot.rename_exit("tw", "tw9")
 assert not ok and msg == "boom"
 assert meta["rs_11111111"]["outbound"] == "hk2"

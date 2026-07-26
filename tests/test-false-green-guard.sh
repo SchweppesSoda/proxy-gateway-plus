@@ -82,6 +82,49 @@ grep -q '^\[FAIL\]' <<<"$out" && bad "现行用例有 FAIL 行" || ok "现行用
 n="$(grep -c '^\[OK\]' <<<"$out")"
 [[ "$n" -ge 30 ]] && ok "现行用例断言数 $n 条(不是零断言绿)" || bad "断言数只有 $n 条, 疑似整段被跳过"
 
+# ── 5. 用例里的 grep 模式必须按 POSIX 写 ──
+# 起因: e2e-config-transaction.sh 用 `grep -o 'PROBE|[^\n]*'` 取探针结论。开发机的 grep 是
+# ugrep, 把 \n 当换行; CI 容器里是 GNU grep 3.8, 按 POSIX 把方括号里的 \n 当成"反斜杠或字母 n",
+# 于是 "PROBE|fail|netns 不可用…" 被截成 "PROBE|fail|" —— 断言拿不到原因那一半, 本地长绿、CI 长红,
+# 而且方向反过来(本地严格、CI 宽松)时就是**假绿**。所以这条护栏两头都要盯:
+STRICT=""
+if command -v busybox >/dev/null 2>&1 && printf 'a\n' | busybox grep -q a 2>/dev/null; then
+  STRICT="busybox grep"
+elif grep --version 2>/dev/null | head -1 | grep -q 'GNU grep'; then
+  STRICT="grep"
+fi
+LINE='PROBE|fail|netns 不可用(x)'
+printf '%s\n' "$LINE" > "$WORK/gl"
+if [[ -n "$STRICT" ]]; then
+  got="$($STRICT -o 'PROBE|.*' "$WORK/gl")"
+  [[ "$got" == "$LINE" ]] \
+    && ok "POSIX grep($STRICT)下 'PROBE|.*' 取到完整结论" \
+    || bad "POSIX grep($STRICT)下取到的是截断结果: [$got]"
+  cut="$($STRICT -o 'PROBE|[^\n]*' "$WORK/gl")"   # posix-grep-ok: 这里就是要那个坏写法当负控
+  [[ "$cut" != "$LINE" ]] \
+    && ok "反向对照: 同一行用 [^\\n] 在 POSIX grep 下确实被截成 [$cut]" \
+    || ok "本机 $STRICT 对 [^\\n] 宽松(不截断)—— 静态扫描仍然拦这类写法"
+fi
+# 静态扫描: 谁再在 shell 的 grep/sed 里写方括号反斜杠转义, 这里就红(内嵌 python 正则不算,
+# 那里 \n 本来就是换行)。
+RISK="$(grep -rnE '(grep|sed|egrep|fgrep|awk)[^#]*\[\^?\\[ndtswb]' \
+          "$ROOT"/tests/*.sh "$ROOT"/deploy/bot/*.sh "$ROOT"/deploy/cert/*.sh \
+          "$ROOT"/lib/*.sh "$ROOT"/install.sh "$ROOT"/uninstall.sh 2>/dev/null \
+        | grep -v 're\.\(sub\|search\|match\|findall\|compile\)' \
+        | grep -v ':[0-9]*:[[:space:]]*#' \
+        | grep -v 'posix-grep-ok' || true)"
+[[ -z "$RISK" ]] \
+  && ok "shell 的 grep/sed 模式里没有方括号反斜杠转义(不依赖 ugrep 的宽松解释)" \
+  || bad "有 POSIX 下会被截断的 grep/sed 模式: $(head -2 <<<"$RISK")"
+# 探测器自身的负控: 用出问题那一版的真实文件喂它, 必须报出来(不然这条扫描是摆设)
+OLDF="$WORK/old-e2e.sh"
+if git -C "$ROOT" show HEAD~0:tests/e2e-config-transaction.sh > "$OLDF" 2>/dev/null; then
+  printf "%s\n" "  python3 - \"\$TX\" \"\$2\" 2>&1 <<'PY' | grep -o 'PROBE|[^\\n]*' | tail -1" >> "$OLDF"
+  grep -qE '(grep|sed|egrep|fgrep|awk)[^#]*\[\^?\\[ndtswb]' "$OLDF" \
+    && ok "负控: 把出问题那行塞回文件, 扫描确实报警" \
+    || bad "负控失败: 扫描连已知有问题的写法都认不出来"
+fi
+
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
 [[ "$nfail" == 0 ]]
