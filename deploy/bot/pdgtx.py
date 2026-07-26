@@ -65,8 +65,10 @@ ROLLBACK_FAILED = "ROLLBACK_FAILED"
 ABORTED = "ABORTED"
 
 TERMINAL = (COMMITTED, ROLLED_BACK, ROLLBACK_FAILED, ABORTED)
-# 中断在这些状态 = 现网可能被改过一半, 必须先 recover 才允许下一次写
-NEEDS_RECOVERY = (APPLYING, ROLLING_BACK, ROLLBACK_FAILED)
+# 中断在这些状态 = 现网**已经**被改过, 必须先 recover 才允许下一次写。
+# OBSERVING 同样在内: 那时文件已全部落盘、服务动作也做完了, 只是还没判定成不成功 ——
+# 此刻断电与停在 APPLYING 没有本质区别, 现网都处在"新配置已生效但没人确认过"的状态。
+NEEDS_RECOVERY = (APPLYING, OBSERVING, ROLLING_BACK, ROLLBACK_FAILED)
 
 _ALLOWED = {
     PREPARING: (VALIDATED, ABORTED),
@@ -476,14 +478,22 @@ def _v_systemd_unit(path, data, ctx):
 #   2) 退而求其次: 把候选**副本**里本项目已知形态的监听地址改到 127.0.0.1 的随机高端口再起;
 #   3) 两条都不可用 → 拒绝应用(不拿结构检查冒充强校验)。
 _LISTEN_RE = re.compile(rb"(?m)^(\s*(?:addr|listen)\s*:\s*)([\"']?)([^\"'\s#]+)\2")
+NETNS_MARK = "PDGTX_NETNS_READY"      # 证明"已经进了命名空间, 马上要 exec mosdns"
 
 
 def _mosdns_bin():
     return shutil.which("mosdns") or (FSROOT + "/usr/local/bin/mosdns")
 
 
-def _mosdns_probe_run(cmd, timeout, workdir):
-    """跑探针: 提前退出=配置有问题; 熬过观察窗口=通过。"""
+def _mosdns_probe_run(cmd, timeout, workdir, marker=None):
+    """跑探针。返回 (结果, 说明):
+
+      True  = 熬过观察窗口 → 候选配置能起来;
+      False = mosdns **确实**起了又提前退出 → 候选配置有问题;
+      None  = 探针本身没跑起来(命名空间没权限、命令缺失…)→ **基础设施不可用**, 不是候选的错。
+
+    区分后两者靠 marker: 它在真正 exec mosdns **之前**打印。输出里没有 marker, 说明连
+    mosdns 都没执行到 —— 那时把候选判成"配置有错"是冤枉它, 而 auto 模式还应该退到备用探针。"""
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              universal_newlines=True, cwd=workdir)
@@ -493,7 +503,10 @@ def _mosdns_probe_run(cmd, timeout, workdir):
     while time.time() - t0 < timeout:
         if p.poll() is not None:
             out = p.stdout.read() if p.stdout else ""
-            return False, redact((out or "").strip()[-400:]) or "mosdns 提前退出"
+            txt = redact((out or "").strip()[-400:])
+            if marker and marker not in (out or ""):
+                return None, txt or "探针环境不可用(未执行到 mosdns)"
+            return False, txt or "mosdns 提前退出"
         time.sleep(0.2)
     p.terminate()
     try:
@@ -521,13 +534,18 @@ def _v_mosdns_probe(path, data, ctx):
                 pass
         mode = os.environ.get("PDG_TX_MOSDNS_PROBE_MODE", "auto")
         if mode in ("auto", "netns") and shutil.which("unshare"):
+            # marker 在 exec mosdns 之前打印: 没有它 = 连命名空间都没进去(容器缺 CAP_SYS_ADMIN
+            # 是最常见的情况), 属基础设施不可用, 不能算候选配置有错。
             # `ip link set lo up`(有 iproute2 时)保证 127.0.0.1 可绑; 没有 ip 命令也先试一把
-            inner = "ip link set lo up 2>/dev/null; exec %s start -c %s -d %s" % (exe, cand, d)
-            ok, err = _mosdns_probe_run(["unshare", "-n", "-r", "bash", "-c", inner], wait, d)
+            inner = ("ip link set lo up 2>/dev/null; echo %s; exec %s start -c %s -d %s"
+                     % (NETNS_MARK, exe, cand, d))
+            ok, err = _mosdns_probe_run(["unshare", "-n", "-r", "bash", "-c", inner], wait, d,
+                                        marker=NETNS_MARK)
             if ok is not None:
                 return ok, (err and ("netns 探针: " + err))
             if mode == "netns":
-                return False, "netns 探针不可用且已强制该模式"
+                return False, "netns 不可用(%s)" % (err or "无权限")[:80]
+            # auto: netns 用不了 → 退到高端口探针(下面), 但**不放宽判据**
         if mode in ("auto", "port"):
             # 备用: 只改副本里的监听地址(生产文件不动), 换到随机高端口再起
             patched, n = _rewrite_listen(data)

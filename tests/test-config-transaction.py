@@ -378,6 +378,51 @@ def main():
         bad("零成功却动了事务: n=%s %d→%d" % (n, before, after))
     box8.clean(); box9.clean()
 
+    # ── 15. OBSERVING 阶段断电: 文件已落盘、服务动作已做完, 只是没人确认过结果 ──
+    # 与停在 APPLYING 没有本质区别 —— 现网已经变了, 必须挡住下一次写并要求 recover。
+    boxA = Box(); txA = load_tx(boxA.env)
+    boxA.up("mosdns")
+    liveA = boxA.path("/etc/mosdns/rules/custom_direct.txt")
+    with open(liveA, "wb") as f:
+        f.write(b"domain:before.com\n")
+    tA = txA.Tx("cli", "observe-crash")
+    tA.stage("mosdns_rule:custom_direct.txt", b"domain:applied.com\n")
+    tA.service("restart:mosdns")
+    real_observe = txA.Tx._observe
+
+    def crash_in_observing(self, services, base):
+        raise SystemExit("模拟 OBSERVING 阶段断电")     # 状态已经是 OBSERVING
+    txA.Tx._observe = crash_in_observing
+    try:
+        tA.commit()
+    except SystemExit:
+        pass
+    finally:
+        txA.Tx._observe = real_observe
+    m = txA.load_meta(tA.dir)
+    if m.get("state") == txA.OBSERVING:
+        ok("在 OBSERVING 阶段断电: 事务停在 OBSERVING")
+    else:
+        bad("状态不是 OBSERVING: %s" % m.get("state"))
+    if txA.OBSERVING in txA.NEEDS_RECOVERY and [x for x in txA.pending_recovery(txA.TX_ROOT)
+                                                if x["txid"] == tA.txid]:
+        ok("OBSERVING 被认定为需要恢复(pending_recovery 报得出来)")
+    else:
+        bad("OBSERVING 没被当成待恢复状态")
+    tB = txA.Tx("bot", "after-observe-crash")
+    tB.stage("mosdns_rule:custom_hijack.txt", b"domain:x.com\n")
+    try:
+        tB.commit(); bad("OBSERVING 残留没挡住后续写")
+    except txA.TxRefused as e:
+        ok("OBSERVING 残留 → 新的写被拒绝(%s)" % str(e)[:28]) if "recover" in str(e) \
+            else bad("拒绝原因没指向 recover: %s" % e)
+    r = txA.recover(tA.txid, root=txA.TX_ROOT)
+    if r.get("ok") and open(liveA, "rb").read() == b"domain:before.com\n":
+        ok("recover 把 OBSERVING 事务完整还原(不再误报为终态)")
+    else:
+        bad("OBSERVING 事务恢复失败: %s" % r)
+    boxA.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

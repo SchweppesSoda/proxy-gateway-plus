@@ -225,6 +225,52 @@ def main():
     else:
         bad("回滚失败却把恢复材料删了")
 
+    # ── 8. netns 不可用时 auto 必须退到高端口, 而不是把候选判成有错 ──
+    # 复现 CI 现场: 容器里 unshare 命令在, 但没有 CAP_SYS_ADMIN, `unshare -n` 直接失败。
+    box2 = Box(); tx2 = load_tx(box2.env)
+    fake_mosdns = os.path.join(box2.bin, "mosdns")
+    with open(fake_mosdns, "w") as f:      # 好配置常驻, 坏配置(含 BADCONF)立刻 FATAL 退出
+        f.write("#!/bin/bash\n"
+                "for a in \"$@\"; do [[ -f \"$a\" ]] && grep -q BADCONF \"$a\" && "
+                "{ echo 'FATAL: bad plugin'; exit 1; }; done\n"
+                "sleep 30\n")
+    os.chmod(fake_mosdns, 0o755)
+    with open(os.path.join(box2.bin, "unshare"), "w") as f:
+        f.write("#!/bin/sh\necho 'unshare: unshare failed: Operation not permitted' >&2\nexit 1\n")
+    os.chmod(os.path.join(box2.bin, "unshare"), 0o755)
+    os.environ["PATH"] = box2.env["PATH"]
+    good = b"log:\n  level: info\nplugins:\n  - tag: s\n    type: udp_server\n    args:\n      addr: \"127.0.0.1:53\"\n"
+    bad_cfg = b"log:\n  level: info\n# BADCONF\nplugins:\n  - tag: s\n    type: udp_server\n    args:\n      addr: \"127.0.0.1:53\"\n"
+    os.environ["PDG_TX_MOSDNS_PROBE_SECS"] = "1"
+
+    os.environ["PDG_TX_MOSDNS_PROBE_MODE"] = "netns"
+    okr, err = tx2.VALIDATORS["mosdns_probe"]("/etc/mosdns/config.yaml", good, None)
+    if okr is False and "netns 不可用" in err:
+        ok("强制 netns 模式 + 无权限 → 如实报 netns 不可用(不冒充候选有错)")
+    else:
+        bad("netns 模式的报错不对: %s / %s" % (okr, err))
+
+    os.environ["PDG_TX_MOSDNS_PROBE_MODE"] = "auto"
+    okr, err = tx2.VALIDATORS["mosdns_probe"]("/etc/mosdns/config.yaml", good, None)
+    if okr:
+        ok("auto: netns 不可用 → 退到高端口探针, 好配置判通过")
+    else:
+        bad("auto 没能退到高端口: %s" % err)
+    okr, err = tx2.VALIDATORS["mosdns_probe"]("/etc/mosdns/config.yaml", bad_cfg, None)
+    if not okr:
+        ok("auto 降级后仍能判出坏候选(降级不等于放宽)")
+    else:
+        bad("降级后把坏配置放行了")
+    # 高端口探针不能碰生产端口: 改写后的副本里不应再出现 :53
+    patched, n = tx2._rewrite_listen(good)
+    if n >= 1 and b":53\"" not in patched and b"127.0.0.1:" in patched:
+        ok("高端口探针改写的是副本且不碰生产监听端口(:53 已换成随机高端口)")
+    else:
+        bad("监听改写不对: n=%s %r" % (n, patched[-60:]))
+    for k in ("PDG_TX_MOSDNS_PROBE_MODE", "PDG_TX_MOSDNS_PROBE_SECS"):
+        os.environ.pop(k, None)
+    box2.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

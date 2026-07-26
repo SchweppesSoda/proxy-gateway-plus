@@ -114,12 +114,15 @@ if command -v mosdns >/dev/null 2>&1; then
     grep -q '^PROBE|ok' <<<"$r" && ok "netns 探针: 好配置判通过(不误杀)" || bad "netns 误判好配置: $r"
   else
     r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$GOOD_CONF")"
-    { grep -q '^PROBE|fail' <<<"$r" && grep -q '不可用' <<<"$r"; } \
-      && ok "本环境没有 netns 能力: 强制 netns 模式如实报不可用(不降级放行)" \
+    { grep -q '^PROBE|fail' <<<"$r" && grep -q 'netns 不可用' <<<"$r"; } \
+      && ok "本环境没有 netns 能力: 强制 netns 模式如实报 netns 不可用(不冒充候选有错)" \
       || bad "netns 不可用时的行为不对: $r"
     r="$(PDG_TX_MOSDNS_PROBE_MODE=auto probe auto "$GOOD_CONF")"
     grep -q '^PROBE|ok' <<<"$r" && ok "auto 模式退到高端口探针并判好配置通过" \
       || bad "auto 没能退到高端口探针: $r"
+    r="$(PDG_TX_MOSDNS_PROBE_MODE=auto probe auto "$BAD_CONF")"
+    grep -q '^PROBE|fail' <<<"$r" && ok "auto 降级后仍判出坏配置(降级不等于放宽)" \
+      || bad "降级后放行了坏配置: $r"
   fi
   r="$(PDG_TX_MOSDNS_PROBE_MODE=port probe port "$BAD_CONF")"
   grep -q '^PROBE|fail' <<<"$r" && ok "高端口探针: 坏配置被判失败" || bad "高端口探针没判出坏配置: $r"
