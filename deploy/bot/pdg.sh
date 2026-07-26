@@ -89,11 +89,17 @@ _pdg_nft_strip_gms(){
 
 # 串行化"会写配置/重启服务"的操作(update/rollback/snapshot), 防 bot 更新按钮与命令行并发。
 # 嵌套调用(update→snapshot)只锁一次。read-only 操作(status/doctor/report/log)不加锁。
-LOCK="/run/privdns-gateway.lock"
+LOCK="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
 PDG_LOCKED=""
 _lock(){
   [[ -n "$PDG_LOCKED" ]] && return 0
-  exec 9>"$LOCK" 2>/dev/null || return 0
+  # 打不开锁文件 → **拒绝执行**(fail-closed)。以前这里 `|| return 0` 继续往下写: 而
+  # /run 出问题往往正意味着系统不正常, 恰恰是最不该让两个进程同时改配置的时候。
+  if ! exec 9>"$LOCK" 2>/dev/null; then
+    echo "⛔ 锁文件不可用($LOCK) —— 为避免并发写坏配置, 本次拒绝执行。"
+    echo "   请检查 /run 是否可写(磁盘满/只读挂载/权限), 修好后重试。"
+    exit 1
+  fi
   flock -n 9 || { echo "⛔ 已有 pdg 操作在运行, 请稍后再试 (锁: $LOCK)"; exit 1; }
   PDG_LOCKED=1
 }

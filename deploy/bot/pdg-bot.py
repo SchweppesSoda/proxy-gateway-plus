@@ -87,8 +87,11 @@ _EXEC = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix=
 _busy: dict[int, bool] = {}
 _busy_lock = threading.Lock()
 _cfg_lock = threading.Lock()                     # 进程内串行化"写 sing-box 配置"
-LOCKFILE = "/run/privdns-gateway.lock"           # 与 pdg update/rollback 共用, 防跨进程并发改配置
+LOCKFILE = os.environ.get("PDG_LOCKFILE", "/run/privdns-gateway.lock")   # 与 pdg update/rollback 共用
 BUSY_MSG = "已有配置操作正在执行,请稍候再试。"   # apply_sb 拿不到锁(进程内或跨进程)时的安全返回
+NOLOCK_MSG = ("⛔ 锁文件不可用(/run 写不了?) —— 为避免并发写坏配置, 本次拒绝执行。\n"
+              "请在服务器上检查 /run 是否可写, 修好后重试。")
+_cfg_lock_err = ""                               # 上一次取锁失败的原因: "" = 忙, 非空 = 锁不可用
 
 class _PanelOwnershipError(Exception):
     pass
@@ -126,15 +129,23 @@ def run_bg(chat, fn):
 @contextlib.contextmanager
 def _cfg_guard():
     """进程内串行(_cfg_lock, 非阻塞)+ 跨进程 flock(与 pdg update/rollback 协调)。
-    两把锁任一被占 → yield False(立即友好返回, 绝不阻塞主轮询); 锁文件不可用 → 退化为仅进程内串行。"""
+
+    两把锁任一被占 → yield False(立即友好返回, 绝不阻塞主轮询);
+    **锁文件不可用同样 yield False**(fail-closed), 并把原因记进 _cfg_lock_err 供调用方区分
+    "有人正在改" 与 "锁坏了"。"""
+    global _cfg_lock_err
+    _cfg_lock_err = ""
     if not _cfg_lock.acquire(blocking=False):    # 非阻塞: 本进程已有配置操作在跑 → 立刻让路, 不卡主循环
         yield False
         return
     try:
         try:
             f = open(LOCKFILE, "w")
-        except OSError:
-            yield True                           # 无法打开锁文件(权限/路径) → 只做进程内串行
+        except OSError as e:
+            # fail-closed: 打不开锁文件就**不写**。旧实现退化成"只做进程内串行"继续写 ——
+            # 那时 CLI/定时任务照样能同时改同一份配置, 谁也拦不住。
+            _cfg_lock_err = "%s: %s" % (LOCKFILE, type(e).__name__)
+            yield False
             return
         locked = False
         try:
@@ -563,7 +574,7 @@ def _mitm_transact(new_wloc):
         return False, "MITM/WLOC 仅 iOS 平台可用。"
     with _cfg_guard() as got:
         if not got:
-            return False, BUSY_MSG
+            return False, busy_msg()
         if callable(new_wloc):                                       # 目标态在锁内算, 不用过期状态
             _w = _wloc_state()
             try:
@@ -706,7 +717,7 @@ def wloc_add_gen(name, lat, lon):
         st["enabled"] = bool(w.get("enabled"))
     w = _wloc_edit_locked(_mut)
     if w is None:
-        return False, BUSY_MSG, 0
+        return False, busy_msg(), 0
     if st["hot"]:
         return True, (f"✅ 当前目标坐标已更新：<b>{name}</b>（{lat}, {lon}）\n"
                       "WLOC 已热加载，无需重启网关服务，也不用再去列表里点一次。\n\n"
@@ -749,7 +760,7 @@ def wloc_del(name):
         st["next"] = w.get("active")
     w = _wloc_edit_locked(_mut)
     if w is None:
-        return False, BUSY_MSG
+        return False, busy_msg()
     if not st.get("exists"):
         return False, "没有这个地点"
     if st.get("needs_txn"):
@@ -785,7 +796,7 @@ def wloc_switch_gen(name):
         _wloc_bump(ww)
     w = _wloc_edit_locked(_mut)
     if w is None:
-        return False, BUSY_MSG, 0
+        return False, busy_msg(), 0
     if not st.get("exists"):
         return False, "没有这个地点", 0
     loc = _wloc_active(w)
@@ -1020,11 +1031,15 @@ def _core_sync_file():
     except Exception:  # noqa: BLE001
         pass
 
+def busy_msg():
+    """区分"别人正在改"与"锁不可用" —— 后者是环境故障, 让用户知道该去看 /run。"""
+    return NOLOCK_MSG if _cfg_lock_err else BUSY_MSG
+
 def apply_sb(modify):
     # 串行化配置写 + 与 pdg update/rollback 用同一把 flock 协调(拿不到锁友好返回, 不卡死)。
     with _cfg_guard() as got:
         if not got:
-            return False, BUSY_MSG
+            return False, busy_msg()
         return _apply_sb_inner(modify)
 
 def _apply_sb_inner(modify):
@@ -3817,7 +3832,7 @@ def handle_text(chat, text, mid=None):
             link = ob = None                         # 尽力减少凭据在内存驻留(非安全擦除, Python 无法保证)
             if ok:
                 send_plain(chat, f"✅ 已添加出口 <b>{tag}</b>")
-            elif msg == BUSY_MSG:                    # 锁冲突: 安全且准确, 原样回显(不是校验失败)
+            elif msg in (BUSY_MSG, NOLOCK_MSG):       # 锁冲突/锁不可用: 原样回显(不是校验失败)
                 send_plain(chat, "❌ " + msg)
             else:                                    # 校验/重启失败: 正文可能含凭据 → 通用提示
                 send_plain(chat, "❌ 添加失败: 配置校验未过, 已回滚(详情见服务器日志, 未回显链接内容)")
