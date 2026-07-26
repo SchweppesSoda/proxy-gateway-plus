@@ -95,7 +95,7 @@ def setup(tmp, backend="mihomo", svc_active=True):
         sys.path.insert(0, str(ROOT / "deploy" / "bot"))
         tx = importlib.import_module("pdgtx")
     tx.svc_stable = lambda unit, **k: (svc_active, "" if svc_active else "%s 未稳定" % unit)
-    tx.health_snapshot = lambda services: {"svc:" + u: svc_active for u in services}
+    tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: svc_active for u in services}
     tx._run = lambda cmd, timeout=60: (0, "")
     # 候选校验沿用本文件既有的注入口 fake.mihomo_t_rc(=1 表示 mihomo -t 判不过)
     tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (

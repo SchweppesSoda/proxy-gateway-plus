@@ -60,6 +60,7 @@ class Box:
             "PDG_TX_ROOT": self.root + "/var/lib/privdns-gateway/tx",
             "PDG_LOCKFILE": self.root + "/run/privdns-gateway.lock",
             "PDG_STABLE_SAMPLES": "1",
+            "PDG_STABLE_INTERVAL": "0.05",     # 采样间隔: 沙箱里没必要按真机的 0.6s 等
             "PATH": self.bin + os.pathsep + os.environ["PATH"],
         }
 
@@ -114,6 +115,9 @@ class Box:
         # crash=True 时模拟"坏配置起来即崩": restart 时看 config.json 里有没有 CRASH_MARK ——
         # 有就进入崩溃循环(NRestarts 每问一次涨一次), 换回旧配置再 restart 就恢复正常。
         # 这样回滚是否**真的解决问题**才有意义, 而不是让桩无条件永远崩。
+        # ActiveState: 事务的 stop 判据看的是它(failed / activating / deactivating 都不能冒充
+        # "已停下"), 所以桩必须能表达这些状态 —— 用 <unit>.state 文件放任意 ActiveState,
+        # 用 <unit>.stopstate 表达"stop 之后它会落到哪个状态"(如 failed)。
         self._write("systemctl", """#!/bin/bash
 echo "systemctl $*" >> %s
 S=%s
@@ -125,15 +129,23 @@ case "$1" in
       NRestarts) n=$(cat "$S/$U.nr" 2>/dev/null || echo 0)
                  if [[ -f "$S/$U.crash" ]]; then n=$((n+1)); echo $n > "$S/$U.nr"; fi
                  echo "$n";;
-      UnitFileState) echo enabled;;
+      UnitFileState) cat "$S/$U.ufs" 2>/dev/null || echo enabled;;
       LoadState) echo loaded;;
+      ActiveState)
+        if [[ -f "$S/$U.state" ]]; then cat "$S/$U.state"
+        elif [[ -f "$S/$U.active" ]]; then echo active
+        else echo inactive; fi;;
       *) echo "";;
     esac; exit 0;;
-  restart)
-    for f in %s; do [[ "$2" == "$f" ]] && { echo "restart refused"; exit 1; }; done
-    touch "$S/$2.active"; %s
+  restart|start)
+    for f in %s; do [[ "$2" == "$f" ]] && { echo "$1 refused"; exit 1; }; done
+    touch "$S/$2.active"; rm -f "$S/$2.state"; %s
     exit 0;;
-  stop) rm -f "$S/$2.active"; exit 0;;
+  stop)
+    [[ -f "$S/$2.nostop" ]] && { echo "stop refused"; exit 1; }
+    rm -f "$S/$2.active"
+    if [[ -f "$S/$2.stopstate" ]]; then cp "$S/$2.stopstate" "$S/$2.state"; else rm -f "$S/$2.state"; fi
+    exit 0;;
   reset-failed|daemon-reload|enable|disable) exit 0;;
 esac
 exit 0
@@ -150,6 +162,34 @@ exit 0
 
     def up(self, unit):
         open(os.path.join(self.state, unit + ".active"), "w").close()
+
+    def down(self, unit):
+        """让 unit 变成"没在跑"(ActiveState=inactive)。"""
+        for suf in (".active", ".state"):
+            try:
+                os.unlink(os.path.join(self.state, unit + suf))
+            except OSError:
+                pass
+
+    def set_active_state(self, unit, state):
+        """直接摆一个 ActiveState(failed / activating / deactivating …), 用来验"不许冒充 inactive"。"""
+        with open(os.path.join(self.state, unit + ".state"), "w") as f:
+            f.write(state + "\n")
+
+    def fail_stop(self, unit):
+        """让 `systemctl stop <unit>` 返回非 0 —— 验"停不下来必须如实报未恢复"。"""
+        open(os.path.join(self.state, unit + ".nostop"), "w").close()
+
+    def stop_leaves(self, unit, state):
+        """stop 之后这个 unit 会落到哪个 ActiveState(如 failed) —— 桩用它模拟"停了但死了"。"""
+        with open(os.path.join(self.state, unit + ".stopstate"), "w") as f:
+            f.write(state + "\n")
+
+    def bump_restarts(self, unit, n):
+        """把 NRestarts 直接抬上去, 模拟"起来了但在崩溃循环里"。"""
+        with open(os.path.join(self.state, unit + ".nr"), "w") as f:
+            f.write(str(n) + "\n")
+        open(os.path.join(self.state, unit + ".crash"), "w").close()
 
     def path(self, rel):
         return self.root + rel

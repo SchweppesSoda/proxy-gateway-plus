@@ -447,13 +447,7 @@ def main():
     live6 = box6.path("/etc/privdns-gateway/mitm.json")
     with open(live6, "wb") as f:
         f.write(b'{"wloc": {"enabled": false}}')
-    with open(os.path.join(box6.bin, "systemctl"), "r") as f:
-        stub = f.read()
-    stub = stub.replace('  stop) rm -f "$S/$2.active"; exit 0;;',
-                        '  stop) [[ "$2" == pdg-mitm ]] && { echo "stop refused"; exit 1; }; '
-                        'rm -f "$S/$2.active"; exit 0;;')
-    with open(os.path.join(box6.bin, "systemctl"), "w") as f:
-        f.write(stub)
+    box6.fail_stop("pdg-mitm")            # 停不下来: 回滚必须如实报"未恢复"而不是假装停好了
     # pdg-mitm 操作前就没在跑 → 普通事务会被基线门正确拒绝; 这类"在降级现场动手"正是
     # 修复模式的用途, 用它才谈得上"回滚要把它停回去"
     t = tx6.Tx("bot", "rt-stop", mode="repair")
@@ -540,7 +534,7 @@ def main():
         json.dumps({"proxies": [], "rules": [], "rule-providers": rs_meta or {}}).encode(), {})
     bt3 = b3._pdgtx()
     bt3.svc_stable = lambda unit, **k: (True, "")
-    bt3.health_snapshot = lambda services: {"svc:" + u: True for u in services}
+    bt3.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
     # 候选阶段绝不能碰生产目录: 下载/解析期间往 RS_DIR 看一眼, 必须还是空的
     seen = {}
     real_stage = bt3.Tx.stage
@@ -803,6 +797,262 @@ def main():
     else:
         bad("TxRefused 的原因丢了: ok=%r msg=%r" % (okr13, msg13))
     box11.clean()
+
+    # ── 12. repair 模式只放宽"操作前就坏的", 绝不放行**新增**退化 ─────────────
+    # 旧实现里 repair 遇到"操作前好、操作后坏"也只记 warning 就 COMMITTED —— 一次"修复"
+    # 可以把本来好的 DNS/DoT/端口弄坏还报成功, 那是修复模式最不该有的权力。
+    def _rule_tx(txm, box, mode, op):
+        t = txm.Tx("test", op, mode=mode)
+        t.stage("mosdns_rule:custom_direct.txt", b"domain:after12.example\n")
+        t.service("restart:mosdns")
+        return t
+
+    # 12a. 操作前 DNS 就不通(Box(healthy=False) 让探针端口指向关着的口): repair 允许 + warning
+    box12 = Box(healthy=False); tx12 = load_tx(box12.env)
+    box12.up("mosdns"); box12.up("mihomo")
+    box12.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before12.example\n", 0o644)
+    res = _rule_tx(tx12, box12, "repair", "repair_old_break").commit()
+    if res["state"] == tx12.COMMITTED and any("操作前就是坏的" in w for w in res.get("warnings", [])):
+        ok("repair: 操作前就坏的硬门 → 允许提交并记 warning")
+    else:
+        bad("repair 没能在旧故障下提交: %s / %s" % (res["state"], res.get("warnings")))
+    # 同一现场 normal 模式必须在基线阶段就拒(对照, 证明放宽只属于 repair)
+    try:
+        _rule_tx(tx12, box12, "normal", "normal_old_break").commit()
+        bad("normal 模式竟然在已损坏的基线上提交了")
+    except tx12.TxRefused as e:
+        ok("normal: 同一破损基线被拒(%s)" % str(e)[:28]) if "操作前" in str(e) else \
+            bad("拒绝原因不对: %s" % e)
+    box12.clean()
+
+    # 12b/c/d. 操作前好、操作后坏 → repair 也必须回滚(DNS / DoT 端口 / 服务三种退化各一条)
+    for label, kind in (("DNS", "dns"), ("DoT 端口", "port"), ("服务稳定性", "svc")):
+        boxd = Box(); txd = load_tx(boxd.env)
+        boxd.up("mosdns"); boxd.up("mihomo")
+        live = boxd.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before12.example\n", 0o644)
+        before = boxd.read("/etc/mosdns/rules/custom_direct.txt")
+        if kind == "dns":                      # 故障注入在探针边界: 基线好, 观察期坏
+            real, calls = txd._dns_answers, []
+            def _dns(*a, **k):
+                calls.append(1); return len(calls) <= 1
+            txd._dns_answers = _dns
+        elif kind == "port":
+            real, calls = txd._tcp_listening, []
+            def _tcp(*a, **k):
+                calls.append(1); return len(calls) <= 1      # 基线那次好, 观察期那次坏
+            txd._tcp_listening = _tcp
+        else:
+            boxd.bump_restarts("mosdns", 7)    # 起来即崩: NRestarts 一直涨
+        res = _rule_tx(txd, boxd, "repair", "repair_new_break_" + kind).commit()
+        # 服务那条的现场是"起来即崩", 回滚重启后照样崩 → 诚实结果是 ROLLBACK_FAILED;
+        # 关键在于**没有 COMMITTED**, 且文件逐字节还原。
+        restored = boxd.read("/etc/mosdns/rules/custom_direct.txt") == before
+        if res["state"] in (txd.ROLLED_BACK, txd.ROLLBACK_FAILED) and restored:
+            ok("repair: 新增%s退化 → 不提交(%s)且文件逐字节还原" % (label, res["state"]))
+        else:
+            bad("新增%s退化竟然被提交: %s / 文件还原=%s" % (label, res["state"], restored))
+        if kind == "dns":
+            txd._dns_answers = real
+        elif kind == "port":
+            txd._tcp_listening = real
+        boxd.clean()
+
+    # ── 13. watch: 只读前置条件 ────────────────────────────────────────────────
+    box13 = Box(); tx13 = load_tx(box13.env)
+    box13.up("mosdns"); box13.up("mihomo")
+    model_json = json.dumps({"outbounds": [{"type": "direct", "tag": "d"}], "route": {"rules": []}}).encode()
+    box13.put("/etc/sing-box/config.json", model_json)
+    box13.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before13.example\n", 0o644)
+
+    def _watch_tx(op):
+        t = tx13.Tx("test", op)
+        got = t.watch("model")
+        t.watch("rs_meta", optional=True)
+        t.stage("mosdns_rule:custom_direct.txt", b"domain:after13.example\n")
+        t.service("restart:mosdns")
+        return t, got
+
+    t13, got = _watch_tx("watch_ok")
+    if got == model_json:
+        ok("watch 返回的正是它记了 sha 的那份内容(调用方不用再读一次)")
+    else:
+        bad("watch 没有返回被 watch 的内容")
+    res = t13.commit()
+    if res["state"] == tx13.COMMITTED:
+        ok("watch: 只读依赖没变 → 正常提交")
+    else:
+        bad("watch 目标未变却提交失败: %s" % res)
+    # COMMITTED 之后 before/candidate 材料会被清掉(正常行为), 所以查 meta.json ——
+    # 它是长期留档: watch 的名字只能出现在 watched 里, 不能出现在 targets/services 里。
+    meta13 = json.load(open(os.path.join(res["dir"], "meta.json"), encoding="utf-8"))
+    if ("model" in (meta13.get("watched") or {}) and "model" not in meta13["targets"]
+            and "mihomo" not in meta13["services"]
+            and box13.read("/etc/sing-box/config.json") == model_json):
+        ok("watch 目标不落盘、不进 targets/before-image、不把它的服务拖进本次事务")
+    else:
+        bad("watch 目标被当成写目标了: targets=%s services=%s"
+            % (meta13["targets"], meta13["services"]))
+
+    t13b, _ = _watch_tx("watch_changed")
+    box13.put("/etc/sing-box/config.json",                       # 别人改了 model
+              json.dumps({"outbounds": [{"type": "direct", "tag": "d2"}], "route": {"rules": []}}).encode())
+    before13 = box13.read("/etc/mosdns/rules/custom_direct.txt")
+    try:
+        t13b.commit(); bad("只读依赖变了却照样提交")
+    except tx13.TxRefused as e:
+        if "PRECONDITION_FAILED" in str(e) and box13.read("/etc/mosdns/rules/custom_direct.txt") == before13:
+            ok("watch: 只读依赖内容变化 → PRECONDITION_FAILED 且生产零改动")
+        else:
+            bad("watch 变化后的行为不对: %s" % e)
+
+    t13c, _ = _watch_tx("watch_absent_to_present")
+    box13.put("/opt/pdg-bot/rulesets.json", b"{}", 0o644)         # optional 的从"不存在"变"存在"
+    try:
+        t13c.commit(); bad("optional 只读依赖从 absent 变 present 却照样提交")
+    except tx13.TxRefused as e:
+        ok("watch: optional 依赖 absent→present 也判 PRECONDITION_FAILED") \
+            if "PRECONDITION_FAILED" in str(e) else bad("原因不对: %s" % e)
+    try:
+        tx13.Tx("test", "watch_missing").watch("model_missing_target")
+        bad("watch 接受了白名单外的名字")
+    except Exception as e:  # noqa: BLE001
+        ok("watch 只认白名单逻辑目标(%s)" % type(e).__name__)
+    t13d = tx13.Tx("test", "watch_required_missing")
+    box13.put("/etc/mosdns/config.yaml", b"log: {}\n", 0o644)
+    try:
+        t13d.watch("dot_marker")                                  # 必需但不存在
+        bad("watch 对不存在的必需依赖没报错")
+    except tx13.TxRefused:
+        ok("watch: 必需的只读依赖不存在 → 直接拒绝")
+    box13.clean()
+
+    # ── 14. 服务期望状态: start/stop pdg-mitm ────────────────────────────────
+    def _mitm_box():
+        b = Box(); t = load_tx(b.env)
+        b.up("mosdns"); b.up("mihomo")
+        b.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
+        return b, t
+
+    def _mitm_tx(txm, op, actions, mode="normal"):
+        t = txm.Tx("test", op, mode=mode)
+        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+        for a in actions:
+            t.service(a)
+        return t
+
+    b14, tx14 = _mitm_box()                       # start: 操作前 pdg-mitm 没在跑(WLOC 常态)
+    b14.down("pdg-mitm")
+    res = _mitm_tx(tx14, "mitm_start", ["start:pdg-mitm"]).commit()
+    if res["state"] == tx14.COMMITTED and os.path.exists(os.path.join(b14.state, "pdg-mitm.active")):
+        ok("start:pdg-mitm: 操作前 inactive 也能开事务(不再被基线硬门拦), 操作后确认 active")
+    else:
+        bad("start 失败: %s" % res)
+    b14.clean()
+
+    b14, tx14 = _mitm_box()                       # stop: 操作后必须确认 inactive
+    b14.up("pdg-mitm")
+    res = _mitm_tx(tx14, "mitm_stop", ["stop:pdg-mitm"]).commit()
+    if res["state"] == tx14.COMMITTED and not os.path.exists(os.path.join(b14.state, "pdg-mitm.active")):
+        ok("stop:pdg-mitm: 停成功不被判成服务故障, 且确认已 inactive")
+    else:
+        bad("stop 失败: %s" % res)
+    b14.clean()
+
+    b14, tx14 = _mitm_box()                       # 动作冲突: 写生产文件之前就拒
+    b14.up("pdg-mitm")
+    live14 = b14.read("/etc/privdns-gateway/mitm.json")
+    try:
+        _mitm_tx(tx14, "mitm_conflict", ["start:pdg-mitm", "stop:pdg-mitm"])
+        bad("同一 unit 上 start+stop 竟然被接受")
+    except tx14.TxError as e:
+        if b14.read("/etc/privdns-gateway/mitm.json") == live14:
+            ok("动作冲突 → 组装阶段就拒(%s), 生产零改动" % str(e)[:24])
+        else:
+            bad("拒绝了但动过生产文件")
+    b14.clean()
+
+    for st in ("failed", "activating", "deactivating"):
+        b14, tx14 = _mitm_box()                   # stop 之后落到 failed/activating… 不算停成功
+        b14.up("pdg-mitm"); b14.stop_leaves("pdg-mitm", st)
+        before14 = b14.read("/etc/privdns-gateway/mitm.json")
+        res = _mitm_tx(tx14, "mitm_stop_" + st, ["stop:pdg-mitm"]).commit()
+        if res["state"] == tx14.ROLLED_BACK and b14.read("/etc/privdns-gateway/mitm.json") == before14:
+            ok("stop 后 ActiveState=%s 不冒充成功 → 回滚且 mitm.json 还原" % st)
+        else:
+            bad("ActiveState=%s 被当成停成功: %s" % (st, res["state"]))
+        b14.clean()
+
+    b14, tx14 = _mitm_box()                       # start 命令本身失败 → 立即回滚
+    b14.down("pdg-mitm"); b14._systemctl(["pdg-mitm"], False)
+    before14 = b14.read("/etc/privdns-gateway/mitm.json")
+    res = _mitm_tx(tx14, "mitm_start_fail", ["start:pdg-mitm"]).commit()
+    if res["state"] == tx14.ROLLED_BACK and b14.read("/etc/privdns-gateway/mitm.json") == before14:
+        ok("start 命令失败 → 回滚 + mitm.json 逐字节还原")
+    else:
+        bad("start 失败却没回滚: %s" % res["state"])
+    b14.clean()
+
+    b14, tx14 = _mitm_box()                       # start 成功但在崩溃循环里 → 判失败
+    b14.down("pdg-mitm"); b14.bump_restarts("pdg-mitm", 3)
+    res = _mitm_tx(tx14, "mitm_start_crash", ["start:pdg-mitm"]).commit()
+    if res["state"] == tx14.ROLLED_BACK:
+        ok("start 后 NRestarts 还在涨 → 判起来即崩并回滚")
+    else:
+        bad("崩溃循环被当成启动成功: %s" % res["state"])
+    if not os.path.exists(os.path.join(b14.state, "pdg-mitm.active")):
+        ok("回滚把 pdg-mitm 恢复成事务前的 inactive(原本没在跑的不许留着在跑)")
+    else:
+        bad("回滚后 pdg-mitm 仍在跑")
+    b14.clean()
+
+    b14, tx14 = _mitm_box()                       # 放宽只针对该 unit: 别的硬门坏了照样拒
+    b14.down("pdg-mitm"); b14.down("mosdns"); b14.up("mihomo")
+    try:
+        t = tx14.Tx("test", "relax_scope")
+        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+        t.stage("mosdns_rule:custom_direct.txt", b"domain:x14.example\n")
+        t.service("start:pdg-mitm"); t.service("restart:mosdns")
+        t.commit()
+        bad("mosdns 操作前就没在跑, normal 模式却放行了")
+    except tx14.TxRefused as e:
+        ok("start:pdg-mitm 只放宽 pdg-mitm 自己的基线, mosdns 的硬门照旧(%s)" % str(e)[:24])
+    b14.clean()
+
+    # ── 15. 兼容: 5.1A 留下的事务(meta 里没有新字段)仍要能 recover ──────────────
+    # 新字段(watched / expected_states / baseline_relaxed)都是可选的, schema 没升级 ——
+    # 把它们从 meta 里删掉模拟"旧核心写的事务目录", 新核心必须照样恢复。
+    box15 = Box(); tx15 = load_tx(box15.env)
+    box15.up("mosdns")
+    if tx15.SCHEMA_VERSION == 1:
+        ok("SCHEMA_VERSION 仍是 1(事务目录格式没有不兼容变化)")
+    else:
+        bad("SCHEMA_VERSION 被改成了 %s" % tx15.SCHEMA_VERSION)
+    box15.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before15.example\n", 0o644)
+    b15 = box15.read("/etc/mosdns/rules/custom_direct.txt")
+    t15 = tx15.Tx("cli", "compat-crash")
+    t15.stage("mosdns_rule:custom_direct.txt", b"domain:applied15.example\n")
+    t15.service("restart:mosdns")
+    real_do = tx15.Tx._do_actions
+    tx15.Tx._do_actions = lambda self: (_ for _ in ()).throw(SystemExit("模拟 APPLYING 断电"))
+    try:
+        t15.commit()
+    except SystemExit:
+        pass
+    finally:
+        tx15.Tx._do_actions = real_do
+    mp = os.path.join(t15.dir, "meta.json")
+    m15 = json.load(open(mp, encoding="utf-8"))
+    stripped = [k for k in ("watched", "expected_states", "baseline_relaxed") if k in m15]
+    for k in stripped:
+        m15.pop(k)
+    with open(mp, "w", encoding="utf-8") as f:
+        json.dump(m15, f, ensure_ascii=False)
+    r15 = tx15.recover(t15.txid, root=t15.root)
+    if r15.get("ok") and box15.read("/etc/mosdns/rules/custom_direct.txt") == b15:
+        ok("旧格式 meta(去掉 5.1B 新字段)仍能 recover 并逐字节还原")
+    else:
+        bad("旧格式 meta 恢复失败: %s" % r15)
+    box15.clean()
 
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))

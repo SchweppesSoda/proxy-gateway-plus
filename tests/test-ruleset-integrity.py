@@ -102,7 +102,7 @@ def setup(tmp):
     import importlib
     tx = importlib.import_module("pdgtx")
     tx.svc_stable = lambda unit, **k: (True, "")            # 服务动力学由事务专属用例覆盖
-    tx.health_snapshot = lambda services: {"svc:" + u: True for u in services}
+    tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
     tx._run = lambda cmd, timeout=60: (0, "")
     tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (
         (False, "mihomo 配置校验失败") if getattr(fake, "mihomo_t_rc", 0) else (True, ""))

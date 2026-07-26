@@ -196,7 +196,7 @@ for _m in list(sys.modules):
         del sys.modules[_m]
 _tx = importlib.import_module("pdgtx")
 _tx.svc_stable = lambda unit, **k: (True, "")
-_tx.health_snapshot = lambda services: {"svc:" + u: True for u in services}
+_tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
 _tx._run = lambda cmd, timeout=60: (0, "")
 
 

@@ -397,7 +397,7 @@ def main():
     tA.service("restart:mosdns")
     real_observe = txA.Tx._observe
 
-    def crash_in_observing(self, services, base):
+    def crash_in_observing(self, services, base, *a, **k):
         raise SystemExit("模拟 OBSERVING 阶段断电")     # 状态已经是 OBSERVING
     txA.Tx._observe = crash_in_observing
     try:
@@ -510,14 +510,14 @@ def main():
 
     real_listen = txC._tcp_listening
 
-    def kill_dot(self, services, base):
+    def kill_dot(self, services, base, *a, **k):
         # 模拟"重启后 853 不再监听"(证书装坏的典型后果)。这里换掉的是端口探测的结果, 而不是
         # 退化判据本身 —— 基线里 853 是好的, 观察期变坏, 事务必须据此回滚。
         # (直接 close() 监听 socket 不行: 线程仍阻塞在 accept, 端口不会立刻释放。)
         txC._tcp_listening = lambda port, host="127.0.0.1", timeout=1.5: (
             False if port == boxC.dot_port else real_listen(port, host, timeout))
         try:
-            return real_obs(self, services, base)
+            return real_obs(self, services, base, *a, **k)
         finally:
             txC._tcp_listening = real_listen
     txC.Tx._observe = kill_dot

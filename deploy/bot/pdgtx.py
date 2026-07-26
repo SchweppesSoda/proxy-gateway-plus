@@ -129,8 +129,41 @@ _TARGET_SVC = {
 }
 
 _SERVICE_UNITS = ("mosdns", "mihomo", "pdg-mitm", "pdg-bot", "pdg-probe81")
+# 只有 pdg-mitm 需要"目标态": WLOC 开 = 让它跑起来(操作前通常没在跑), 关 = 让它停下。
+# 不给 mosdns/mihomo 开 start/stop —— 那两个在本项目里永远应该是 active, 给它们加"停"
+# 这种能力只会让某天写错的事务把 DNS 停掉。
+_STATE_UNITS = ("pdg-mitm",)
 _ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
+                 ["start:" + u for u in _STATE_UNITS] +
+                 ["stop:" + u for u in _STATE_UNITS] +
                  ["daemon-reload", "nft:apply", "sysctl:apply"])
+
+
+def expected_states(actions):
+    """本笔事务对各 unit 的**期望终态**, 只由显式动作决定(没写动作的 unit 不在其中)。"""
+    exp = {}
+    for a in actions:
+        verb, _, unit = a.partition(":")
+        if verb in ("restart", "start"):
+            exp[unit] = "active"
+        elif verb == "stop":
+            exp[unit] = "inactive"
+    return exp
+
+
+def action_conflicts(actions):
+    """同一个 unit 上互相矛盾的动作(restart 又 stop 之类)。返回冲突说明列表, 空 = 没问题。"""
+    seen = {}
+    for a in actions:
+        verb, _, unit = a.partition(":")
+        if verb not in ("restart", "start", "stop"):
+            continue
+        want = "inactive" if verb == "stop" else "active"
+        if unit in seen and seen[unit][1] != want:
+            return ["%s 上同时要求 %s 和 %s —— 期望终态自相矛盾"
+                    % (unit, seen[unit][0], a)]
+        seen[unit] = (a, want)
+    return []
 
 
 # 证书目录允许自定义(PDG_CERT_DIR), 但**只认项目自己的可信配置**, 不接受调用方传路径 ——
@@ -301,11 +334,21 @@ def _svc_active(unit):
     return out.strip() == "active"
 
 
-def svc_stable(unit, samples=None, interval=0.6, max_polls=15):
+def _stable_interval(interval):
+    if interval is not None:
+        return interval
+    try:
+        return float(os.environ.get("PDG_STABLE_INTERVAL", "0.6"))
+    except ValueError:
+        return 0.6
+
+
+def svc_stable(unit, samples=None, interval=None, max_polls=15):
     """稳定 active 判据 —— **CLI 与 Bot 从此共用这一份**:
     连续 N 次 is-active 都是 active, 且观察窗口内 NRestarts 没有增长。
     只看一次 is-active 会把"起来即崩"判成成功: 崩溃循环里总有那么一瞬是 active。"""
     n = samples if samples is not None else int(os.environ.get("PDG_STABLE_SAMPLES", "3"))
+    interval = _stable_interval(interval)
     r0 = _svc_prop(unit, "NRestarts") or "0"
     streak = 0
     for _ in range(max_polls):
@@ -325,6 +368,28 @@ def svc_stable(unit, samples=None, interval=0.6, max_polls=15):
     except ValueError:
         pass
     return True, ""
+
+
+def svc_inactive_stable(unit, samples=None, interval=None, max_polls=15):
+    """稳定 inactive 判据 —— 与 svc_stable 对称, 供 stop:<unit> 使用。
+
+    必须看 ActiveState 而不是 `is-active` 的真假: failed / activating / deactivating / unknown
+    都"不是 active", 但它们都**不等于我们把它停下来了** —— 尤其 failed, 那是它自己死了。
+    连续 N 次都明确 inactive 才算数, 免得把"停下来又被 systemd 拉起"判成成功。"""
+    n = samples if samples is not None else int(os.environ.get("PDG_STABLE_SAMPLES", "3"))
+    interval = _stable_interval(interval)
+    streak, last = 0, ""
+    for _ in range(max_polls):
+        st = (_svc_prop(unit, "ActiveState") or "unknown").strip() or "unknown"
+        last = st
+        if st == "inactive":
+            streak += 1
+            if streak >= n:
+                return True, ""
+        else:
+            streak = 0
+        time.sleep(interval)
+    return False, "%s 没有稳定 inactive(ActiveState=%s)" % (unit, last)
 
 
 def _dns_answers(host="127.0.0.1", port=53, timeout=2.0):
@@ -354,10 +419,17 @@ def _tcp_listening(port, host="127.0.0.1", timeout=1.5):
         s.close()
 
 
-def health_snapshot(services):
-    """本次事务**范围内**的硬门指标。与公网无关 —— 出口探测那类属软门, 不在这里。"""
+def health_snapshot(services, relax_units=()):
+    """本次事务**范围内**的硬门指标。与公网无关 —— 出口探测那类属软门, 不在这里。
+
+    relax_units: 本笔事务显式给了 start:/stop: 的 unit。它们的 active 与否由"期望终态"单独判
+    (见 Tx._observe), 不进这份快照 —— 否则"开启 WLOC"这种操作前 pdg-mitm 本来就没在跑的场景,
+    会在基线阶段被判成"操作前硬门就是坏的"而根本开不了事务。**只放宽这一个 unit 的 active 检查**,
+    DNS / DoT / redir 端口以及其它服务一条都不放宽。"""
     h = {}
     for u in sorted(set(services)):
+        if u in relax_units:
+            continue
         if u == "pdg-mitm" and not _svc_prop(u, "LoadState") == "loaded":
             continue
         h["svc:" + u] = _svc_active(u)
@@ -738,6 +810,12 @@ def _restore_runtime(bi):
                 failed.append("%s 停止失败(%s)" % (u, redact(out)[-60:]))
             elif _svc_active(u):
                 failed.append("%s 本应保持 inactive, 现在却是 active" % u)
+        # enabled 本事务从不修改(没有 enable/disable 动作), 所以它必须与操作前一致 ——
+        # 不一致说明有别的东西动过 unit, 如实报出来而不是假定"回滚完成"。
+        was = (st.get("enabled") or "").strip()
+        now = (_svc_prop(u, "UnitFileState") or "").strip()
+        if was and now and was != now:
+            failed.append("%s 的开机自启状态从 %s 变成了 %s(本事务没改过它)" % (u, was, now))
     return failed
 
 
@@ -759,6 +837,7 @@ class Tx:
         self.source, self.op, self.mode = source, op, mode
         self.state = PREPARING
         self.targets = {}          # name -> {"path","data"(bytes|None),"expect","validators"}
+        self.watches = {}          # 只读依赖: name -> {"path","sha256","absent","optional"}
         self._read_sha = {}        # read_for_update 记下的"候选所依据的源内容" sha
         self.derivers = []         # (target, fn)
         self.actions = []
@@ -804,6 +883,31 @@ class Tx:
         self._read_sha[target] = sha
         return cur, sha
 
+    def watch(self, target, optional=False):
+        """登记一个**只读依赖**: 候选是根据它算出来的, 但本次不打算改它。返回它当前的 bytes(或 None)。
+
+        典型场景: mihomo 配置由 model + rs_meta 渲染, 而本次只改 mitm.json —— model/rs_meta
+        不该被"假装 stage 一遍再原样写回"(那会凭空产生一次写入、一份 before-image 和一次
+        服务牵连)。watch 只记 sha, 在拿到全局锁、动生产文件之前再核对一次: 变了就
+        PRECONDITION_FAILED, 生产文件一个字节都不动。
+
+        只接受白名单逻辑目标名(resolve_target 把关), 不接受任意路径; 软链/硬链/穿越的拒绝
+        判据与写目标完全一致(走同一个 _read_target)。"""
+        if self.state != PREPARING:
+            raise TxError("watch 只能在 PREPARING 阶段")
+        path, _m, _s, _v = resolve_target(target)
+        cur, _st = _read_target(path)
+        if cur is None and not optional:
+            raise TxRefused("只读依赖 %s 不存在, 无法据它生成候选" % target)
+        self.watches[target] = {"path": path, "optional": bool(optional),
+                                "sha256": _sha(cur) if cur is not None else None,
+                                "absent": cur is None}
+        self.meta["watched"] = {n: {"sha256": w["sha256"], "absent": w["absent"],
+                                    "optional": w["optional"]}
+                                for n, w in sorted(self.watches.items())}
+        self._save_meta()
+        return cur
+
     def stage(self, target, data, expect=_UNSET):
         """登记一个目标的候选内容。data=None 表示"这次要把它删掉"。
 
@@ -847,6 +951,11 @@ class Tx:
         if action not in _ACTIONS:
             raise TxError("不在白名单里的服务动作: %s" % action)
         if action not in self.actions:
+            # 同一个 unit 上"又要它跑又要它停"是组装错误, 现在就拦 —— 拖到执行期才发现,
+            # 前一半动作已经真的做了。
+            bad = action_conflicts(self.actions + [action])
+            if bad:
+                raise TxError("服务动作冲突: %s" % "; ".join(bad))
             self.actions.append(action)
         return self
 
@@ -895,12 +1004,27 @@ class Tx:
             self.stage_derived(tgt, data)
         if not self.targets and not self.actions:
             raise TxRefused("这笔事务没有任何目标或服务动作")
+        # 冲突动作再拦一次(service() 已拦过): 手工拼 actions 列表的路径也不许溜过去,
+        # 而且必须发生在**动生产文件之前**。
+        bad_actions = action_conflicts(self.actions)
+        if bad_actions:
+            self.meta["error_class"] = "ACTION_CONFLICT"
+            raise TxRefused("服务动作冲突: %s" % "; ".join(bad_actions))
         services = sorted({s for s in (target_service(t) for t in self.targets) if s} |
-                          {a.split(":", 1)[1] for a in self.actions if a.startswith("restart:")})
+                          {a.split(":", 1)[1] for a in self.actions
+                           if a.split(":", 1)[0] in ("restart", "start", "stop")})
         self.meta["services"] = services
         self.meta["targets"] = sorted(self.targets)
+        exp = expected_states(self.actions)
+        self.meta["expected_states"] = exp
+        # 显式 start/stop 的 unit: 它操作前是 active 还是 inactive 都不该挡住本次操作,
+        # 判据换成"操作后是否达到期望终态"(见 _observe)。只放宽这些 unit 的 active 检查。
+        relax = tuple(u for u, w in exp.items() if any(
+            a in self.actions for a in ("start:" + u, "stop:" + u)))
         # 2) 基线
-        base = health_snapshot(services)
+        base = health_snapshot(services, relax_units=relax)
+        if relax:      # 放宽的那几个 unit 操作前什么样, 仍要留档(审计要看得见)
+            self.meta["baseline_relaxed"] = {"svc:" + u: _svc_active(u) for u in relax}
         self.meta["baseline"] = base
         if self.mode == "normal":
             bad = [k for k, v in base.items() if not v]
@@ -914,6 +1038,15 @@ class Tx:
                 self.meta["error_class"] = "PRECONDITION_FAILED"
                 raise TxRefused("PRECONDITION_FAILED: 目标 %s 自本次读取之后被其它进程改过, "
                                 "本次不覆盖(请重新读取现网内容后重试)" % name)
+        # 3b) 只读依赖也要核对: 候选是按它算出来的, 它变了候选就已经过期(例如 model 换了出口,
+        #     而本次要落盘的 mihomo 配置还是按旧 model 渲染的)。同样在动生产文件之前。
+        for name, w in sorted(self.watches.items()):
+            cur, _ = _read_target(w["path"])
+            cur_sha = _sha(cur) if cur is not None else None
+            if cur_sha != w["sha256"]:
+                self.meta["error_class"] = "PRECONDITION_FAILED"
+                raise TxRefused("PRECONDITION_FAILED: 只读依赖 %s 自本次读取之后被改过, "
+                                "本次候选已过期(请重新读取现网内容后重试)" % name)
         # 4) 校验全部候选
         for name, t in sorted(self.targets.items()):
             if t["data"] is None:
@@ -951,7 +1084,7 @@ class Tx:
             if err:
                 raise _ApplyFailed(err)
             self._set_state(OBSERVING)
-            err = self._observe(services, base)
+            err = self._observe(services, base, exp=exp, relax=relax)
             if err:
                 raise _ApplyFailed(err)
         except _ApplyFailed as e:
@@ -1053,6 +1186,13 @@ class Tx:
                         rc2, cur = _run(["sysctl", "-n", k], timeout=15)
                         if rc2 != 0 or cur.strip() != v:
                             return "sysctl %s 应用后实际值是 %r(期望 %r)" % (k, cur.strip(), v)
+            elif a.startswith("start:"):
+                unit = a.split(":", 1)[1]
+                _run(["systemctl", "reset-failed", unit], timeout=30)
+                rc, out = _run(["systemctl", "start", unit], timeout=120)
+            elif a.startswith("stop:"):
+                unit = a.split(":", 1)[1]
+                rc, out = _run(["systemctl", "stop", unit], timeout=60)
             else:
                 unit = a.split(":", 1)[1]
                 _run(["systemctl", "reset-failed", unit], timeout=30)
@@ -1061,15 +1201,35 @@ class Tx:
                 return "%s 失败: %s" % (a, redact(out)[-200:])
         return ""
 
-    def _observe(self, services, base):
+    def _observe(self, services, base, exp=None, relax=()):
+        """观察期判据。
+
+        两类判据要分开:
+          · **显式动作**(restart/start/stop)的 unit → 硬门: 本次事务点名要它变成什么样, 没做到
+            就是失败, 不因 repair 放宽(否则"启动 pdg-mitm 失败"也能提交成功);
+          · 其余硬门(未点名动作的 unit、DNS、DoT、redir 端口)→ 判据是"不得比操作前更差":
+            操作前坏、操作后仍坏 = 记 warning 后放行(这才是 repair 的用处);
+            **操作前好、操作后坏 = 一律回滚, normal 与 repair 都一样**。
+        旧实现在 repair 模式下把后者也降级成 warning, 于是一次"修复"可以把本来好的 DNS / DoT /
+        端口弄坏还照样 COMMITTED —— 那是修复模式最不该有的权力。"""
+        exp = exp or {}
         obs = {}
         for u in services:
-            ok, why = svc_stable(u)
+            want = exp.get(u)
+            if want == "inactive":
+                ok, why = svc_inactive_stable(u)
+            else:
+                ok, why = svc_stable(u)
             obs["svc:" + u] = ok
-            if not ok:
-                self.meta["observed"] = obs
-                return why
-        after = health_snapshot(services)
+            if ok:
+                continue
+            if want is None and base.get("svc:" + u) is False:
+                # 没点名动作、且操作前就没在跑 → 保留原状并告警, 不算本次造成的退化
+                self.warn("svc:%s 在操作前就没在跑, 本次未修复(与本事务无关)" % u)
+                continue
+            self.meta["observed"] = obs
+            return why
+        after = health_snapshot(services, relax_units=relax)
         obs.update(after)
         self.meta["observed"] = obs
         self._save_meta()
@@ -1078,9 +1238,6 @@ class Tx:
                 continue
             if not base.get(k, True):
                 self.warn("%s 在操作前就是坏的, 本次未修复(与本事务无关)" % k)
-                continue
-            if self.mode == "repair":
-                self.warn("修复模式: %s 仍未恢复" % k)
                 continue
             return "关键链路在本次操作后退化: %s(操作前是好的)" % k
         return ""
@@ -1205,6 +1362,34 @@ def _audit_rec(rec):
         pass
 
 
+def _audit_write(rec):
+    """把一条审计记录追加进审计日志并按需轮转。**审计日志只有这一个写入口**。"""
+    line = json.dumps(rec, ensure_ascii=False) + "\n"
+    os.makedirs(os.path.dirname(AUDIT), mode=0o700, exist_ok=True)
+    with open(AUDIT, "a", encoding="utf-8") as f:
+        f.write(line)
+    _rotate_audit()
+
+
+def audit_event(source, op, result, extra=None):
+    """给"不是一笔完整事务"的受控写路径留的审计入口(如 WLOC 热切换)。
+
+    格式与事务记录同源(同一个 _audit_write / 同一份日志 / 同样会轮转), 只是没有 txid。
+    **extra 只允许放非敏感的结构化标量**(计数、代号、布尔) —— 位置名、经纬度、chat id、token
+    一类一律不许进来; 调用方自己负责, 这里再脱敏一次兜底。
+    调用方必须已经持有全局配置锁: 审计写入与事务的写入共用同一个文件与轮转逻辑。"""
+    rec = {"ts": time.time(), "txid": None, "source": source, "op": op,
+           "mode": "hotpath", "state": result, "targets": [], "services": [],
+           "error": "", "error_class": "", "rollback_complete": None,
+           "warnings": [], "schema_version": SCHEMA_VERSION}
+    for k, v in sorted((extra or {}).items()):
+        if isinstance(v, (int, float, bool)) or v is None:
+            rec[k] = v
+        else:
+            rec[k] = redact(str(v))[:120]
+    _audit_write(rec)
+
+
 def _audit(tx):
     rec = {"ts": time.time(), "txid": tx.txid, "source": tx.source, "op": tx.op,
            "mode": tx.mode, "state": tx.state, "targets": sorted(tx.targets),
@@ -1212,12 +1397,8 @@ def _audit(tx):
            "error_class": tx.meta.get("error_class", ""),
            "rollback_complete": tx.meta.get("rollback_complete"),
            "warnings": tx.meta.get("warnings", []), "schema_version": SCHEMA_VERSION}
-    line = json.dumps(rec, ensure_ascii=False) + "\n"
     try:
-        os.makedirs(os.path.dirname(AUDIT), mode=0o700, exist_ok=True)
-        with open(AUDIT, "a", encoding="utf-8") as f:
-            f.write(line)
-        _rotate_audit()
+        _audit_write(rec)
     except OSError:
         pass
 
