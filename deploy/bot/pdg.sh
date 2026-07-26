@@ -135,7 +135,7 @@ _journald_set_key(){
 }
 
 # 原子 upsert: 只更新 profile.env 里的 key=val 这一行, 其余键/注释/未知项原样保留。
-# 语义与 pdg-bot.py 的 _profile_set 一致(去前导空白后以 key= 开头才算命中; #key= 注释不算)。
+# 语义与 pdg-bot.py 的 _profile_text_with 一致(去前导空白后以 key= 开头才算命中; #key= 注释不算)。
 # 重复(多行同键)规范为一个有效值(保首个位置, 丢后续); 缺失则追加; 文件不存在则创建。
 # 临时文件 + mv 原子替换: 失败不留半截/空文件。返回非 0 表示写入失败。
 _profile_set(){

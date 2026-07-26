@@ -20,6 +20,10 @@ bot = u.module_from_spec(spec); spec.loader.exec_module(bot)
 import sb2mihomo  # noqa: E402
 
 pass_n = 0
+def bad(m):
+    print("[FAIL]", m); sys.exit(1)
+
+
 def ok(m):
     global pass_n; print("[OK]  ", m); pass_n += 1
 
@@ -39,6 +43,18 @@ def cfg():
         "route": {"rules": [], "final": "jp"}}
 
 
+def profile_set(key, val):
+    """把 profile.env 写成"含这条 key"的样子。
+
+    生产侧写 profile.env 只有一条路: _profile_text_with 生成候选 → tx_apply 落盘(事务)。
+    本用例关心的是 TFO 意图的读判定, 不是事务本身, 所以直接把同一份纯函数的产物写到盘上 ——
+    与生产内容逐字节一致, 但不需要拉起整笔事务。
+    """
+    data = bot._profile_text_with(key, val)
+    with open(bot.PROFILE_ENV, "wb") as f:
+        f.write(data)
+
+
 def main():
     tmp = tempfile.mkdtemp()
     bot.PROFILE_ENV = os.path.join(tmp, "profile.env")
@@ -47,7 +63,7 @@ def main():
     assert bot._tfo_on(c) is False; ok("初始(无 PDG_TFO, 出口无标志)→ 关闭")
 
     # 开启 → 持久化 + 同步
-    bot._profile_set("PDG_TFO", "1"); apply_like(c, lambda cc: None)
+    profile_set("PDG_TFO", "1"); apply_like(c, lambda cc: None)
     assert bot._tfo_on(c) is True
     assert all(o.get("tcp_fast_open") for o in c["outbounds"] if o["type"] in bot.PROXY_TYPES)
     ok("开启 → _tfo_on True + 所有代理出口带标志")
@@ -60,7 +76,7 @@ def main():
     ok("加新出口 → 状态保持开启 + 新出口继承(原 bug 已修)")
 
     # 关闭 → 清标志
-    bot._profile_set("PDG_TFO", "0"); apply_like(c, lambda cc: None)
+    profile_set("PDG_TFO", "0"); apply_like(c, lambda cc: None)
     assert bot._tfo_on(c) is False
     assert not any(o.get("tcp_fast_open") for o in c["outbounds"])
     ok("关闭 → _tfo_on False + 清掉所有标志")
@@ -76,7 +92,7 @@ def main():
     assert bot._tfo_intent(empty) is False; ok("老装无代理出口 → 关闭")
 
     # 渲染器: tcp_fast_open → mihomo tfo, 仅 TCP 类
-    bot.PROFILE_ENV = os.path.join(tmp, "p2.env"); bot._profile_set("PDG_TFO", "1")
+    bot.PROFILE_ENV = os.path.join(tmp, "p2.env"); profile_set("PDG_TFO", "1")
     c2 = cfg(); apply_like(c2, lambda cc: cc["outbounds"].insert(
         0, {"type": "vmess", "tag": "vm", "server": "4.4.4.4", "server_port": 443, "uuid": "u"}))
     mh, _ = sb2mihomo.singbox_to_mihomo(c2)
@@ -87,9 +103,21 @@ def main():
 
     # profile.env upsert 不破坏其它键
     bot.PROFILE_ENV = os.path.join(tmp, "p3.env")
-    bot._profile_set("PDG_LOWMEM", "1"); bot._profile_set("PDG_TFO", "1"); bot._profile_set("PDG_LOWMEM", "0")
+    profile_set("PDG_LOWMEM", "1"); profile_set("PDG_TFO", "1"); profile_set("PDG_LOWMEM", "0")
     assert bot._profile_get("PDG_LOWMEM") == "0" and bot._profile_get("PDG_TFO") == "1"
     ok("profile.env upsert 保留其它键(PDG_LOWMEM 与 PDG_TFO 共存)")
+
+    # profile.env 的 Python 写入口只剩"纯函数 + 事务": 那个没人调的 _profile_set 已删除,
+    # 而 pdg.sh 里的同名 Bash 函数仍是生产代码(PDG_LOWMEM / PDG_PLATFORM), 不能跟着删。
+    if hasattr(bot, "_profile_set"):
+        bad("Python 侧 _profile_set 还在(它没有生产调用点, 是死代码)")
+    else:
+        ok("Python 侧 _profile_set 已删除(生产写 profile.env 只走 _profile_text_with + 事务)")
+    sh_src = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+    if "_profile_set(){" in sh_src and "_profile_set PDG_PLATFORM" in sh_src:
+        ok("pdg.sh 里仍在用的 Bash _profile_set 原样保留")
+    else:
+        bad("误删了 pdg.sh 的 Bash _profile_set(平台切换/低内存还在用)")
 
     # ── 跨语言回归: 真跑升级 __migrate 路径的 BASH profile.env 写入(pdg.sh 的 pdg_lowmem_resolve),
     #    证明升级后 PDG_TFO 不丢、_tfo_intent 仍以持久化值为准(无需手动重开) ──

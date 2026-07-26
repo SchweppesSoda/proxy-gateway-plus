@@ -191,6 +191,22 @@ def main():
         bad("审计泄露了凭据")
     box.clean()
 
+    # ── 1b. 平台净化: iOS 上恢复带 GMS 入站的备份, 落盘的 model 不能留下 5228-5230 ──
+    box, bot = make_box()
+    gms = json.loads(json.dumps(AFTER_SB))
+    gms["inbounds"] = [{"type": "direct", "tag": "in-gms-5228", "listen_port": 5228},
+                       {"type": "direct", "tag": "in"}]
+    okr, msg = bot.restore_from(blob([
+        ("etc/sing-box/config.json", json.dumps(gms).encode()),
+        ("opt/pdg-bot/rulesets.json", b"{}")]))
+    landed = json.loads(box.read("/etc/sing-box/config.json").decode())
+    tags = [i.get("tag") for i in landed.get("inbounds", [])]
+    if okr and "in-gms-5228" not in tags:
+        ok("iOS 恢复: 备份里的 GMS 入站在进候选前被净化(落盘的 model 里没有 5228)")
+    else:
+        bad("平台净化没生效: ok=%s tags=%s" % (okr, tags))
+    box.clean()
+
     # ── 2. 可选文件缺失 → 保持现网, 不清空 ──
     box, bot = make_box()
     before = snap(box)

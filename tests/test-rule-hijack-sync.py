@@ -160,11 +160,13 @@ def main():
         ok("恢复净化: Android 不动 GMS 入站(它需要 5228-5230)")
     finally:
         bot._platform = _op
-    # 净化必须发生在校验/落盘之前
+    # 净化必须发生在**进候选**之前(校验与落盘都在那之后, 由事务负责)。
+    # 端到端的行为覆盖在 test-restore-transaction.py: 备份里带 GMS 入站的 iOS 恢复, 落盘的
+    # model 里不能有 5228-5230。这里守的是顺序本身。
     src = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
-    body = src[src.index("def restore_from("):]
-    assert body.index("_platform_sanitize_model") < body.index("MIHOMO_BIN"), "净化晚于校验"
-    ok("恢复净化: 排在配置校验之前")
+    body = src[src.index("def _restore_commit("):]
+    assert body.index("_platform_sanitize_model") < body.index('t.stage("model"'), "净化晚于入候选"
+    ok("恢复净化: 排在候选 stage 之前(校验/落盘都在其后)")
 
     print(f"\n通过 {pass_n} 项断言")
 

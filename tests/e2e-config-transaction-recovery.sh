@@ -138,7 +138,7 @@ python3 - "$TX" <<'PY' >/tmp/tx-crash6.out 2>&1
 import importlib.util, os, signal, sys
 spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-def die(self, services, base):          # 进入 OBSERVING 之后、判定之前把自己打死
+def die(self, services, base, *a, **k):   # 进入 OBSERVING 之后、判定之前把自己打死
     print(self.txid, flush=True)
     os.kill(os.getpid(), signal.SIGKILL)
 m.Tx._observe = die

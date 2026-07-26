@@ -374,13 +374,6 @@ def clash_up():
 def load():
     return json.load(open(SB))
 
-def _write(c):
-    t = SB + ".tmp"
-    with open(t, "w") as f:
-        json.dump(c, f, ensure_ascii=False, indent=2)
-    os.chmod(t, 0o600)        # config.json 含出口密码/uuid, 收紧到 600
-    os.replace(t, SB)
-
 def _svc_active(unit, need=3, delay=0.6, max_polls=15):
     """确认服务"稳定" active: 要求连续 need 次观测都是 active。
     systemd 默认 Type=simple, restart 返 0 只代表 exec 成功; 起来又崩(flapping)时单看一次会误判 ——
@@ -1657,29 +1650,6 @@ def _profile_text_with(key, val):
     return ("\n".join(out) + "\n").encode("utf-8")
 
 
-def _profile_set(key, val):
-    try:
-        lines = open(PROFILE_ENV, encoding="utf-8").read().splitlines()
-    except OSError:
-        lines = []
-    out, found = [], False
-    for line in lines:
-        if line.strip().startswith(key + "="):
-            out.append(f"{key}={val}"); found = True
-        else:
-            out.append(line)
-    if not found:
-        out.append(f"{key}={val}")
-    os.makedirs(os.path.dirname(PROFILE_ENV), exist_ok=True)
-    tmp = PROFILE_ENV + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
-    os.replace(tmp, PROFILE_ENV)
-
-# ── TCP Fast Open ──
-# 状态以持久化意图(PDG_TFO)为准, 不再靠"所有出口都带 tcp_fast_open"推断 —— 否则加一个新出口
-# (parse_link 出来的不带标志)就把 all(...) 打成假, 表现为"开了 TFO 却显示关闭、新出口也没享受到"。
-# apply_sb 每次改配置都会把意图同步到(含新增的)所有出口, 状态不再被冲掉。
 def _tfo_intent(c=None):
     v = _profile_get("PDG_TFO")
     if v in ("0", "1"):
@@ -2126,10 +2096,6 @@ def _rs_meta():
     if os.path.exists(RS_META):
         return json.load(open(RS_META))
     return {}
-
-def _save_rs_meta(m):
-    os.makedirs(os.path.dirname(RS_META), exist_ok=True)
-    json.dump(m, open(RS_META, "w"), ensure_ascii=False, indent=2)
 
 def _fetch_surge(url):
     req = urllib.request.Request(url, headers={"User-Agent": "pdg-bot"})
