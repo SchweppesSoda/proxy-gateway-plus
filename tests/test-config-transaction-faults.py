@@ -1414,6 +1414,145 @@ def main():
         bad("空值被跳过比较了: %s / %s" % (res["state"], res.get("rollback_failed_items")))
     b21.clean()
 
+    # ── 22. 敏感材料清理失败必须可观测(而不是被 ignore_errors 静默吞掉) ──────────
+    # candidate/before 里可能有出口密码、UUID、证书私钥。以前 rmtree(ignore_errors=True) 删不掉
+    # 也当过去了, 事务已是终态 → doctor 与 stale 都不会再提, 材料就那么留在盘上。
+    import shutil as _sh22
+
+    box22 = Box(); tx22 = load_tx(box22.env)
+    box22.up("mosdns")
+    box22.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before22.example\n", 0o644)
+
+    def _mk22(op):
+        t = tx22.Tx("test", op)
+        t.stage("mosdns_rule:custom_direct.txt", b"domain:SECRET_SENTINEL.example\n")
+        return t
+
+    class Boom22(Exception):
+        pass
+
+    # 同时盯住调用契约: 清理**不许**用 ignore_errors=True 调 rmtree —— 那是"删不掉也算过去"的
+    # 静默语义, 有它的话真实删除失败根本不会进异常分支(存在性复核也只能兜住一部分情况)。
+    rm_kwargs = []
+
+    def _rec(fn):
+        def wrapper(p_, **k):
+            rm_kwargs.append(dict(k))
+            return fn(p_, **k)
+        return wrapper
+
+    for label, patch in (("rmtree 成了空操作", _rec(lambda p_, **k: None)),
+                         ("rmtree 抛 OSError", _rec(lambda p_, **k: (_ for _ in ()).throw(
+                             OSError("SECRET_SENTINEL rmtree 失败"))))):
+        # ① 调用方带着自己的异常退出: 原始异常必须原样传出
+        t = _mk22("cleanup_fail_exc")
+        real_rmtree = _sh22.rmtree
+        _sh22.rmtree = patch
+        try:
+            try:
+                with t:
+                    raise Boom22("原始异常")
+                bad("%s: 原始异常没传出来" % label)
+            except Boom22:
+                ok("%s: 调用方原始异常原样传播" % label)
+            except Exception as e:  # noqa: BLE001
+                bad("%s: 原始异常被换成了 %s" % (label, type(e).__name__))
+        finally:
+            _sh22.rmtree = real_rmtree
+        m = tx22.load_meta(t.dir)
+        cand = os.path.isdir(os.path.join(t.dir, "candidate"))
+        bef = os.path.isdir(os.path.join(t.dir, "before"))
+        if m.get("state") == "ABORTED":
+            ok("%s: 状态仍是 ABORTED(业务结论没被清理失败改坏)" % label)
+        else:
+            bad("%s: 状态被改坏了: %s" % (label, m.get("state")))
+        if cand:
+            ok("%s: candidate 确实还在(残留是事实, 不许假装清干净了)" % label)
+        else:
+            bad("%s: 材料不见了, 这条用例的前提不成立" % label)
+        wl = " ".join(m.get("warnings") or [])
+        if "未能清理" in wl and ("candidate" in wl or "before" in wl):
+            ok("%s: meta 里落了脱敏 warning 并点名材料类型" % label)
+        else:
+            bad("%s: meta 没有残留 warning: %s" % (label, m.get("warnings")))
+        left = tx22.leftover_materials(root=t.root)
+        hit = [x for x in left if x["txid"] == t.txid]
+        if hit and set(hit[0]["materials"]) & {"candidate", "before"}:
+            ok("%s: leftover_materials 报出这笔终态事务的残留(doctor 据此点名)" % label)
+        else:
+            bad("%s: leftover_materials 没报出来: %s" % (label, left))
+        raw = json.dumps(m, ensure_ascii=False) + json.dumps(hit, ensure_ascii=False)
+        if "SECRET_SENTINEL" not in raw:
+            ok("%s: meta 与残留报告都不含候选正文/异常正文" % label)
+        else:
+            bad("%s: SECRET_SENTINEL 泄露了" % label)
+        _ = bef  # before 目录可能本来就没建(候选阶段没到 before-image), 不作硬断言
+
+        # ② 调用方正常返回: 返回值不被清理失败改写, 且 result() 里带着 warning
+        t2 = _mk22("cleanup_fail_ret")
+        _sh22.rmtree = patch
+        try:
+            def _ret():
+                with t2:
+                    return "业务成功"
+            got = _ret()
+        finally:
+            _sh22.rmtree = real_rmtree
+        if got == "业务成功":
+            ok("%s: 正常返回值不被清理失败改写" % label)
+        else:
+            bad("%s: 返回值被改了: %r" % (label, got))
+        if any("未能清理" in w for w in t2.result().get("warnings") or []):
+            ok("%s: 内存 result() 里也能看到残留 warning" % label)
+        else:
+            bad("%s: result 里没有 warning: %s" % (label, t2.result().get("warnings")))
+
+    if rm_kwargs and not any(k.get("ignore_errors") for k in rm_kwargs):
+        ok("清理调用 rmtree 时没有 ignore_errors=True(删不掉必须能被发现)")
+    else:
+        bad("清理仍在用 ignore_errors=True 调 rmtree: %s" % rm_kwargs[:3])
+
+    # ③ rmtree 恢复正常后, 材料必须真的消失
+    t3 = _mk22("cleanup_ok")
+    t3.abort_unstarted("正常收尾")
+    if not os.path.isdir(os.path.join(t3.dir, "candidate")) \
+            and not [x for x in tx22.leftover_materials(root=t3.root) if x["txid"] == t3.txid] \
+            and tx22.load_meta(t3.dir)["state"] == "ABORTED":
+        ok("rmtree 正常时: candidate/before 真的消失, 也不再报残留")
+    else:
+        bad("正常路径没把材料清掉")
+
+    box22.clean()
+
+    # ④ doctor(checks.check_transactions)必须能看见终态残留且不显示凭据。
+    #    单独一个干净沙箱: 只留一笔残留, 断言才能精确点名(doctor 只列前 3 笔)。
+    box22 = Box(); tx22 = load_tx(box22.env)
+    box22.up("mosdns")
+    box22.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before22.example\n", 0o644)
+    t4 = _mk22("cleanup_fail_doctor")
+    _sh22.rmtree = lambda p_, **k: None
+    try:
+        t4.abort_unstarted("放弃")
+    finally:
+        _sh22.rmtree = real_rmtree
+    import importlib.util as _il22
+    for _m in list(sys.modules):
+        if _m in ("pdgtx", "checks", "nftscan"):
+            del sys.modules[_m]
+    sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+    _cspec = _il22.spec_from_file_location("checks", ROOT / "deploy/bot/checks.py")
+    _checks = _il22.module_from_spec(_cspec)
+    try:
+        _cspec.loader.exec_module(_checks)
+        lvl, label22, detail = _checks.check_transactions()
+        if t4.txid in detail and "candidate" in detail and "SECRET_SENTINEL" not in detail:
+            ok("doctor 的「配置事务」项点名残留事务与材料类型, 且不显示任何凭据(%s)" % lvl)
+        else:
+            bad("doctor 没点名残留: %s / %s" % (lvl, detail[:120]))
+    except Exception as e:  # noqa: BLE001
+        bad("加载 checks 失败: %s" % type(e).__name__)
+    box22.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

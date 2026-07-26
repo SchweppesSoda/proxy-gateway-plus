@@ -1579,16 +1579,48 @@ migrate_ios_gms_cleanup(){
   chmod 700 "$wd"
 
   # ── 1) before-image: 逐个文件记"原本存在/不存在 + 权限", 内容留在 0600 的副本里 ──
-  # 逻辑名固定为 config.json / config.yaml / nftables.conf —— 与落盘、回滚共用同一套键名。
-  # 用 basename 当键会在路径被 env 换过时对不上(沙箱里就是这样), 回滚就会静默找不到材料。
+  # ① 形态守卫: 事务目标必须是**受控普通文件**。软链会让 `cp -a` 把链接原样搬进候选目录,
+  #    随后的 chmod / python 写入 / sed -i 就直接改到现网(甚至改到链接指向的别处), 而 before-image
+  #    也不再是真正的旧内容; 硬链接则会让"只改这一个文件"波及另一个名字。
+  #    这一步必须在任何 cp / chmod / stat / python / sed 之前完成, 拒绝时现网、链接目标、权限
+  #    与服务状态都还没被碰过。
   local f name g
+  for g in "$sb:config.json" "$mh:config.yaml" "$nf:nftables.conf"; do
+    f="${g%%:*}"
+    if [[ -L "$f" ]]; then
+      c_y "  iOS GMS 清理: $f 是符号链接, 事务目标只接受普通文件 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+    [[ -e "$f" ]] || continue                     # 不存在: absent 语义, 下面照旧
+    if [[ ! -f "$f" ]]; then
+      c_y "  iOS GMS 清理: $f 不是普通文件 → 未改动任何文件"; rm -rf "$wd"; return 1
+    fi
+    local _nl; _nl="$(stat -c '%h' "$f" 2>/dev/null)"
+    if [[ -z "$_nl" ]]; then
+      c_y "  iOS GMS 清理: 取不到 $f 的 stat 信息 → 未改动任何文件"; rm -rf "$wd"; return 1
+    fi
+    if [[ "$_nl" != 1 ]]; then
+      c_y "  iOS GMS 清理: $f 是硬链接(nlink=$_nl), 改它会波及另一个名字 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+  done
+  # ② before-image: 逻辑名固定为 config.json / config.yaml / nftables.conf —— 与落盘、回滚共用
+  #    同一套键名(用 basename 当键会在路径被 env 换过时对不上)。**内容用读写复制**而不是 cp -a,
+  #    这样材料一定是工作目录里的独立普通文件。mode/uid/gid 取不到就拒(不许猜 600 / 0:0 —— 那会
+  #    在成功提交时悄悄改掉属主)。
   for g in "$sb:config.json" "$mh:config.yaml" "$nf:nftables.conf"; do
     f="${g%%:*}"; name="${g##*:}"
     if [[ -f "$f" ]]; then
-      cp -a "$f" "$wd/before-$name" || { c_y "  iOS GMS 清理: 存 before-image 失败($name) → 未改动任何文件"; rm -rf "$wd"; return 1; }
+      local _m _o
+      _m="$(stat -c '%a' "$f" 2>/dev/null)"; _o="$(stat -c '%u:%g' "$f" 2>/dev/null)"
+      if [[ -z "$_m" || -z "$_o" ]]; then
+        c_y "  iOS GMS 清理: 取不到 $name 的权限/归属 → 未改动任何文件"; rm -rf "$wd"; return 1
+      fi
+      ( umask 177; cat "$f" > "$wd/before-$name" ) 2>/dev/null \
+        || { c_y "  iOS GMS 清理: 存 before-image 失败($name) → 未改动任何文件"; rm -rf "$wd"; return 1; }
       chmod 600 "$wd/before-$name"
-      stat -c '%a' "$f" > "$wd/mode-$name" 2>/dev/null || echo 600 > "$wd/mode-$name"
-      stat -c '%u:%g' "$f" > "$wd/own-$name" 2>/dev/null || echo "0:0" > "$wd/own-$name"
+      printf '%s\n' "$_m" > "$wd/mode-$name"
+      printf '%s\n' "$_o" > "$wd/own-$name"
       echo 1 > "$wd/existed-$name"
     else
       echo 0 > "$wd/existed-$name"
@@ -1597,7 +1629,8 @@ migrate_ios_gms_cleanup(){
 
   # ── 2) 候选: 全部在工作目录里生成, 生产文件此刻一个字节都没动 ──
   if [[ "$need_sb" == 1 ]]; then
-    cp -a "$sb" "$wd/cand-config.json" && chmod 600 "$wd/cand-config.json" || rc=1
+    ( umask 177; cat "$sb" > "$wd/cand-config.json" ) 2>/dev/null \
+      && chmod 600 "$wd/cand-config.json" || rc=1
     if [[ $rc == 0 ]] && ! python3 - "$wd/cand-config.json" <<'PY'
 import json, sys
 f = sys.argv[1]
@@ -1642,7 +1675,8 @@ PY
       c_y "  iOS GMS 清理: $nf 不存在, 无法保证运行态可回滚 → 未改动任何文件"
       rm -rf "$wd"; return 1
     fi
-    cp -a "$nf" "$wd/cand-nftables.conf" || { c_y "  iOS GMS 清理: 复制 nft 配置失败 → 未改动任何文件"; rm -rf "$wd"; return 1; }
+    ( umask 177; cat "$nf" > "$wd/cand-nftables.conf" ) 2>/dev/null \
+      || { c_y "  iOS GMS 清理: 复制 nft 配置失败 → 未改动任何文件"; rm -rf "$wd"; return 1; }
     _pdg_nft_strip_gms "$wd/cand-nftables.conf"
     if grep -qE 'tcp dport [{][^}]*5228' "$wd/cand-nftables.conf"; then
       # 剥完还在 = 自定义形态, 不猜也不动(交 doctor warn), 但这不是失败
@@ -1663,7 +1697,9 @@ PY
         local want_mode want_own
         want_mode="$(cat "$wd/mode-$name")"; want_own="$(cat "$wd/own-$name" 2>/dev/null || echo 0:0)"
         install -m "$want_mode" "$wd/before-$name" "$f" 2>/dev/null || bad+=("$name 写回失败")
-        chown "$want_own" "$f" 2>/dev/null || true      # 非 root 环境下 chown 会失败, 下面按实际值复核
+        # 回滚阶段允许尽力执行(非 root 环境 chown 必失败), 但**最终以下面的逐项复核为准** ——
+        # 复核不过就是 rollback incomplete, 不存在"chown 失败却算还原成功"。
+        chown "$want_own" "$f" 2>/dev/null || true
         cmp -s "$wd/before-$name" "$f" || bad+=("$name 内容未还原")
         [[ "$(stat -c '%a' "$f" 2>/dev/null)" == "$want_mode" ]] || bad+=("$name 权限未还原")
         [[ "$(stat -c '%u:%g' "$f" 2>/dev/null)" == "$want_own" ]] || bad+=("$name 归属未还原")
@@ -1697,10 +1733,28 @@ PY
 
   # ── 4) 落盘: 固定顺序 + 同目录临时文件 + 原子替换(绝不截断生产文件后再写) ──
   _iosgms_put(){  # $1=候选 $2=目标 $3=记账名
-    local d; d="$(dirname "$2")"
-    install -m "$(stat -c '%a' "$2" 2>/dev/null || echo 600)" "$1" "$d/.pdg-iosgms.$$" 2>/dev/null \
-      && mv -f "$d/.pdg-iosgms.$$" "$2" 2>/dev/null || { rm -f "$d/.pdg-iosgms.$$"; return 1; }
-    applied+=("$3"); return 0
+    # 原本存在的目标: 临时文件在 mv **之前**就设成原 mode/uid/gid —— 以 root 跑时, 只保 mode
+    # 会把非 root:root 的文件悄悄换成 root:root。chmod/chown 任一步失败就不许覆盖生产。
+    # 原本不存在的: 用该目标的明确默认 mode, owner 就是当前执行用户(生产由 need_root 保证是
+    # root), 不伪造"恢复旧 owner"。
+    local d t want_mode want_own
+    d="$(dirname "$2")"; t="$d/.pdg-iosgms.$$"
+    if [[ "$(cat "$wd/existed-$3" 2>/dev/null)" == 1 ]]; then
+      want_mode="$(cat "$wd/mode-$3")"; want_own="$(cat "$wd/own-$3")"
+    else
+      case "$3" in nftables.conf) want_mode=644;; *) want_mode=600;; esac
+      want_own="$(id -u):$(id -g)"
+    fi
+    cp -f "$1" "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+    chmod "$want_mode" "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+    chown "$want_own" "$t" 2>/dev/null || { rm -f "$t"; return 1; }
+    mv -f "$t" "$2" 2>/dev/null || { rm -f "$t"; return 1; }
+    applied+=("$3")
+    # 落盘后复核: 内容 + 权限 + 归属都必须是期望值(不复核就等于"写了就算成功")
+    cmp -s "$1" "$2" || return 1
+    [[ "$(stat -c '%a' "$2" 2>/dev/null)" == "$want_mode" ]] || return 1
+    [[ "$(stat -c '%u:%g' "$2" 2>/dev/null)" == "$want_own" ]] || return 1
+    return 0
   }
   if [[ "$need_sb" == 1 ]]; then
     step="model";        _iosgms_put "$wd/cand-config.json"    "$sb" config.json  || rc=1

@@ -813,6 +813,20 @@ def check_transactions():
         pend = pdgtx.pending_recovery()
     except Exception:  # noqa: BLE001
         return ("warn", "配置事务", "读不到事务目录, 无法确认是否有未完成事务")
+    # 终态事务却仍留着 candidate/before: 事务本身收尾了, 但那些目录里可能有出口密码、UUID、
+    # 证书私钥 —— 清理失败不会再被 pending/stale 提起, 必须单独报出来(只报 txid 与材料类型)。
+    try:
+        left = pdgtx.leftover_materials()
+    except Exception:  # noqa: BLE001  老机器的核心还没有这个函数
+        left = []
+    if left:
+        items = "; ".join("%s(%s: %s)" % (x.get("txid"), x.get("state"),
+                                          "、".join(x.get("materials") or []))
+                          for x in left[:3])
+        note = ("有 %d 笔已收尾的事务仍留着敏感材料: %s —— 里面可能有出口密码/证书私钥, "
+                "确认无需排查后请删除对应事务目录下的这些子目录。" % (len(left), items))
+        if not pend:
+            return ("warn", "配置事务", note)
     if not pend:
         recent = pdgtx.list_tx(limit=1)
         note = ("最近一笔: %s %s" % (recent[0].get("op"), recent[0].get("state"))) if recent \

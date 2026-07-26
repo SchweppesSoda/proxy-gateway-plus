@@ -1034,9 +1034,10 @@ class Tx:
             self.state = prev
             return False
         try:
-            self._cleanup_materials()      # 只有 ABORTED 落盘成功才尽力清材料
+            self._note_leftovers(self._cleanup_materials())   # ABORTED 落盘成功后才清材料
         except Exception:  # noqa: BLE001
-            self.warnings.append("候选材料清理失败, 材料保留在事务目录")
+            self.warnings.append("事务材料清理过程本身出错, 材料保留在事务目录")
+            self.meta["warnings"] = [redact(w) for w in self.warnings]
         try:
             _audit(self)
         except Exception:  # noqa: BLE001
@@ -1067,7 +1068,7 @@ class Tx:
             self.meta["ended_at"] = time.time()
             self.state = ABORTED
             self._save_meta()
-            self._cleanup_materials()
+            self._note_leftovers(self._cleanup_materials())
             _audit(self)
 
     def _commit_locked(self):
@@ -1181,7 +1182,7 @@ class Tx:
         self._set_state(COMMITTED)
         self.meta["ended_at"] = time.time()
         self._save_meta()
-        self._cleanup_materials()
+        self._note_leftovers(self._cleanup_materials())
         _audit(self)
         _gc(self.root)
         return self.result()
@@ -1382,7 +1383,7 @@ class Tx:
             _audit(self)
             return self.result()
         self._set_state(ROLLED_BACK)
-        self._cleanup_materials()
+        self._note_leftovers(self._cleanup_materials())
         _audit(self)
         _gc(self.root)
         return self.result()
@@ -1390,14 +1391,43 @@ class Tx:
     # ---- 收尾 ----
     def _cleanup_materials(self):
         """COMMITTED / 已验证的 ROLLED_BACK / ABORTED: 删掉候选与 before 材料。
+        **返回没能删掉的材料逻辑名列表**(空 = 干净)。
 
         它们可能含出口密码、UUID、证书私钥 —— 留在盘上没有意义, 恢复也用不到了。只保留脱敏
         的 meta.json / diff.txt。注意: 这里只是 unlink, **不承诺安全擦除** —— 底层是 SSD/日志
         文件系统时, 数据块可能仍残留在介质上, 这一点不做任何夸大。"""
         if self.state not in (COMMITTED, ROLLED_BACK, ABORTED):
-            return
+            return []
+        left = []
         for sub in ("candidate", "before"):
-            shutil.rmtree(os.path.join(self.dir, sub), ignore_errors=True)
+            p = os.path.join(self.dir, sub)
+            try:
+                shutil.rmtree(p)          # 不再 ignore_errors: 删不掉必须看得见
+            except FileNotFoundError:
+                continue
+            except Exception:  # noqa: BLE001  只记逻辑名, 不带异常正文(免得漏出路径/内容)
+                left.append(sub)
+                continue
+            if os.path.exists(p):         # 删除"成功"了也要复核: 真没了才算干净
+                left.append(sub)
+        if left:
+            self.meta["leftover_materials"] = left
+        return left
+
+    def _note_leftovers(self, left):
+        """材料没删干净: 记一条脱敏 warning(内存结果里一定有, 盘上尽力写)。
+
+        绝不改变事务的业务结果 —— 已经 COMMITTED 的操作确实成功了; 但"敏感材料还在盘上"必须
+        可观测, 否则就是静默残留(doctor 也会据此点名)。"""
+        if not left:
+            return
+        self.warnings.append("事务材料未能清理: %s —— 请人工删除该事务目录下的对应子目录"
+                             % "、".join(left))
+        self.meta["warnings"] = [redact(w) for w in self.warnings]
+        try:
+            self._save_meta()
+        except Exception:  # noqa: BLE001  二次落盘失败也不能影响调用方的结果
+            pass
 
     def result(self):
         return {"txid": self.txid, "state": self.state, "op": self.op, "source": self.source,
@@ -1553,6 +1583,24 @@ def pending_recovery(root=None, exclude=None):
     只看最近 N 笔的话, 一台机器攒够 N 笔新事务之后, 那笔真正卡住的就再也不会被报出来了。"""
     return [m for m in list_tx(root, limit=None)
             if m.get("state") in NEEDS_RECOVERY and m.get("txid") != exclude]
+
+
+def leftover_materials(root=None):
+    """已经是终态、却仍留着 candidate/before 的事务。
+
+    这些目录里可能有出口密码、UUID、证书私钥 —— 清理失败时事务本身已经收尾, pending/stale 都
+    不会再提它, 所以要单独报出来。只回 txid 与材料类型, 不碰内容。"""
+    root = root or TX_ROOT
+    out = []
+    for m in list_tx(root, limit=None):
+        if m.get("state") not in TERMINAL:
+            continue
+        d = os.path.join(root, m.get("txid") or "")
+        left = [sub for sub in ("candidate", "before")
+                if m.get("txid") and os.path.isdir(os.path.join(d, sub))]
+        if left:
+            out.append({"txid": m.get("txid"), "state": m.get("state"), "materials": left})
+    return out
 
 
 def stale_unstarted(root=None, older_than=86400):
