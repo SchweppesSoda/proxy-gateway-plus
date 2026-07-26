@@ -139,29 +139,13 @@ def main():
         assert meta["unknown_proxies"] == []
         ok("_render_mihomo_file 渲染落盘 + chmod 600")
 
-    # ── _core_apply: 成功 ──
+    # ── 内核候选的判据: 校验/重启/回滚已由 pdgtx 事务承担(见 test-config-transaction*),
+    #    Bot 侧只剩"派生出来的候选能不能用"这一条 —— _mihomo_derive 是它的唯一入口。
     with tempfile.TemporaryDirectory() as tmp:
-        fake = setup(tmp, svc_active=True)
-        ret = bot._core_apply()
-        assert ret == (True, "", True), ret
-        assert fake.has(["mihomo", "-t"]) and fake.has(["systemctl", "restart", "mihomo"])
-        ok("_core_apply mihomo 成功 → (True,'',True) 且校验+重启 mihomo")
-
-    # ── _core_apply: 校验失败(核心未重启) ──
-    with tempfile.TemporaryDirectory() as tmp:
-        fake = setup(tmp, svc_active=True)
-        fake.mihomo_t_rc = 1
-        okr, err, restarted = bot._core_apply()
-        assert okr is False and restarted is False and "校验失败" in err
-        assert not fake.has(["systemctl", "restart", "mihomo"]), "校验失败不该重启核心"
-        ok("_core_apply mihomo 校验失败 → 未重启")
-
-    # ── _core_apply: 重启失败(已重启) ──
-    with tempfile.TemporaryDirectory() as tmp:
-        fake = setup(tmp, svc_active=False)     # 重启后 svc 起不来
-        okr, err, restarted = bot._core_apply()
-        assert okr is False and restarted is True and "重启 mihomo 失败" in err
-        ok("_core_apply mihomo 重启失败 → restarted=True")
+        setup(tmp, svc_active=True)
+        data = bot._mihomo_derive({"model": json.dumps(SAMPLE).encode()})
+        assert b"proxies" in data or b"proxy-groups" in data, data[:80]
+        ok("_mihomo_derive: 正常 model → 渲染出候选内容(不落盘、不重启)")
 
     # ── apply_sb: mihomo 成功写入 ──
     with tempfile.TemporaryDirectory() as tmp:
@@ -220,16 +204,13 @@ def main():
         assert "RULE-SET,rs_a,ss1" in cfg["rules"]
         ok("_render_mihomo_file 从 RS_META 产出 rule-providers + RULE-SET")
 
-    # ── _core_apply: v1.6.0 唯一路径就是 mihomo(渲染 + mihomo -t + restart mihomo) ──
+    # ── 内核唯一路径仍是 mihomo: 候选渲染只产出 mihomo 配置, 不碰 sing-box ──
     with tempfile.TemporaryDirectory() as tmp:
         fake = setup(tmp, backend="mihomo", svc_active=True)
-        ret = bot._core_apply()
-        assert ret == (True, "", True), ret
-        assert fake.has(["mihomo", "-t", "-d", bot.MIHOMO_DIR, "-f", bot.MIHOMO_CFG])
-        assert fake.has(["systemctl", "restart", "mihomo"])
-        assert os.path.exists(bot.MIHOMO_CFG), "应渲染出 mihomo 配置"
+        data = bot._mihomo_derive({"model": json.dumps(SAMPLE).encode()})
+        assert b"mixed-port" in data or b"proxies" in data, data[:80]
         assert not fake.has(["sing-box", "check", "-c", bot.SB]), "不该再碰 sing-box"
-        ok("_core_apply → 渲染 + mihomo -t + restart mihomo(不碰 sing-box)")
+        ok("内核候选只走 mihomo 渲染(不碰 sing-box); 校验与重启由事务承担")
 
     print(f"\n通过 {pass_n} 项断言")
 

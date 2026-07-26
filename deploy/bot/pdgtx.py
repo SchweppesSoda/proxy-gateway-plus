@@ -638,15 +638,32 @@ def _v_mosdns_probe(path, data, ctx):
     wait = float(os.environ.get("PDG_TX_MOSDNS_PROBE_SECS", "3"))
     d = tempfile.mkdtemp(prefix="pdgtx-mosdns.")
     try:
-        # 探针工作目录要能读到 rules/ 等相对资源: 软链现网的 rules 目录(只读用途)
+        # 探针工作目录要能读到 rules/ 等相对资源。这里**不能**直接软链现网的 rules 目录:
+        # 同一笔事务如果也在改规则文件(恢复备份就是典型 —— mosdns 配置与 custom_direct/
+        # custom_hijack 一起换), 那样探针验的是"新配置 + 旧规则", 通过了也不代表候选整体成立。
+        # 所以逐个文件软链现网内容, 再用**本事务的候选**覆盖同名文件(候选是删除的就不放)。
         cand = os.path.join(d, "config.yaml")
         atomic_write(cand, data, 0o600)
         live_rules = FSROOT + "/etc/mosdns/rules"
-        if os.path.isdir(live_rules):
-            try:
-                os.symlink(live_rules, os.path.join(d, "rules"))
-            except OSError:
-                pass
+        probe_rules = os.path.join(d, "rules")
+        try:
+            os.makedirs(probe_rules, exist_ok=True)
+            if os.path.isdir(live_rules):
+                for leaf in os.listdir(live_rules):
+                    src = os.path.join(live_rules, leaf)
+                    if os.path.isfile(src):
+                        os.symlink(src, os.path.join(probe_rules, leaf))
+            for name, t in sorted(getattr(ctx, "targets", {}).items() if ctx else []):
+                if not (name.startswith("mosdns_rule:") or name == "mitm_hijack"):
+                    continue
+                leaf = os.path.basename(t["path"])
+                dst = os.path.join(probe_rules, leaf)
+                if os.path.islink(dst) or os.path.exists(dst):
+                    os.unlink(dst)
+                if t["data"] is not None:                # None = 本次要删掉它 → 探针里也不该有
+                    atomic_write(dst, t["data"], 0o644)
+        except OSError:
+            pass
         mode = os.environ.get("PDG_TX_MOSDNS_PROBE_MODE", "auto")
         if mode in ("auto", "netns") and shutil.which("unshare"):
             # marker 在 exec mosdns 之前打印: 没有它 = 连命名空间都没进去(容器缺 CAP_SYS_ADMIN
@@ -997,6 +1014,8 @@ class Tx:
         for tgt, fn in self.derivers:
             try:
                 data = fn({k: v["data"] for k, v in self.targets.items()})
+            except TxRefused:
+                raise            # 派生器自己给的拒绝理由是写给用户看的(已脱敏), 原样上报
             except Exception as e:  # noqa: BLE001
                 raise TxRefused("生成候选失败(%s): %s" % (tgt, type(e).__name__))
             if data is None:
