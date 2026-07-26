@@ -513,6 +513,71 @@ def main():
         bad("重启失败没回滚: %s / %s" % (okr, open(conf).read()[-40:]))
     box7.clean()
 
+    # ── 13. add_ruleset 与 scheduler 并发: 不能丢新增, 也不能提交前就写生产目录(七/3) ──
+    import importlib.util as _il2
+    box8 = Box(); tx8 = load_tx(box8.env)
+    box8.up("mosdns"); box8.up("mihomo")
+    box8.put("/etc/sing-box/config.json", json.dumps(
+        {"outbounds": [{"type": "direct", "tag": "hk"}], "route": {"rules": []},
+         "inbounds": []}).encode())
+    os.makedirs(box8.path("/etc/sing-box/rs"), exist_ok=True)
+    box8.put("/opt/pdg-bot/rulesets.json", b"{}", 0o644)
+    for _m in list(sys.modules):
+        if _m == "pdgtx":
+            del sys.modules[_m]
+    sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+    spec = _il2.spec_from_file_location("pdg_bot_rs3", ROOT / "deploy/bot/pdg-bot.py")
+    b3 = _il2.module_from_spec(spec); spec.loader.exec_module(b3)
+    b3.SB = box8.path("/etc/sing-box/config.json")
+    b3.RS_DIR = box8.path("/etc/sing-box/rs")
+    b3.RS_META = box8.path("/opt/pdg-bot/rulesets.json")
+    b3.MIHOMO_CFG = box8.path("/etc/mihomo/config.yaml")
+    b3.LOCKFILE = box8.env["PDG_LOCKFILE"]
+    b3.exit_tags = lambda c=None: ["hk"]
+    b3._build_source = lambda url, path: (open(path, "wb").write(
+        b'{"version": 1, "rules": [{"domain": ["added.example"]}]}') and (3, False) or (3, False))
+    b3._render_mihomo_bytes = lambda model, rs_meta=None: (
+        json.dumps({"proxies": [], "rules": [], "rule-providers": rs_meta or {}}).encode(), {})
+    bt3 = b3._pdgtx()
+    bt3.svc_stable = lambda unit, **k: (True, "")
+    bt3.health_snapshot = lambda services: {"svc:" + u: True for u in services}
+    # 候选阶段绝不能碰生产目录: 下载/解析期间往 RS_DIR 看一眼, 必须还是空的
+    seen = {}
+    real_stage = bt3.Tx.stage
+
+    def spy(self, target, data, *a, **kw):
+        seen.setdefault("rs_dir_at_stage", sorted(os.listdir(b3.RS_DIR)))
+        return real_stage(self, target, data, *a, **kw)
+    bt3.Tx.stage = spy
+    okr, msg = b3.add_ruleset("https://example.com/x.list", "hk", label="测试集")
+    bt3.Tx.stage = real_stage
+    if okr and seen.get("rs_dir_at_stage") == []:
+        ok("add_ruleset: 下载解析全在候选阶段, stage 之前 RS_DIR 一个文件都没写")
+    else:
+        bad("提交前就写了生产目录或添加失败: %s / %s / %s" % (okr, msg, seen))
+    files = sorted(os.listdir(b3.RS_DIR))
+    meta_now = json.loads(box8.read("/opt/pdg-bot/rulesets.json").decode())
+    if files and meta_now:
+        ok("add_ruleset: 提交后规则集文件与元数据同时到位(一笔事务)")
+    else:
+        bad("提交后状态不全: files=%s meta=%s" % (files, meta_now))
+    mih = json.loads(box8.read("/etc/mihomo/config.yaml").decode())
+    if mih.get("rule-providers"):
+        ok("派生渲染读的是**候选**元数据(新增的规则集当场就进了 rule-providers)")
+    else:
+        bad("渲染没看到新增规则集: %s" % mih)
+    # 并发: scheduler 持锁时 Bot 的添加立即 BUSY, 且不留半截
+    import fcntl as _f
+    lf = open(box8.env["PDG_LOCKFILE"], "w"); _f.flock(lf, _f.LOCK_EX)
+    before_files = sorted(os.listdir(b3.RS_DIR))
+    okr, msg = b3.add_ruleset("https://example.com/y.list", "hk")
+    _f.flock(lf, _f.LOCK_UN); lf.close()
+    if not okr and sorted(os.listdir(b3.RS_DIR)) == before_files:
+        ok("scheduler 持锁时并发添加: 立即让路且 RS_DIR 零改动(不丢也不留半截)")
+    else:
+        bad("并发添加留下了痕迹: %s / %s" % (okr, sorted(os.listdir(b3.RS_DIR))))
+    box8.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0

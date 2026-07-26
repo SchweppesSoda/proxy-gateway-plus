@@ -67,7 +67,7 @@ def _tx_apply(op, **kw):
 
 bot.tx_apply = _tx_apply
 # mihomo 渲染在本用例里不是被测对象(出口是假的), 用最小合法配置代替渲染结果
-bot._render_mihomo_bytes = lambda model: (b'{"proxies": [], "rules": []}', {})
+bot._render_mihomo_bytes = lambda model, rs_meta=None: (b'{"proxies": [], "rules": []}', {})
 
 
 def restarts_of(unit):

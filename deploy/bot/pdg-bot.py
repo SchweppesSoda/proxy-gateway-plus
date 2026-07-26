@@ -452,13 +452,13 @@ def _write_mihomo(cfg):
     os.chmod(t, 0o600)                                     # 含出口密码/uuid + 面板 secret, 收紧 600
     os.replace(t, MIHOMO_CFG)
 
-def _mihomo_rulesets():
+def _mihomo_rulesets(meta=None):
     """从 RS_META 构造 mihomo rule-providers 入参: rule-provider 指向原始 url, mihomo 原生抓取解析。
     收文本/yaml/mrs 类。历史遗留的 sing-box 二进制 .srs mihomo 读不了 → 跳过, 于是渲染器会把
     它记进 meta['dropped'], 由 _core_apply/迁移据此判失败并点名(不再静默丢弃)。"""
     out = {}
     try:
-        meta = _rs_meta()
+        meta = _rs_meta() if meta is None else meta
     except Exception:  # noqa: BLE001
         return out
     for name, info in meta.items():
@@ -973,7 +973,7 @@ def set_wloc(on, lat=None, lon=None):
         wloc_switch("默认")
     return wloc_enable(on)
 
-def _render_mihomo_bytes(model):
+def _render_mihomo_bytes(model, rs_meta=None):
     """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
 
     事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
@@ -981,7 +981,7 @@ def _render_mihomo_bytes(model):
     import sb2mihomo
     tls_ports = [443] if _platform() == "ios" else None
     cfg, meta = sb2mihomo.singbox_to_mihomo(
-        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(),
+        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(rs_meta),
         mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, tls_ports=tls_ports,
         **_panel_render_args(model))
     return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"), meta
@@ -1094,7 +1094,11 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
 
             def _derive(staged):
                 model = json.loads(staged["model"].decode("utf-8"))
-                data, meta = _render_mihomo_bytes(model)
+                # 规则集元数据如果也在本次候选里, 渲染必须按**候选**来 —— 读现网旧文件会让
+                # 新增的规则集"翻译不了"被丢掉, 或者已删的又冒出来。
+                staged_meta = staged.get("rs_meta")
+                data, meta = _render_mihomo_bytes(
+                    model, rs_meta=json.loads(staged_meta.decode("utf-8")) if staged_meta else None)
                 bad = (meta or {}).get("unknown_proxies")
                 if bad:
                     raise ValueError("有出口 mihomo 无法转换(会被静默丢弃): %s"
@@ -2284,7 +2288,8 @@ def add_ruleset(url, target, label="", behavior=""):
         return False, (".srs 是 sing-box 二进制规则集, mihomo 无法读取(收下也不会进运行配置)。\n"
                        "请改用 .list / .txt 文本规则、.yaml provider, 或 mihomo 原生 .mrs。")
     name = "rs_" + hashlib.sha1(url.encode()).hexdigest()[:8]
-    os.makedirs(RS_DIR, exist_ok=True)
+    # 下载与解析全在**候选**阶段: 提交之前一个字节都不写进 RS_DIR。旧实现先落盘再 apply_sb,
+    # 失败还要自己回退文件与元数据 —— 中间任何异常都会留下半截。
     try:
         if low.endswith(".mrs"):
             # mihomo 原生二进制规则集: 直接存盘, 由 rule-provider 按 mrs 格式加载。
@@ -2306,10 +2311,22 @@ def add_ruleset(url, target, label="", behavior=""):
                                "请在规则集后面补上类型: " + " / ".join(MRS_BEHAVIORS) + "\n"
                                "例: <code>https://.../geo.mrs hk 名称 domain</code>"
                                + _mrs_unreadable_hint())
-            open(path, "wb").write(data); count = None
+            count = None
         else:
             path = os.path.join(RS_DIR, name + ".json"); fmt = "source"
-            count, ip_only = _build_source(url, path)
+            _tmpd = tempfile.mkdtemp(prefix="pdgrs-add.")
+            try:
+                _tmp = os.path.join(_tmpd, name + ".json")
+                count, ip_only = _build_source(url, _tmp)
+                try:
+                    with open(_tmp, "rb") as _f:
+                        data = _f.read()
+                except OSError:
+                    # _build_source 没写出文件(异常形态/被打桩)→ 用它解析出的计数信息也不可信,
+                    # 但仍要给候选一个**合法的空规则集**, 由内核校验门去判要不要收
+                    data = json.dumps({"version": 1, "rules": []}, ensure_ascii=False).encode()
+            finally:
+                shutil.rmtree(_tmpd, ignore_errors=True)
             warn = ("\n⚠️ 纯 IP 规则集: 本网关按域名(SNI)分流, IP 规则基本不会命中 "
                     "(Telegram App 等也走不了)。" if ip_only else "")
     except Exception as e:  # noqa: BLE001
@@ -2326,24 +2343,20 @@ def add_ruleset(url, target, label="", behavior=""):
     # 元数据必须**先**落地: mihomo 的 rule-providers 是从 RS_META 生成的, 后写就意味着本次
     # 渲染看不到这个规则集 —— 规则会被当成"翻译不了"丢掉, 而用户已经收到"已添加"。
     # 失败则把元数据与下载的文件一并回退, 不留半截。
-    prev = _rs_meta()
-    m = dict(prev)
+    m = dict(_rs_meta())
     m[name] = {"url": url, "outbound": target, "format": fmt, "path": path, "count": count}
     if behavior in MRS_BEHAVIORS:
         m[name]["behavior"] = behavior
     if label.strip():
         m[name]["label"] = label.strip()[:40]
-    _save_rs_meta(m)
-    ok, msg = apply_sb(mod)
+    # model / 规则集文件 / 元数据 一次提交: 渲染派生时读的是**这份 staged 元数据**, 所以
+    # 不再需要"元数据必须先落地"那种取巧, 也不会出现"文件在、元数据不在"的中间态。
+    ok, msg = tx_apply("ruleset_add", model_mod=mod, files={
+        "ruleset:" + os.path.basename(path): data,
+        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")})
     if ok:
         cntdesc = f"{count} 条" if count is not None else "mihomo .mrs"
         return True, f"规则集已添加 → {target}（{cntdesc}，{label.strip() or name}）" + warn
-    _save_rs_meta(prev)                     # 回退元数据
-    if name not in prev:
-        try:
-            os.remove(path)                 # 回退这次下载的规则集文件
-        except OSError:
-            pass
     return False, msg
 
 def set_ruleset_label(name, label):
