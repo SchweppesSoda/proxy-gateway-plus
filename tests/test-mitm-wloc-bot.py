@@ -36,8 +36,10 @@ def main():
                 return False, str(e)
             w = ww
         bot._wloc_save(w)
-        doms = bot._mitm_enabled_domains()
-        bot._atomic_write_text(bot.MITM_HIJACK_FILE, "".join("domain:" + d + "\n" for d in doms))
+        # hijack 现在是事务里由候选 mitm.json 派生的; 桩里照同一份纯函数算, 不再自己拼字符串
+        doms = bot._mitm_domains_from(open(bot.MITM_CONFIG, "rb").read())
+        with open(bot.MITM_HIJACK_FILE, "wb") as f:
+            f.write(bot._mitm_hijack_bytes(doms))
         return True, ""
     bot._mitm_transact = _fake_transact
     # 5.1 起锁是 fail-closed 的: 锁文件打不开就拒绝写(以前会退化成仅进程内锁继续写)。

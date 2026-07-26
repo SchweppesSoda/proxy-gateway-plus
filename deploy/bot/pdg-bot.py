@@ -539,107 +539,133 @@ def _mitm_ca_pem():
     except Exception:  # noqa: BLE001
         return ""
 
-def _read_bytes(path):
+def _mitm_hijack_bytes(domains):
+    """接管域名 → mosdns 强制劫持集的文件内容(纯函数, 供事务派生用)。"""
+    return "".join("domain:" + d + "\n" for d in domains).encode("utf-8")
+
+
+def _mitm_domains_from(mitm_json_bytes):
+    """从**候选** mitm.json 推导接管域名(不读生产文件)。非 iOS 一律为空。"""
+    if _platform() != "ios":
+        return []
     try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return None            # 文件本不存在 → 回滚时应删除(而非写空)
+        cfg = json.loads((mitm_json_bytes or b"{}").decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    doms = []
+    for name, dl in MITM_PLUGIN_DOMAINS.items():
+        if isinstance(cfg, dict) and (cfg.get(name) or {}).get("enabled"):
+            doms += dl
+    return doms
 
-def _restore_bytes(path, data):
-    """把 path 还原成 data(None=删除)。原子: 临时文件 + os.replace。"""
-    if data is None:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    t = path + ".tmp"
-    with open(t, "wb") as f:
-        f.write(data)
-    os.replace(t, path)
 
-def _atomic_write_text(path, text):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    t = path + ".tmp"
-    with open(t, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(t, path)
+def _mitm_json_bytes(cur, w):
+    """把 WLOC 目标态并进现有 mitm.json, 返回候选字节(纯函数, 不落盘)。
+
+    只改 wloc 这一段 —— 别的插件段(以后有)原样保留, 这与 _wloc_save 的语义一致。"""
+    try:
+        cfg = json.loads((cur or b"{}").decode("utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    cfg["wloc"] = _wloc_doc(w)
+    return (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
 
 def _mitm_transact(new_wloc):
-    """事务化落地 WLOC/MITM 目标态。单锁内完成, 任一步失败全量回滚。
+    """落地 WLOC/MITM 目标态 —— **一笔 pdgtx 事务**: mitm.json + mitm_hijack + mihomo 配置
+    一起校验、一起落盘, 服务动作与观察期、回滚、崩溃恢复全交给事务核心。
 
-    new_wloc 可以是算好的目标态(dict), 也可以是**在锁内**跑的 mutate(w) —— 后者用于
-    开/关 WLOC 这类"要先看当前状态再决定目标"的操作: 锁外读状态、锁内拿它当真, 中间被别人
-    改掉就会把过期状态写回去。mutate 里 raise _WlocAbort(msg) = 现场一动未动地放弃。
-    顺序: 备份旧 mitm.json+hijack → 写新 mitm.json → CA(有域名)→ 写 hijack → 渲染内核+校验+稳定active
-          → pdg-mitm 稳定active(有域名)/停(无) → mosdns 重启+稳定active。
-    保证: 绝不『返回失败但新态(含 enabled)已持久化』, 也绝不『服务失败却返回成功』。返回 (ok, msg)。"""
-    if _platform() != "ios":         # 平台硬门控: Android 不生成 CA / 不写 hijack / 不重启 pdg-mitm / 不改核心 MITM 路由
+    new_wloc 可以是算好的目标态(dict), 也可以是 mutate(w) —— 后者用于开/关 WLOC 这类
+    "要先看当前状态再决定目标"的操作: 目标态基于 read_for_update 读到的那一份算, 并把它的 sha
+    当前置条件, 中途被别人改掉就 PRECONDITION_FAILED 而不是把过期状态写回去。
+    mutate 里 raise _WlocAbort(msg) = 现场一动未动地放弃。
+
+    CA 与叶子证书预签属于**缓存准备**: 在 stage 之前做完, 失败就直接返回, 这时生产配置一个字节
+    都还没动; 失败事务残留的证书不被任何配置引用(enabled 没落盘), 下次开启命中缓存而已。
+
+    动作顺序固定 —— 开启: 落盘 → restart:mihomo → restart:mosdns → start:pdg-mitm;
+    关闭: 落盘 → stop:pdg-mitm → restart:mihomo → restart:mosdns。返回 (ok, msg)。"""
+    if _platform() != "ios":         # 平台硬门控: Android 连事务都不开(不生成 CA / 不写任何文件)
         return False, "MITM/WLOC 仅 iOS 平台可用。"
-    with _cfg_guard() as got:
-        if not got:
-            return False, busy_msg()
-        if callable(new_wloc):                                       # 目标态在锁内算, 不用过期状态
-            _w = _wloc_state()
+    tx = _pdgtx()
+    try:
+        t = tx.Tx(source="bot", op="wloc_apply")
+    except Exception as e:  # noqa: BLE001
+        return False, "无法开始配置事务(%s)" % type(e).__name__
+    try:
+        cur, sha = t.read_for_update("mitm_json")
+        if callable(new_wloc):
+            w = _wloc_state_from(cur)
             try:
-                new_wloc(_w)
+                new_wloc(w)
             except _WlocAbort as e:
                 return False, str(e)                                 # 还没动任何东西
-            new_wloc = _w
-        old_mitm = _read_bytes(MITM_CONFIG)
-        old_hijack = _read_bytes(MITM_HIJACK_FILE)
-
-        def _restore():
-            _restore_bytes(MITM_CONFIG, old_mitm)                     # 回滚 mitm.json(含 enabled)
-            _restore_bytes(MITM_HIJACK_FILE, old_hijack if old_hijack is not None else b"")
+        else:
+            w = new_wloc
+        cand_mitm = _mitm_json_bytes(cur, w)
+        doms = _mitm_domains_from(cand_mitm)
+        if doms:                                                     # 缓存准备: 事务之外, 失败零改动
             try:
-                _apply_sb_inner(lambda c: None)                      # 用还原后的 hijack 重渲染内核回旧态
-            except Exception:  # noqa: BLE001
-                pass
-            if _mitm_enabled_domains():                              # 恢复 pdg-mitm 到旧态
-                sh(["systemctl", "reset-failed", "pdg-mitm"]); sh(["systemctl", "restart", "pdg-mitm"])
-            else:
-                sh(["systemctl", "stop", "pdg-mitm"])
-            sh(["systemctl", "reset-failed", "mosdns"]); sh(["systemctl", "restart", "mosdns"])
-
-        try:
-            _wloc_save(new_wloc)                                     # 1. 写新 mitm.json(原子, 内部 os.replace)
-            doms = _mitm_enabled_domains()
-            if doms:                                                # 2. CA + 叶子证书(有域名才需)
-                try:
-                    import mitm_ca
-                    mitm_ca.ensure_ca()
-                    warmed = mitm_ca.prewarm(doms, strict=True)     # 严格预签: 少一张就抛, 不容"半套证书"上线
-                except Exception as e:  # noqa: BLE001
-                    _restore(); return False, "MITM 根 CA 生成失败(%s), 已回滚。" % type(e).__name__
-                if warmed != len(doms):                             # 不吞返回值: 张数对不上同样整体回滚
-                    _restore()
-                    return False, "MITM 叶子证书预签不完整(%d/%d), 已回滚。" % (warmed, len(doms))
-            _atomic_write_text(MITM_HIJACK_FILE,                    # 3. 写 hijack(原子)
-                               "".join("domain:" + d + "\n" for d in doms))
-            ok, err = _apply_sb_inner(lambda c: None)               # 4. 渲染内核 + 校验 + 稳定 active
-            if not ok:
-                _restore(); return False, "内核应用失败(%s), 已回滚。" % (err or "")
-            if doms:                                                # 5. pdg-mitm 稳定 active
-                sh(["systemctl", "reset-failed", "pdg-mitm"])
-                r = sh(["systemctl", "restart", "pdg-mitm"])
-                if r.returncode != 0 or not _svc_active("pdg-mitm"):
-                    _restore(); return False, "pdg-mitm 未稳定运行, 已回滚。"
-            else:
-                sh(["systemctl", "stop", "pdg-mitm"])
-            sh(["systemctl", "reset-failed", "mosdns"])             # 6. mosdns 重启 + 稳定 active
-            r = sh(["systemctl", "restart", "mosdns"])
-            if r.returncode != 0 or not _svc_active("mosdns"):
-                _restore(); return False, "mosdns 未稳定运行, 已回滚。"
-            return True, ""
-        except Exception as e:  # noqa: BLE001
-            _restore(); return False, "MITM 应用异常(%s), 已回滚。" % type(e).__name__
+                import mitm_ca
+                mitm_ca.ensure_ca()
+                warmed = mitm_ca.prewarm(doms, strict=True)          # 严格预签: 少一张就抛
+            except Exception as e:  # noqa: BLE001
+                return False, "MITM 根 CA 生成失败(%s), 未改动任何配置。" % type(e).__name__
+            if warmed != len(doms):
+                return False, ("MITM 叶子证书预签不完整(%d/%d), 未改动任何配置。"
+                               % (warmed, len(doms)))
+        # 内核配置由 model + rs_meta + **候选**接管域名渲染。model/rs_meta 本次不改 → 只 watch:
+        # 它们变了说明候选已过期, 提交前就该拒, 而不是把按旧 model 渲染的配置写下去。
+        model_raw = t.watch("model")
+        meta_raw = t.watch("rs_meta", optional=True)
+        model = json.loads((model_raw or b"{}").decode("utf-8"))
+        rs_meta = json.loads(meta_raw.decode("utf-8")) if meta_raw else None
+        t.stage("mitm_json", cand_mitm, expect=sha)
+        t.derive("mitm_hijack", lambda c: _mitm_hijack_bytes(_mitm_domains_from(c["mitm_json"])))
+        t.derive("mihomo_cfg", lambda c: _render_mihomo_bytes(
+            model, rs_meta, mitm_domains=_mitm_domains_from(c["mitm_json"]))[0])
+        if doms:
+            t.service("restart:mihomo"); t.service("restart:mosdns"); t.service("start:pdg-mitm")
+        else:
+            t.service("stop:pdg-mitm"); t.service("restart:mihomo"); t.service("restart:mosdns")
+        res = t.commit()
+    except tx.TxBusy:
+        return False, BUSY_MSG
+    except tx.TxRefused as e:
+        return False, tx.redact(str(e))
+    except tx.TxError as e:
+        return False, "配置事务内部错误: %s" % tx.redact(str(e))
+    except Exception as e:  # noqa: BLE001
+        return False, "MITM 应用异常(%s)" % type(e).__name__
+    if res["state"] == tx.COMMITTED:
+        return True, ""
+    if res["state"] == tx.ROLLBACK_FAILED:
+        return False, ("应用失败(%s)\n⚠️ 回滚未完成: %s\n事务材料已保留, 请运行 "
+                       "<code>sudo pdg tx recover %s</code>"
+                       % (res.get("error", ""), "、".join(res.get("rollback_failed_items") or []),
+                          res["txid"]))
+    return False, "应用失败(%s), 已回滚到操作前。" % res.get("error", "")
 
 def _wloc_state():
     """归一化 WLOC 配置(迁移老单坐标格式)→ {enabled, accuracy, active, generation, locations:[…]}。"""
-    w = dict(_mitm_config().get("wloc") or {})
+    return _wloc_state_from_cfg(_mitm_config())
+
+
+def _wloc_state_from(mitm_json_bytes):
+    """同 _wloc_state, 但基于**给定的 mitm.json 字节**(事务候选阶段用: 读到的那一份才算数)。"""
+    try:
+        cfg = json.loads((mitm_json_bytes or b"{}").decode("utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    return _wloc_state_from_cfg(cfg)
+
+
+def _wloc_state_from_cfg(cfg):
+    w = dict((cfg or {}).get("wloc") or {})
     locs = w.get("locations")
     if locs is None:                              # 迁移老格式 {lat,lon} → 一个"默认"地点
         locs = [{"name": "默认", "lat": w["lat"], "lon": w["lon"]}] if "lat" in w and "lon" in w else []
@@ -661,11 +687,16 @@ def _wloc_active(w=None):
             return l
     return None
 
+def _wloc_doc(w):
+    """WLOC 目标态 → 写进 mitm.json 的那一段(纯函数, 事务候选与热路径共用同一份形态)。"""
+    return {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
+            "active": w.get("active"), "generation": int(w.get("generation") or 0),
+            "locations": w.get("locations", [])}
+
+
 def _wloc_save(w):
     cfg = _mitm_config()
-    cfg["wloc"] = {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
-                   "active": w.get("active"), "generation": int(w.get("generation") or 0),
-                   "locations": w.get("locations", [])}
+    cfg["wloc"] = _wloc_doc(w)
     _save_mitm_config(cfg)
 
 class _WlocAbort(Exception):
@@ -681,15 +712,34 @@ def _wloc_edit_locked(mutate):
     切地点走这里而不是 _mitm_transact: 接管域名只由 enabled 决定, 换坐标既不影响 CA、也不
     影响 hijack 表和内核路由, 而 pdg-mitm 会在下一次 WLOC 请求开始时读取当前 mitm.json —— 那一整套
     (预热证书/重渲内核/重启 pdg-mitm/重启 mosdns)对"只换经纬度"是纯粹的浪费, 还会断一次
-    DNS。返回改后的 w; 锁忙返回 None。"""
+    DNS。返回改后的 w; 锁忙返回 None。
+
+    **这是受控的 hot-path 例外, 不走 pdgtx**: 单文件、单次原子替换、零服务动作 —— 没有
+    "多组件半成功"可言(写失败 = 旧文件完好), 而完整事务的观察期光稳定性采样就够把 1 秒的
+    目标击穿。例外不等于不留痕: 成功/失败都在同一把锁内写一条脱敏审计(与事务同一份日志、
+    同一种格式), 只记代号与 generation 变化, 不记地点名、经纬度、chat id 之类。"""
     with _cfg_guard() as got:
         if not got:
             return None
         w = _wloc_state()
+        gen_before = int(w.get("generation") or 0)
         if mutate(w) is False:
+            _wloc_hot_audit("wloc_hot_noop", "NOCHANGE", gen_before, gen_before)
             return w
         _wloc_save(w)
+        _wloc_hot_audit("wloc_hot_edit", "APPLIED", gen_before, int(w.get("generation") or 0))
         return w
+
+
+def _wloc_hot_audit(op, result, gen_before, gen_after):
+    """给热路径写一条审计。**审计失败绝不能让已经成功的切换报失败** —— 坐标已经落盘了,
+    这时回一句"失败"会让用户以为没生效而反复重试。只把脱敏后的异常类型记进日志。"""
+    try:
+        _pdgtx().audit_event("bot", op, result,
+                             extra={"generation_before": gen_before, "generation_after": gen_after,
+                                    "generation_changed": gen_after != gen_before})
+    except Exception as e:  # noqa: BLE001
+        print("[wloc] 审计写入失败(%s), 切换本身已生效" % type(e).__name__, file=sys.stderr)
 
 def _wloc_bump(w):
     """generation +1 —— bot 靠它认出"这次 WLOC 命中对应的是我刚才那次切换"。"""
@@ -979,16 +1029,20 @@ def set_wloc(on, lat=None, lon=None):
         wloc_switch("默认")
     return wloc_enable(on)
 
-def _render_mihomo_bytes(model, rs_meta=None):
+def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
     """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
 
     事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
-    一起落盘 —— 否则"model 写进去了、渲染失败"就会留下两份不一致的配置。"""
+    一起落盘 —— 否则"model 写进去了、渲染失败"就会留下两份不一致的配置。
+
+    mitm_domains: 显式给出接管域名(WLOC 事务用**候选** mitm.json 推出来的那一份)。不给就读
+    生产的 mitm_hijack.txt —— 那是"这次不改 MITM"的路径才成立的默认值。"""
     import sb2mihomo
     tls_ports = [443] if _platform() == "ios" else None
     cfg, meta = sb2mihomo.singbox_to_mihomo(
         model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(rs_meta),
-        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, tls_ports=tls_ports,
+        mitm_domains=_mitm_domains() if mitm_domains is None else mitm_domains,
+        mitm_port=MITM_PORT, tls_ports=tls_ports,
         **_panel_render_args(model))
     return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"), meta
 
@@ -1043,14 +1097,6 @@ def _core_apply():
     if r.returncode != 0 or not _svc_active("mihomo"):
         return False, "重启 mihomo 失败:\n" + (r.stdout + r.stderr)[-300:], True
     return True, "", True
-
-def _core_sync_file():
-    """校验失败回滚后: 把 good model 重新渲染落盘(免得磁盘上留着坏 mihomo 配置), 但不重启
-    (运行中的 mihomo 未受影响)。"""
-    try:
-        _render_mihomo_file()
-    except Exception:  # noqa: BLE001
-        pass
 
 def busy_msg():
     """区分"别人正在改"与"锁不可用" —— 后者是环境故障, 让用户知道该去看 /run。"""
@@ -1153,41 +1199,6 @@ def apply_sb(modify):
     """兼容入口: 只改 model 的操作(加删出口/组/默认出口/改名/排序…)。"""
     ok, msg = tx_apply("apply_sb", model_mod=modify)
     return ok, ("" if ok else msg)
-
-def _apply_sb_inner(modify):
-    """apply_sb 的**不含锁**主体。供 _mitm_transact 事务在同一把 _cfg_guard 内复用 ——
-    _cfg_guard 非可重入(非阻塞 threading.Lock + 非阻塞 flock), 事务里再调 apply_sb 会 BUSY,
-    故事务先持锁一次, 内核步走这里。"""
-    if True:
-        shutil.copy(SB, SB + ".botbak"); os.chmod(SB + ".botbak", 0o600)
-        wrote = False
-        try:
-            c = load()
-            tfo = _tfo_intent(c)                     # 改动前判定 TFO 意图(持久标志优先, 老装回退推断)
-            modify(c)
-            _tfo_apply(c, tfo)                        # 同步到(含新增的)所有出口 → 加/改出口不冲掉 TFO 状态
-            _write(c); wrote = True                   # 写了新配置后, 任何异常都必须还原
-            ok, err, restarted = _core_apply()
-            if not ok:
-                shutil.copy(SB + ".botbak", SB)              # 还原 model
-                if restarted:
-                    _core_apply()                            # 重启失败: 用 good model 再渲染+重启回已知good
-                else:
-                    _core_sync_file()                        # 校验失败: 只同步渲染文件, 不重启(核心没动过)
-                return False, err
-            return True, ""
-        except _PanelOwnershipError:
-            return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
-        except Exception as e:  # noqa: BLE001
-            # check/restart 超时(TimeoutExpired)、modify/写盘等异常: 绝不留未验证的新配置。
-            # 已写过新配置就还原备份并尽力重启回已知good; 返回失败(TG Bot 会据此提示), 不外泄异常正文。
-            if wrote:
-                try:
-                    shutil.copy(SB + ".botbak", SB)
-                    _core_apply()
-                except Exception:  # noqa: BLE001
-                    pass
-            return False, "应用配置异常(%s),已还原上一份配置。" % type(e).__name__
 
 # 可作出口的代理协议(决定哪些出站算"出口": 可选默认/故障组成员/测出口/删除)。sing-box 支持的都列上。
 PROXY_TYPES = ("shadowsocks", "vmess", "trojan", "vless", "hysteria", "hysteria2",

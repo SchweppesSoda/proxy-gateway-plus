@@ -65,7 +65,8 @@ def bad(m):
 class Spy:
     """记录本轮里"重活"被干了几次。"""
     def __init__(self):
-        self.apply = 0
+        self.tx = 0                 # 开过几笔 pdgtx 事务(热路径必须是 0)
+        self.transact = 0           # 走过几次完整路径(_mitm_transact)
         self.sh = []
         self.ca0 = FakeCA.calls
 
@@ -85,11 +86,6 @@ def _sh(cmd):
     return types.SimpleNamespace(returncode=0, stdout="active", stderr="")
 
 
-def _apply_inner(mod):
-    SPY.apply += 1
-    return True, ""
-
-
 def setup(tmp):
     global SPY
     bot.MITM_CONFIG = os.path.join(tmp, "mitm.json")
@@ -99,7 +95,42 @@ def setup(tmp):
     bot._platform = lambda: "ios"
     bot._svc_active = lambda unit, **k: True
     bot.sh = _sh
-    bot._apply_sb_inner = _apply_inner
+    # 热路径的判据从"没调某个内部函数"改成"**没开事务**": 前者在函数被删掉后会变成空断言,
+    # 后者盯的是真正要避免的东西(完整事务 = 观察窗口 + 服务动作)。
+    os.environ["PDG_TX_ROOT"] = os.path.join(tmp, "tx")
+    real_pdgtx = bot._pdgtx
+
+    def _spy_pdgtx():
+        m = real_pdgtx()
+        m.TX_ROOT = os.path.join(tmp, "tx")
+        m.AUDIT = os.path.join(tmp, "tx", "index.jsonl")
+        if not getattr(m, "_spied", False):
+            real_tx = m.Tx
+
+            class SpyTx(real_tx):
+                def __init__(self, *a, **k):
+                    SPY.tx += 1
+                    super().__init__(*a, **k)
+            m.Tx = SpyTx
+            m._spied = True
+        return m
+    bot._pdgtx = _spy_pdgtx
+
+    def _fake_transact(new_wloc):
+        """只记账 + 落盘目标态。完整事务的内部行为(候选/服务动作/回滚)由
+        test-mitm-wloc-txn.py 在真沙箱里验 —— 这里验的是**哪条路径被选中**。"""
+        SPY.transact += 1
+        w = bot._wloc_state()
+        if callable(new_wloc):
+            try:
+                new_wloc(w)
+            except bot._WlocAbort as e:
+                return False, str(e)
+        else:
+            w = new_wloc
+        bot._wloc_save(w)
+        return True, ""
+    bot._mitm_transact = _fake_transact
     SPY = Spy()
 
 
@@ -138,9 +169,9 @@ def main():
         if w["generation"] != 4 or gen != 4:
             bad(f"generation 没 +1: {w.get('generation')} / 返回 {gen}")
         ok("generation 恰好 +1(bot 靠它认出这次命中属于哪次切换)")
-        if SPY.apply:
-            bad(f"_apply_sb_inner 被调用了 {SPY.apply} 次(不该重渲内核)")
-        ok("_apply_sb_inner 未被调用(不重渲/不校验内核)")
+        if SPY.tx:
+            bad(f"热路径开了 {SPY.tx} 笔完整事务(观察窗口会把 1 秒目标击穿)")
+        ok("热路径没开完整事务(不重渲内核、不进观察窗口)")
         if SPY.ca:
             bad(f"CA 相关函数被调用了 {SPY.ca} 次(不该重生成/预热证书)")
         ok("CA 未被生成或预热")
@@ -160,6 +191,43 @@ def main():
             bad(f"文案把网关改写说成了手机位置已变化: {msg}")
         ok("提示只说到「网关目标已切换 / 已热加载」, 不谎称手机位置已变")
 
+        # ── 热路径例外的代价: 必须留一条脱敏审计(与事务同一份日志/同一种格式) ──
+        audit = os.path.join(tmp, "tx", "index.jsonl")
+        lines = [json.loads(l) for l in open(audit, encoding="utf-8")] \
+            if os.path.exists(audit) else []
+        hot = [r for r in lines if str(r.get("op", "")).startswith("wloc_hot")]
+        if not hot:
+            bad("热路径没有留下任何审计记录(受控例外也要留痕)")
+        ok("热路径写了审计记录: %s" % hot[-1]["op"])
+        rec = hot[-1]
+        if rec.get("generation_before") == 3 and rec.get("generation_after") == 4 \
+                and rec.get("generation_changed") is True:
+            ok("审计记了 generation 变化(3→4)与结果, 足够对账")
+        else:
+            bad("审计里的 generation 信息不对: %s" % rec)
+        raw = json.dumps(rec, ensure_ascii=False)
+        leaked = [x for x in ("大阪", "东京", "35.68", "139.76", "34.69", "135.50") if x in raw]
+        if leaked:
+            bad("审计泄露了位置信息: %s" % leaked)
+        ok("审计里没有地点名, 也没有经纬度(位置数据不入日志)")
+        if rec.get("txid") is None and rec.get("schema_version") == 1:
+            ok("审计格式与事务记录同源(同字段集, txid 为空表示不是完整事务)")
+        else:
+            bad("审计格式和事务记录不一致: %s" % rec)
+
+        # ── 审计写失败绝不能把已经成功的切换报成失败 ──
+        real_pdgtx = bot._pdgtx
+        bot._pdgtx = lambda: (_ for _ in ()).throw(OSError("audit down"))
+        try:
+            okr2, msg2, gen2 = bot.wloc_switch_gen("上海")
+        finally:
+            bot._pdgtx = real_pdgtx
+        w2 = json.load(open(bot.MITM_CONFIG))["wloc"]
+        if okr2 and w2["active"] == "上海" and gen2 == 5:
+            ok("审计写入失败时: 切换照样成功落盘并如实回报(坐标已生效, 不能谎报失败)")
+        else:
+            bad(f"审计故障影响了切换本身: ok={okr2} active={w2.get('active')} gen={gen2}")
+
     # ══ 2. WLOC 未开启时切地点: 只存配置, 不碰任何服务 ══════════════════════
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp); seed(enabled=False)
@@ -167,8 +235,8 @@ def main():
         w = json.load(open(bot.MITM_CONFIG))["wloc"]
         if not okr or w["active"] != "上海" or w["generation"] != 4:
             bad(f"未开启时切换没存对: {okr} {w}")
-        if SPY.apply or SPY.ca or SPY.sh:
-            bad(f"未开启却动了东西: apply={SPY.apply} ca={SPY.ca} sh={SPY.sh}")
+        if SPY.transact or SPY.ca or SPY.sh:
+            bad(f"未开启却动了东西: transact={SPY.transact} ca={SPY.ca} sh={SPY.sh}")
         if w["enabled"] is not False:
             bad("未开启的状态被改掉了")
         ok("未开启时切地点: 只存 active+generation, 不启动/重启任何服务")
@@ -182,27 +250,24 @@ def main():
         okr, msg = bot.wloc_enable(True)
         if not okr:
             bad(f"开启失败: {msg}")
-        if not SPY.apply:
-            bad("开启 WLOC 没有重渲内核(完整事务被绕过了)")
-        if not SPY.ca:
-            bad("开启 WLOC 没有生成/预热 CA")
-        r = SPY.restarts()
-        if "pdg-mitm" not in r or "mosdns" not in r:
-            bad(f"开启 WLOC 没重启 pdg-mitm/mosdns: {r}")
-        hij = open(bot.MITM_HIJACK_FILE).read()
-        if "gs-loc.apple.com" not in hij:
-            bad(f"开启没写接管域名: {hij!r}")
-        ok("开启 WLOC: 仍走完整事务(CA + hijack + 内核 + pdg-mitm + mosdns)")
+        if not SPY.transact:
+            bad("开启 WLOC 没走完整事务(热路径不该处理接管域名变化)")
+        w = json.load(open(bot.MITM_CONFIG))["wloc"]
+        if w.get("enabled") is not True:
+            bad(f"开启没落盘: {w}")
+        # CA 预热 / hijack / 内核渲染 / 服务动作发生在完整事务内部, 由
+        # test-mitm-wloc-txn.py 在真沙箱里逐项验(那里连顺序都断言); 这里只认路径选择。
+        ok("开启 WLOC: 走完整事务(候选/CA/服务动作由 test-mitm-wloc-txn.py 覆盖)")
 
         SPY.__init__()
         okr, msg = bot.wloc_enable(False)
         if not okr:
             bad(f"关闭失败: {msg}")
-        if not SPY.apply or "mosdns" not in SPY.restarts():
-            bad(f"关闭 WLOC 没走完整事务: apply={SPY.apply} sh={SPY.sh}")
-        if open(bot.MITM_HIJACK_FILE).read().strip():
-            bad("关闭后接管域名没清空")
-        ok("关闭 WLOC: 仍走完整事务并撤掉接管域名")
+        if not SPY.transact:
+            bad(f"关闭 WLOC 没走完整事务: transact={SPY.transact}")
+        if json.load(open(bot.MITM_CONFIG))["wloc"].get("enabled") is not False:
+            bad("关闭没落盘")
+        ok("关闭 WLOC: 走完整事务(撤接管域名与停 pdg-mitm 由事务用例覆盖)")
 
     # ══ 4. 删除地点的三条路径 ══════════════════════════════════════════════
     with tempfile.TemporaryDirectory() as tmp:
@@ -213,8 +278,8 @@ def main():
             bad(f"删非 active 没删对: {okr} {w}")
         if w["active"] != "东京" or w["generation"] != 3:
             bad(f"删非 active 不该动 active/generation: {w}")
-        if SPY.apply or SPY.ca or SPY.sh:
-            bad(f"删非 active 却动了服务: apply={SPY.apply} sh={SPY.sh}")
+        if SPY.transact or SPY.ca or SPY.sh:
+            bad(f"删非 active 却动了服务: transact={SPY.transact} sh={SPY.sh}")
         ok("删除非当前目标: 只更新地点列表, 不动服务、不改 generation")
 
         SPY.__init__()
@@ -222,8 +287,8 @@ def main():
         w = json.load(open(bot.MITM_CONFIG))["wloc"]
         if not okr or w["active"] != "大阪" or w["generation"] != 4:
             bad(f"删 active 没切到剩余地点/没 +1: {w}")
-        if SPY.apply or SPY.ca or SPY.sh:
-            bad(f"删 active 走了完整事务: apply={SPY.apply} sh={SPY.sh}")
+        if SPY.transact or SPY.ca or SPY.sh:
+            bad(f"删 active 走了完整事务: transact={SPY.transact} sh={SPY.sh}")
         if "大阪" not in msg:
             bad(f"没告诉用户切到了哪个地点: {msg}")
         ok("删除当前目标(还有别的): 切到剩余地点并走热切换, 仍不重启服务")
@@ -233,11 +298,9 @@ def main():
         w = json.load(open(bot.MITM_CONFIG))["wloc"]
         if not okr or w["locations"] or w["enabled"] is not False:
             bad(f"删最后一个地点没关掉 WLOC: {okr} {w}")
-        if not SPY.apply or "mosdns" not in SPY.restarts():
-            bad(f"删最后一个地点没走完整关闭事务: apply={SPY.apply} sh={SPY.sh}")
-        if open(bot.MITM_HIJACK_FILE).read().strip():
-            bad("删到没地点了却还留着接管域名")
-        ok("删除最后一个地点: 走完整关闭事务(撤接管域名)")
+        if not SPY.transact:
+            bad(f"删最后一个地点没走完整关闭事务: transact={SPY.transact}")
+        ok("删除最后一个地点: 走完整关闭事务(撤接管域名由事务用例覆盖)")
 
     # ══ 4b. 加/改地点的三种语义 ════════════════════════════════════════════
     # 以前含糊: 改当前地点会被 pdg-mitm 立刻热加载, 但 generation 不变, bot 还让用户"到列表
@@ -260,8 +323,8 @@ def main():
         cur = [l for l in w["locations"] if l["name"] == "东京"][0]
         if cur["lat"] != 35.9 or cur["lon"] != 139.9:
             bad(f"新坐标没存进去: {cur}")
-        if SPY.apply or SPY.ca or SPY.sh:
-            bad(f"改当前地点却动了服务: apply={SPY.apply} sh={SPY.sh}")
+        if SPY.transact or SPY.ca or SPY.sh:
+            bad(f"改当前地点却动了服务: transact={SPY.transact} sh={SPY.sh}")
         if "已更新" not in msg or "热加载" not in msg:
             bad(f"没提示当前目标坐标已更新并热加载: {msg}")
         if "地点/切换" in msg or "再点" in msg:
@@ -278,8 +341,8 @@ def main():
             bad("未开启时新坐标没存下来")
         if "开启" not in msg:
             bad(f"未开启时没提示开启后才生效: {msg}")
-        if SPY.apply or SPY.sh:
-            bad(f"未开启却动了服务: apply={SPY.apply} sh={SPY.sh}")
+        if SPY.transact or SPY.sh:
+            bad(f"未开启却动了服务: transact={SPY.transact} sh={SPY.sh}")
         ok("修改当前地点(WLOC 未开启): 只保存, 提示开启后才生效")
 
     # ══ 5. 并发切换: mitm.json 任何时刻都是完整 JSON ════════════════════════
@@ -591,8 +654,8 @@ def main():
             bad("Android 上竟然能删地点")
         if bot._mitm_enabled_domains() or bot._mitm_domains():
             bad("Android 上仍推导出了接管域名")
-        if SPY.apply or SPY.sh:
-            bad(f"Android 上动了服务: apply={SPY.apply} sh={SPY.sh}")
+        if SPY.transact or SPY.sh:
+            bad(f"Android 上动了服务: transact={SPY.transact} sh={SPY.sh}")
         ok("Android: WLOC 切换/删除一律拒绝, 也推不出接管域名")
 
     print(f"\n通过 {pass_n} 项断言")

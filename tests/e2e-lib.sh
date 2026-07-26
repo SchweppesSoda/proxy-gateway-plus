@@ -187,7 +187,20 @@ case "$verb" in
       u="$1"; v=$(cat "$D/${u}.en" 2>/dev/null)
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       [ "$v" = 1 ] && { echo enabled; exit 0; }; echo disabled; exit 1;;
-  show)   echo 0; exit 0;;
+  show)
+      # show -p PROP --value UNIT。ActiveState 是"停稳"判据要看的东西(failed/activating 都不算
+      # inactive), 其余属性沿用原来的 0(NRestarts 那类数值)。
+      u=""; prop=""
+      for a in "$@"; do
+        case "$a" in -p) ;; --value) ;; ActiveState|NRestarts|UnitFileState|LoadState) prop="$a";; *) u="$a";; esac
+      done
+      if [ "$prop" = ActiveState ]; then
+        v=$(cat "$D/${u}.ac" 2>/dev/null)
+        [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+        [ "$v" = 1 ] && echo active || echo inactive
+        exit 0
+      fi
+      echo 0; exit 0;;
 esac
 exit 0
 S
