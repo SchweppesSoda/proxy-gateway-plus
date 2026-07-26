@@ -1128,7 +1128,11 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
     except _PanelOwnershipError:
         return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
     except tx.TxBusy:
-        return False, busy_msg()
+        # 直接用 BUSY_MSG, **不要**走 busy_msg(): 后者看的是本线程上一次 _cfg_guard() 的结果,
+        # 而这里的失败来自 pdgtx 自己的锁。线程池会复用线程 —— 同一个工作线程先前若碰上过
+        # "锁文件不可用"(比如一次 WLOC 操作), 那份状态还在, TxBusy 就会被错报成 NOLOCK。
+        # pdgtx._Lock 已经把两件事分开了: 打不开锁文件 → TxRefused, 锁被占 → TxBusy。
+        return False, BUSY_MSG
     except tx.TxRefused as e:
         return False, tx.redact(str(e))
     except tx.TxError as e:
@@ -1515,7 +1519,7 @@ def set_mosdns_upstream(which, addrs):
     try:
         res = t.commit()
     except tx.TxBusy:
-        return False, busy_msg()
+        return False, BUSY_MSG          # 同上: 锁被占是 pdgtx 报的, 与 _cfg_guard 的历史无关
     except tx.TxRefused as e:
         return False, tx.redact(str(e))
     except Exception as e:  # noqa: BLE001

@@ -717,6 +717,93 @@ def main():
         bad("拿不到锁却动了生产文件")
     box10.clean()
 
+    # ── 11. 同线程遗留: 上一次"锁文件不可用"不能污染下一次 TxBusy ─────────────
+    # 线程局部状态解决了跨线程覆盖, 但**同一个线程**里它会留到下一次调用: 线程池会复用线程,
+    #   一次 WLOC 操作碰上 /run 不可写 → 本线程记下 err(正确地回 NOLOCK);
+    #   同一个工作线程稍后跑一笔完全无关的 tx_apply(), pdgtx 因为锁被别人占着抛 TxBusy;
+    #   而 except tx.TxBusy 走的是 busy_msg() —— 读到上一次的遗留, 把 BUSY 报成 NOLOCK。
+    # 修法: pdgtx._Lock 已经把"打不开锁文件"(TxRefused)和"锁被占"(TxBusy)分开了, TxBusy 分支
+    # 直接回 BUSY_MSG, 不再问 _cfg_guard 的历史。这里全程单线程、用真 flock, 不靠 sleep。
+    box11 = Box(); load_tx(box11.env)
+    box11.up("mosdns"); box11.up("mihomo")
+    box11.put("/etc/sing-box/config.json", json.dumps(
+        {"outbounds": [{"type": "shadowsocks", "tag": "hk", "server": "1.1.1.1",
+                        "server_port": 1, "method": "aes-256-gcm", "password": "p"}],
+         "route": {"rules": []}, "inbounds": [{"type": "direct", "tag": "in"}]}).encode())
+    box11.put("/etc/mosdns/config.yaml",
+              b"plugins:\n  - tag: remote_upstream\n    type: forward\n"
+              b"    args: { concurrent: 1, upstreams: [ {addr: \"udp://8.8.8.8:53\"} ] }\n")
+    box11.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before11.example\n")
+    for _m in list(sys.modules):
+        if _m == "pdgtx":
+            del sys.modules[_m]
+    spec11 = _il3.spec_from_file_location("pdg_bot_stale", ROOT / "deploy/bot/pdg-bot.py")
+    b11 = _il3.module_from_spec(spec11); spec11.loader.exec_module(b11)
+    b11.SB = box11.path("/etc/sing-box/config.json")
+    b11.MOSDNS_CONF = box11.path("/etc/mosdns/config.yaml")
+    b11.MOSDNS_DIRECT = box11.path("/etc/mosdns/rules/custom_direct.txt")
+    b11.MIHOMO_CFG = box11.path("/etc/mihomo/config.yaml")
+    b11._render_mihomo_bytes = lambda model, rs_meta=None: (b'{"proxies": [], "rules": []}', {})
+    live11 = {p: box11.read(p) for p in ("/etc/sing-box/config.json", "/etc/mosdns/config.yaml",
+                                         "/etc/mosdns/rules/custom_direct.txt")}
+
+    # ① 本线程先经历一次"锁文件不可用"(锁路径指向目录 → open(…, "w") 必失败)
+    b11.LOCKFILE = box11.path("/run/lock-is-a-dir")
+    os.makedirs(b11.LOCKFILE, exist_ok=True)
+    with b11._cfg_guard() as got11:
+        first_msg = b11.busy_msg() if not got11 else "(竟然拿到锁了)"
+    if got11 is False and first_msg == b11.NOLOCK_MSG:
+        ok("同线程①: 锁文件不可用 → 如实回 NOLOCK(这份状态本来就要留给调用方读)")
+    else:
+        bad("第一步就不对: got=%r msg=%r" % (got11, first_msg))
+
+    # ② 换回可用锁路径, 用**另一个进程**真占住 pdgtx 的全局锁 → 必然 TxBusy
+    b11.LOCKFILE = box11.env["PDG_LOCKFILE"]
+    holder11 = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl, sys\nf = open(sys.argv[1], 'w')\nfcntl.flock(f, fcntl.LOCK_EX)\n"
+         "sys.stdout.write('READY\\n'); sys.stdout.flush()\nsys.stdin.readline()\n",
+         box11.env["PDG_LOCKFILE"]],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True)
+    try:
+        if (holder11.stdout.readline() or "").strip() != "READY":
+            bad("占锁进程没拿到 pdgtx 的全局锁, 这条用例前提不成立")
+        okr11, msg11 = b11.tx_apply(
+            "stale_probe", files={"mosdns_rule:custom_direct.txt": b"domain:after11.example\n"})
+        if okr11 is False and msg11 == b11.BUSY_MSG:
+            ok("同线程②: 之后的 tx_apply 撞上 TxBusy → 回 BUSY, 没读上一次的遗留状态")
+        else:
+            bad("tx_apply 的 TxBusy 报成了别的: ok=%r msg=%r" % (okr11, msg11))
+        okr12, msg12 = b11.set_mosdns_upstream("remote", ["udp://1.2.3.4:53"])
+        if okr12 is False and msg12 == b11.BUSY_MSG:
+            ok("同线程③: set_mosdns_upstream 的 TxBusy 同样回 BUSY(两处分支都改到了)")
+        else:
+            bad("set_mosdns_upstream 的 TxBusy 报成了别的: ok=%r msg=%r" % (okr12, msg12))
+    finally:
+        try:
+            holder11.stdin.write("go\n"); holder11.stdin.flush()
+        except Exception:  # noqa: BLE001
+            holder11.kill()
+        holder11.wait(timeout=10)
+    if all(box11.read(p) == v for p, v in live11.items()):
+        ok("同线程④: 两次拒绝期间 model / mosdns 配置 / 规则文件一个字节都没变")
+    else:
+        bad("拿不到锁却动了生产文件")
+    # ⑤ TxRefused(锁文件真的打不开)必须仍然说"锁文件不可用", 不能被统一成 BUSY
+    b11.LOCKFILE = box11.path("/run/lock-is-a-dir")
+    os.environ["PDG_LOCKFILE"] = box11.path("/run/lock-is-a-dir")
+    for _m in list(sys.modules):
+        if _m == "pdgtx":
+            del sys.modules[_m]
+    okr13, msg13 = b11.tx_apply(
+        "refused_probe", files={"mosdns_rule:custom_direct.txt": b"domain:after13.example\n"})
+    os.environ["PDG_LOCKFILE"] = box11.env["PDG_LOCKFILE"]
+    if okr13 is False and "锁文件不可用" in msg13:
+        ok("TxRefused 未退化: 锁文件真打不开时仍如实说「锁文件不可用」")
+    else:
+        bad("TxRefused 的原因丢了: ok=%r msg=%r" % (okr13, msg13))
+    box11.clean()
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
