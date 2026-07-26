@@ -29,22 +29,7 @@ HIJ=/etc/mosdns/rules/custom_hijack.txt
 printf 'domain:before.example\n' > "$HIJ"
 BEFORE_SHA="$(sha256sum "$HIJ" | cut -d' ' -f1)"
 
-# 硬门探针落点(与 e2e-config-transaction.sh 同法): 真 DNS 应答 + 真 TCP 监听
-python3 - >/dev/null 2>&1 <<'PY' &
-import socket, threading
-u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 5399))
-t = socket.socket(); t.bind(("127.0.0.1", 7893)); t.listen(8)
-def dns():
-    while True:
-        d, a = u.recvfrom(512); u.sendto(d[:2] + b"\x81\x83" + d[4:12], a)
-threading.Thread(target=dns, daemon=True).start()
-while True:
-    c, _ = t.accept(); c.close()
-PY
-PROBE=$!
-sleep 0.5
-export PDG_TX_DNS_PROBE=127.0.0.1:5399
-trap 'kill "$PROBE" 2>/dev/null' EXIT
+# 硬门探针由 e2e_stub_system 统一起(见 e2e-lib.sh 的 e2e_tx_probes)
 
 # ══ 1. 造一笔"应用到一半被 kill -9"的事务 ═════════════════════════════════
 echo "── 1. APPLYING 阶段被强杀 ──"

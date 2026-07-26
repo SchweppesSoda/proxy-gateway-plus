@@ -110,8 +110,49 @@ e2e_enter(){
 }
 
 # ── 打桩: 沙盒里没有 systemd / netlink ──────────────────────────────────────
+# 配置事务的硬门探针落点(本地 DNS 应答 + 内核 redir 端口)。沙箱里 mosdns/mihomo 是桩,
+# 真端口上没人听, 而事务的基线门要求"本次要动的组件操作前是好的" —— 那条判据**不该为了测试
+# 而关掉**, 所以这里起真的 socket 顶上, 并把探针落点告诉事务核心(判据本身一行没改)。
+# 端口动态选取: 多个 E2E 在同一台机器上先后跑, 写死端口会互相占用。
+e2e_tx_probes(){
+  local pf=/tmp/e2e-tx-probe.ports ps=/tmp/e2e-tx-probe.py
+  rm -f "$pf"
+  # 脚本先落盘再 setsid 起 —— `setsid python3 - <<EOF` 拿不到 stdin(会被脱开), 探针根本跑不起来
+  cat > "$ps" <<'PY'
+import os, socket, sys, threading
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 0))
+t = socket.socket(); t.bind(("127.0.0.1", 0)); t.listen(16)
+with open(sys.argv[1], "w") as f:
+    f.write("%d %d\n" % (u.getsockname()[1], t.getsockname()[1]))
+def dns():
+    while True:
+        try:
+            d, a = u.recvfrom(512); u.sendto(d[:2] + b"\x81\x83" + d[4:12], a)
+        except OSError:
+            return
+threading.Thread(target=dns, daemon=True).start()
+while True:
+    try:
+        c, _ = t.accept(); c.close()
+    except OSError:
+        break
+PY
+  setsid python3 "$ps" "$pf" >/dev/null 2>&1 &
+  local n=0
+  while [[ ! -s "$pf" && "$n" -lt 40 ]]; do sleep 0.1; n=$((n+1)); done
+  [[ -s "$pf" ]] || return 1
+  local ports; ports="$(cat "$pf")"
+  export PDG_TX_DNS_PROBE="127.0.0.1:${ports%% *}"
+  export PDG_TX_REDIR_PORT="${ports##* }"
+}
+
 e2e_stub_system(){
   mkdir -p /tmp/e2e-svc
+  e2e_tx_probes || echo "[!] 事务硬门探针没起来, 相关用例会如实失败"
+  # 真机上做变更时 mosdns/mihomo 本来就在跑; 沙箱的假 systemd 默认全 inactive, 会让事务的
+  # 基线门(操作前组件必须是好的)正确地拒掉一切普通变更。这里把它们置为 active, 让沙箱与
+  # 真机同形态 —— 判据没动, 只是把"现场"补齐。
+  printf 1 > /tmp/e2e-svc/mosdns.ac; printf 1 > /tmp/e2e-svc/mihomo.ac
   # 有状态的假 systemd: 记录每个 unit 的 active/enabled。切核纪律(旧核必须真的 inactive
   # 且 disabled)只有靠状态机才验得出来 —— 无脑回 active 的桩会把 activate 判成失败。
   cat > /usr/local/bin/systemctl <<'S'

@@ -27,23 +27,7 @@ TX=/opt/privdns-gateway/deploy/bot/pdgtx.py
 [[ -f "$TX" ]] || TX="$E2E_ROOT/deploy/bot/pdgtx.py"
 export PDG_STABLE_SAMPLES=1
 
-# 让事务的硬门探针有真实落点: 起一个应答 DNS 的小服务 + 一个 TCP 监听
-python3 - >/dev/null 2>&1 <<'PY' &
-import socket, threading
-u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 5399))
-t = socket.socket(); t.bind(("127.0.0.1", 7893)); t.listen(8)
-def dns():
-    while True:
-        d, a = u.recvfrom(512); u.sendto(d[:2] + b"\x81\x83" + d[4:12], a)
-def tcp():
-    while True:
-        c, _ = t.accept(); c.close()
-threading.Thread(target=dns, daemon=True).start(); tcp()
-PY
-PROBE=$!
-sleep 0.5
-export PDG_TX_DNS_PROBE=127.0.0.1:5399
-trap 'kill "$PROBE" 2>/dev/null' EXIT
+# 硬门探针由 e2e_stub_system 统一起(见 e2e-lib.sh 的 e2e_tx_probes)
 
 # ══ 1. 三方并发: 只有一个拿到写锁 ═══════════════════════════════════════════
 echo "── 1. CLI / Bot / scheduler 并发抢锁 ──"
