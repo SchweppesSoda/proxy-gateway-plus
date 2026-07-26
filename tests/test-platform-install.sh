@@ -162,7 +162,40 @@ run_ok "migrate_fw_gms(自定义)" migrate_fw_gms "$WORK/nfcust"
 rm -f "$WORK"/nf.pregms.* "$WORK"/nfcust.pregms.*
 
 # ── C. migrate_ios_gms_cleanup: 删 in-gms-* + nft 移除 5228-5230 ────────────────
-use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms; _pdg_core_svc(){ echo sing-box; }
+use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms; _pdg_core_svc(){ echo mihomo; }
+# 沙箱化真实现: 内核配置/工作目录/bot 模块都用 env 指进 $WORK, 服务动作与着色输出打桩。
+# 被测的是 migrate_ios_gms_cleanup 本身(候选→校验→落盘→回滚), 不是 systemd。
+export PDG_MIHOMO_CFG="$WORK/mihomo.yaml" PDG_STATE_DIR="$WORK/state" \
+       PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py"
+c_g(){ echo "  $*"; }; c_y(){ echo "  $*"; }; c_r(){ echo "  $*"; }
+GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""; GMS_NFT_F_FAIL=""
+systemctl(){
+  echo "systemctl $*" >> "$WORK/gms-calls"
+  [[ "${GMS_RESTART_FAIL:-}" == 1 && "$1" == restart ]] && return 1
+  return 0
+}
+_core_kernel_stable(){ [[ "${GMS_CORE_UNSTABLE:-}" != 1 ]]; }
+nft(){
+  if [[ "$1" == -c ]]; then [[ "${GMS_NFT_C_FAIL:-}" != 1 ]]; return; fi
+  if [[ "$1" == -f ]]; then
+    if [[ "${GMS_NFT_F_FAIL:-}" == 1 ]]; then
+      local n; n=$(( $(cat "$WORK/nftf" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WORK/nftf"
+      [[ "$n" -gt 1 ]]      # 第一次(应用)失败, 之后(回滚)成功
+      return
+    fi
+    return 0
+  fi
+  return 0
+}
+# 内核配置的基线内容 = 用当前 model 渲染出来的那一份 —— 这样"回滚后的内核配置对应回滚后的
+# model"才是可验证的, 而不是拿一个手写字符串充数。
+_gms_render(){ PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py" python3 - "$1" "$2" <<'RPY'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("bot", os.environ["PDG_BOT_PY"])
+bot = importlib.util.module_from_spec(spec); spec.loader.exec_module(bot)
+open(sys.argv[2], "wb").write(bot._mihomo_derive({"model": open(sys.argv[1], "rb").read()}))
+RPY
+}
 cat > "$WORK/sbg.json" <<'JSON'
 {"inbounds":[{"type":"direct","tag":"in-https","listen_port":443},
              {"type":"direct","tag":"in-gms-5228","listen_port":5228},
@@ -171,6 +204,7 @@ cat > "$WORK/sbg.json" <<'JSON'
 JSON
 printf 'table inet pdg {\n  chain input { ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept }\n}\n' > "$WORK/nfg"
 _pdg_platform(){ echo ios; }
+_gms_render "$WORK/sbg.json" "$WORK/mihomo.yaml" || bad "渲染基线内核配置失败"
 run_ok "migrate_ios_gms_cleanup(iOS)" migrate_ios_gms_cleanup "$WORK/sbg.json" "$WORK/nfg"
 { ! grep -q 'in-gms-5228' "$WORK/sbg.json" && ! grep -q 'in-gms-5230' "$WORK/sbg.json"; } \
   && ok "iOS 清理: sing-box 删掉 in-gms-5228/5229/5230 入站" || bad "in-gms-* 未删净"
@@ -215,6 +249,120 @@ printf 'table inet pdg {\n\tchain prerouting { ip saddr X tcp dport { 80, 443, 5
 snapc="$(cat "$WORK/nfcustom")"
 run_ok "migrate_ios_gms_cleanup(自定义)" migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfcustom"
 [[ "$(cat "$WORK/nfcustom")" == "$snapc" ]] && ok "自定义 5228 形态无法安全识别 → 还原不破坏配置" || bad "破坏了自定义配置"
+
+# ── C4. 事务性: 候选先行 / 校验不过零改动 / 落盘失败完整回滚 / 失败必须传播 ─────────
+# 这一段盯的是"迁移会不会把现网留在半套状态", 以及"失败有没有被上层收到"。
+_gms_fixture(){                                   # 造一套干净现场, 返回三个文件的 SHA
+  cat > "$WORK/g-sb.json" <<'JSON'
+{"inbounds":[{"type":"direct","tag":"in-https","listen_port":443},
+             {"type":"direct","tag":"in-gms-5228","listen_port":5228},
+             {"type":"direct","tag":"in-gms-5229","listen_port":5229}],
+ "outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[],"final":"direct"}}
+JSON
+  printf 'table inet pdg {\n\tchain prerouting { ip saddr 172.22.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893 }\n}\n' > "$WORK/g-nf"
+  _gms_render "$WORK/g-sb.json" "$WORK/mihomo.yaml"
+  rm -f "$WORK/nftf" "$WORK/gms-calls"
+  GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""; GMS_NFT_F_FAIL=""; GMS_NFT_C_FAIL=""
+  export PDG_MIHOMO_CFG="$WORK/mihomo.yaml" PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py"
+  _G_SB="$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)"
+  _G_MH="$(sha256sum "$WORK/mihomo.yaml" | cut -d" " -f1)"
+  _G_NF="$(sha256sum "$WORK/g-nf" | cut -d" " -f1)"
+}
+_gms_unchanged(){                                 # 三个生产文件必须一个字节都没变
+  local what="$1" bad3=()
+  [[ "$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)" == "$_G_SB" ]] || bad3+=(model)
+  [[ "$(sha256sum "$WORK/mihomo.yaml" | cut -d" " -f1)" == "$_G_MH" ]] || bad3+=(内核配置)
+  [[ "$(sha256sum "$WORK/g-nf" | cut -d" " -f1)" == "$_G_NF" ]] || bad3+=(防火墙)
+  [[ ${#bad3[@]} -eq 0 ]] && ok "$what" || bad "$what —— 这些文件被动了: ${bad3[*]}"
+}
+_pdg_platform(){ echo ios; }
+
+# 1) 候选渲染失败(bot 侧判 dropped/无法转换那一类)→ 三个文件零改动
+_gms_fixture
+cat > "$WORK/badbot.py" <<'PYB'
+def _mihomo_derive(staged):
+    raise ValueError("渲染失败(测试注入)")
+PYB
+PDG_BOT_PY="$WORK/badbot.py" migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "候选渲染失败却返回 0" || ok "候选渲染失败 → 返回非 0"
+_gms_unchanged "候选渲染失败: 三个生产文件零修改"
+
+# 2) mihomo -t 校验失败 → 零改动
+_gms_fixture
+mihomo(){ [[ "$1" == -t ]] && return 1; return 0; }
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "mihomo -t 失败却返回 0" || ok "候选 mihomo -t 失败 → 返回非 0"
+_gms_unchanged "mihomo -t 失败: 三个生产文件零修改"
+unset -f mihomo
+
+# 3) nft -c 校验失败 → 零改动
+_gms_fixture; GMS_NFT_C_FAIL=1
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "nft -c 失败却返回 0" || ok "候选 nft -c 失败 → 返回非 0"
+_gms_unchanged "nft -c 失败: 三个生产文件零修改"
+GMS_NFT_C_FAIL=""
+
+# 4) 第 2 个文件(内核配置)落盘失败 → 第 1 个(model)必须已还原
+_gms_fixture
+: > "$WORK/blocker"                                  # 父目录是个**文件** → install 必失败
+PDG_MIHOMO_CFG="$WORK/blocker/config.yaml" migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "内核配置落盘失败却返回 0" || ok "第 N 个文件落盘失败 → 返回非 0"
+[[ "$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)" == "$_G_SB" ]] \
+  && ok "落盘中途失败: 先落的 model 已还原(不留半套)" || bad "model 没还原"
+
+# 5) nft apply 失败(第一次 -f 失败, 回滚时的 -f 成功)→ 配置与运行态都恢复
+_gms_fixture; GMS_NFT_F_FAIL=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+[[ $rc != 0 ]] && ok "nft apply 失败 → 返回非 0" || bad "nft apply 失败却返回 0"
+grep -q "已回滚" <<<"$out" && ok "nft apply 失败: 明确报告已回滚" || bad "没报告回滚: $out"
+_gms_unchanged "nft apply 失败: 三个生产文件都回到清理前"
+GMS_NFT_F_FAIL=""
+
+# 6) 内核重启失败 → model 与内核配置必须**一起**还原, 且内核配置对应还原后的 model
+_gms_fixture; GMS_RESTART_FAIL=1
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "内核重启失败却返回 0" || ok "内核重启失败 → 返回非 0"
+_gms_unchanged "内核重启失败: model / 内核配置 / 防火墙 全部还原"
+_gms_render "$WORK/g-sb.json" "$WORK/expect-mh.yaml"
+cmp -s "$WORK/expect-mh.yaml" "$WORK/mihomo.yaml" \
+  && ok "还原后的内核配置确实对应还原后的 model(不是旧的错位副本)" \
+  || bad "内核配置与 model 不对应"
+GMS_RESTART_FAIL=""
+
+# 7) 回滚里的服务也起不来 → 必须明确报"回滚不完整"并保留材料, 不许打印"已还原"
+_gms_fixture; GMS_RESTART_FAIL=1; GMS_CORE_UNSTABLE=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+{ [[ $rc != 0 ]] && grep -q "回滚不完整" <<<"$out" && ! grep -q "已回滚:" <<<"$out"; } \
+  && ok "回滚阶段服务失败 → 返回非 0 且明说回滚不完整(不谎称已还原)" \
+  || bad "回滚失败的报告不对: rc=$rc | $(tr '\n' ' ' <<<"$out" | head -c 120)"
+grep -q "$WORK/state" <<<"$out" && ok "回滚不完整时给出保留的材料目录路径" || bad "没给材料路径"
+rm -rf "$WORK/state"/iosgms.* 2>/dev/null
+GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""
+
+# 8) 失败必须被这些调用方收到 —— 用真函数体 + 注入一个必失败的迁移
+_rams="$(xt run_all_migrations)"
+[[ -n "$_rams" ]] || bad "抽不到 run_all_migrations"
+( eval "$_rams"
+  for f in migrate_platform_marker migrate_backend_marker migrate_botenv migrate_firewall_to_pdg \
+           migrate_mosdns_concurrent migrate_mosdns_unlock migrate_fw_gms migrate_mosdns_ratelimit \
+           migrate_lowmem migrate_mihomo_safepaths migrate_deploy_botfiles migrate_deploy_units \
+           migrate_mosdns_hijack_shape migrate_custom_hijack migrate_mosdns_mitm \
+           migrate_pdg_mitm_service migrate_android_cleanup migrate_drop_singbox; do
+    eval "$f(){ return 0; }"
+  done
+  migrate_ios_gms_cleanup(){ return 1; }
+  run_all_migrations >/dev/null 2>&1 ) \
+  && bad "run_all_migrations 吞掉了 iOS GMS 清理的失败" \
+  || ok "run_all_migrations 把 iOS GMS 清理的失败传出(cmd_update/cmd_migrate 据此回滚/点名快照)"
+grep -q 'migrate_ios_gms_cleanup || true' "$ROOT/deploy/bot/pdg.sh" \
+  && bad "pdg.sh 里还有 `migrate_ios_gms_cleanup || true`" \
+  || ok "pdg.sh 里不再用 || true 吞掉这条关键迁移"
+_cp="$(xt cmd_platform)"
+grep -q 'migrate_ios_gms_cleanup' <<<"$_cp" && grep -q '_plat_rollback' <<<"$_cp" \
+  && ok "cmd_platform 会跑这条关键迁移, 失败走 _plat_rollback" || bad "cmd_platform 没接这条迁移"
+awk '/migrate_ios_gms_cleanup/{m=NR} /rm -rf "\$wd"/{if(m && NR>m){print "AFTER"; exit}}' <<<"$_cp" \
+  | grep -q AFTER && ok "cmd_platform 里这条迁移排在删除回滚材料之前" \
+  || bad "迁移跑在 rm -rf \$wd 之后(那时已经没有回滚材料了)"
 
 # ── C2. _pdg_nft_strip_gms: iOS 渲染后剥掉 GMS(装机/切核共用)──────────────────
 printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept\n  ip saddr 10.0.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n}\n' > "$WORK/nfr"
