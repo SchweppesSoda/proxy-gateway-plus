@@ -2260,23 +2260,76 @@ cmd_hijack_mode(){
   echo "✅ 劫持模式 → $mode"
 }
 
-# 下一次以 root 运行"管理类"命令(update/restart/menu/…)时幂等自动迁移防火墙(已迁移则首个 grep 秒退)。
-# 只读命令(status/doctor/log/traffic/report)与卸载不触发, 以保持"只读命令不写任何东西"的语义;
-# 只跑只读命令的用户可显式 `sudo pdg migrate-fw` 迁移(且证书 hook/doctor 已兼容旧 inet filter, 不迁也能用)。
-if [[ $EUID -eq 0 ]]; then
-  case "${1:-menu}" in
-    status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm|__migrate) : ;;   # 只读/卸载/内部迁移: 不重复迁移
-    update|up)
-      # `update --dry-run` 是**查看**命令: 不该在"只是看看有没有新版"时就把迁移跑了
-      # (迁移会改 unit / nft / mosdns 配置)。真正的 update 仍照旧先迁移。
-      [[ "${2:-}" == "--dry-run" ]] || run_all_migrations ;;
-    *) run_all_migrations ;;   # 管理类命令才迁移(idempotent)
-  esac
-fi
+# 显式迁移: 先上锁、先快照, 再跑幂等迁移, 并记一笔审计(source=cli, op=migrate)。
+# 边界说明(不夸大): 迁移内部仍是各自的就地改写 + 局部还原, 尚未逐文件走事务核心的
+# before-image —— 那属于 5.1B。这里保证的是"迁移前一定有可回滚的快照, 且不会在用户
+# 不知情时发生", 失败时明确指出用哪一份快照回退。
+cmd_migrate(){
+  need_root migrate; _lock
+  c_g "迁移前留快照…"
+  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
+    c_y "❌ 快照失败, 拒绝在无法回滚的前提下迁移。"; return 1
+  fi
+  local snap="$_PDG_SNAP_CREATED" rc=0
+  run_all_migrations || rc=$?
+  if [[ $rc == 0 ]]; then
+    _tx_audit cli migrate COMMITTED "snapshot=$snap"
+    c_g "✅ 迁移完成(快照: $snap)"
+    return 0
+  fi
+  _tx_audit cli migrate ROLLBACK_FAILED "snapshot=$snap"
+  c_y "❌ 迁移失败。快照仍在: $snap"
+  c_y "   需要回退时: sudo pdg rollback --dir $snap"
+  return 1
+}
+
+# 往事务审计里补一条记录 —— CLI 侧那些尚未逐文件事务化的操作, 至少要记在同一本账上。
+_tx_audit(){
+  local m
+  for m in "$REPO_DIR/deploy/bot/pdgtx.py" /opt/pdg-bot/pdgtx.py; do
+    [[ -f "$m" ]] || continue
+    python3 - "$m" "$1" "$2" "$3" "${4:-}" <<'TXAUDIT' 2>/dev/null || true
+import importlib.util, json, os, sys, time
+spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
+tx = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tx)
+rec = {"ts": time.time(), "txid": tx.new_txid(), "source": sys.argv[2], "op": sys.argv[3],
+       "mode": "normal", "state": sys.argv[4], "targets": [], "services": [], "error": "",
+       "note": tx.redact(sys.argv[5]), "schema_version": tx.SCHEMA_VERSION}
+try:
+    os.makedirs(os.path.dirname(tx.AUDIT), mode=0o700, exist_ok=True)
+    with open(tx.AUDIT, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+except OSError:
+    pass
+TXAUDIT
+    return 0
+  done
+}
+
+# pdg tx: 查看/恢复事务。list/show 是只读的(不取写锁); recover 自己在核心里取同一把锁。
+cmd_tx(){
+  need_root tx
+  local m
+  for m in "$REPO_DIR/deploy/bot/pdgtx.py" /opt/pdg-bot/pdgtx.py; do
+    [[ -f "$m" ]] && { python3 "$m" "$@"; return $?; }
+  done
+  echo "❌ 找不到 pdgtx.py(事务核心缺失)"; return 1
+}
+
+# 5.1: **取消命令分派前的隐藏迁移**。
+# 以前这里对所有管理类命令(含 update)先跑一遍 run_all_migrations —— 那发生在 _lock 之前、
+# 也在 cmd_update 打快照之前: 迁移会改 unit / nft / mosdns, 于是"更新失败回滚"只能回到
+# **已经被迁移改过**的现网, 而用户以为回到了操作前。菜单、restart 这类命令更不该在用户
+# 不知情时改配置。
+# 现在迁移只有两个入口, 都在锁与快照之后: cmd_update 装好新脚本后调用的 `pdg __migrate`,
+# 以及用户显式运行的 `sudo pdg migrate`(先上锁、先快照, 并记一笔审计)。
 
 case "${1:-menu}" in
   menu|"")       menu;;
   __migrate)     need_root __migrate; run_all_migrations;;   # 内部: cmd_update 装好新脚本后据此跑"新版"迁移
+  migrate)       cmd_migrate;;
+  tx)            shift || true; cmd_tx "$@";;
   status|st)     cmd_status;;
   doctor|dr)     shift || true; cmd_doctor "${1:-}";;
   update|up)     shift || true; cmd_update "${1:-}";;
@@ -2293,5 +2346,5 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate-fw|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover>|uninstall [--purge]]";;
 esac
