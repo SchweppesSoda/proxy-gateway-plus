@@ -3312,6 +3312,25 @@ def _platform_sanitize_model(cfg):
 
 
 def restore_from(data):
+    """恢复备份的入口: 只负责取全局配置锁, 主体在 _restore_from_locked 里。
+
+    恢复要覆盖 model / mosdns 配置 / direct·hijack / 规则集元数据 / rs 目录并重启两个服务,
+    却一直没有跨进程锁 —— 与 `pdg update`、定时规则更新、Bot 自己的事务写入并发时, 两边各写
+    一半, 谁也拦不住。这里补上与 pdgtx / CLI / 定时任务**同一把**锁(LOCKFILE 上的 flock):
+    锁忙或锁文件不可用一律 fail-closed, 解包都不做就返回, 绝不"先写了再说"。
+
+    锁的范围就是整个主体 —— 读现网身份(_machine_id)、暂存 before、正式落盘、重启服务、
+    手写回滚全在锁内, 中间不放手, 不留 TOCTOU 窗口。主体里不调用 tx_apply/apply_sb 这类会
+    再取同一把锁的入口(内核仍走 _core_apply 手写路径), 所以不会自锁。
+    """
+    with _cfg_guard() as got:
+        if not got:
+            return False, busy_msg()
+        return _restore_from_locked(data)
+
+
+def _restore_from_locked(data):
+    """恢复备份的主体。**调用方必须已持有 _cfg_guard**(见 restore_from)。"""
     try:
         tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
     except Exception:  # noqa: BLE001

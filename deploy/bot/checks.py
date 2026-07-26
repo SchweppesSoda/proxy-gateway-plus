@@ -796,7 +796,12 @@ def check_nft_input_chains():
 
 
 def check_transactions():
-    """未完成的配置事务 —— 停在 APPLYING/ROLLING_BACK 的那种。
+    """未完成的配置事务 —— pdgtx.NEEDS_RECOVERY 的四个状态全算:
+    APPLYING / OBSERVING / ROLLING_BACK / ROLLBACK_FAILED。
+
+    OBSERVING 尤其容易被漏掉: 那时文件已经落盘、服务动作也做完了, 只差最后判定, 现网却已经
+    是新内容 —— 崩在这里和崩在 APPLYING 一样需要人工收尾, 所以必须报出来, 并**点名 txid**
+    (只说"有未完成事务"等于让人自己去猜是哪一笔, 而 recover 命令要的正是那个 id)。
 
     doctor 只**报告**, 绝不代为恢复: 恢复要写现网、要拿写锁, 那是 `pdg tx recover` 的事;
     自检必须保持只读, 否则"跑个 doctor 顺手改了配置"就是下一个惊喜。"""

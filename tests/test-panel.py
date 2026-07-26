@@ -386,6 +386,9 @@ with tempfile.TemporaryDirectory() as td:
         tar.addfile(info, io.BytesIO(data))
     bot.SB = sb; bot.MOSDNS_CONF = mos; bot.RS_DIR = os.path.join(td, "rs")
     bot.RESTORE_MAP = {"etc/sing-box/config.json": sb}
+    # restore_from 现在要取全局配置锁(与 pdgtx/CLI 同一把)。非 root 跑用例时 /run 写不了,
+    # 真实现会如实 fail-closed —— 这里把锁文件挪进沙箱, 测的仍是恢复本身而不是权限。
+    bot.LOCKFILE = os.path.join(td, "lock")
     # restore 走 _core_apply → 渲染 mihomo 配置, 落在临时目录(别写真 /etc/mihomo)
     bot.MIHOMO_DIR = os.path.join(td, "mihomo"); bot.MIHOMO_CFG = os.path.join(bot.MIHOMO_DIR, "config.yaml")
     bot.sh = lambda cmd: _R()

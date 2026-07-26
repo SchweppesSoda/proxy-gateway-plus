@@ -165,11 +165,13 @@ PY
 )
 { grep -q '^REFUSED' <<<"$out" && grep -q recover <<<"$out"; } \
   && ok "OBSERVING 残留同样挡住后续写(与 APPLYING 一致)" || bad "没挡住: $out"
-# 注: doctor 对**未完成事务**的点名已由第 3 段(APPLYING)覆盖; 这里同样跑一次 doctor 只为
-# 确认它在 OBSERVING 残留下不炸、且仍是只读 —— 点名与否交给上面那段与单测(pending_recovery)。
+# OBSERVING 残留与 APPLYING 一样必须被点名: 只说"有未完成事务"等于让人自己去猜是哪一笔,
+# 而恢复命令要的正是那个 txid。用固定字符串匹配, 免得 txid 里的字符被当成正则。
 dout6="$(pdg doctor 2>&1)"; S6H="$(sha256sum "$HIJ" | cut -d' ' -f1)"
 grep -q '配置事务' <<<"$dout6" && ok "OBSERVING 残留下 doctor 仍能跑完并给出「配置事务」项" \
   || bad "doctor 没有事务项: $(tail -2 <<<"$dout6")"
+grep -Fq -- "$C6" <<<"$dout6" && ok "doctor 点名 OBSERVING 事务 ID" \
+  || bad "doctor 没点名 OBSERVING 事务 $C6: $(tail -3 <<<"$dout6")"
 [[ "$(sha256sum "$HIJ" | cut -d' ' -f1)" == "$S6H" ]] \
   && ok "doctor 在 OBSERVING 残留下同样只读" || bad "doctor 改了现网"
 rout="$(pdg tx recover "$C6" 2>&1)"

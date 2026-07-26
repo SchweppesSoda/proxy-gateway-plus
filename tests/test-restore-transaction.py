@@ -19,9 +19,11 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -373,6 +375,73 @@ def main():
             ok("_rollback_restore_targets 返回 (是否全部成功, 未恢复项), 不再静默吞异常")
         finally:
             shutil.rmtree(bakdir, ignore_errors=True)
+
+    # ══ 并发安全: 恢复必须持有与 pdgtx / CLI / 定时任务同一把全局锁 ═══════════════
+    # 恢复覆盖一整组生产配置并重启两个服务, 以前却**完全不持锁**: 与 `pdg update`、定时规则
+    # 更新、Bot 自己的事务写入并发时, 两边各写一半, 谁也拦不住。这里不 mock 锁, 用**真进程**
+    # 占住 flock 做故障注入。
+    HOLDER = ("import fcntl, sys\n"
+              "f = open(sys.argv[1], 'w')\n"
+              "fcntl.flock(f, fcntl.LOCK_EX)\n"
+              "sys.stdout.write('READY\\n'); sys.stdout.flush()\n"
+              "sys.stdin.readline()\n")
+
+    def unpack_dirs():
+        """解包出来的临时目录(pdgrs*), 但不含事务备份目录(pdgrsbak*)。"""
+        return {d for d in glob.glob(os.path.join(tempfile.gettempdir(), "pdgrs*"))
+                if not os.path.basename(d).startswith("pdgrsbak")}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp)
+        before = snapshot()
+        unpack_before = unpack_dirs()
+        holder = subprocess.Popen([sys.executable, "-c", HOLDER, bot.LOCKFILE],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  universal_newlines=True)
+        try:
+            if (holder.stdout.readline() or "").strip() != "READY":
+                bad("占锁进程没能拿到锁, 这条用例的前提根本不成立")
+            t0 = time.time()
+            okr, msg = bot.restore_from(blob)
+            waited = time.time() - t0
+            if okr:
+                bad("别的进程正持有全局配置锁, 恢复却报成功")
+            if msg != bot.BUSY_MSG:
+                bad(f"锁被占时应回 BUSY_MSG, 实际: {msg!r}")
+            if waited > 3:
+                bad(f"取不到锁必须立即返回, 实际等了 {waited:.1f}s —— 阻塞会卡死 Bot 主轮询")
+            check_all_restored(before, "锁被别的进程占着")
+            ok("锁被占 → 立即回 BUSY, model / mosdns / 规则集 / rs 目录 一个字节都没变")
+            if unpack_dirs() - unpack_before:
+                bad("拿不到锁却已经把备份解包了 —— 应当在动任何东西之前就返回")
+            ok("拿不到锁时连备份都不解包(不是'先干起来再说')")
+        finally:
+            try:
+                holder.stdin.write("go\n"); holder.stdin.flush()
+            except Exception:  # noqa: BLE001
+                holder.kill()
+            holder.wait(timeout=10)
+        # 放锁之后功能照常 —— 锁是挡并发, 不是把恢复锁死
+        okr, msg = bot.restore_from(blob)
+        if not okr:
+            bad(f"占锁进程退出后恢复仍失败: {msg}")
+        now = snapshot()
+        if not [k for k in before if before[k] != now[k]]:
+            bad("放锁后的恢复什么都没改, 这条断言是空的")
+        ok("占锁进程退出后, 同一份备份照常恢复成功(锁只挡并发)")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        setup(tmp)
+        before = snapshot()
+        bot.LOCKFILE = os.path.join(tmp, "lock-is-a-dir")   # 目录 → open(…, "w") 必失败
+        os.makedirs(bot.LOCKFILE, exist_ok=True)
+        okr, msg = bot.restore_from(blob)
+        if okr:
+            bad("锁文件不可用却报恢复成功(退化成无锁写生产配置)")
+        if msg != bot.NOLOCK_MSG:
+            bad(f"锁文件不可用应回 NOLOCK_MSG(与'有人正在改'区分开), 实际: {msg!r}")
+        check_all_restored(before, "锁文件不可用")
+        ok("锁文件不可用 → fail-closed 且指出是锁坏了, 现网一个字节都没动")
 
     # 收尾: 清掉本次运行产生的事务备份目录(注入的服务故障会让实现有意保留它们)
     for d in set(glob.glob(os.path.join(tempfile.gettempdir(), "pdgrsbak*"))) - bak_before:
