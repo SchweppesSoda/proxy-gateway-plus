@@ -20,7 +20,8 @@ e2e_stub_system
 # 写进去之后同一个 job 里后面的 e2e 就没 DNS 了 → 退出时把内容写回。
 E2E_RESOLV_SAVE="$(cat /etc/resolv.conf 2>/dev/null)"
 restore_resolv(){ [[ -n "$E2E_RESOLV_SAVE" ]] && printf '%s\n' "$E2E_RESOLV_SAVE" > /etc/resolv.conf 2>/dev/null; :; }
-trap restore_resolv EXIT
+# 走统一 hook 而不是自己 `trap ... EXIT`: 探针清理也挂在 EXIT 上, 谁后设置谁就把对方顶掉。
+e2e_add_exit_hook restore_resolv
 
 # ── 打桩外部世界 ────────────────────────────────────────────────────────────
 mkdir -p /usr/local/sbin
