@@ -3031,7 +3031,11 @@ RESTORE_MAP = {
 RESTORE_RS_PREFIX = RS_DIR.lstrip("/") + "/"
 # 受管规则集的文件名白名单: 与 pdgtx 的 ruleset:<name> 目标同形(只认单个文件名 + 当前支持的
 # 两种扩展名)。历史遗留的 .srs 是 sing-box 二进制格式, mihomo 读不了 → 明确拒绝, 不隐式转换。
-_RS_LEAF_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")          # etc/sing-box/rs/ 下的规则集
+_RS_LEAF_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
+# 备份里的路径是**导出那台机器**上的路径, 只可能是生产规范目录; 而镜像沙箱(用例/E2E)把整棵树
+# 挪了根, 所以也接受本机 RS_DIR。两者都是精确相等, 不做 endswith —— 否则
+# /evil/etc/sing-box/rs/foo.json 会被当成合法。
+_RS_DIR_CANON = "/etc/sing-box/rs"          # etc/sing-box/rs/ 下的规则集
 
 def _restore_limit(name, default, lo, hi):
     """解包限额: 可用 bot.env 里的 PDG_RESTORE_* 调整, 但**只在安全区间内**。
@@ -3292,11 +3296,10 @@ def _managed_rulesets(meta):
                 raise ValueError("规则集 %s 的路径含 .., 拒绝" % name)
             if "//" in raw or raw != os.path.normpath(raw):
                 raise ValueError("规则集 %s 的路径不是规范化形态(%s), 拒绝" % (name, raw))
-            # 目录部分必须以本项目的规则集相对路径结尾(etc/sing-box/rs), 只比最后一段"rs"
-            # 会放过 /tmp/rs/foo.json 这种别处的同名目录。
-            want = "/".join(RS_DIR.strip("/").split("/")[-3:])
-            if (not os.path.dirname(raw).strip("/").endswith(want)
-                    or os.path.basename(raw) != leaf):
+            # 目录部分必须**正好**是生产规范目录, 或本机 RS_DIR(测试/镜像沙箱把整棵树挪了根)。
+            # 只用 endswith 会放过 /evil/etc/sing-box/rs/foo.json 这种"看起来像"的路径。
+            d = os.path.dirname(raw)
+            if d not in (_RS_DIR_CANON, RS_DIR.rstrip("/")) or os.path.basename(raw) != leaf:
                 raise ValueError("规则集 %s 的路径不是「规则集目录 + 单个文件名」, 拒绝" % name)
         if not _RS_LEAF_RE.match(leaf):
             raise ValueError("规则集 %s 的文件 %s 不是当前支持的 .json/.mrs" % (name, leaf))

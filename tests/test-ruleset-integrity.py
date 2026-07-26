@@ -103,6 +103,11 @@ def setup(tmp):
     tx = importlib.import_module("pdgtx")
     tx.svc_stable = lambda unit, **k: (True, "")            # 服务动力学由事务专属用例覆盖
     tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
+    # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。
+    # 这些用例本来就不测 systemd, 沙箱里也没有真 unit —— 给它一份确定的应答, 免得"查不到"
+    # 触发 fail-closed(那条判据本身由 test-config-transaction-faults.py 专门验)。
+    tx._svc_prop_ex = lambda unit, prop: (
+        {"ActiveState": "active", "UnitFileState": "enabled", "NRestarts": "0"}.get(prop, ""), True)
     tx._run = lambda cmd, timeout=60: (0, "")
     tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (
         (False, "mihomo 配置校验失败") if getattr(fake, "mihomo_t_rc", 0) else (True, ""))

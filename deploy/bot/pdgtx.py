@@ -841,12 +841,19 @@ def _restore_runtime(bi):
         # enabled 本事务从不修改(没有 enable/disable 动作), 所以它必须与操作前一致 ——
         # 不一致说明有别的东西动过 unit。**查不到也算没复核到位**: 空字符串以前会让这一步
         # 悄悄跳过, 于是"回滚完成"是猜的。
-        was = (st.get("enabled") or "").strip()
+        # enabled 本事务从不修改, 所以回滚后必须与操作前**完全一致**。这里要分三件事:
+        #   · 查询失败 → 没复核到位, 单独记;
+        #   · 操作前根本没记过这一项(旧格式 before-image) → 无从比对, 跳过;
+        #   · 记过就精确比对 —— **包括合法的空字符串**(以前 `was and …` 会让空值悄悄跳过,
+        #     于是"原本为空、回滚后变成 enabled"这种不一致会被当成回滚成功)。
         now, q_ok = _svc_prop_ex(u, "UnitFileState")
         if not q_ok:
             failed.append("%s 的开机自启状态查不到(systemctl 查询失败), 无法复核回滚是否到位" % u)
-        elif was and was != now.strip():
-            failed.append("%s 的开机自启状态从 %s 变成了 %s(本事务没改过它)" % (u, was, now.strip()))
+        elif "enabled" in st:
+            was = (st.get("enabled") or "").strip()
+            if was != now.strip():
+                failed.append("%s 的开机自启状态从 %r 变成了 %r(本事务没改过它)"
+                              % (u, was, now.strip()))
     return failed
 
 
@@ -1014,13 +1021,26 @@ class Tx:
         返回是否真的收尾了。"""
         if self.state not in (PREPARING, VALIDATED):
             return False
-        self.meta["error"] = redact(why)[:200]
-        self.meta["error_class"] = self.meta.get("error_class") or cls
-        self.meta["ended_at"] = time.time()
-        self.state = ABORTED
-        self._save_meta()
-        self._cleanup_materials()
-        _audit(self)
+        prev = self.state
+        try:
+            self.meta["error"] = redact(why)[:200]
+            self.meta["error_class"] = self.meta.get("error_class") or cls
+            self.meta["ended_at"] = time.time()
+            self.state = ABORTED
+            self._save_meta()
+        except Exception:  # noqa: BLE001
+            # ABORTED 没落盘 → **不许删证据**: 状态回退成原样, 目录与候选留给 doctor/recover
+            # 去看。这里也不能往外抛 —— 调用方的原始异常/返回值优先。
+            self.state = prev
+            return False
+        try:
+            self._cleanup_materials()      # 只有 ABORTED 落盘成功才尽力清材料
+        except Exception:  # noqa: BLE001
+            self.warnings.append("候选材料清理失败, 材料保留在事务目录")
+        try:
+            _audit(self)
+        except Exception:  # noqa: BLE001
+            pass                            # 审计写不进去不改变业务结果
         return True
 
     # 用法: `with Tx(...) as t:` —— 候选阶段 return / 抛异常都会自动收尾, 不留 PREPARING 目录
@@ -1029,10 +1049,12 @@ class Tx:
         return self
 
     def __exit__(self, et, ev, tb):
+        # abort_unstarted 自身已是严格 no-throw; 这层 try 是"两条路径语义一致"的保险 ——
+        # finally 里直接调它的那些生产入口(tx_apply / _mitm_transact / …)也同样不会被它影响。
         try:
             self.abort_unstarted("候选阶段异常: %s" % et.__name__ if et is not None
                                  else "调用方在候选阶段返回")
-        except Exception:  # noqa: BLE001  清理失败绝不能盖掉调用方的原始异常
+        except Exception:  # noqa: BLE001
             pass
         return False
 
@@ -1191,12 +1213,24 @@ class Tx:
         for u in services:
             en, en_ok = _svc_prop_ex(u, "UnitFileState")
             nr, nr_ok = _svc_prop_ex(u, "NRestarts")
-            if not (en_ok and nr_ok):
-                # 快照不完整就别动现网: 回滚要靠它判"该起还是该停、有没有被人改过自启",
-                # 拿半份快照继续等于把回滚变成猜。
+            # ActiveState 必须**带返回码**取: _svc_active 走 `is-active`, 它把"查询失败"和
+            # "确实没在跑"都变成 False —— 那会把本来 active 的服务记成 inactive, 回滚时反而
+            # 把它停掉。查不到就在动生产文件之前拒。
+            st, st_ok = _svc_prop_ex(u, "ActiveState")
+            if not (en_ok and nr_ok and st_ok):
                 raise TxRefused("取不到 %s 的运行态(systemctl 查询失败), before-image 不完整 —— "
                                 "拒绝在没有完整回退材料的前提下改动现网" % u)
-            bi["services"][u] = {"active": _svc_active(u), "enabled": en, "nrestarts": nr}
+            st = st.strip()
+            if not st:
+                raise TxRefused("%s 的 ActiveState 是空的, 无法判定操作前状态 —— "
+                                "拒绝在没有完整回退材料的前提下改动现网" % u)
+            if st in ("activating", "deactivating", "reloading"):
+                # 过渡态下拍的快照不代表任何稳定目标: 回滚该把它起来还是停下都说不清。
+                raise TxRefused("%s 正处于 %s(过渡状态), 现在无法确定操作前的稳定状态 —— "
+                                "请稍后重试" % (u, st))
+            # active 布尔继续保留: 旧恢复记录只有它, _restore_runtime 也仍以它为准
+            bi["services"][u] = {"active": st == "active", "active_state": st,
+                                 "enabled": en, "nrestarts": nr}
         if "sysctl_tfo" in self.targets or "sysctl:apply" in self.actions:
             rc, out = _run(["sysctl", "-n", "net.ipv4.tcp_fastopen"], timeout=10)
             bi["sysctl"]["net.ipv4.tcp_fastopen"] = out.strip() if rc == 0 else ""

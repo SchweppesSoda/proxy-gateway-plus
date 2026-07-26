@@ -1562,6 +1562,9 @@ migrate_ios_gms_cleanup(){
   local mh="${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}"
   local statedir="${PDG_STATE_DIR:-/var/lib/privdns-gateway}"
   local botpy="${PDG_BOT_PY:-/opt/pdg-bot/bot.py}"
+  # nft 位置用项目统一判据(_pdg_nft_bin): `command -v nft` 只看 PATH, 而 nft 常在 /usr/sbin ——
+  # PATH 里没有 sbin 时会"跳过校验与应用却照样写配置并报成功", 那正是要避免的。
+  local nftexe; nftexe="$(_pdg_nft_bin)"
   local need_sb=0 need_nf=0
   [[ -f "$sb" ]] && grep -q '"in-gms-5228"' "$sb" && need_sb=1
   [[ -f "$nf" ]] && grep -qE 'tcp dport [{][^}]*5228' "$nf" && need_nf=1
@@ -1585,6 +1588,7 @@ migrate_ios_gms_cleanup(){
       cp -a "$f" "$wd/before-$name" || { c_y "  iOS GMS 清理: 存 before-image 失败($name) → 未改动任何文件"; rm -rf "$wd"; return 1; }
       chmod 600 "$wd/before-$name"
       stat -c '%a' "$f" > "$wd/mode-$name" 2>/dev/null || echo 600 > "$wd/mode-$name"
+      stat -c '%u:%g' "$f" > "$wd/own-$name" 2>/dev/null || echo "0:0" > "$wd/own-$name"
       echo 1 > "$wd/existed-$name"
     else
       echo 0 > "$wd/existed-$name"
@@ -1628,12 +1632,22 @@ PY
     fi
   fi
   if [[ "$need_nf" == 1 ]]; then
+    # 这一步要改防火墙 → 没有可用的 nft 就**不许往下走**(以前会静默跳过校验与应用)
+    if [[ -z "$nftexe" || ! -x "$nftexe" ]]; then
+      c_y "  iOS GMS 清理: 找不到可执行的 nft, 无法校验/应用防火墙 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+    # 旧配置文件必须在: 回滚运行态要靠"用旧配置再 nft -f 一次"。不在就别开始改运行态。
+    if [[ ! -f "$nf" ]]; then
+      c_y "  iOS GMS 清理: $nf 不存在, 无法保证运行态可回滚 → 未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
     cp -a "$nf" "$wd/cand-nftables.conf" || { c_y "  iOS GMS 清理: 复制 nft 配置失败 → 未改动任何文件"; rm -rf "$wd"; return 1; }
     _pdg_nft_strip_gms "$wd/cand-nftables.conf"
     if grep -qE 'tcp dport [{][^}]*5228' "$wd/cand-nftables.conf"; then
       # 剥完还在 = 自定义形态, 不猜也不动(交 doctor warn), 但这不是失败
       c_y "  防火墙 5228-5230 非原装形态, 未自动改(交 doctor)"; need_nf=0
-    elif command -v nft >/dev/null 2>&1 && ! nft -c -f "$wd/cand-nftables.conf" >/dev/null 2>&1; then
+    elif ! "$nftexe" -c -f "$wd/cand-nftables.conf" >/dev/null 2>&1; then
       c_y "  iOS GMS 清理: 候选防火墙 nft -c 未过 → 未改动任何文件"; rm -rf "$wd"; return 1
     fi
   fi
@@ -1646,14 +1660,27 @@ PY
       f="${g%%:*}"; name="${g##*:}"
       [[ " ${applied[*]} " == *" $name "* ]] || continue
       if [[ "$(cat "$wd/existed-$name" 2>/dev/null)" == 1 ]]; then
-        install -m "$(cat "$wd/mode-$name")" "$wd/before-$name" "$f" 2>/dev/null || bad+=("$name 写回失败")
+        local want_mode want_own
+        want_mode="$(cat "$wd/mode-$name")"; want_own="$(cat "$wd/own-$name" 2>/dev/null || echo 0:0)"
+        install -m "$want_mode" "$wd/before-$name" "$f" 2>/dev/null || bad+=("$name 写回失败")
+        chown "$want_own" "$f" 2>/dev/null || true      # 非 root 环境下 chown 会失败, 下面按实际值复核
         cmp -s "$wd/before-$name" "$f" || bad+=("$name 内容未还原")
+        [[ "$(stat -c '%a' "$f" 2>/dev/null)" == "$want_mode" ]] || bad+=("$name 权限未还原")
+        [[ "$(stat -c '%u:%g' "$f" 2>/dev/null)" == "$want_own" ]] || bad+=("$name 归属未还原")
       else
-        rm -f "$f" 2>/dev/null || bad+=("$name 删除失败")
+        # 原本不存在的必须回到"不存在", 不许留下我们造出来的文件
+        rm -f "$f" 2>/dev/null
+        [[ -e "$f" ]] && bad+=("$name 本应不存在却还在")
       fi
     done
-    if [[ " ${applied[*]} " == *" nft-apply "* ]] && command -v nft >/dev/null 2>&1; then
-      nft -f "$nf" >/dev/null 2>&1 || bad+=("nft 运行态未还原")
+    # 只要 apply **被尝试过**就必须重放旧配置: 磁盘文件在上面已经还原, 这里用它把内核里的
+    # 规则也拉回操作前, 并检查返回码 —— 第二次也失败就必须如实说"回滚不完整"。
+    if [[ " ${applied[*]} " == *" nft-apply "* ]]; then
+      if [[ -z "$nftexe" || ! -x "$nftexe" ]]; then
+        bad+=("找不到 nft, 无法确认防火墙运行态已还原")
+      elif ! "$nftexe" -f "$nf" >/dev/null 2>&1; then
+        bad+=("nft 运行态未还原(用旧配置重新加载失败)")
+      fi
     fi
     if [[ " ${applied[*]} " == *" core-restart "* ]]; then
       systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 || bad+=("内核重启失败")
@@ -1681,8 +1708,11 @@ PY
   fi
   if [[ $rc == 0 && "$need_nf" == 1 ]]; then
     step="防火墙配置"; _iosgms_put "$wd/cand-nftables.conf" "$nf" nftables.conf || rc=1
-    if [[ $rc == 0 ]] && command -v nft >/dev/null 2>&1; then
-      step="nft apply"; nft -f "$nf" >/dev/null 2>&1 && applied+=("nft-apply") || rc=1
+    if [[ $rc == 0 ]]; then
+      # **先记账再执行**: nft -f 可能改了一部分内核状态之后才返回非 0, 那时运行态已经不是
+      # 操作前的样子了 —— 只在成功后记账会让回滚只还原磁盘文件, 内核里留着半套规则。
+      step="nft apply"; applied+=("nft-apply")
+      "$nftexe" -f "$nf" >/dev/null 2>&1 || rc=1
     fi
   fi
   if [[ $rc == 0 && "$need_sb" == 1 ]]; then

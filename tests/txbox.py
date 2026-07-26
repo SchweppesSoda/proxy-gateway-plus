@@ -80,6 +80,24 @@ class Box:
                 except OSError:
                     return
         threading.Thread(target=loop, daemon=True).start()
+        # **就绪同步**: 线程起来之前(或解释器忙得没调度到它时)事务的 DNS 硬门会拿不到应答,
+        # 于是"基线好、观察期坏"被误判成本次操作造成的退化 —— 那是沙箱的锅, 不是判据的锅。
+        # 这里先自己问一次, 确认应答器真的在服务了再把端口交出去; 判据本身一行没改。
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(0.3)
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    probe.sendto(b"\x00\x01\x01\x00" + b"\x00" * 8, ("127.0.0.1", port))
+                    probe.recvfrom(512)
+                    break
+                except OSError:
+                    continue
+            else:
+                raise RuntimeError("沙箱 DNS 应答器 5 秒内没就绪")
+        finally:
+            probe.close()
         return port
 
     def _start_tcp(self):
@@ -132,9 +150,16 @@ case "$1" in
       UnitFileState) cat "$S/$U.ufs" 2>/dev/null || echo enabled;;
       LoadState) echo loaded;;
       ActiveState)
-        if [[ -f "$S/$U.state" ]]; then cat "$S/$U.state"
-        elif [[ -f "$S/$U.active" ]]; then echo active
-        else echo inactive; fi;;
+        M=$(cat "$S/__as_mode" 2>/dev/null || echo normal)
+        case "$M" in
+          fail)  exit 1;;                      # 查询失败(命令返回非 0)
+          empty) echo "";;                     # 命令成功但没输出
+          normal)
+            if [[ -f "$S/$U.state" ]]; then cat "$S/$U.state"
+            elif [[ -f "$S/$U.active" ]]; then echo active
+            else echo inactive; fi;;
+          *) echo "$M";;                       # 直接给一个字面状态(activating 之类)
+        esac;;
       *) echo "";;
     esac; exit 0;;
   restart|start)
@@ -175,6 +200,12 @@ exit 0
         """直接摆一个 ActiveState(failed / activating / deactivating …), 用来验"不许冒充 inactive"。"""
         with open(os.path.join(self.state, unit + ".state"), "w") as f:
             f.write(state + "\n")
+
+    def active_state_mode(self, mode):
+        """ActiveState 查询的行为: normal / fail(命令失败) / empty(成功但空输出) / 字面状态。
+        before-image 那一步就是靠它区分"查不到"与"确实没在跑"。"""
+        with open(os.path.join(self.state, "__as_mode"), "w") as f:
+            f.write(mode + "\n")
 
     def fail_stop(self, unit):
         """让 `systemctl stop <unit>` 返回非 0 —— 验"停不下来必须如实报未恢复"。"""

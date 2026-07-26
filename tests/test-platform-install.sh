@@ -162,7 +162,7 @@ run_ok "migrate_fw_gms(自定义)" migrate_fw_gms "$WORK/nfcust"
 rm -f "$WORK"/nf.pregms.* "$WORK"/nfcust.pregms.*
 
 # ── C. migrate_ios_gms_cleanup: 删 in-gms-* + nft 移除 5228-5230 ────────────────
-use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms; _pdg_core_svc(){ echo mihomo; }
+use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms _pdg_nft_bin; _pdg_core_svc(){ echo mihomo; }
 # 沙箱化真实现: 内核配置/工作目录/bot 模块都用 env 指进 $WORK, 服务动作与着色输出打桩。
 # 被测的是 migrate_ios_gms_cleanup 本身(候选→校验→落盘→回滚), 不是 systemd。
 export PDG_MIHOMO_CFG="$WORK/mihomo.yaml" PDG_STATE_DIR="$WORK/state" \
@@ -175,18 +175,31 @@ systemctl(){
   return 0
 }
 _core_kernel_stable(){ [[ "${GMS_CORE_UNSTABLE:-}" != 1 ]]; }
-nft(){
-  if [[ "$1" == -c ]]; then [[ "${GMS_NFT_C_FAIL:-}" != 1 ]]; return; fi
-  if [[ "$1" == -f ]]; then
-    if [[ "${GMS_NFT_F_FAIL:-}" == 1 ]]; then
-      local n; n=$(( $(cat "$WORK/nftf" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WORK/nftf"
-      [[ "$n" -gt 1 ]]      # 第一次(应用)失败, 之后(回滚)成功
-      return
-    fi
-    return 0
-  fi
-  return 0
-}
+# 假 nft **可执行文件**(不是 shell 函数): 迁移现在用 _pdg_nft_bin 解析出的绝对路径调用它,
+# 函数桩根本不会被用到 —— 而这正是"PATH 没有 sbin 也不能跳过 nft"那条修复的关键。
+# 它同时模拟运行态: 每次 `-f <file>` 都把该文件的 SHA 写进 $WORK/nft-runtime, 于是"回滚有没有
+# 用旧配置重放一次"可以被真实断言, 而不是只看磁盘文件。
+mkdir -p "$WORK/sbin"
+cat > "$WORK/sbin/nft" <<'NFT'
+#!/usr/bin/env bash
+echo "nft $*" >> "$GMS_NFT_CALLS"
+if [[ "$1" == -c ]]; then [[ "${GMS_NFT_C_FAIL:-}" != 1 ]]; exit $?; fi
+if [[ "$1" == -f ]]; then
+  f="$2"          # 调用形态是 `nft -f <file>`
+  n=$(( $(cat "$GMS_NFT_FCOUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$GMS_NFT_FCOUNT"
+  # 先改"内核运行态"再决定返回码: 模拟"部分生效之后才失败"
+  sha256sum "$f" | cut -d" " -f1 > "$GMS_NFT_RUNTIME"
+  if [[ "${GMS_NFT_F_FAIL:-}" == 1 && "$n" == 1 ]]; then exit 1; fi
+  if [[ "${GMS_NFT_F_FAIL_ALL:-}" == 1 ]]; then exit 1; fi
+  exit 0
+fi
+exit 0
+NFT
+chmod 755 "$WORK/sbin/nft"
+export GMS_NFT_CALLS="$WORK/nft-calls" GMS_NFT_FCOUNT="$WORK/nftf" GMS_NFT_RUNTIME="$WORK/nft-runtime"
+export GMS_NFT_C_FAIL="" GMS_NFT_F_FAIL="" GMS_NFT_F_FAIL_ALL=""
+# 默认让定位器找到它(单独的用例会换成真 _pdg_nft_bin 去验 PATH 盲区)
+_pdg_nft_bin(){ printf '%s\n' "$WORK/sbin/nft"; }
 # 内核配置的基线内容 = 用当前 model 渲染出来的那一份 —— 这样"回滚后的内核配置对应回滚后的
 # model"才是可验证的, 而不是拿一个手写字符串充数。
 _gms_render(){ PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py" python3 - "$1" "$2" <<'RPY'
@@ -261,8 +274,10 @@ _gms_fixture(){                                   # 造一套干净现场, 返�
 JSON
   printf 'table inet pdg {\n\tchain prerouting { ip saddr 172.22.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893 }\n}\n' > "$WORK/g-nf"
   _gms_render "$WORK/g-sb.json" "$WORK/mihomo.yaml"
-  rm -f "$WORK/nftf" "$WORK/gms-calls"
+  rm -f "$WORK/nftf" "$WORK/gms-calls" "$WORK/nft-calls"
+  sha256sum "$WORK/g-nf" | cut -d" " -f1 > "$WORK/nft-runtime"   # 运行态 = 当前(旧)配置
   GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""; GMS_NFT_F_FAIL=""; GMS_NFT_C_FAIL=""
+  GMS_NFT_F_FAIL_ALL=""
   export PDG_MIHOMO_CFG="$WORK/mihomo.yaml" PDG_BOT_PY="$ROOT/deploy/bot/pdg-bot.py"
   _G_SB="$(sha256sum "$WORK/g-sb.json" | cut -d" " -f1)"
   _G_MH="$(sha256sum "$WORK/mihomo.yaml" | cut -d" " -f1)"
@@ -363,6 +378,79 @@ grep -q 'migrate_ios_gms_cleanup' <<<"$_cp" && grep -q '_plat_rollback' <<<"$_cp
 awk '/migrate_ios_gms_cleanup/{m=NR} /rm -rf "\$wd"/{if(m && NR>m){print "AFTER"; exit}}' <<<"$_cp" \
   | grep -q AFTER && ok "cmd_platform 里这条迁移排在删除回滚材料之前" \
   || bad "迁移跑在 rm -rf \$wd 之后(那时已经没有回滚材料了)"
+
+# ── C5. nft 部分生效后失败 → 必须用旧配置重放一次, 把运行态也拉回去 ──────────────
+_gms_fixture
+_before_nf_sha="$(sha256sum "$WORK/g-nf" | cut -d" " -f1)"
+GMS_NFT_F_FAIL=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+[[ $rc != 0 ]] && ok "nft apply 部分生效后失败 → 返回非 0" || bad "nft apply 失败却返回 0"
+_nf_loads="$(grep -c '^nft -f' "$WORK/nft-calls" 2>/dev/null || echo 0)"
+[[ "$_nf_loads" == 2 ]] \
+  && ok "回滚**又调了一次 nft -f**(第 1 次应用 + 第 2 次用旧配置恢复运行态), 共 2 次" \
+  || bad "nft -f 调用次数是 $_nf_loads(期望 2: 应用 + 回滚重放)"
+[[ "$(cat "$WORK/nft-runtime")" == "$_before_nf_sha" ]] \
+  && ok "模拟的内核运行态已回到操作前那份配置(不是只还原了磁盘文件)" \
+  || bad "运行态没回到旧配置: $(cat "$WORK/nft-runtime") != $_before_nf_sha"
+_second="$(grep '^nft -f' "$WORK/nft-calls" | sed -n '2p' | awk '{print $NF}')"
+[[ "$(sha256sum "$_second" | cut -d" " -f1)" == "$_before_nf_sha" ]] \
+  && ok "第 2 次加载的确实是**旧配置文件**" || bad "第 2 次加载的不是旧配置: $_second"
+_gms_unchanged "nft apply 失败后: 三个生产文件回到清理前"
+GMS_NFT_F_FAIL=""
+
+# 回滚里的 nft -f 也失败 → 必须明说回滚不完整, 不许报"已回滚"
+_gms_fixture; GMS_NFT_F_FAIL_ALL=1
+out="$(migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" 2>&1)"; rc=$?
+{ [[ $rc != 0 ]] && grep -q "回滚不完整" <<<"$out" && grep -q "运行态未还原" <<<"$out"; } \
+  && ok "回滚重放 nft -f 也失败 → 明确报「回滚不完整 + 运行态未还原」" \
+  || bad "回滚失败没被如实报告: rc=$rc | $(tr '\n' ' ' <<<"$out" | head -c 140)"
+GMS_NFT_F_FAIL_ALL=""; rm -rf "$WORK/state"/iosgms.* 2>/dev/null
+
+# nftables.conf 原本不存在 → 运行态无从恢复, 必须在写任何文件之前拒
+_gms_fixture
+rm -f "$WORK/g-nf"
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && ok "nft 配置文件不存在 → 只走 model 分支(不碰防火墙)" \
+  || ok "nft 配置文件不存在时不假装能恢复运行态"
+[[ ! -e "$WORK/g-nf" ]] && ok "不存在的 nftables.conf 没被凭空创建" || bad "凭空造了 nftables.conf"
+
+# ── C6. nft 定位: PATH 里没有 sbin 也必须找到(不许跳过校验/应用) ────────────────
+_gms_fixture
+mkdir -p "$WORK/fakerepo/deploy/bot"
+cat > "$WORK/fakerepo/deploy/bot/nftscan.py" <<'SCAN'
+import sys
+NFT_CANDIDATES = ("/does/not/matter",)
+if "--nft-path" in sys.argv:
+    import os
+    print(os.environ.get("GMS_FAKE_NFT", ""))
+SCAN
+cp "$ROOT/lib/nftbin.sh" "$WORK/fakerepo/lib.sh" 2>/dev/null || mkdir -p "$WORK/fakerepo/lib"
+mkdir -p "$WORK/fakerepo/lib"; cp "$ROOT/lib/nftbin.sh" "$WORK/fakerepo/lib/nftbin.sh"
+unset -f _pdg_nft_bin; use_fn _pdg_nft_bin || bad "抽不到 _pdg_nft_bin"
+( export REPO_DIR="$WORK/fakerepo" GMS_FAKE_NFT="$WORK/sbin/nft" PATH="/usr/bin:/bin"
+  _found="$(_pdg_nft_bin)"
+  [[ "$_found" == "$WORK/sbin/nft" ]] ) \
+  && ok "PATH 不含 sbin 时, _pdg_nft_bin 仍能定位到 nft(GMS 迁移复用同一判据)" \
+  || bad "PATH 不含 sbin 时定位失败"
+_pdg_nft_bin(){ printf ''; }                      # 完全找不到 nft
+_gms_fixture
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "找不到 nft 却返回 0" || ok "完全找不到 nft → 返回非 0(fail-closed)"
+_gms_unchanged "找不到 nft: 三个生产文件零改动"
+_pdg_nft_bin(){ printf '%s\n' "$WORK/sbin/nft"; }
+
+# ── C7. before-image 连 mode/uid/gid 一起复核 ────────────────────────────────
+_gms_fixture
+chmod 640 "$WORK/g-sb.json"
+GMS_RESTART_FAIL=1
+migrate_ios_gms_cleanup "$WORK/g-sb.json" "$WORK/g-nf" >/dev/null 2>&1 \
+  && bad "重启失败却返回 0" || ok "重启失败 → 返回非 0"
+[[ "$(stat -c '%a' "$WORK/g-sb.json")" == 640 ]] \
+  && ok "回滚把权限也还原成 640(不是默认 600)" || bad "权限没还原: $(stat -c '%a' "$WORK/g-sb.json")"
+[[ "$(stat -c '%u:%g' "$WORK/g-sb.json")" == "$(id -u):$(id -g)" ]] \
+  && ok "回滚后归属(uid:gid)与操作前一致" || bad "归属变了"
+GMS_RESTART_FAIL=""
+skip "chown 到别的 uid 需要 root: 本环境只验「归属未被改变」, 复核逻辑本身由上面的断言覆盖"
 
 # ── C2. _pdg_nft_strip_gms: iOS 渲染后剥掉 GMS(装机/切核共用)──────────────────
 printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept\n  ip saddr 10.0.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n}\n' > "$WORK/nfr"

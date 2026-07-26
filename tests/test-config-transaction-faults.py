@@ -535,6 +535,11 @@ def main():
     bt3 = b3._pdgtx()
     bt3.svc_stable = lambda unit, **k: (True, "")
     bt3.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
+    # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。
+    # 这些用例本来就不测 systemd, 沙箱里也没有真 unit —— 给它一份确定的应答, 免得"查不到"
+    # 触发 fail-closed(那条判据本身由 test-config-transaction-faults.py 专门验)。
+    bt3._svc_prop_ex = lambda unit, prop: (
+        {"ActiveState": "active", "UnitFileState": "enabled", "NRestarts": "0"}.get(prop, ""), True)
     # 候选阶段绝不能碰生产目录: 下载/解析期间往 RS_DIR 看一眼, 必须还是空的
     seen = {}
     real_stage = bt3.Tx.stage
@@ -1202,6 +1207,212 @@ def main():
     else:
         bad("stale_unstarted 没报出来: %s" % stale)
     box18.clean()
+
+    # ── 19. abort_unstarted 对调用方严格 no-throw, 且 meta 写不进去时不删证据 ──────
+    class Sentinel(Exception):
+        pass
+
+    box19 = Box(); tx19 = load_tx(box19.env)
+    box19.up("mosdns")
+    box19.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before19.example\n", 0o644)
+
+    def _mk19(op):
+        t = tx19.Tx("test", op)
+        t.stage("mosdns_rule:custom_direct.txt", b"domain:SECRET_SENTINEL.example\n")
+        return t
+
+    def _boom(*_a, **_k):
+        raise OSError("SECRET_SENTINEL 写不进去")
+
+    # ① _save_meta 抛异常: 不抛给调用方、状态不变、证据留着
+    t = _mk19("abort_meta_fail")
+    t._save_meta = _boom
+    try:
+        r = t.abort_unstarted("放弃")
+        ok("abort_unstarted: _save_meta 抛异常时不向调用方抛(返回 %r)" % r)
+    except Exception as e:  # noqa: BLE001
+        bad("abort_unstarted 把异常抛出来了: %s" % type(e).__name__)
+    if tx19.load_meta(t.dir).get("state") == "PREPARING" \
+            and os.path.isdir(os.path.join(t.dir, "candidate")):
+        ok("ABORTED 没落盘 → 状态与候选证据都保留(交 doctor/recover 排查)")
+    else:
+        bad("meta 写失败却把证据删了: %s" % tx19.load_meta(t.dir).get("state"))
+
+    # ② _cleanup_materials 抛异常: 状态仍是 ABORTED, 不抛, 记 warning
+    t = _mk19("abort_cleanup_fail")
+    t._cleanup_materials = _boom
+    r = None
+    try:
+        r = t.abort_unstarted("放弃")
+    except Exception as e:  # noqa: BLE001
+        bad("cleanup 异常被抛出: %s" % type(e).__name__)
+    if r is True and tx19.load_meta(t.dir)["state"] == "ABORTED":
+        ok("cleanup 抛异常: 仍收尾为 ABORTED 且不抛(材料保留并记 warning)")
+    else:
+        bad("cleanup 异常后的状态不对: %s" % r)
+
+    # ③ _audit 抛异常: 同样不影响结果
+    t = _mk19("abort_audit_fail")
+    real_audit = tx19._audit
+    tx19._audit = _boom
+    r = None
+    try:
+        r = t.abort_unstarted("放弃")
+    except Exception as e:  # noqa: BLE001
+        bad("audit 异常被抛出: %s" % type(e).__name__)
+    finally:
+        tx19._audit = real_audit
+    if r is True and tx19.load_meta(t.dir)["state"] == "ABORTED":
+        ok("audit 抛异常: 收尾照旧完成, 业务结果不变")
+    else:
+        bad("audit 异常影响了收尾: %s" % r)
+
+    # ④ 调用方原始异常必须原样传播, 且清理异常不改写它
+    def _caller_raises():
+        with _mk19("abort_keeps_exc") as t2:
+            t2._save_meta = _boom
+            raise Sentinel("SENTINEL 原始异常")
+    try:
+        _caller_raises(); bad("原始异常没传出来")
+    except Sentinel:
+        ok("with 退出时清理失败, 调用方的原始异常仍原样传播")
+    except Exception as e:  # noqa: BLE001
+        bad("原始异常被换成了 %s" % type(e).__name__)
+
+    # ⑤ 正常返回路径不被清理异常改成失败
+    def _caller_returns():
+        with _mk19("abort_keeps_ret") as t3:
+            t3._cleanup_materials = _boom
+            return "业务成功"
+    if _caller_returns() == "业务成功":
+        ok("with 退出时清理失败, 正常返回值不被改写")
+    else:
+        bad("返回值被清理逻辑改了")
+
+    # ⑥ 任何路径都不许把候选正文/异常正文写进 meta 或审计
+    leak = []
+    for d in sorted(os.listdir(box19.env["PDG_TX_ROOT"])):
+        mp = os.path.join(box19.env["PDG_TX_ROOT"], d, "meta.json")
+        if os.path.isfile(mp) and "SECRET_SENTINEL" in open(mp, encoding="utf-8").read():
+            leak.append(d)
+    au19 = open(tx19.AUDIT, encoding="utf-8").read() if os.path.exists(tx19.AUDIT) else ""
+    if not leak and "SECRET_SENTINEL" not in au19:
+        ok("abort 各条失败路径都没把 SECRET_SENTINEL 写进 meta 或审计")
+    else:
+        bad("SECRET_SENTINEL 泄露: meta=%s" % leak)
+    box19.clean()
+
+    # ── 20. before-image 的 ActiveState: 查询失败/空输出/过渡态一律在写盘前拒 ─────
+    for label, mode, want in (("查询失败", "fail", "systemctl 查询失败"),
+                              ("命令成功但没输出", "empty", "ActiveState 是空的"),
+                              ("过渡态 activating", "activating", "过渡状态")):
+        b20 = Box(); tx20 = load_tx(b20.env)
+        b20.up("mosdns")
+        b20.put("/etc/mosdns/rules/custom_direct.txt", b"domain:before20.example\n", 0o644)
+        b20.active_state_mode(mode)
+        t = tx20.Tx("test", "activestate")
+        t.stage("mosdns_rule:custom_direct.txt", b"domain:after20.example\n")
+        t.service("restart:mosdns")
+        try:
+            t.commit(); bad("%s 却照样提交了" % label)
+        except tx20.TxRefused as e:
+            intact = b20.read("/etc/mosdns/rules/custom_direct.txt") == b"domain:before20.example\n"
+            if want in str(e) and intact:
+                ok("ActiveState %s → 在写生产文件之前拒绝, 现网零改动" % label)
+            else:
+                bad("%s 的拒绝原因/现网状态不对: %s" % (label, e))
+        b20.clean()
+
+    # 正常 active / inactive 两种 before-image + 回滚
+    for pre_active in (True, False):
+        b20 = Box(); tx20 = load_tx(b20.env)
+        b20.up("mosdns")
+        if pre_active:
+            b20.up("pdg-mitm")
+        else:
+            b20.down("pdg-mitm")
+        b20.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
+        before20 = b20.read("/etc/privdns-gateway/mitm.json")
+        t = tx20.Tx("bot", "before-image", mode="repair")
+        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+        t.service("restart:pdg-mitm"); t.service("restart:mosdns")
+        b20._systemctl(["mosdns"], False)            # mosdns 重启失败 → 触发回滚
+        res = t.commit()
+        rec = {}
+        try:
+            bi20 = json.load(open(os.path.join(res["dir"], "before", "index.json"), encoding="utf-8"))
+            rec = (bi20.get("services") or {}).get("pdg-mitm") or {}
+        except Exception:  # noqa: BLE001
+            pass
+        now_active = os.path.exists(os.path.join(b20.state, "pdg-mitm.active"))
+        want_state = "active" if pre_active else "inactive"
+        if rec.get("active") is pre_active and rec.get("active_state") == want_state \
+                and now_active is pre_active \
+                and b20.read("/etc/privdns-gateway/mitm.json") == before20:
+            ok("操作前 %s 的服务: before-image 记对了, 回滚后回到同一状态" % want_state)
+        else:
+            bad("before-image/回滚不对(pre_active=%s): %s / now=%s" % (pre_active, rec, now_active))
+        b20.clean()
+
+    # 旧格式 before-image(只有 active 布尔)仍能 recover
+    b20 = Box(); tx20 = load_tx(b20.env)
+    b20.up("mosdns")
+    b20.put("/etc/mosdns/rules/custom_direct.txt", b"domain:old20.example\n", 0o644)
+    keep20 = b20.read("/etc/mosdns/rules/custom_direct.txt")
+    t = tx20.Tx("cli", "legacy-bi")
+    t.stage("mosdns_rule:custom_direct.txt", b"domain:new20.example\n")
+    t.service("restart:mosdns")
+    real_do20 = tx20.Tx._do_actions
+    tx20.Tx._do_actions = lambda self: (_ for _ in ()).throw(SystemExit("断电"))
+    try:
+        t.commit()
+    except SystemExit:
+        pass
+    finally:
+        tx20.Tx._do_actions = real_do20
+    bip = os.path.join(t.dir, "before", "index.json")
+    bi = json.load(open(bip, encoding="utf-8"))
+    for u in bi.get("services", {}):
+        bi["services"][u].pop("active_state", None)      # 退化成旧格式
+        bi["services"][u].pop("enabled", None)
+    with open(bip, "w", encoding="utf-8") as f:
+        json.dump(bi, f)
+    r20 = tx20.recover(t.txid, root=t.root)
+    if r20.get("ok") and b20.read("/etc/mosdns/rules/custom_direct.txt") == keep20:
+        ok("旧格式 before-image(无 active_state / 无 enabled)仍能 recover 并逐字节还原")
+    else:
+        bad("旧格式 before-image 恢复失败: %s" % r20)
+    b20.clean()
+
+    # ── 21. UnitFileState: 合法空值也要参与精确比对 ──────────────────────────
+    b21 = Box(); tx21 = load_tx(b21.env)
+    b21.up("mosdns"); b21.down("pdg-mitm")
+    with open(os.path.join(b21.state, "pdg-mitm.ufs"), "w") as f:
+        f.write("\n")                                   # 操作前 UnitFileState 是**合法空值**
+    b21.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
+    t = tx21.Tx("bot", "ufs-empty-then-enabled", mode="repair")
+    t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+    t.service("restart:pdg-mitm"); t.service("restart:mosdns")
+    # 在**事务进行中**把 UnitFileState 从空值改成 enabled(模拟别的东西动了 unit), 同时让这一步
+    # 失败以触发回滚 —— 顺序很关键: before-image 必须先记下那个合法空值。
+    ufs21 = os.path.join(b21.state, "pdg-mitm.ufs")
+    real_do21 = tx21.Tx._do_actions
+
+    def _flip21(self):
+        with open(ufs21, "w") as fh:
+            fh.write("enabled\n")
+        return "注入: 服务动作失败"
+    tx21.Tx._do_actions = _flip21
+    try:
+        res = t.commit()
+    finally:
+        tx21.Tx._do_actions = real_do21
+    named = any("开机自启" in x for x in res.get("rollback_failed_items") or [])
+    if res["state"] == tx21.ROLLBACK_FAILED and named:
+        ok("原值为空、回滚后变 enabled → 识别为不一致并记 ROLLBACK_FAILED(不假成功)")
+    else:
+        bad("空值被跳过比较了: %s / %s" % (res["state"], res.get("rollback_failed_items")))
+    b21.clean()
 
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))

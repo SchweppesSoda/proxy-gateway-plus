@@ -417,6 +417,11 @@ with tempfile.TemporaryDirectory() as td:
     _tx = bot._pdgtx()
     _tx.svc_stable = lambda unit, **k: (True, "")            # 沙箱里没有真 systemd
     _tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
+    # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。
+    # 这些用例本来就不测 systemd, 沙箱里也没有真 unit —— 给它一份确定的应答, 免得"查不到"
+    # 触发 fail-closed(那条判据本身由 test-config-transaction-faults.py 专门验)。
+    _tx._svc_prop_ex = lambda unit, prop: (
+        {"ActiveState": "active", "UnitFileState": "enabled", "NRestarts": "0"}.get(prop, ""), True)
     _tx.VALIDATORS["mihomo_check"] = lambda path, data, ctx: (True, "")
     _tx.VALIDATORS["mosdns_probe"] = lambda path, data, ctx: (True, "")
     ok, err = bot.restore_from(raw.getvalue())

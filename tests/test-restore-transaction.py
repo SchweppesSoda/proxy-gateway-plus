@@ -436,6 +436,7 @@ def main():
     # ── 10c. 规则集路径的各种绕过写法都要拒(且拒在落盘之前) ──
     for label, path in (("../rs/foo.json", "/etc/sing-box/rs/../rs/foo.json"),
                         ("别处的绝对路径", "/tmp/rs/foo.json"),
+                        ("前缀伪装(/evil/etc/sing-box/rs)", "/evil/etc/sing-box/rs/foo.json"),
                         ("双斜杠", "/etc/sing-box//rs/foo.json"),
                         ("反斜杠", "\\etc\\sing-box\\rs\\foo.json")):
         box, bot = make_box()
@@ -449,6 +450,18 @@ def main():
         else:
             bad("规则集路径 %s 被接受了: %s" % (label, msg))
         box.clean()
+
+    # 合法沙箱映射(path 指向本机 RS_DIR)也必须通过 —— 收紧不能把镜像树的合法备份挡掉
+    box, bot = make_box()
+    okr, msg = bot.restore_from(full_backup(
+        meta={"rs_ok": {"url": "https://x/a", "outbound": "new-tw", "format": "source",
+                        "path": os.path.join(bot.RS_DIR, "rs_ok.json"), "count": 1}},
+        rs=[("rs_ok.json", b'{"rules":["DOMAIN,ok.com"]}')]))
+    if okr and box.read("/etc/sing-box/rs/rs_ok.json") == b'{"rules":["DOMAIN,ok.com"]}':
+        ok("合法沙箱映射路径(本机 RS_DIR)仍被接受并落盘")
+    else:
+        bad("收紧误伤了合法沙箱路径: %s" % msg)
+    box.clean()
 
     # 同一个 tar 成员出现两次 → 整包拒绝(不采用"后一个覆盖前一个")
     box, bot = make_box()
