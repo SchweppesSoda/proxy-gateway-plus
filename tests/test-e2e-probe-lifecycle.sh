@@ -21,7 +21,9 @@ skip(){ echo "[SKIP] $1"; }          # 不计入 pass
 # 本测试专属的探针标记: 让 e2e-lib 把临时文件建在这个目录下, 于是"数进程"可以精确到本实例
 WORK="$(mktemp -d /tmp/e2e-probe-life.XXXXXX)"
 export TMPDIR="$WORK"                       # e2e-lib 的 mktemp 会落在这里
-trap 'rm -rf "$WORK"' EXIT
+# 这里**不能**直接 `trap ... EXIT`: source e2e-lib.sh 之后第一次 e2e_tx_probes 会通过
+# e2e_add_exit_hook 重设统一的 EXIT trap, 把这条顶掉 —— 于是每跑一次就留一个空的
+# /tmp/e2e-probe-life.*。改为在 source 之后注册具名清理函数(见 _life_cleanup)。
 
 # 只数"命令行里带本测试 WORK 前缀"的探针进程 —— 与并发跑的其它 E2E、其它 python3 完全隔离
 probe_count(){ pgrep -f -- "$WORK/e2e-tx-probe\." 2>/dev/null | wc -l | tr -d ' '; }
@@ -43,6 +45,16 @@ source "$HERE/e2e-lib.sh"
 # 于是本测试的计数只会停在 1。把本测试的计数函数重新定义回来。
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
+
+# 本测试的夹具清理: **先收探针再删目录** —— 反过来会把探针脚本先删掉, 那时 _e2e_probe_is_mine
+# 靠 cmdline 认身份还认得出, 但材料已经没了; 顺序固定更稳。只删本实例精确持有的 $WORK,
+# 不碰并发实例的目录; 重复调用安全; 不改变退出码。
+_life_cleanup(){
+  e2e_tx_probe_stop || true
+  [[ -n "${WORK:-}" && -d "$WORK" ]] && rm -rf -- "$WORK"
+  return 0
+}
+e2e_add_exit_hook _life_cleanup             # 异常中断时的兜底(正常流程末尾会显式再调一次)
 
 # ── 1. 单次启动: 就绪成功 / PID 活着 / ports 三个合法端口 / 文件属于本实例 ──
 if e2e_tx_probes; then
@@ -239,6 +251,15 @@ _pc="$(probe_count)"; _oc="$(orphan_count)"; _tc="$(tmpfile_count)"
 [[ ! -e /tmp/e2e-tx-probe.py && ! -e /tmp/e2e-tx-probe.ports ]] \
   && ok "旧的固定共享路径没有被重新创建" \
   || skip "机器上仍有旧路径残留(可能来自本次修复之前的历史进程, 与本实现无关)"
+
+# ── 11. 夹具清理: 显式跑一次并验证结果(EXIT hook 只作异常兜底) ──
+_life_cleanup
+if [[ ! -d "$WORK" ]]; then ok "夹具清理: 本实例 WORK 目录已删除(不再每跑一次留一个空目录)"
+else bad "WORK 目录还在: $WORK"; fi
+_pc="$(probe_count)"; _tc="$(tmpfile_count)"
+if [[ "$_pc" == 0 ]]; then ok "夹具清理后: 本实例探针 0 个"; else bad "清理后仍有 $_pc 个探针"; fi
+if [[ "$_tc" == 0 ]]; then ok "夹具清理后: 本实例 script/ports 临时文件 0 个"; else bad "仍有 $_tc 个临时文件"; fi
+if _life_cleanup; then ok "夹具清理: 重复调用安全(不报错)"; else bad "重复清理报错了"; fi
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
