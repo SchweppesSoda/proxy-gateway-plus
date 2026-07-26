@@ -271,6 +271,84 @@ def main():
         os.environ.pop(k, None)
     box2.clean()
 
+    # ── 9. certbot deploy-hook 必须 fail-closed(四) ──
+    # 场景: 事务核心在, 但准备阶段出错(第二个证书 stage 失败 / 没有 python3 / new 失败)。
+    # 旧实现会 fall through 去逐个 cp —— 恰恰在最不该冒险的时刻绕过事务覆盖生产证书。
+    import shutil as _sh
+    hookdir = tempfile.mkdtemp(prefix="pdgtx-hook.")
+    live = os.path.join(hookdir, "live"); os.makedirs(live)
+    certdir = os.path.join(hookdir, "certs"); os.makedirs(certdir)
+    binp = os.path.join(hookdir, "bin"); os.makedirs(binp)
+    txroot = os.path.join(hookdir, "opt", "privdns-gateway", "deploy", "bot")
+    os.makedirs(txroot)
+    with open(os.path.join(live, "fullchain.pem"), "wb") as f:
+        f.write(b"NEW-CHAIN\n")
+    with open(os.path.join(live, "privkey.pem"), "wb") as f:
+        f.write(b"NEW-KEY\n")
+    OLD_CHAIN, OLD_KEY = b"OLD-CHAIN\n", b"OLD-KEY\n"
+    for n, v in (("fullchain.pem", OLD_CHAIN), ("privkey.pem", OLD_KEY)):
+        with open(os.path.join(certdir, n), "wb") as f:
+            f.write(v)
+    # 假事务核心: new 给个 id; 第一次 stage 成功、第二次(私钥)失败
+    fake_tx = os.path.join(hookdir, "pdgtx.py")
+    with open(fake_tx, "w") as f:
+        f.write("import sys\n"
+                "cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+                "if cmd == 'new':\n    print('TX-FAKE-1'); sys.exit(0)\n"
+                "if cmd == 'stage':\n"
+                "    sys.exit(1 if 'cert_privkey' in sys.argv else 0)\n"
+                "sys.exit(0)\n")
+    # 把 hook 拷出来, 只把它写死的两个事务核心路径改到沙箱(不给生产代码加接缝)
+    hook = os.path.join(hookdir, "hook.sh")
+    src = (ROOT / "deploy/cert/99-reload-cert.deploy-hook.sh").read_text(encoding="utf-8")
+    src = src.replace("/opt/privdns-gateway/deploy/bot/pdgtx.py", fake_tx)
+    src = src.replace("/opt/pdg-bot/pdgtx.py", os.path.join(hookdir, "nonexistent.py"))
+    with open(hook, "w") as f:
+        f.write(src)
+    env = dict(os.environ, PDG_CERT_DIR=certdir, RENEWED_LINEAGE=live,
+               PATH=binp + os.pathsep + os.environ["PATH"])
+    r = subprocess.run(["bash", hook], capture_output=True, text=True, env=env)
+    same = (open(os.path.join(certdir, "fullchain.pem"), "rb").read() == OLD_CHAIN
+            and open(os.path.join(certdir, "privkey.pem"), "rb").read() == OLD_KEY)
+    if r.returncode != 0 and same:
+        ok("hook: 第二个证书 stage 失败 → 非 0 退出, **两个生产证书都没被动**")
+    else:
+        bad("hook fail-open 了: rc=%s 证书是否原样=%s" % (r.returncode, same))
+    if "未改动生产证书" in (r.stdout + r.stderr):
+        ok("hook: 明说了未改动生产证书(不含糊)")
+    else:
+        bad("hook 没说清楚: %s" % (r.stdout + r.stderr)[:120])
+    # 事务核心在但没有 python3 → 同样中止, 不绕过事务
+    nopy = os.path.join(hookdir, "nopy"); os.makedirs(nopy)
+    for c in ("bash", "sh", "cp", "chmod", "mkdir", "systemctl", "find", "sort", "head", "tr"):
+        srcb = _sh.which(c)
+        if srcb:
+            os.symlink(srcb, os.path.join(nopy, c))
+    r = subprocess.run(["bash", hook], capture_output=True, text=True,
+                       env=dict(env, PATH=nopy))
+    same = (open(os.path.join(certdir, "fullchain.pem"), "rb").read() == OLD_CHAIN
+            and open(os.path.join(certdir, "privkey.pem"), "rb").read() == OLD_KEY)
+    if r.returncode != 0 and same and "python3" in (r.stdout + r.stderr):
+        ok("hook: 事务核心在但没有 python3 → 中止并点名原因, 不绕过事务")
+    else:
+        bad("无 python3 时没 fail-closed: rc=%s 原样=%s %s" % (r.returncode, same,
+                                                              (r.stdout + r.stderr)[:80]))
+    # legacy: 事务核心**完全不存在**才允许直接部署, 且必须标注
+    src2 = (ROOT / "deploy/cert/99-reload-cert.deploy-hook.sh").read_text(encoding="utf-8")
+    src2 = src2.replace("/opt/privdns-gateway/deploy/bot/pdgtx.py",
+                        os.path.join(hookdir, "no1.py"))
+    src2 = src2.replace("/opt/pdg-bot/pdgtx.py", os.path.join(hookdir, "no2.py"))
+    hook2 = os.path.join(hookdir, "hook-legacy.sh")
+    with open(hook2, "w") as f:
+        f.write(src2)
+    r = subprocess.run(["bash", hook2], capture_output=True, text=True, env=env)
+    if r.returncode == 0 and open(os.path.join(certdir, "fullchain.pem"), "rb").read() == b"NEW-CHAIN\n" \
+            and "legacy" in (r.stdout + r.stderr):
+        ok("hook: 只有事务核心完全不存在时才走 legacy 直接部署, 且明确标注")
+    else:
+        bad("legacy 分支不对: rc=%s %s" % (r.returncode, (r.stdout + r.stderr)[:100]))
+    _sh.rmtree(hookdir, ignore_errors=True)
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
