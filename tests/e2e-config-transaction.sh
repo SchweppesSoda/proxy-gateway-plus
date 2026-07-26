@@ -100,6 +100,9 @@ okr, err = m.VALIDATORS["mosdns_probe"]("/etc/mosdns/config.yaml", data, None)
 print("PROBE|" + ("ok" if okr else "fail") + "|" + (err or "")[:100].replace("\n", " "))
 PY
 }
+# CI 的容器里没有 mosdns —— 强校验这三条路径必须真跑, 所以按钉死版本取一份真二进制,
+# 取不到就如实判失败(不 SKIP 冒充通过)。
+e2e_fetch_mosdns || true
 if command -v mosdns >/dev/null 2>&1; then
   r="$(PDG_TX_MOSDNS_PROBE_MODE=netns probe netns "$BAD_CONF")"
   grep -q '^PROBE|fail' <<<"$r" && ok "netns 探针: 坏配置被判失败($(cut -d'|' -f3 <<<"$r" | head -c 40))" \
