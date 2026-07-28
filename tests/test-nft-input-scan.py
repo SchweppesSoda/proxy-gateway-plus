@@ -617,6 +617,10 @@ table inet filter {
         with open(os.path.join(stub, "systemctl"), "w") as fh:
             fh.write("#!/bin/sh\nexit 0\n")                     # 别真去动本机服务
         os.chmod(os.path.join(stub, "systemctl"), 0o755)
+        quic = os.path.join(tmp, "pdg-quic-routing.sh")
+        with open(quic, "w") as fh:
+            fh.write('#!/bin/sh\ncase "$1" in\n  apply|status) exit 0 ;;\n  *) exit 1 ;;\nesac\n')
+        os.chmod(quic, 0o755)
         base = _clean_env(REPO_DIR=repo)
         env = dict(base, PATH=stub + os.pathsep + base["PATH"])
 
@@ -645,7 +649,9 @@ table inet filter {
             hook = os.path.join(tmp, name)
             with open(hook, "w", encoding="utf-8") as fh:
                 fh.write(src.replace("/opt/privdns-gateway/lib", os.path.join(repo, "lib"))
-                            .replace("/etc/nftables.conf", conf))
+                            .replace("/etc/nftables.conf", conf)
+                            .replace("/usr/local/libexec/pdg-quic-routing.sh",
+                                     quic.replace("\\", "/")))
             os.chmod(hook, 0o755)
             open(log, "w").close(); open(ipt_log, "w").close()
             r = subprocess.run(["bash", hook], capture_output=True, text=True, env=env)
