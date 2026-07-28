@@ -22,6 +22,14 @@ e2e_seed_singbox_model
 printf 'mihomo\n' > /etc/privdns-gateway/backend
 e2e_seed_platform ios                                  # WLOC 仅 iOS
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
+# 已部署的 iOS 机器必有受管 pdg-mitm unit；事务只负责启停它，不负责
+# 临时补 unit。使用真实 unit 生成器建立基线，让假 systemctl 可严格拒绝
+# 不存在/拼错的服务名而不把测试跑绿。
+# shellcheck source=lib/units.sh
+source "$E2E_ROOT/lib/units.sh" \
+  || { echo "[FAIL] 无法加载 unit 生成器" >&2; exit 1; }
+pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service \
+  || { echo "[FAIL] 无法建立 pdg-mitm unit 基线" >&2; exit 1; }
 
 LAT=34.6937; LON=135.5023      # 大阪
 

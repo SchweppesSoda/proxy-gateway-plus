@@ -43,7 +43,6 @@ for u in pdg-bot mosdns mihomo; do echo 1 > "/tmp/e2e-svc/$u.ac"; echo 1 > "/tmp
 # 有效的 mihomo 配置(下面某些用例会故意写坏它)
 printf '{"log-level":"silent","mixed-port":17890,"proxies":[],"rules":["MATCH,DIRECT"]}\n' \
   > /etc/mihomo/config.yaml
-GOOD_CFG="$(cat /etc/mihomo/config.yaml)"
 
 # ══ 1. restart: 服务起不来必须返回非 0 ══════════════════════════════════════
 echo "── 1. restart 的真实校验 ──"
@@ -65,25 +64,46 @@ out=$(pdg restart 2>&1); rc=$?
   && ok "mosdns 起不来 → 返回非 0 并点名" || bad "1e: rc=$rc: $(tail -3 <<<"$out")"
 e2e_svc_heal mosdns
 
-# 内核配置坏掉 → 一个服务都不该重启。这条要求 PATH 上是**真** mihomo(桩会把任何配置判过),
-# 串行跑时前一个脚本可能留了个桩 —— 明确要一次真内核, 拿不到就说清楚而不是默默判绿。
-if ! e2e_mihomo_is_real; then
-  e2e_fetch_mihomo || true
-fi
-if ! e2e_mihomo_is_real; then
-  bad "1f: 拿不到真 mihomo(PATH 上是桩), 配置校验这条无法验证"
-else
-printf 'proxies: [\n' > /etc/mihomo/config.yaml
-out=$(pdg restart 2>&1); rc=$?          # 第一次顺带让幂等迁移落定(它自己也会重启服务)
-{ [[ "$rc" != 0 ]] && grep -q '校验' <<<"$out"; } \
-  && ok "内核配置不合法 → 先报校验失败, 返回非 0" || bad "1f: rc=$rc: $(tail -3 <<<"$out")"
+# restart 会从 canonical source model 重新渲染 mihomo，单独破坏当前 config 会被合法候选覆盖，
+# 不能证明失败门真的挡在重启之前。给 model 注入一个转换器明确不支持的 outbound；候选渲染
+# 必须失败，live config 不得改写，systemctl restart 次数也必须保持不变。用例结束后逐字节
+# 恢复 model，避免污染后续 section。
+MODEL=/etc/sing-box/config.json
+MODEL_BEFORE=/tmp/e2e-cli-model.before
+GOOD_CFG=/tmp/e2e-cli-good-config.before
+cp -a "$MODEL" "$MODEL_BEFORE"
+cp -a /etc/mihomo/config.yaml "$GOOD_CFG"
+python3 - "$MODEL" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    model = json.load(stream)
+model.setdefault("outbounds", []).append({
+    "type": "wireguard",
+    "tag": "restart-unsupported",
+})
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(model, stream, ensure_ascii=False, indent=2)
+    stream.write("\n")
+PY
 CALLS_BEFORE="$(grep -c 'systemctl restart' /tmp/e2e-calls.log 2>/dev/null)"
 out=$(pdg restart 2>&1); rc=$?
 CALLS_AFTER="$(grep -c 'systemctl restart' /tmp/e2e-calls.log 2>/dev/null)"
-{ [[ "$rc" != 0 ]] && [[ "$CALLS_BEFORE" == "$CALLS_AFTER" ]]; } \
-  && ok "校验没过时一个服务都没重启" || bad "1g: rc=$rc 重启计数 $CALLS_BEFORE→$CALLS_AFTER"
-printf '%s\n' "$GOOD_CFG" > /etc/mihomo/config.yaml
-fi
+{ [[ "$rc" != 0 ]] && grep -qE '候选渲染/校验失败|校验失败' <<<"$out"; } \
+  && ok "canonical model 含不支持出口 → 候选渲染失败并返回非 0" \
+  || bad "1f: rc=$rc: $(tail -3 <<<"$out")"
+{ [[ "$CALLS_BEFORE" == "$CALLS_AFTER" ]] \
+  && cmp -s "$GOOD_CFG" /etc/mihomo/config.yaml; } \
+  && ok "候选失败时未重启服务且 live config 未改写" \
+  || bad "1g: 重启计数 $CALLS_BEFORE→$CALLS_AFTER 或 live config 漂移"
+cp -a "$MODEL_BEFORE" "$MODEL"
+cmp -s "$MODEL_BEFORE" "$MODEL" \
+  && ok "负向用例后 canonical model 已逐字节恢复" \
+  || bad "1h: canonical model 恢复后字节漂移"
+rm -f "$MODEL_BEFORE"
+rm -f "$GOOD_CFG"
 
 # ══ 2. restart: 未配 Bot 凭据时明确跳过 pdg-bot ═════════════════════════════
 echo; echo "── 2. 未配 Bot 凭据 ──"

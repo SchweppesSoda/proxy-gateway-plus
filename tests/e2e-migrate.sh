@@ -67,6 +67,7 @@ PY
 {"log":{"level":"warn"},
  "inbounds":[{"type":"direct","tag":"in-http","listen":"0.0.0.0","listen_port":80,"sniff":true,"sniff_override_destination":true},
              {"type":"direct","tag":"in-https","listen":"0.0.0.0","listen_port":443,"sniff":true,"sniff_override_destination":true},
+             {"type":"mixed","tag":"tg-proxy","listen":"0.0.0.0","listen_port":8445},
              {"type":"direct","tag":"in-gms-5228","listen":"0.0.0.0","listen_port":5228,"sniff":true,"sniff_override_destination":true},
              {"type":"direct","tag":"in-gms-5229","listen":"0.0.0.0","listen_port":5229,"sniff":true,"sniff_override_destination":true},
              {"type":"direct","tag":"in-gms-5230","listen":"0.0.0.0","listen_port":5230,"sniff":true,"sniff_override_destination":true}],
@@ -76,8 +77,9 @@ PY
                    {"domain_suffix":["ip.skk.moe","example.test"],"outbound":"jp"}],
           "final":"direct"}}
 J
-  # 当时由 PDG 安装且仍在运行的 sing-box runtime。可信归属标记与历史
-  # unit 形态让迁移真正覆盖 stop/disable/read-back/remove 生命周期。
+  # 当时由 PDG 安装且仍在运行的 sing-box runtime。v1.4.x 还没有可信归属
+  # token；迁移先据现场落 backend 标记，再由完整历史 unit + PDG model
+  # 特征证明归属，覆盖 stop/disable/read-back/remove 生命周期。
   cat > /usr/local/bin/sing-box <<'SB'
 #!/bin/sh
 exit 0
@@ -96,7 +98,7 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 SBU
-  : > /etc/privdns-gateway/singbox.pdg-owned
+  rm -f /etc/privdns-gateway/singbox.pdg-owned
   echo 1 > /tmp/e2e-svc/sing-box.ac
   echo 1 > /tmp/e2e-svc/sing-box.en
   echo 0 > /tmp/e2e-svc/mihomo.ac

@@ -318,12 +318,23 @@ unit_key(){
 unit_file(){
   case "$1" in *.service|*.timer) printf '%s\n' "$1";; *) printf '%s.service\n' "$1";; esac
 }
+os_unit_known(){
+  # 容器里的 /lib/systemd/system 属于宿主镜像，不能把其中任意 unit 都当成
+  # 测试夹具的一部分；否则拼错/误用一个恰好存在的宿主服务也会被桩跑绿。
+  case "$(unit_file "$1")" in
+    nftables.service|systemd-journald.service|systemd-resolved.service|vnstat.service)
+      return 0;;
+  esac
+  return 1
+}
 unit_known(){
   uk=$(unit_key "$1"); uf=$(unit_file "$1")
   [ -e "/etc/systemd/system/$uf" ] \
-    || [ -e "/lib/systemd/system/$uf" ] \
-    || [ -e "/usr/lib/systemd/system/$uf" ] \
+    || os_unit_known "$1" \
     || [ -f "$D/${uk}.ac" ] || [ -f "$D/${uk}.en" ]
+}
+units_known(){
+  for candidate in "$@"; do unit_known "$candidate" || return 1; done
 }
 quic_action(){
   [ "$1" = pdg-quic-routing ] || return 0
@@ -333,7 +344,10 @@ quic_action(){
 verb="$1"; shift
 now=0; [ "$1" = "--now" ] && { now=1; shift; }
 case "$verb" in
-  daemon-reload|reset-failed|preset|mask|unmask) exit 0;;
+  daemon-reload) exit 0;;
+  reset-failed|preset|mask|unmask)
+      units_known "$@" || exit 1
+      exit 0;;
   enable)  rc=0; for u in "$@"; do
              unit_known "$u" || { rc=1; continue; }
              u=$(unit_key "$u"); echo 1 > "$D/${u}.en"
@@ -392,7 +406,7 @@ case "$verb" in
         exit 0
       fi
       if [ "$prop" = LoadState ]; then
-        [ -f "/etc/systemd/system/${u%.service}.service" ] && echo loaded || echo not-found
+        unit_known "$u" && echo loaded || echo not-found
         exit 0
       fi
       if [ "$prop" = UnitFileState ]; then
@@ -411,11 +425,13 @@ case "$verb" in
       done
       exit 0;;
   list-unit-files)
-      for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer \
-               /lib/systemd/system/*.service /lib/systemd/system/*.timer \
-               /usr/lib/systemd/system/*.service /usr/lib/systemd/system/*.timer; do
+      for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer; do
         [ -e "$f" ] || continue
         printf '%s disabled\n' "${f##*/}"
+      done
+      for uf in nftables.service systemd-journald.service \
+                systemd-resolved.service vnstat.service; do
+        printf '%s disabled\n' "$uf"
       done
       exit 0;;
   status)
@@ -430,7 +446,91 @@ S
   cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
 echo "nft $*" >> /tmp/e2e-calls.log
-exit 0
+state=/tmp/e2e-nft-ruleset
+list_tables(){
+  awk '
+    $1 == "table" && index($0, "{") {
+      key = $2 SUBSEP $3
+      if (!seen[key]++) print "table " $2 " " $3
+    }
+  ' "$state" 2>/dev/null
+}
+list_table(){
+  awk -v family="$1" -v table_name="$2" '
+    function opens(s, copy)  { copy=s; return gsub(/\{/, "", copy) }
+    function closes(s, copy) { copy=s; return gsub(/\}/, "", copy) }
+    !inside && $1 == "table" && $2 == family && $3 == table_name \
+      && index($0, "{") {
+        inside=1; found=1
+        depth=opens($0)-closes($0)
+        print
+        if (depth <= 0) inside=0
+        next
+      }
+    inside {
+      depth+=opens($0)-closes($0)
+      print
+      if (depth <= 0) inside=0
+    }
+    END { if (!found || inside) exit 1 }
+  ' "$state" 2>/dev/null
+}
+delete_table(){
+  family="$1"; table_name="$2"; tmp="${state}.tmp.$$"
+  awk -v family="$family" -v table_name="$table_name" '
+    function opens(s, copy)  { copy=s; return gsub(/\{/, "", copy) }
+    function closes(s, copy) { copy=s; return gsub(/\}/, "", copy) }
+    inside {
+      depth+=opens($0)-closes($0)
+      if (depth <= 0) inside=0
+      next
+    }
+    $1 == "delete" && $2 == "table" && $3 == family && $4 == table_name {
+      found=1
+      next
+    }
+    $1 == "table" && $2 == family && $3 == table_name {
+      found=1
+      if (index($0, "{")) {
+        inside=1
+        depth=opens($0)-closes($0)
+        if (depth <= 0) inside=0
+      }
+      next
+    }
+    { print }
+    END { if (!found || inside) exit 1 }
+  ' "$state" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$state"
+}
+case "${1:-}" in
+  -c)
+      [ "$#" -eq 3 ] && [ "${2:-}" = -f ] && [ -r "${3:-}" ] || exit 2
+      exit 0;;
+  -f)
+      [ "$#" -eq 2 ] && [ -r "${2:-}" ] || exit 2
+      cp "${2:-}" "$state" || exit 1
+      exit 0;;
+  list)
+      if [ "$#" -eq 2 ] && [ "${2:-}" = ruleset ]; then
+        cat "$state" 2>/dev/null || true
+        exit 0
+      fi
+      if [ "$#" -eq 2 ] && [ "${2:-}" = tables ]; then
+        list_tables
+        exit 0
+      fi
+      if [ "$#" -eq 4 ] && [ "${2:-}" = table ]; then
+        list_table "${3:-}" "${4:-}"
+        exit $?
+      fi
+      exit 2;;
+  delete)
+      [ "$#" -eq 4 ] && [ "${2:-}" = table ] || exit 2
+      delete_table "${3:-}" "${4:-}"
+      exit $?;;
+esac
+exit 2
 S
   chmod 755 /usr/local/bin/systemctl /usr/local/bin/nft
   : > /tmp/e2e-calls.log
@@ -497,7 +597,8 @@ E2E_CIDR=127.0.0.0/8
 # 装好 bot 模块 + 仓库 + pdg 脚本
 e2e_seed_install(){
   mkdir -p /opt/pdg-bot /etc/mosdns/rules /etc/privdns-gateway \
-           /usr/local/libexec /etc/systemd/system
+           /usr/local/libexec /etc/systemd/system \
+           /etc/letsencrypt/renewal-hooks/deploy
   cp -a "$E2E_ROOT" /opt/privdns-gateway
   install -m755 "$E2E_ROOT/deploy/bot/pdg.sh" /usr/local/bin/pdg
   install -m755 "$E2E_ROOT/deploy/firewall/pdg-quic-routing.sh" \
