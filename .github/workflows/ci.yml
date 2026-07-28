@@ -1,0 +1,537 @@
+name: CI
+
+# lint job 只做编译、语法、渲染与本地回归；functional / e2e job 才启动真实组件。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Python 语法 (py_compile)
+        run: python3 -m py_compile deploy/bot/*.py deploy/web/*.py tests/*.py
+
+      - name: Shell 语法 (bash -n)
+        run: |
+          bash -n install.sh uninstall.sh \
+            deploy/bot/*.sh deploy/cert/*.sh deploy/firewall/*.sh \
+            deploy/web/*.sh lib/*.sh
+
+      - name: Web 前端 JavaScript 语法
+        run: node --check deploy/web/static/app.js
+
+      - name: JSON 模板渲染后可解析
+        run: |
+          set -euo pipefail
+          render() {
+            sed -e 's|__SERVER_IP__|203.0.113.1|g' \
+                -e 's|__INTERNAL_CIDR__|172.22.0.0/16|g' \
+                -e 's|__CERT_DIR__|/etc/mosdns/certs|g' \
+                -e 's|__SSH_PORT__|22|g' "$1"
+          }
+          for t in deploy/singbox/config.json.tmpl; do
+            echo "→ 渲染并校验 $t"
+            render "$t" | python3 -m json.tool > /dev/null
+            # jq 在 ubuntu-latest 默认就有, 再用它复核一遍
+            if command -v jq >/dev/null; then render "$t" | jq -e . > /dev/null; fi
+            echo "  OK"
+          done
+
+      - name: mobileconfig 模板是合法 plist/XML
+        run: |
+          python3 - <<'PY'
+          import plistlib, glob, sys
+          ok = True
+          for f in glob.glob("deploy/ios/*.mobileconfig.tmpl"):
+              try:
+                  plistlib.load(open(f, "rb")); print("  OK", f)
+              except Exception as e:
+                  print("  FAIL", f, e); ok = False
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Mihomo / QUIC routing systemd 依赖契约
+        run: |
+          set -euo pipefail
+          # mihomo.service 由共享函数生成；先对实际生成结果做阻断式依赖检查。
+          # shellcheck source=lib/units.sh
+          source lib/units.sh
+          pdg_unit_mihomo > "$RUNNER_TEMP/mihomo.service"
+          grep -Fqx 'Requires=pdg-quic-routing.service' "$RUNNER_TEMP/mihomo.service"
+          grep -Eq '^After=.*pdg-quic-routing\.service([[:space:]]|$)' "$RUNNER_TEMP/mihomo.service"
+          grep -Fqx 'Before=mihomo.service' deploy/firewall/pdg-quic-routing.service
+
+      - name: systemd unit 静态检查 (含生成的 Mihomo 与 QUIC routing; best-effort)
+        continue-on-error: true
+        run: |
+          if command -v systemd-analyze >/dev/null; then
+            systemd-analyze verify \
+              "$RUNNER_TEMP/mihomo.service" deploy/firewall/pdg-quic-routing.service \
+              deploy/bot/pdg-bot.service deploy/bot/pdg-health.service \
+              deploy/bot/pdg-rules-update.service deploy/bot/pdg-health.timer \
+              deploy/bot/pdg-rules-update.timer deploy/ios/pdg-probe81.service || true
+            echo "(CI 环境缺二进制/路径, 上面的告警多为预期; 重点看指令拼写/语法错)"
+          else
+            echo "systemd-analyze 不可用, 跳过"
+          fi
+
+      - name: "真实 nftables parser: 四种 profile 渲染后 sudo nft -c"
+        run: |
+          set -euo pipefail
+          if ! command -v nft >/dev/null; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q nftables
+          fi
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          printf '#!/usr/sbin/nft -f\n' > "$work/base.nft"
+          for firewall_mode in managed external; do
+            for quic_mode in tproxy reject; do
+              profile="$work/${firewall_mode}-${quic_mode}.env"
+              raw="$work/${firewall_mode}-${quic_mode}.raw.nft"
+              rendered="$work/${firewall_mode}-${quic_mode}.nft"
+              cat > "$profile" <<EOF
+          PDG_FIREWALL_MODE=$firewall_mode
+          PDG_PLATFORM=android
+          PDG_INTERNAL_CIDR=192.0.2.0/24
+          PDG_SSH_PORT=22
+          PDG_QUIC_MODE=$quic_mode
+          PDG_HIJACK_TLS_TCP_PORTS=443,5228,5229,5230
+          PDG_HIJACK_HTTP_TCP_PORTS=80
+          PDG_QUIC_MARK=0x504447
+          PDG_QUIC_MARK_MASK=0xffffffff
+          PDG_QUIC_ROUTE_TABLE=7895
+          PDG_QUIC_RULE_PRIORITY=17895
+          EOF
+              python3 deploy/bot/pdgprofile.py \
+                --profile "$profile" --platform android --ssh-port 22 --profile-only \
+                render-nft --template deploy/firewall/nftables-mihomo.conf \
+                --internal-cidr 192.0.2.0/24 --firewall-mode "$firewall_mode" \
+                > "$raw"
+              python3 deploy/bot/nftmerge.py --mode "$firewall_mode" \
+                "$raw" "$work/base.nft" "$rendered"
+              ! grep -Eq '__[A-Z0-9_]+__' "$rendered"
+              if [[ "$firewall_mode" == managed ]]; then
+                grep -Fq 'hook input' "$rendered"
+              else
+                ! grep -Fq 'hook input' "$rendered"
+              fi
+              # Count only an actual, non-comment nft rule statement. Template
+              # comments intentionally mention "tproxy", so raw substring
+              # greps make the reject combination falsely fail.
+              tproxy_rules="$(
+                awk '
+                  !/^[[:space:]]*#/ &&
+                  /^[[:space:]]*ip[[:space:]]+saddr[[:space:]]+[^[:space:]]+[[:space:]]+udp[[:space:]]+dport[[:space:]]+443/ &&
+                  /[[:space:]]tproxy[[:space:]]+ip[[:space:]]+to[[:space:]]+:7895([[:space:]]|$)/ {
+                    count++
+                  }
+                  END { print count + 0 }
+                ' "$rendered"
+              )"
+              if [[ "$quic_mode" == tproxy ]]; then
+                [[ "$tproxy_rules" -eq 1 ]]
+              else
+                [[ "$tproxy_rules" -eq 0 ]]
+              fi
+              # -c/--check validates the complete kernel transaction but never applies it.
+              sudo nft -c -f "$rendered"
+              echo "OK: $firewall_mode + $quic_mode"
+            done
+          done
+          # A masked mark is a distinct nft expression: verify it is rendered
+          # and accepted by the real parser as well as the full-mask profiles.
+          profile="$work/managed-tproxy-partial-mask.env"
+          raw="$work/managed-tproxy-partial-mask.raw.nft"
+          rendered="$work/managed-tproxy-partial-mask.nft"
+          cat > "$profile" <<EOF
+          PDG_FIREWALL_MODE=managed
+          PDG_PLATFORM=android
+          PDG_INTERNAL_CIDR=192.0.2.0/24
+          PDG_SSH_PORT=22
+          PDG_QUIC_MODE=tproxy
+          PDG_HIJACK_TLS_TCP_PORTS=443,5228,5229,5230
+          PDG_HIJACK_HTTP_TCP_PORTS=80
+          PDG_QUIC_MARK=0x4400
+          PDG_QUIC_MARK_MASK=0xff00
+          PDG_QUIC_ROUTE_TABLE=7895
+          PDG_QUIC_RULE_PRIORITY=17895
+          EOF
+          python3 deploy/bot/pdgprofile.py \
+            --profile "$profile" --platform android --ssh-port 22 --profile-only \
+            render-nft --template deploy/firewall/nftables-mihomo.conf \
+            --internal-cidr 192.0.2.0/24 --firewall-mode managed \
+            > "$raw"
+          python3 deploy/bot/nftmerge.py --mode managed \
+            "$raw" "$work/base.nft" "$rendered"
+          ! grep -Eq '__[A-Z0-9_]+__' "$rendered"
+          grep -Fq \
+            'meta mark set ((meta mark & 0xffff00ff) | 0x4400) tproxy ip to :7895 accept' \
+            "$rendered"
+          sudo nft -c -f "$rendered"
+          echo "OK: managed + tproxy + partial mark/mask"
+
+      - name: "ShellCheck (阻断: 有 warning 即失败)"
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y -q shellcheck
+          shellcheck --severity=warning -e SC1091 \
+            install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh \
+            deploy/firewall/*.sh deploy/web/*.sh lib/*.sh tests/*.sh
+
+      - name: "原生 Web API/安全/前端回归"
+        run: |
+          python3 tests/test-web-api.py
+          python3 tests/test-web-adversarial.py
+          python3 tests/test-web-security-static.py
+          python3 tests/test-web-frontend-static.py
+
+      - name: "原生 Web 安装生命周期回归"
+        run: bash tests/test-web-install.sh
+
+      - name: "Web setup 晚期失败恢复与 enable 回滚"
+        run: bash tests/test-webctl-failure.sh
+
+      - name: "规则集手机直连完整生命周期回归"
+        run: python3 tests/test-ruleset-phone-direct.py
+
+      - name: "防火墙迁移识别回归 (原装应迁移 / 自定义应跳过)"
+        run: bash tests/test-fw-migration.sh
+
+      - name: "mosdns concurrent 迁移回归 (单上游=1/多上游=2/幂等)"
+        run: bash tests/test-mosdns-concurrent.sh
+
+      - name: "低内存模式回归 (fixture meminfo 解析/渲染/迁移幂等)"
+        run: bash tests/test-lowmem.sh
+
+      - name: "内核激活纪律回归 (假 systemctl+重启模拟: 只起一个内核/失败回滚/unit 无漂移)"
+        run: bash tests/test-core-activate.sh
+
+      - name: "sing-box→mihomo 迁移回归 (转不了的出口逐个列名/失败非0且回滚标记/成功清干净/幂等/第三方不删)"
+        run: bash tests/test-migrate-drop-singbox.sh
+
+      - name: "unit 写入原子性 (生成函数缺失/失败/空产出都不许截断既有 unit —— 跨版本回滚)"
+        run: bash tests/test-write-unit-atomic.sh
+
+      - name: "sing-box 归属保护 (uninstall/--purge 只删本项目装的, 第三方原样保留)"
+        run: bash tests/test-singbox-ownership.sh
+
+      - name: "第三方 sing-box 保护 (标准 ExecStart 也不认亲; 迁移/卸载/purge 后 sentinel 不变)"
+        run: bash tests/test-singbox-thirdparty.sh
+
+      - name: "平台隔离安装/迁移矩阵 (marker 证据回退/GMS 仅安卓/iOS GMS 清理/服务集按平台; 抽不到函数即 FAIL)"
+        run: bash tests/test-platform-install.sh
+
+      - name: "测试自身不许假绿 (抽不到函数/命令不存在/退出码非 0 必须记 FAIL)"
+        run: bash tests/test-false-green-guard.sh
+
+      - name: "E2E 探针生命周期回归(重复启动/退出/信号/并发/临时目录清理)"
+        run: bash tests/test-e2e-probe-lifecycle.sh
+
+      - name: "GMS 推送端口迁移回归 (fw/sing-box 补 5228-5230, 自定义跳过, 失败回滚)"
+        run: bash tests/test-gms-migration.sh
+
+      - name: "v1.4.x→WLOC 迁移回归 (补 force_hijack/seq/优先级规则/mitm_hijack, 幂等/自定义跳过/失败还原)"
+        run: bash tests/test-mitm-migration.sh
+
+      - name: "parse_link 多协议回归 (各协议链接 + Surge ss 行字段映射)"
+        run: python3 tests/test-parse-links.py
+
+      - name: "内网卡段取值回归 (真 pty: 抓包/手输并行谁先用谁 + 形态校验 + 半截输入不漏)"
+        run: python3 tests/test-cidr-input.py
+
+      - name: "老机器 unit 重部署 (sing-box 悬空依赖换 mihomo / 保住装机 CERT_DIR / 幂等)"
+        run: bash tests/test-unit-redeploy.sh
+
+      - name: "内核版本精确匹配 (v1.19.1 不得匹配 v1.19.10; 读不到版本不跳过安装)"
+        run: bash tests/test-version-match.sh
+
+      - name: "发布链路回归 (tag-only 安装/更新 + 文档版本)"
+        run: bash tests/test-release-flow.sh
+
+      - name: "更新快照+精确回滚回归 (--dir 精确目标/--git 复位/部分失败不谎报/快照覆盖脚本)"
+        run: bash tests/test-update-rollback.sh
+
+      - name: "update 关键步骤故障注入 (git reset/必需文件/迁移/内核/daemon-reload 失败均回滚且不谎报成功)"
+        run: bash tests/test-update-faults.sh
+
+      - name: "内核热切回归 (check/重启不稳定均还原旧核; 稳定后才删 .prev; 快照含内核二进制)"
+        run: bash tests/test-core-swap.sh
+
+      - name: "Phase3: install 回滚与 QUIC routing 恢复资产保留"
+        run: bash tests/test-install-rollback.sh
+
+      - name: "Phase3: Android DoT 双连接与 TLS session 恢复探针"
+        run: python3 tests/test-dot-session-probe.py
+
+      - name: "Phase3: patched MosDNS 产物供应链契约"
+        run: bash tests/test-mosdns-patched-artifact.sh
+
+      - name: "Phase3: MosDNS binary + attestation 热替换事务"
+        run: bash tests/test-mosdns-swap.sh
+
+      - name: "Phase3: 首装 geosite 离线事务与 live updater 硬门"
+        run: bash tests/test-update-rules-bootstrap.sh
+
+      - name: "Phase3: pdgtx 服务 guard 锁内前置与 CLI round-trip"
+        run: python3 tests/test-pdgtx-service-guard.py
+
+      - name: "install 二进制事务回归 (备份失败即中止/半截安装可恢复/强制重装也还原/清理失败不假报)"
+        run: bash tests/test-install-bintxn.sh
+
+      - name: "bot 导航回归 (操作结果不刷一级菜单)"
+        run: python3 tests/test-bot-nav.py
+
+      - name: "bot 凭据保护/后台执行器/BUSY 锁回归"
+        run: python3 tests/test-bot-credential.py
+
+      - name: "备份恢复解包安全 (绝对路径/../symlink/hardlink/设备/FIFO/压缩炸弹均不得越界)"
+        run: python3 tests/test-restore-tar-safety.py
+
+      - name: "恢复备份事务化 (内核校验/dropped/mosdns/内核起不来: 全部目标逐字节还原)"
+        run: python3 tests/test-restore-transaction.py
+
+      - name: "观测面板回归 (zashboard 开关 + clash_api secret)"
+        run: python3 tests/test-panel.py
+
+      - name: "面板快照/回滚净化回归 (secret 不入档)"
+        run: bash tests/test-panel-snapshot.sh
+
+      - name: "规则集完整性 (dropped 非空即拒/.srs 拒/真实 YAML provider + 真实 .mrs fixture 走本地 HTTP)"
+        run: python3 tests/test-ruleset-integrity.py
+
+      - name: "bot 测域名规则集显示名回归"
+        run: python3 tests/test-domain-label.py
+
+      - name: "出口改名级联回归 (规则/故障组/final/TG 同步)"
+        run: python3 tests/test-exit-rename.py
+
+      - name: "iOS 描述文件回归 (Wi-Fi 探测判定 + SSID 直连名单)"
+        run: python3 tests/test-ios-ssid.py
+
+      - name: "Phase3: doctor 防火墙端口回归"
+        run: python3 tests/test-doctor-firewall.py
+
+      - name: "Phase3: nftscan/input 链冲突判据"
+        run: python3 tests/test-nft-input-scan.py
+
+      - name: "Phase3: 防火墙 ownership/mode 回归"
+        run: python3 tests/test-firewall-ownership.py
+
+      - name: "Phase3: Mihomo 数据面参数与持久 profile"
+        run: python3 tests/test-mihomo-dataplane.py
+
+      - name: "Phase3: profile / nft / Mihomo / doctor 跨组件一致性"
+        run: python3 tests/test-dataplane-profile.py
+
+      - name: "Phase3: 数据面生命周期顺序与回滚门"
+        run: python3 tests/test-dataplane-lifecycle.py
+
+      - name: "Phase3: status 必需服务活性 (mosdns/Mihomo inactive 必须失败)"
+        run: bash tests/test-status-required-services.sh
+
+      - name: "Phase3: QUIC policy routing ownership 与精确回滚"
+        run: bash tests/test-quic-routing.sh
+
+      - name: "Phase3: 迁移必须使用同一 checked-out 数据面 bundle"
+        run: bash tests/test-migration-dataplane-bundle.sh
+
+      - name: "Phase3: switchcore persistent/live nft 回滚故障必须阻断"
+        run: bash tests/test-switchcore-nft-rollback.sh
+
+      - name: "Phase3: 当前快照五阶段故障必须精确恢复"
+        run: bash tests/test-snapshot-rollback-transaction.sh
+
+      - name: "Phase3: 旧 sing-box 快照清理 Mihomo 残留并重建 QUIC 前置"
+        run: bash tests/test-legacy-snapshot-rollback.sh
+
+      - name: "Phase3: 旧快照兼容迁移四阶段故障恢复"
+        run: bash tests/test-legacy-migration-transaction.sh
+
+      - name: "Phase3: 旧快照迁移后完整事务故障恢复"
+        run: bash tests/test-legacy-post-migration-transaction.sh
+
+      - name: "配置事务核心 (状态机/白名单/前置检查/观察期/回滚/审计/runner 固定)"
+        run: python3 tests/test-config-transaction.py
+
+      - name: "配置事务安全边界 (路径穿越/软硬链接/权限/凭据脱敏/恢复漂移保护)"
+        run: python3 tests/test-config-transaction-security.py
+
+      - name: "配置事务故障注入 (锁 fail-closed/并发/before-image/部分替换/回滚失败)"
+        run: python3 tests/test-config-transaction-faults.py
+
+      - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
+        run: bash tests/test-migration-timing.sh
+
+      - name: "分流规则→mosdns 劫持同步回归 (指到出口的域名必须被 mosdns 劫持, 否则规则是死的)"
+        run: python3 tests/test-rule-hijack-sync.py
+
+
+      - name: "CLI/report/bot 杂项回归 (rollback 校验/inet pdg/菜单 exec)"
+        run: python3 tests/test-maintenance-polish.py
+
+      - name: "sb2mihomo 渲染层回归 (sing-box 配置→mihomo 各协议/组/规则映射)"
+        run: python3 tests/test-sb2mihomo.py
+
+      - name: "Hysteria v1/v2 转换回归 (v1→hysteria, v2→hysteria2, 不支持→拒绝, 真 mihomo -t)"
+        run: python3 tests/test-hysteria-convert.py
+
+      - name: "bot 内核后端切换回归 (mihomo/singbox 分支 + apply_sb 事务回滚)"
+        run: python3 tests/test-mihomo-backend.py
+
+      - name: "TFO 状态回归 (持久化意图 + 加出口不冲掉 + 渲染映射)"
+        run: python3 tests/test-tfo.py
+
+      - name: "MITM CA 骨架回归 (自签 CA + 叶子证书验链/SAN/EKU/缓存)"
+        run: python3 tests/test-mitm-ca.py
+
+      - name: "MITM CA 并发回归 (24 线程+跨进程同域签发: 0 异常/cert-key 匹配/无残留)"
+        run: python3 tests/test-mitm-ca-concurrent.py
+
+      - name: "MITM 服务回归 (socks5→CA叶子终止TLS→插件; 客户端CA验链; 非接管兜底关闭)"
+        run: python3 tests/test-mitm-server.py
+
+      - name: "Apple WLOC 插件回归 (gs-loc protobuf 编解码 + 坐标改写 + 负坐标)"
+        run: python3 tests/test-mitm-wloc.py
+
+      - name: "WLOC bot 后端回归 (set_wloc 开关/坐标/平台门控/接管域名同源)"
+        run: python3 tests/test-mitm-wloc-bot.py
+
+      - name: "平台文案/门控回归 (客户端·状态·WLOC 按平台/内核 + README 文案一致)"
+        run: python3 tests/test-platform-copy.py
+
+      - name: "诊断报告内核一致性 (版本/日志按当前后端取, mihomo 机上不再固定问 sing-box)"
+        run: python3 tests/test-report-backend.py
+
+      - name: "WLOC 手机端文案一致性 (README/Bot 同一套三步 + 平台隔离)"
+        run: python3 tests/test-wloc-copy.py
+
+      - name: "WLOC 事务化回归 (BUSY/CA/内核/pdg-mitm/mosdns 故障注入均回滚, 不留 enabled=true)"
+        run: python3 tests/test-mitm-wloc-txn.py
+
+      - name: "WLOC 热切换回归 (切地点零 systemctl/零重渲 + 配置锁 + 加改语义 + 监听不覆盖菜单)"
+        run: python3 tests/test-wloc-hotswitch.py
+
+      - name: "WLOC 热加载回归 (真起 pdg-mitm: 同 PID 换坐标 + 并发不混坐标 + 状态文件)"
+        run: python3 tests/test-wloc-hotreload.py
+
+      - name: "文案与当前行为一致 (WLOC 热加载/:81 返回 200/端口按平台)"
+        run: python3 tests/test-wording-accuracy.py
+
+      - name: "Bot 凭据三态 (都空=正常禁用/只配一半=配置错/配齐才要求 pdg-bot 在跑)"
+        run: python3 tests/test-bot-credentials.py
+
+      - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
+        run: python3 tests/test-platform-isolation.py
+
+  functional:
+    # 真功能测试: 下载并校验钉死版本的 Mihomo / MosDNS, 真起一遍验证两层核心链路。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: 流量层 (真起单个 Mihomo 验证 TLS SNI 多出口分流 + final 兜底)
+        run: bash tests/functional-test.sh
+      - name: DNS 层 (真起 mosdns 验证 A 劫持 / AAAA·HTTPS 置空 / 国内直连 / 按来源门控)
+        run: bash tests/dns-policy-test.sh
+      - name: DNS 限流 (rate_limiter 迁移幂等 + 真起 mosdns 验证超限 REFUSED + doctor)
+        run: bash tests/test-mosdns-ratelimit.sh
+      - name: 数据模型出站 schema (锁定版 sing-box check 验证 parse_link 兼容模型)
+        run: bash tests/test-outbound-schema.sh
+      - name: 劫持形态 (真起 mosdns 验证 all=排除式劫持 / gfw=白名单放行)
+        run: bash tests/test-hijack-shape.sh
+
+  e2e:
+    # 端到端: 在真实绝对路径上跑真正的 migrate / switch-core / bot 代码, 配合真内核与真 mosdns。
+    # 单测都在函数级别打桩, 跨组件的接缝没人看着 —— 这几条查出过 GMS 重复插入、backend 标记
+    # 从不落地、分流规则不进 mosdns、不可转换出站被静默丢弃等接缝 bug。
+    #
+    # 为什么用容器而不是 runner 上的 unshare: ubuntu-24.04 runner 用 AppArmor 禁掉了非特权
+    # 用户命名空间, unshare -rm 不可用, 脚本会整条跳过(CI 绿但零覆盖)。容器本身就是一次性
+    # 隔离环境且以 root 运行, 直接置 PDG_E2E_ISOLATED=1 跑同一份测试主体。
+    #
+    # **一个脚本一个 job**: 以前所有脚本挤在同一个容器里顺序跑, 前一个留下的东西会让后一个
+    # 挂掉 —— e2e-cross-version-rollback 留下 /usr/local/bin/sing-box, 于是 e2e-install 的
+    # 装机路径判成"机器上已有来源不明的 sing-box"而中止(单独跑 23/23, 串起来只有 11/34),
+    # 失败原因和被测代码毫无关系。矩阵拆开后每个脚本都有干净容器; 脚本自身进场也会
+    # e2e_reset_box(见 tests/e2e-lib.sh), 两道保险。
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    strategy:
+      fail-fast: false
+      matrix:
+        script:
+          - e2e-migrate.sh
+          - e2e-exit-rule.sh
+          - e2e-drop-singbox.sh
+          - e2e-custom-nft.sh
+          - e2e-cross-version-rollback.sh
+          - e2e-install.sh
+          - e2e-install-nft.sh
+          - e2e-platform-switch.sh
+          - e2e-update.sh
+          - e2e-wloc.sh
+          - e2e-cli-ops.sh
+          - e2e-config-transaction.sh
+          - e2e-config-transaction-recovery.sh
+    name: "E2E ${{ matrix.script }}"
+    steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        # 容器镜像里没有 git 时, actions/checkout 会退化成"用 REST API 下载 tarball" ——
+        # 工作区里**没有 .git**。跑 install.sh 的 E2E 于是全部停在"复制后的仓库没有 .git,
+        # 更新/卸载会用不了"这条硬检查上, 而失败原因与被测代码毫无关系。
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
+      # fetch-depth: 0 —— 跨版本回滚用例要取**真的** v1.5.12 代码当更新器; 默认浅克隆没有
+      # tag, 那条用例会静默 skip(CI 绿但零覆盖), 正是本项目最怕的假绿。
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
+      - name: "跑 ${{ matrix.script }}"
+        env: { PDG_E2E_ISOLATED: "1" }
+        run: bash tests/${{ matrix.script }}
+
+  # 串行 hermetic 守卫: 就算将来有人把这些脚本又塞回同一个环境顺序跑, 也必须全绿。
+  # 这条专门盯"脚本之间互相踩"的回归 —— 矩阵拆开只是让 CI 不受影响, 并不能保证脚本本身干净。
+  e2e-serial:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        # 容器镜像里没有 git 时, actions/checkout 会退化成"用 REST API 下载 tarball" ——
+        # 工作区里**没有 .git**。跑 install.sh 的 E2E 于是全部停在"复制后的仓库没有 .git,
+        # 更新/卸载会用不了"这条硬检查上, 而失败原因与被测代码毫无关系。
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
+      - name: "E2E 串行 hermetic (同一容器里按原顺序连着跑, 每个都必须全绿)"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_SERIAL_SCRIPTS: >-
+            e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
+            e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
+            e2e-platform-switch.sh e2e-update.sh e2e-wloc.sh e2e-cli-ops.sh
+            e2e-config-transaction.sh e2e-config-transaction-recovery.sh
+        run: bash tests/e2e-serial-hermetic.sh

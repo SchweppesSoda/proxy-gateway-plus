@@ -1,0 +1,26 @@
+<svg viewBox="0 0 250 480" width="300" height="576" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Telegram bot 主菜单示意">
+<title>bot 主菜单</title>
+<rect x="0" y="0" width="250" height="480" rx="14" fill="#17212b"/>
+<rect x="0" y="0" width="250" height="34" rx="14" fill="#1f2c3a"/><rect x="0" y="20" width="250" height="14" fill="#1f2c3a"/>
+<text x="14" y="22" fill="#ffffff" font-family="sans-serif" font-size="12" font-weight="500">PrivDNS Gateway</text>
+<rect x="12" y="44" width="226" height="150" rx="10" fill="#1c2a39"/>
+<g font-family="sans-serif" font-size="10.5">
+<text x="22" y="62" fill="#7fd28a">🟢 mosdns / sing-box / pdg-bot 都在</text>
+<text x="22" y="80" fill="#c7d4e0">DoT: dot.example.com</text>
+<text x="22" y="97" fill="#c7d4e0">IP: 203.0.113.10</text>
+<text x="22" y="114" fill="#c7d4e0">出口(5): hk, tw, jp, us, auto</text>
+<text x="22" y="131" fill="#c7d4e0">故障组 auto: hk › tw › jp › us</text>
+<text x="22" y="148" fill="#c7d4e0">默认出口: hk · 规则集: 3</text>
+<text x="22" y="165" fill="#c7d4e0">分流: 国内直连 / 4 条规则 / 其余→hk</text>
+</g>
+<g font-family="sans-serif" font-size="11.5" fill="#e3edf5" text-anchor="middle">
+<rect x="12" y="206" width="111" height="32" rx="6" fill="#29384a"/><text x="67" y="226">🔄 更新</text>
+<rect x="127" y="206" width="111" height="32" rx="6" fill="#29384a"/><text x="182" y="226">🩺 自检</text>
+<rect x="12" y="244" width="111" height="32" rx="6" fill="#29384a"/><text x="67" y="264">🚦 测出口</text>
+<rect x="127" y="244" width="111" height="32" rx="6" fill="#29384a"/><text x="182" y="264">📈 流量</text>
+<rect x="12" y="282" width="111" height="32" rx="6" fill="#29384a"/><text x="67" y="302">📤 出口管理</text>
+<rect x="127" y="282" width="111" height="32" rx="6" fill="#29384a"/><text x="182" y="302">📑 分流管理</text>
+<rect x="12" y="320" width="111" height="32" rx="6" fill="#29384a"/><text x="67" y="340">📱 客户端</text>
+<rect x="127" y="320" width="111" height="32" rx="6" fill="#29384a"/><text x="182" y="340">🛠 运维</text>
+</g>
+</svg>

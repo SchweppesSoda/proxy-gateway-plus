@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# P0 回归: install.sh 的 rollback 不得因未初始化变量在 set -u 下二次崩溃。
+#
+# 现场: `MIHOMO_INSTALLED: unbound variable` —— rollback 里 set +e 只关了 errexit,
+# nounset 仍然生效, 读到未赋值的 MIHOMO_INSTALLED 直接中断, 于是它后面的
+# systemd-resolved / resolv.conf 等系统级还原全部没跑, 而且
+# 原始安装错误被这个二次错误盖掉。
+#
+# 覆盖:
+#   A. set -u 且 MIHOMO_INSTALLED 从未赋值 → 无 unbound variable, 跑到末尾
+#   B. sing-box 本次新装, 后续步骤失败 → rollback 完整执行, 删本次装的 sing-box
+#   C. mihomo 装前已存在(未重新下载) → rollback 完整执行, **不删** mihomo
+#   D. mihomo 本次新装 → 删 mihomo; 同时装前已有的 mosdns 不被删
+#   E. 单个清理命令失败(nft 返回非0) 不阻断后续 → 三项系统级还原仍完成
+#   F. 原始安装错误可见 + 退出码保持非 0, 不被 rollback 的二次错误替代
+#
+# 沙箱化: 抽出真实的 rollback/on_exit, 只把**绝对路径字面量**重定向到临时根目录
+# (变量引用、控制流、set +e/nounset 行为一字未改 —— 正是本用例要验的部分),
+# 再打桩 systemctl/nft(测试环境无 systemd/netlink)。
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+pass=0; nfail=0
+ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
+bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
+
+# 抽出真身。按花括号配平抽取: on_exit 可能是单行定义, 用 /^}/ 收尾会把 install.sh
+# 后半截(apt-get 等)一起吞进来并真的执行 —— 必须按 depth 精确切。
+xfn(){
+  awk -v fn="$1" '
+    index($0, fn "(){") == 1 { inf = 1 }
+    inf {
+      print
+      n = gsub(/\{/, "{"); m = gsub(/\}/, "}"); depth += n - m
+      if (depth <= 0) exit
+    }' "$ROOT/install.sh"
+}
+: > "$WORK/fn.sh"
+for _f in _sha _stash_bin _rollback_bins _commit_bins _commit_dirs rollback on_exit; do
+  xfn "$_f" >> "$WORK/fn.sh"
+done
+grep -q '^rollback(){' "$WORK/fn.sh" && grep -q '^on_exit(){' "$WORK/fn.sh" \
+  || { echo "抽取 rollback/on_exit 失败"; exit 1; }
+# 防呆: 抽出来的东西不该含安装流程的指令(抽多了会真的去跑 apt-get)
+grep -qE 'apt-get|curl -fsSL' "$WORK/fn.sh" && { echo "抽取越界: 含安装流程指令"; exit 1; }
+
+# 只重定向绝对路径字面量到沙箱根
+sed -i -e 's#/etc/#$SB/etc/#g' -e 's#/usr/local/bin/#$SB/usr/local/bin/#g' \
+       -e 's#/usr/local/libexec/#$SB/usr/local/libexec/#g' \
+       -e 's#/opt/#$SB/opt/#g' "$WORK/fn.sh"
+
+mk_sandbox(){   # 造一个"安装到一半"的现场
+  SB="$WORK/root"; rm -rf "$SB"
+  mkdir -p "$SB/etc/systemd/system" "$SB/etc/systemd/journald.conf.d" "$SB/usr/local/bin" \
+           "$SB/usr/local/libexec" "$SB/opt/pdg-bot" "$SB/etc/mosdns" \
+           "$SB/etc/privdns-gateway"
+  printf 'PDG-NEW\n'  > "$SB/etc/nftables.conf"
+  printf 'PDG-NEW\n'  > "$SB/etc/resolv.conf"
+  printf 'ORIG-RESOLV\n' > "$SB/etc/resolv.conf.pdg-orig"
+  for b in mosdns sing-box mihomo pdg pdg-set-token; do printf '%s\n' "$b" > "$SB/usr/local/bin/$b"; done
+  export SB
+}
+
+# 桩: 测试环境没有 systemd / netlink
+harness(){ cat <<'EOF'
+BIN_TXN=()
+c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
+systemctl(){ echo "systemctl $*" >> "$SB/../calls.log"; return "${SYSTEMCTL_RC:-0}"; }
+nft(){ echo "nft $*" >> "$SB/../calls.log"; return "${NFT_RC:-0}"; }
+EOF
+}
+
+# 在 set -u 下跑 rollback; $1=额外的前置赋值(模拟安装进行到哪一步)
+run_rb(){   # $1=前置变量赋值; $2=(可选) source 真身之后、rollback 之前跑的脚本
+  : > "$WORK/calls.log"
+  env SB="$SB" NFT_RC="${NFT_RC:-0}" SYSTEMCTL_RC="${SYSTEMCTL_RC:-0}" \
+    bash -c "set -uo pipefail
+$(harness)
+$1
+source '$WORK/fn.sh'
+${2:-}
+rollback" 2>&1
+}
+
+# ── A. MIHOMO_INSTALLED 从未赋值 ────────────────────────────────────────────
+mk_sandbox
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0')
+grep -q 'unbound variable' <<<"$out" && bad "A: rollback 仍报 unbound variable" || ok "A: set -u 下 MIHOMO_INSTALLED 未赋值也不报 unbound variable"
+grep -qE '已回滚到安装前状态|回滚已尽力执行完' <<<"$out" && ok "A: rollback 跑到了末尾(没有中途夭折)" || bad "A: 未跑到末尾 out=$out"
+[[ "$(cat "$SB/etc/nftables.conf")" == "PDG-NEW" ]] \
+  && ok "A: 未登记本次 owned 变更时不做整文件覆盖" \
+  || bad "A: nftables.conf 被旧整文件备份覆盖"
+[[ "$(cat "$SB/etc/resolv.conf")" == "ORIG-RESOLV" ]] && ok "A: resolv.conf 已从 .pdg-orig 还原" || bad "A: resolv.conf 未还原"
+[[ -d "$SB/etc/mosdns" && -d "$SB/opt/pdg-bot" ]] \
+  && ok "A: DIR_TXN 为空时不猜测删除任何目录" \
+  || bad "A: DIR_TXN 为空却删除了安装前目录"
+
+# ── B. sing-box 本次新装 → 删掉本次装的 ─────────────────────────────────────
+mk_sandbox
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0' \
+  "command rm -f \"\$SB/usr/local/bin/sing-box\"
+_stash_bin \"\$SB/usr/local/bin/sing-box\" || exit 9
+printf 'NEW\n' > \"\$SB/usr/local/bin/sing-box\"")
+grep -q 'unbound variable' <<<"$out" && bad "B: unbound variable" || {
+  [[ ! -e "$SB/usr/local/bin/sing-box" ]] && ok "B: sing-box 全新安装后失败 → 本次装的 sing-box 被删" || bad "B: sing-box 未删"; }
+[[ "$(cat "$SB/etc/resolv.conf")" == "ORIG-RESOLV" ]] && ok "B: 后续系统级还原仍完整执行" || bad "B: 系统级还原未执行"
+
+# ── C. mihomo 装前已存在(未重新下载) → 不删 ─────────────────────────────────
+mk_sandbox
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0')
+[[ -e "$SB/usr/local/bin/mihomo" ]] && ok "C: mihomo 装前已存在且未重装 → 不被删除" || bad "C: 误删了装前已存在的 mihomo"
+[[ "$(cat "$SB/etc/nftables.conf")" == "PDG-NEW" ]] \
+  && ok "C: rollback 不用装前整文件覆盖当前 nftables.conf" \
+  || bad "C: rollback 覆盖了当前 nftables.conf"
+
+# ── D. mihomo 本次新装 → 只删本次新增的 ─────────────────────────────────────
+mk_sandbox
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0' \
+  "command rm -f \"\$SB/usr/local/bin/mihomo\"
+_stash_bin \"\$SB/usr/local/bin/mihomo\" || exit 9
+printf 'NEW\n' > \"\$SB/usr/local/bin/mihomo\"")
+[[ ! -e "$SB/usr/local/bin/mihomo" ]] && ok "D: mihomo 本次新装 → 被删" || bad "D: 本次新装的 mihomo 未删"
+[[ -e "$SB/usr/local/bin/mosdns" ]] && ok "D: 装前已有的 mosdns(未标记本次安装) 不被删" || bad "D: 误删了装前已有的 mosdns"
+
+# ── E. 单个清理失败不阻断后续 ───────────────────────────────────────────────
+mk_sandbox; NFT_RC=1
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=1')
+NFT_RC=0
+[[ "$(cat "$SB/etc/resolv.conf")" == "ORIG-RESOLV" ]] && ok "E: nft 失败不阻断 → resolv.conf 仍还原" || bad "E: nft 失败挡住了后续还原"
+grep -q 'systemctl enable --now systemd-resolved' "$WORK/calls.log" && ok "E: systemd-resolved 恢复仍被执行" || bad "E: systemd-resolved 未恢复"
+
+# ── F. 原始退出码与原始错误不被 rollback 掩盖 ───────────────────────────────
+mk_sandbox
+cat > "$WORK/prog.sh" <<EOF
+set -euo pipefail
+$(harness)
+INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
+MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0
+source '$WORK/fn.sh'
+trap 'on_exit \$?' EXIT
+echo "原始安装错误: mosdns 配置校验失败" >&2
+exit 42
+EOF
+out=$(SB="$SB" bash "$WORK/prog.sh" 2>&1); rc=$?
+[[ "$rc" == 42 ]] && ok "F: 保留原始退出码 42(不被回滚二次错误改写)" || bad "F: 退出码变成 $rc"
+grep -q '原始安装错误' <<<"$out" && ok "F: 原始安装错误仍可见" || bad "F: 原始错误被掩盖"
+grep -q 'unbound variable' <<<"$out" && bad "F: 回滚过程报 unbound variable" || ok "F: 回滚过程无 unbound variable"
+[[ "$(cat "$SB/etc/resolv.conf")" == "ORIG-RESOLV" ]] && ok "F: 走 EXIT trap 时系统级还原完整" || bad "F: EXIT trap 下还原不完整"
+
+# ── H. 装前已存在(本次被覆盖) → 回滚还原**原件**, 不是删掉 ────────────────
+# 别人装的 mosdns/sing-box/mihomo(哪怕版本不同)不算"本次新增"。走真实 _stash_bin 建账,
+# 与线上流程一致(旧写法手工摆 .pdg-preinstall + *_INSTALLED=1, 已不是现在的机制)。
+mk_sandbox
+printf 'OLD-SINGBOX-v1.9\n' > "$SB/usr/local/bin/sing-box"
+OLDSHA=$(sha256sum "$SB/usr/local/bin/sing-box" | cut -d' ' -f1)
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0' \
+  "_stash_bin \"\$SB/usr/local/bin/sing-box\" || exit 9
+printf 'NEW-SINGBOX-v1.12\n' > \"\$SB/usr/local/bin/sing-box\"")
+if [[ -e "$SB/usr/local/bin/sing-box" ]] \
+   && [[ "$(sha256sum "$SB/usr/local/bin/sing-box" | cut -d' ' -f1)" == "$OLDSHA" ]]; then
+  ok "H: 覆盖了装前已有的 sing-box → 回滚按 sha 还原原件(不误删别人的)"
+else bad "H: 未还原原件 (内容=$(cat "$SB/usr/local/bin/sing-box" 2>/dev/null || echo 已删))"; fi
+[[ ! -e "$SB/usr/local/bin/sing-box.pdg-preinstall" ]] && ok "H: 还原后 .pdg-preinstall 备份已清理" || bad "H: 备份残留"
+[[ "$(cat "$SB/etc/resolv.conf")" == "ORIG-RESOLV" ]] && ok "H: 系统级还原仍完整" || bad "H: 系统级还原不完整"
+
+# ── I. 装前不存在(纯新增) → 仍然删掉 ─────────────────────────────────────
+mk_sandbox
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0' \
+  "command rm -f \"\$SB/usr/local/bin/mihomo\"
+_stash_bin \"\$SB/usr/local/bin/mihomo\" || exit 9
+printf 'NEW\n' > \"\$SB/usr/local/bin/mihomo\"")
+[[ ! -e "$SB/usr/local/bin/mihomo" ]] && ok "I: 装前不存在的 mihomo(无备份) → 仍按新增删除" || bad "I: 本次新增的 mihomo 未删"
+
+# ── J. _stash_bin 语义 + 成功路径按事务台账清理备份 ───────────────────────
+mk_sandbox
+out=$(env SB="$SB" bash -c "set -uo pipefail
+$(harness)
+source '$WORK/fn.sh'
+_stash_bin '$SB/usr/local/bin/mihomo'          # 存在 → 应留备份
+_stash_bin '$SB/usr/local/bin/nonexistent'     # 不存在 → 不留备份且返回0
+echo rc=\$?" 2>&1)
+[[ -e "$SB/usr/local/bin/mihomo.pdg-preinstall" ]] && ok "J: _stash_bin 对已存在的二进制留了原件备份" || bad "J: 未留备份"
+[[ ! -e "$SB/usr/local/bin/nonexistent.pdg-preinstall" ]] && grep -q 'rc=0' <<<"$out" \
+  && ok "J: _stash_bin 对不存在的二进制不留备份且返回 0(装前没有不算异常)" || bad "J: 空 stash 行为不对 out=$out"
+
+# 成功安装(INSTALL_OK=1) → on_exit 按台账清掉备份, 且不动二进制本身
+mk_sandbox
+out=$(env SB="$SB" bash -c "set -uo pipefail
+$(harness)
+INSTALL_OK=1
+source '$WORK/fn.sh'
+_stash_bin '$SB/usr/local/bin/mihomo'  || exit 9
+_stash_bin '$SB/usr/local/bin/sing-box' || exit 9
+on_exit 0" 2>&1)
+if [[ ! -e "$SB/usr/local/bin/mihomo.pdg-preinstall" && ! -e "$SB/usr/local/bin/sing-box.pdg-preinstall" ]]; then
+  ok "J: 安装成功 → .pdg-preinstall 备份被清理干净"
+else bad "J: 成功后备份残留"; fi
+[[ -e "$SB/usr/local/bin/mihomo" && -e "$SB/usr/local/bin/sing-box" ]] \
+  && ok "J: 成功路径不动二进制本身(只清备份)" || bad "J: 成功路径误删了二进制"
+
+# ── K. 静态守卫: 三个二进制的安装点前必须先 _stash_bin(将来新增安装路径不能漏留原件) ──
+for b in mosdns sing-box mihomo; do
+  if awk -v b="$b" '
+      { buf[NR] = $0 }
+      $0 ~ ("install -m755 .*/usr/local/bin/" b "([^-a-zA-Z0-9_.]|$)") {
+        found = 0
+        # MosDNS has a multi-line fail-closed error handler between the stash
+        # and install. Keep the guard local while allowing that reviewed block.
+        for (i = NR - 6; i < NR; i++)
+          if (i > 0 && buf[i] ~ ("_stash_bin /usr/local/bin/" b "([^-a-zA-Z0-9_.]|$)")) found = 1
+        if (!found) bad = 1
+      }
+      END { exit bad ? 1 : 0 }' "$ROOT/install.sh"; then
+    ok "K: $b 安装点之前已调用 _stash_bin"
+  else
+    bad "K: $b 的安装点未先 _stash_bin → 回滚会误删装前已有的 $b"
+  fi
+done
+
+# ── G. 静态守卫: trap 路径读到的每个变量, 要么在 trap 注册前初始化, 要么引用处一律带 :- 默认值 ──
+trapline=$(grep -n "^trap 'on_exit" "$ROOT/install.sh" | cut -d: -f1)
+[[ -n "$trapline" ]] && ok "定位到 EXIT trap 注册行($trapline)" || bad "G: 找不到 trap 注册行"
+{ xfn rollback; xfn on_exit; } > "$WORK/trapbody.sh"
+miss=""
+for v in $(grep -oE '\$\{?[A-Z_][A-Z0-9_]*' "$WORK/trapbody.sh" | tr -d '${' | sort -u); do
+  # 该变量在 trap 体内的所有引用是否都带 :- 兜底
+  safe=1
+  while read -r r; do
+    [[ -z "$r" ]] && continue
+    [[ "$r" == *':-'* ]] || safe=0
+  done < <(grep -oE "\\\$\{${v}[^}]*\}|\\\$${v}([^A-Z0-9_]|\$)" "$WORK/trapbody.sh" | sort -u)
+  # 或者在 trap 注册前就已初始化
+  init=$(head -n "$trapline" "$ROOT/install.sh" | grep -cE "(^|[; ])$v=")
+  [[ "$safe" == 1 || "$init" -gt 0 ]] || miss="$miss $v"
+done
+[[ -z "$miss" ]] && ok "G: trap/rollback 路径无未初始化且无默认值的变量(set -u 安全)" \
+  || bad "G: 这些变量既未在 trap 前初始化, 引用处也没有 :- 兜底 →$miss"
+
+# ── L. QUIC 精确清理失败: 禁用启动，但保留完整 provenance/recovery 工具 ─────
+mk_sandbox
+printf 'MARK=0x504447\nMASK=0xffffffff\nTABLE=7895\nPRIORITY=17895\n' \
+  >"$SB/etc/privdns-gateway/quic-routing.state"
+printf 'PDG_QUIC_MODE=tproxy\n' >"$SB/etc/privdns-gateway/profile.env"
+printf 'parser\n' >"$SB/opt/pdg-bot/pdgprofile.py"
+printf 'converter\n' >"$SB/opt/pdg-bot/sb2mihomo.py"
+printf '[Unit]\n' >"$SB/etc/systemd/system/pdg-quic-routing.service"
+cat >"$SB/usr/local/libexec/pdg-quic-routing.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$SB/usr/local/libexec/pdg-quic-routing.sh"
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; RESOLVED_DISABLED=0; QUIC_ROUTING_TOUCHED=1; NFT_CONFIG_CHANGED=0; NFT_RUNTIME_TOUCHED=0')
+lout="$out"
+grep -q 'systemctl disable --now pdg-quic-routing.service' "$WORK/calls.log" \
+  && ok "L: cleanup 不确定时 route unit 仍 stop+disable" \
+  || bad "L: route unit 未被禁用"
+for kept in \
+  "$SB/etc/privdns-gateway/quic-routing.state" \
+  "$SB/etc/privdns-gateway/profile.env" \
+  "$SB/usr/local/libexec/pdg-quic-routing.sh" \
+  "$SB/etc/systemd/system/pdg-quic-routing.service" \
+  "$SB/opt/pdg-bot/pdgprofile.py" \
+  "$SB/opt/pdg-bot/sb2mihomo.py"; do
+  [[ -e "$kept" ]] || bad "L: recovery 文件被删: $kept"
+done
+
+# ── L2. 仓库目录与证书 hook 都走精确事务 ───────────────────────────────────
+mk_sandbox
+mkdir -p "$SB/opt/privdns-gateway"
+printf 'NEW-REPO\n' > "$SB/opt/privdns-gateway/HEAD"
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; RESOLVED_DISABLED=0' \
+  'DIR_TXN=("$SB/opt/privdns-gateway|0|")')
+[[ ! -e "$SB/opt/privdns-gateway" ]] \
+  && ok "L2: 装前不存在的 /opt 仓库副本在失败后删除" \
+  || bad "L2: 新建 /opt 仓库副本残留"
+
+mk_sandbox
+mkdir -p "$SB/etc/letsencrypt/renewal-hooks/deploy"
+printf 'OLD-HOOK\n' > "$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh"
+old_hook_sha=$(sha256sum "$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh" | cut -d' ' -f1)
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; RESOLVED_DISABLED=0' \
+  "_stash_bin \"\$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh\" || exit 9
+printf 'NEW-HOOK\n' > \"\$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh\"")
+[[ "$(sha256sum "$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh" | cut -d' ' -f1)" == "$old_hook_sha" ]] \
+  && ok "L2: 既有 99-pdg-cert.sh 在失败后精确还原" \
+  || bad "L2: 证书 deploy hook 未还原"
+
+grep -q '/var/lib/privdns-gateway' "$ROOT/install.sh" \
+  && ok "L2: pdgtx 状态目录已纳入 DIR_TXN" || bad "L2: pdgtx 状态目录未入账"
+grep -q 'mktemp -d /opt/.privdns-gateway.bootstrap' "$ROOT/install.sh" \
+  && ok "L2: curl 自举先在 /opt 临时目录 clone/checkout" || bad "L2: 自举仍可能直接污染目标"
+grep -q 'set -o noclobber' "$ROOT/install.sh" \
+  && ok "L2: 首装 marker 拒绝覆盖预存对象" || bad "L2: marker 创建非排他"
+ok "L: QUIC cleanup 失败时 state/profile/helper/unit/parser bundle 均保留"
+grep -q '精确清理/证明 QUIC policy routing' <<<"$lout" \
+  && ok "L: 不完整回滚明确报告" || bad "L: cleanup 失败未报告"
+
+echo "────────────────────────────────────────"
+echo "通过 $pass, 失败 $nfail"
+[[ "$nfail" == 0 ]]

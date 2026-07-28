@@ -1,0 +1,139 @@
+log:
+  level: warn
+# 占位符由 install.sh 渲染:
+#   __SERVER_IP__     本机公网 IP (代理域名 A 记录劫持到这里)
+#   __INTERNAL_CIDR__ 内网卡来源段 (只有这个来源的查询才劫持/分流)
+#   __CERT_DIR__      DoT 证书目录 (含 fullchain.pem / privkey.pem)
+plugins:
+  # concurrent: 2 = 每次并发查"随机起点的 2 个上游", 先返回的有效结果胜、出错的被跳过
+  #   → 任一上游挂掉(如阿里 DoH 跨境 reset)查询仍成功。
+  #   ⚠️ mosdns 默认 concurrent=1 是"随机选 1 个、出错不换下一个", 多写上游并不会自动故障转移, 故必须显式设。
+  - tag: remote_upstream
+    type: forward
+    args: { concurrent: 2, upstreams: [ {addr: "https://1.1.1.1/dns-query"}, {addr: "udp://8.8.8.8:53"} ] }
+  - tag: local_upstream
+    type: forward
+    # 国内多厂商冗余: 阿里 DoH(防污染) + 阿里 UDP(兜底) + 腾讯 UDP(异厂商, 阿里抽风/限速时顶上)。
+    # 想换/加用 bot『🌐 DNS 上游』(会保留 concurrent: 2)。
+    args: { concurrent: 2, upstreams: [ {addr: "https://223.5.5.5/dns-query"}, {addr: "udp://223.5.5.5:53"}, {addr: "udp://119.29.29.29:53"} ] }
+  # WDA/流媒体解锁支(常驻, 平时休眠): bot『🌐 DNS 上游→🔓 解锁走 WDA』开启时, 会把要解锁的域名
+  # 写进 unlock.txt; 仅"本机查询"(=sing-box 直出解析这些域名时)走解锁 DNS 22.22.22.22 拿中继 IP。
+  # 落地模式下 unlock.txt 由 bot 留空/这些域名走各自出口, 本支不命中=休眠。unlock.txt 由 install 建空文件。
+  - tag: unlock_upstream
+    type: forward
+    args: { concurrent: 1, upstreams: [ {addr: "udp://22.22.22.22"} ] }
+  - tag: geosite_unlock
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/unlock.txt"] }
+  - tag: geosite_cn
+    type: domain_set
+    # custom_direct = 显式单域名手机直连；ruleset_direct = target=direct 规则集的事务派生聚合。
+    # 两者都让手机取得真实地址，不进入 VPS/Mihomo。
+    args: { files: ["/etc/mosdns/rules/geosite_cn.txt","/etc/mosdns/rules/geosite_apple.txt","/etc/mosdns/rules/custom_direct.txt","/etc/mosdns/rules/ruleset_direct.txt"] }
+  - tag: npn_clients
+    type: ip_set
+    args: { ips: ["__INTERNAL_CIDR__"] }
+  # 劫持集: 决定哪些海外域名 A 记录劫持到网关(进代理)。all 模式=geolocation-!cn(全非CN);
+  # gfw 模式=gfw(只劫持真被墙域名, 其余海外域名返真实 IP+AAAA → SSH/直连不被劫持)。install/切换按模式渲染。
+  # custom_hijack.txt = bot 里"指到出口"的域名。geosite 的 geolocation-!cn 是**策展分类**,
+  # 不含任意个人域名 —— 只靠它, 用户加的显式出口规则会因为域名没被劫持而完全不生效。
+  - tag: hijack_set
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/__HIJACK_SET_FILE__","/etc/mosdns/rules/custom_hijack.txt"] }
+  # 显式单域名出口规则比 geosite_cn/宽泛 direct 规则集更具体，必须先强制劫持；否则一个
+  # ruleset_direct 的宽后缀会吞掉“该后缀内某域名 → 代理出口”的显式覆盖。
+  - tag: explicit_hijack
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/custom_hijack.txt"] }
+  # MITM 接管域名集(Feature B / iOS): 这些域名强制劫持到网关(即使是 Apple/国内直连域名),
+  # 好让 mihomo 把它们路由到 MITM 服务终止 TLS。平时空文件 = 无接管(休眠); bot 启用插件时填。
+  - tag: force_hijack
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/mitm_hijack.txt"] }
+  - tag: ecs_china
+    type: ecs_handler
+    args: {forward: false, send: true, preset: "139.226.48.0", mask4: 24, mask6: 48}
+  - tag: ecs_neutral
+    type: ecs_handler
+    args: {forward: false, send: true, preset: "0.0.0.0", mask4: 24, mask6: 48}
+  - tag: has_resp
+    type: sequence
+    args: [ { matches: has_resp, exec: accept } ]
+  # 单客户端 QPS 兜底(误配置/异常设备): 仅内网来源进 internal_sequence 时生效, 放在缓存查询之前,
+  # 超限直接 REFUSED, 不再消耗缓存/上游。nftables 来源限制仍是第一道边界; 这不是 DDoS 防护。
+  # rate_limiter 是 matcher: matches 为真=在限额内; 故用 "!$client_limiter" 命中超限。
+  - tag: client_limiter
+    type: rate_limiter
+    args: { qps: 200, burst: 400, mask4: 32, mask6: 128 }
+  # 响应缓存 (lazy): 只在 internal_sequence 内缓存, 按 qname+qtype 缓存安全。
+  - tag: lazy_cache
+    type: cache
+    args:
+      size: __MOSDNS_CACHE__            # 标准 8192 / 低内存 2048(install 按内存模式渲染, pdg 更新按 profile 迁移)
+      lazy_cache_ttl: 86400
+  # MITM 接管域名的劫持序列(经 goto 进入, 不返回): 抑制 AAAA/HTTPS + A 劫持到网关。
+  - tag: force_hijack_seq
+    type: sequence
+    args:
+      - matches: qtype 28
+        exec: reject 0
+      - matches: qtype 65
+        exec: reject 0
+      - exec: jump has_resp
+      - matches: qtype 1
+        exec: black_hole __SERVER_IP__
+  - tag: internal_sequence
+    type: sequence
+    args:
+      - matches: "!$client_limiter"     # 单客户端超 QPS → REFUSED, 抢在缓存/上游之前拦掉
+        exec: reject 5
+      - exec: $lazy_cache
+      - exec: jump has_resp
+      # MITM 接管域名: 强制劫持(在 CN 判断之前, 即使 Apple/国内域名也劫持; goto 不返回)
+      - matches: qname $force_hijack
+        exec: goto force_hijack_seq
+      # 显式单域名代理覆盖优先于 CN/规则集手机直连，进入同一 fake-IP/SNI 劫持序列。
+      - matches: qname $explicit_hijack
+        exec: goto force_hijack_seq
+      - matches: qname $geosite_cn
+        exec: $ecs_china
+      - matches: qname $geosite_cn
+        exec: $local_upstream
+      - exec: jump has_resp
+      # 不在劫持集的海外域名 → 真实海外解析(含 AAAA), 不劫持。
+      # all 模式下 hijack_set=geolocation-!cn, 非CN都在集内, 此门基本不放行(维持原"非CN全劫持");
+      # gfw 模式下只有 gfw 域名在集内, 非墙海外域名从这里返真实 IP(修 SSH/直连被劫持)。
+      - matches: "!qname $hijack_set"
+        exec: $ecs_neutral
+      - matches: "!qname $hijack_set"
+        exec: $remote_upstream
+      - exec: jump has_resp
+      # 劫持集内域名: 抑制 AAAA/HTTPS + A 记录劫持到网关(进 TCP/QUIC 代理)
+      - matches: qtype 28
+        exec: reject 0
+      - matches: qtype 65
+        exec: reject 0
+      - exec: jump has_resp
+      - matches: qtype 1
+        exec: black_hole __SERVER_IP__
+      - exec: jump has_resp
+      - exec: $ecs_neutral
+      - exec: $remote_upstream
+  - tag: main_sequence
+    type: sequence
+    args:
+      - matches: client_ip $npn_clients
+        exec: goto internal_sequence
+      - matches: qname $geosite_unlock
+        exec: $unlock_upstream
+      - exec: jump has_resp
+      - exec: $remote_upstream
+  - tag: udp_server
+    type: udp_server
+    args: {entry: main_sequence, listen: "0.0.0.0:53"}
+  - tag: tcp_server
+    type: tcp_server
+    args: {entry: main_sequence, listen: "0.0.0.0:53"}
+  - tag: dot_server
+    type: tcp_server
+    args: {entry: main_sequence, listen: "0.0.0.0:853", cert: "__CERT_DIR__/fullchain.pem", key: "__CERT_DIR__/privkey.pem"}

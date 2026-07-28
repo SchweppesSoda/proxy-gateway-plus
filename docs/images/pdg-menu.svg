@@ -1,0 +1,25 @@
+<svg viewBox="0 0 380 380" width="420" height="400" xmlns="http://www.w3.org/2000/svg" xml:space="preserve" role="img" aria-label="sudo pdg 管理菜单(竖排)示意">
+<title>pdg 管理菜单</title>
+<rect x="0" y="0" width="380" height="380" rx="8" fill="#1b1b1b"/>
+<rect x="0" y="0" width="380" height="22" rx="8" fill="#2b2b2b"/><rect x="0" y="14" width="380" height="8" fill="#2b2b2b"/>
+<circle cx="14" cy="11" r="4" fill="#ff5f56"/><circle cx="28" cy="11" r="4" fill="#ffbd2e"/><circle cx="42" cy="11" r="4" fill="#27c93f"/>
+<g font-family="monospace" font-size="12">
+<text x="14" y="42" fill="#5fd35f">===== PrivDNS Gateway 管理 =====</text>
+<text x="14" y="62" fill="#d8d8d8">  1) 状态</text>
+<text x="14" y="80" fill="#d8d8d8">  2) 自检 (doctor)</text>
+<text x="14" y="98" fill="#d8d8d8">  3) 更新</text>
+<text x="14" y="116" fill="#d8d8d8">  4) 快照备份</text>
+<text x="14" y="134" fill="#d8d8d8">  5) 回滚</text>
+<text x="14" y="152" fill="#d8d8d8">  6) 设置/更换 Bot Token 与 TG ID</text>
+<text x="14" y="170" fill="#d8d8d8">  7) 重启服务</text>
+<text x="14" y="188" fill="#d8d8d8">  8) 日志</text>
+<text x="14" y="206" fill="#d8d8d8">  9) 流量 (vnstat)</text>
+<text x="14" y="224" fill="#d8d8d8"> 10) iOS 描述文件</text>
+<text x="14" y="242" fill="#d8d8d8"> 11) 诊断报告 (脱敏)</text>
+<text x="14" y="260" fill="#d8d8d8"> 12) 识别内网卡段</text>
+<text x="14" y="278" fill="#d8d8d8"> 13) 卸载</text>
+<text x="14" y="296" fill="#d8d8d8">  0) 退出</text>
+<text x="14" y="316" fill="#8a8a8a">  下次打开本菜单命令: pdg</text>
+<text x="14" y="338" fill="#d8d8d8">选择: <tspan fill="#5fd35f">█</tspan></text>
+</g>
+</svg>

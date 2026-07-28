@@ -1,0 +1,17 @@
+<svg viewBox="0 0 220 372" width="300" height="507" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="安卓私人 DNS 设置示意">
+<title>安卓私人 DNS</title>
+<rect x="0" y="0" width="220" height="372" rx="14" fill="#ffffff"/>
+<rect x="0" y="0" width="220" height="44" rx="14" fill="#ffffff"/>
+<text x="16" y="28" fill="#202124" font-family="sans-serif" font-size="14" font-weight="500">私人 DNS</text>
+<line x1="0" y1="44" x2="220" y2="44" stroke="#e3e3e3"/>
+<circle cx="26" cy="74" r="7" fill="none" stroke="#9aa0a6" stroke-width="2"/>
+<text x="42" y="78" fill="#3c4043" font-family="sans-serif" font-size="12">自动</text>
+<circle cx="26" cy="108" r="7" fill="none" stroke="#9aa0a6" stroke-width="2"/>
+<text x="42" y="112" fill="#3c4043" font-family="sans-serif" font-size="12">关闭</text>
+<circle cx="26" cy="142" r="7" fill="#1a73e8"/><circle cx="26" cy="142" r="3" fill="#fff"/>
+<text x="42" y="146" fill="#202124" font-family="sans-serif" font-size="12">指定私人 DNS 提供商主机名</text>
+<rect x="42" y="158" width="160" height="32" rx="5" fill="#fff" stroke="#1a73e8" stroke-width="1.5"/>
+<text x="52" y="178" fill="#202124" font-family="sans-serif" font-size="12">dot.example.com</text>
+<rect x="118" y="206" width="42" height="26" rx="13" fill="#fff"/><text x="139" y="224" fill="#1a73e8" font-family="sans-serif" font-size="12" text-anchor="middle">取消</text>
+<rect x="162" y="206" width="42" height="26" rx="13" fill="#fff"/><text x="183" y="224" fill="#1a73e8" font-family="sans-serif" font-size="12" font-weight="500" text-anchor="middle">保存</text>
+</svg>

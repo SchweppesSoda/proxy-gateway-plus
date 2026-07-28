@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# 端到端: 管理命令不许"假成功"。
+#
+#   · pdg restart 以前把 systemctl 的返回值直接丢掉(`systemctl restart $svcs 2>/dev/null`),
+#     mihomo 配置是空的、服务一直起不来, 它照样 return 0 打印"已重启";
+#   · pdg detect-cidr 的快照失败被 `|| true` 吞掉, 出事再按 index 0 回滚(可能回到上周某次
+#     无关快照), sed 没命中也照报成功;
+#   · pdg update --dry-run 会先跑一遍迁移(改 unit/nft/mosdns), 且 fetch/describe/tag 失败
+#     一律吞掉后打印"最新发布: (无 tag)" + return 0 —— 用户当成"已是最新";
+#   · 极简 Debian 没有 iproute2, status 的"监听端口"整块是空的而装机不报错;
+#   · uninstall 遇到 bind-mount 的 /etc/resolv.conf 直接 rm+mv, 失败也宣布完成 —— 机器
+#     从此指着一个已被卸载的本机 mosdns, 整机没 DNS。
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=tests/e2e-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/e2e-lib.sh"
+e2e_enter "$@"
+
+export PDG_STABLE_SAMPLES=1     # 假 systemd 没有真实重启动力学; is-active/NRestarts 照常查
+
+e2e_stub_system
+e2e_seed_install
+e2e_seed_mosdns all
+e2e_seed_singbox_model
+e2e_seed_nft
+printf 'mihomo\n' > /etc/privdns-gateway/backend
+printf 'android\n' > /etc/privdns-gateway/platform
+e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
+
+# unit 用**真实形态**(带 ExecStart=…/usr/local/bin/<svc>): 幂等迁移是按 unit 内容判断要不要
+# 补 SAFE_PATHS 的, 拿 ExecStart=/bin/true 这种占位 unit 当现场, 那条迁移每次都会重跑一遍并
+# 重启内核, 后面"校验没过时一个服务都没重启"就永远测不成。
+# shellcheck source=lib/units.sh
+source "$E2E_ROOT/lib/units.sh"
+pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
+for u in pdg-bot mosdns; do
+  printf '[Unit]\nDescription=%s\n[Service]\nExecStart=/usr/local/bin/%s\n' "$u" "$u" \
+    > "/etc/systemd/system/$u.service"
+done
+for u in pdg-bot mosdns mihomo; do echo 1 > "/tmp/e2e-svc/$u.ac"; echo 1 > "/tmp/e2e-svc/$u.en"; done
+# 有效的 mihomo 配置(下面某些用例会故意写坏它)
+printf '{"log-level":"silent","mixed-port":17890,"proxies":[],"rules":["MATCH,DIRECT"]}\n' \
+  > /etc/mihomo/config.yaml
+
+# ══ 1. restart: 服务起不来必须返回非 0 ══════════════════════════════════════
+echo "── 1. restart 的真实校验 ──"
+printf 'PDG_BOT_TOKEN=123456:AAaa\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
+out=$(pdg restart 2>&1); rc=$?
+{ [[ "$rc" == 0 ]] && grep -q '已重启并确认运行' <<<"$out"; } \
+  && ok "一切正常时 restart 返回 0 并确认运行" || bad "1: rc=$rc: $(tail -3 <<<"$out")"
+
+e2e_svc_crash mihomo                                  # 起得来但立刻崩(restart 返回 0, 随即 inactive)
+out=$(pdg restart 2>&1); rc=$?
+[[ "$rc" != 0 ]] && ok "内核起不来 → restart 返回非 0" || bad "1b: 竟然返回 0: $(tail -3 <<<"$out")"
+grep -q 'mihomo' <<<"$out" && ok "点名了起不来的服务" || bad "1c: 没点名: $(tail -3 <<<"$out")"
+grep -qE '最近日志|journal' <<<"$out" && ok "附带了近期日志" || bad "1d: 没给日志"
+e2e_svc_heal mihomo
+
+e2e_svc_crash mosdns
+out=$(pdg restart 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -q 'mosdns' <<<"$out"; } \
+  && ok "mosdns 起不来 → 返回非 0 并点名" || bad "1e: rc=$rc: $(tail -3 <<<"$out")"
+e2e_svc_heal mosdns
+
+# restart 会从 canonical source model 重新渲染 mihomo，单独破坏当前 config 会被合法候选覆盖，
+# 不能证明失败门真的挡在重启之前。给 model 注入一个转换器明确不支持的 outbound；候选渲染
+# 必须失败，live config 不得改写，systemctl restart 次数也必须保持不变。用例结束后逐字节
+# 恢复 model，避免污染后续 section。
+MODEL=/etc/sing-box/config.json
+MODEL_BEFORE=/tmp/e2e-cli-model.before
+GOOD_CFG=/tmp/e2e-cli-good-config.before
+cp -a "$MODEL" "$MODEL_BEFORE"
+cp -a /etc/mihomo/config.yaml "$GOOD_CFG"
+python3 - "$MODEL" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    model = json.load(stream)
+model.setdefault("outbounds", []).append({
+    "type": "wireguard",
+    "tag": "restart-unsupported",
+})
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(model, stream, ensure_ascii=False, indent=2)
+    stream.write("\n")
+PY
+CALLS_BEFORE="$(grep -c 'systemctl restart' /tmp/e2e-calls.log 2>/dev/null)"
+out=$(pdg restart 2>&1); rc=$?
+CALLS_AFTER="$(grep -c 'systemctl restart' /tmp/e2e-calls.log 2>/dev/null)"
+{ [[ "$rc" != 0 ]] && grep -qE '候选渲染/校验失败|校验失败' <<<"$out"; } \
+  && ok "canonical model 含不支持出口 → 候选渲染失败并返回非 0" \
+  || bad "1f: rc=$rc: $(tail -3 <<<"$out")"
+{ [[ "$CALLS_BEFORE" == "$CALLS_AFTER" ]] \
+  && cmp -s "$GOOD_CFG" /etc/mihomo/config.yaml; } \
+  && ok "候选失败时未重启服务且 live config 未改写" \
+  || bad "1g: 重启计数 $CALLS_BEFORE→$CALLS_AFTER 或 live config 漂移"
+cp -a "$MODEL_BEFORE" "$MODEL"
+cmp -s "$MODEL_BEFORE" "$MODEL" \
+  && ok "负向用例后 canonical model 已逐字节恢复" \
+  || bad "1h: canonical model 恢复后字节漂移"
+rm -f "$MODEL_BEFORE"
+rm -f "$GOOD_CFG"
+
+# ══ 2. restart: 未配 Bot 凭据时明确跳过 pdg-bot ═════════════════════════════
+echo; echo "── 2. 未配 Bot 凭据 ──"
+: > /etc/privdns-gateway/bot.env
+echo 0 > /tmp/e2e-svc/pdg-bot.ac                      # 没配凭据, bot 本来就不该在跑
+out=$(pdg restart 2>&1); rc=$?
+[[ "$rc" == 0 ]] && ok "未配凭据 + pdg-bot 未运行 → restart 仍返回 0" || bad "2: rc=$rc: $(tail -3 <<<"$out")"
+grep -q '未配置' <<<"$out" && ok "明确显示「未配置, 未启动」" || bad "2b: 没说明: $(tail -3 <<<"$out")"
+grep -q 'pdg-bot' <<<"$(sed -n '/已重启并确认运行/p' <<<"$out")" \
+  && bad "2c: 未配凭据却仍去重启 pdg-bot" || ok "未配凭据: 重启清单里没有 pdg-bot"
+printf 'PDG_BOT_TOKEN=123456:AAaa\n' > /etc/privdns-gateway/bot.env   # 只配一半
+out=$(pdg restart 2>&1)
+grep -q '只配了一项' <<<"$out" && ok "只配一半 → 明确提示配置错误" || bad "2d: $(tail -3 <<<"$out")"
+printf 'PDG_BOT_TOKEN=123456:AAaa\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
+echo 1 > /tmp/e2e-svc/pdg-bot.ac
+
+# ══ 3. restart: iOS 服务集 ═════════════════════════════════════════════════
+echo; echo "── 3. iOS 服务集 ──"
+e2e_seed_platform ios
+printf '[Unit]\nDescription=probe81\n[Service]\nExecStart=/bin/true\n' > /etc/systemd/system/pdg-probe81.service
+echo 1 > /tmp/e2e-svc/pdg-probe81.ac; echo 1 > /tmp/e2e-svc/pdg-probe81.en
+out=$(pdg restart 2>&1); rc=$?
+{ [[ "$rc" == 0 ]] && grep -q 'pdg-probe81' <<<"$out"; } \
+  && ok "iOS: 重启清单含 pdg-probe81" || bad "3: $(tail -3 <<<"$out")"
+e2e_svc_crash pdg-probe81
+out=$(pdg restart 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -q 'pdg-probe81' <<<"$out"; } \
+  && ok "iOS: probe81 起不来 → 非 0 并点名" || bad "3b: rc=$rc: $(tail -3 <<<"$out")"
+e2e_svc_heal pdg-probe81
+# pdg-mitm 已启用时也要核验
+printf '[Unit]\nDescription=mitm\n[Service]\nExecStart=/bin/true\n' > /etc/systemd/system/pdg-mitm.service
+echo 1 > /tmp/e2e-svc/pdg-mitm.en; echo 1 > /tmp/e2e-svc/pdg-mitm.ac
+out=$(pdg restart 2>&1)
+grep -q 'pdg-mitm' <<<"$out" && ok "已启用的 pdg-mitm 也纳入核验" || bad "3c: $(tail -3 <<<"$out")"
+e2e_svc_crash pdg-mitm
+out=$(pdg restart 2>&1); rc=$?
+[[ "$rc" != 0 ]] && ok "pdg-mitm 起不来 → 非 0" || bad "3d: 竟然返回 0: $(tail -3 <<<"$out")"
+e2e_svc_heal pdg-mitm
+rm -f /etc/systemd/system/pdg-mitm.service /etc/systemd/system/pdg-probe81.service
+rm -f /tmp/e2e-svc/pdg-mitm.* /tmp/e2e-svc/pdg-probe81.*
+e2e_seed_platform android
+
+# ══ 4. status: 监听端口靠 ss(iproute2) ═════════════════════════════════════
+echo; echo "── 4. status 的监听端口 ──"
+command -v ss >/dev/null 2>&1 && ok "环境里有 ss(装机依赖已含 iproute2)" \
+  || bad "4: 没有 ss —— 装机依赖漏了 iproute2"
+grep -qE '^apt-get install .*\biproute2\b' "$E2E_ROOT/install.sh" \
+  && ok "install.sh 的依赖列表显式包含 iproute2" || bad "4b: 依赖列表没有 iproute2"
+cat > /usr/local/bin/ss <<'S'
+#!/bin/sh
+if [ "${1:-}" = "-H" ]; then
+cat <<'E'
+LISTEN 0 4096   0.0.0.0:53    0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:853   0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:7893  0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:8445  0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:81    0.0.0.0:*
+E
+exit 0
+fi
+cat <<'E'
+tcp   LISTEN 0 4096   0.0.0.0:53    0.0.0.0:*
+tcp   LISTEN 0 4096   0.0.0.0:853   0.0.0.0:*
+tcp   LISTEN 0 4096   0.0.0.0:7893  0.0.0.0:*
+tcp   LISTEN 0 4096   0.0.0.0:8445  0.0.0.0:*
+tcp   LISTEN 0 4096   0.0.0.0:81    0.0.0.0:*
+E
+S
+chmod 755 /usr/local/bin/ss
+out=$(pdg status 2>&1)
+for p in 53 853 7893 8445; do
+  grep -qE "监听端口.*\b$p\b" <<<"$out" && ok "status 显示端口 $p" || bad "4c: 没显示 $p: $(grep 监听端口 <<<"$out")"
+done
+e2e_seed_platform ios
+out=$(pdg status 2>&1)
+grep -qE "监听端口.*\b81\b" <<<"$out" && ok "iOS: status 还显示 :81(probe81)" || bad "4d: iOS 没显示 81"
+e2e_seed_platform android
+
+# ══ 5. status: 版本读不到要说"未知", 不能空 ════════════════════════════════
+echo; echo "── 5. status 的版本显示 ──"
+out=$(pdg status 2>&1)
+grep -qE '代码版本 +[^ ]' <<<"$out" && ok "正常时显示版本" || bad "5: 版本是空的: $(grep 代码版本 <<<"$out")"
+mv /opt/privdns-gateway/.git /opt/privdns-gateway/.git-hidden
+out=$(pdg status 2>&1)
+grep -qE '代码版本 +未知' <<<"$out" && ok "仓库读不到 → 明确显示「未知」" || bad "5b: $(grep 代码版本 <<<"$out")"
+mv /opt/privdns-gateway/.git-hidden /opt/privdns-gateway/.git
+
+# ══ 6. update --dry-run: 严格只读 + 失败要报错 ═════════════════════════════
+echo; echo "── 6. update --dry-run ──"
+hash_state(){
+  { sha256sum /etc/mihomo/config.yaml /etc/nftables.conf /etc/mosdns/config.yaml \
+              /etc/privdns-gateway/profile.env 2>/dev/null
+    sha256sum /etc/systemd/system/*.service 2>/dev/null
+    git -C /opt/privdns-gateway rev-parse HEAD 2>/dev/null
+  } | sha256sum | cut -d' ' -f1
+}
+# 故意降成 legacy/incomplete profile：若 dry-run 偷跑 migration，它一定会补键，
+# 从而被下面的零修改哈希哨兵抓到。section 7 前再逐字节恢复 canonical profile。
+cp -a /etc/privdns-gateway/profile.env /tmp/e2e-cli-canonical-profile.env
+printf 'PDG_PLATFORM=android\n' > /etc/privdns-gateway/profile.env
+# origin 指向**本地** bare 仓库: dry-run 会真的 fetch, 不该依赖外网(串行跑时前一个脚本
+# 可能已经把 /etc/resolv.conf 指到本机 mosdns, 那时解析 github.com 必然失败)。
+rm -rf /tmp/e2e-cli-origin.git
+git init -q --bare /tmp/e2e-cli-origin.git
+( cd /opt/privdns-gateway
+  git init -q -b main 2>/dev/null; git config user.email t@t; git config user.name t
+  git config commit.gpgsign false
+  git add -A >/dev/null 2>&1; git commit -qm base >/dev/null 2>&1
+  git remote remove origin >/dev/null 2>&1
+  git remote add origin /tmp/e2e-cli-origin.git
+  git push -q origin HEAD:refs/heads/main >/dev/null 2>&1
+  git tag -f v9.9.9 >/dev/null 2>&1
+  git push -q origin --tags >/dev/null 2>&1 ) || true
+BEFORE="$(hash_state)"
+out=$(pdg update --dry-run 2>&1); rc=$?
+[[ "$rc" == 0 ]] && ok "dry-run 正常返回 0" || bad "6: rc=$rc: $(tail -3 <<<"$out")"
+[[ "$(hash_state)" == "$BEFORE" ]] \
+  && ok "dry-run 零修改(配置/unit/nft/profile/仓库 HEAD 哈希不变)" || bad "6b: dry-run 改了东西"
+grep -qE '当前:.*最新发布:' <<<"$out" && ok "dry-run 报出当前/最新版本" || bad "6c: $(tail -3 <<<"$out")"
+
+# 远端拉不到 tag(remote 不可用)→ 必须返回非 0 并说明, 而不是"最新发布: (无 tag)" + 0
+git -C /opt/privdns-gateway remote remove origin >/dev/null 2>&1
+git -C /opt/privdns-gateway remote add origin /nonexistent/repo.git >/dev/null 2>&1
+BEFORE="$(hash_state)"
+out=$(pdg update --dry-run 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -qE '拉取远端 tag 失败|无法判断' <<<"$out"; } \
+  && ok "fetch 失败 → 返回非 0 并说明原因" || bad "6d: rc=$rc: $(tail -3 <<<"$out")"
+[[ "$(hash_state)" == "$BEFORE" ]] && ok "fetch 失败路径同样零修改" || bad "6e: 失败路径改了东西"
+
+# 远端能拉但一个发布 tag 都没有 → 同样要明说, 不能装作"已是最新"
+rm -rf /tmp/e2e-empty-origin.git
+git init -q --bare /tmp/e2e-empty-origin.git
+( cd /opt/privdns-gateway && git remote remove origin >/dev/null 2>&1
+  git remote add origin /tmp/e2e-empty-origin.git
+  git push -q origin HEAD:refs/heads/main >/dev/null 2>&1 ) || true
+git -C /opt/privdns-gateway tag -l 'v*' | xargs -r git -C /opt/privdns-gateway tag -d >/dev/null 2>&1
+BEFORE="$(hash_state)"
+out=$(pdg update --dry-run 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -q 'tag' <<<"$out"; } \
+  && ok "没有任何发布 tag → 返回非 0 并说明" || bad "6f: rc=$rc: $(tail -3 <<<"$out")"
+[[ "$(hash_state)" == "$BEFORE" ]] && ok "无 tag 路径同样零修改" || bad "6g: 改了东西"
+
+mv /opt/privdns-gateway/.git /opt/privdns-gateway/.git-hidden
+out=$(pdg update --dry-run 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -qE 'git 仓库|无法查看' <<<"$out"; } \
+  && ok "仓库不可用 → 返回非 0 并说明" || bad "6h: rc=$rc: $(tail -3 <<<"$out")"
+mv /opt/privdns-gateway/.git-hidden /opt/privdns-gateway/.git
+git -C /opt/privdns-gateway tag -f v9.9.9 >/dev/null 2>&1
+rm -rf /tmp/e2e-empty-origin.git /tmp/e2e-cli-origin.git
+cp -a /tmp/e2e-cli-canonical-profile.env /etc/privdns-gateway/profile.env
+cmp -s /tmp/e2e-cli-canonical-profile.env /etc/privdns-gateway/profile.env \
+  && ok "dry-run 负向哨兵后已逐字节恢复 canonical profile" \
+  || bad "6i: canonical profile 恢复失败"
+rm -f /tmp/e2e-cli-canonical-profile.env
+
+# ══ 7. detect-cidr 事务化 ══════════════════════════════════════════════════
+echo; echo "── 7. detect-cidr ──"
+cp /etc/nftables.conf /tmp/pristine.nft
+cp /etc/mosdns/config.yaml /tmp/pristine.mos
+cp /etc/privdns-gateway/profile.env /tmp/pristine.profile
+if ! nft list table inet pdg > /tmp/pristine.live.nft; then
+  bad "7 setup: 无法捕获 live inet pdg 基线"
+fi
+NFT_SHA0="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+MOS_SHA0="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
+PROFILE_SHA0="$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)"
+LIVE_SHA0="$(sha256sum /tmp/pristine.live.nft | cut -d' ' -f1)"
+reset_cidr(){
+  cp /tmp/pristine.nft /etc/nftables.conf
+  cp /tmp/pristine.mos /etc/mosdns/config.yaml
+  nft -f /tmp/pristine.nft
+}
+# 抓包桩: 固定报一个与当前不同的网段; 交互确认自动回 y
+cat > /usr/local/bin/tcpdump <<'S'
+#!/bin/sh
+printf 'IP 10.44.0.5.55000 > 10.0.0.1.853: tcp\n10.44.0.5\n10.44.0.5\n'
+exit 0
+S
+chmod 755 /usr/local/bin/tcpdump
+detect(){ printf 'y\n' | pdg detect-cidr 1 2>&1; }
+
+# 7a. 快照失败 → 一个字节都不许改(注入: 让 tar 失败, 快照就打不出包)
+reset_cidr
+cp "$(command -v tar)" /usr/local/bin/tar.real 2>/dev/null || cp /bin/tar /usr/local/bin/tar.real
+printf '#!/bin/sh\nexit 1\n' > /usr/local/bin/tar; chmod 755 /usr/local/bin/tar
+out=$(detect); rc=$?
+rm -f /usr/local/bin/tar   # 还原成系统自带的 tar
+{ [[ "$rc" != 0 ]] && grep -q '快照失败' <<<"$out"; } \
+  && ok "快照失败 → 明确中止并返回非 0" || bad "7a: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
+  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
+  && ok "快照失败后两份配置逐字节未变" || bad "7b: 配置被改了"
+
+# 7b. mosdns 是自定义形态(没有可替换的 ips)→ sed 不命中必须报错而不是报成功
+reset_cidr
+python3 - <<'PY2'
+p = "/etc/mosdns/config.yaml"
+t = open(p, encoding="utf-8").read().replace("ips:", "ips_custom:")
+open(p, "w", encoding="utf-8").write(t)
+PY2
+MOS_CUSTOM="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
+out=$(detect); rc=$?
+{ [[ "$rc" != 0 ]] && grep -qE '未能替换|没找到可替换' <<<"$out"; } \
+  && ok "sed 不命中 → 报错而不是谎报成功" || bad "7c: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
+  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_CUSTOM" ]]; } \
+  && ok "不命中时两份配置都没被改" || bad "7d: 配置被改了"
+
+# 7c. nft 校验失败可以合法地发生在 live before-image 预检(首写之前)或候选预检；
+# 无论在哪一层失败都必须非 0，且四类事务目标保持零写。
+reset_cidr
+cp /usr/local/bin/nft /usr/local/bin/nft.real
+printf '#!/bin/sh\n[ "$1" = "-c" ] && exit 1\nexec /usr/local/bin/nft.real "$@"\n' > /usr/local/bin/nft
+chmod 755 /usr/local/bin/nft
+out=$(detect); rc=$?
+cp -f /usr/local/bin/nft.real /usr/local/bin/nft
+{ [[ "$rc" != 0 ]] && grep -qE 'nft -c|live nft before-image.*预检' <<<"$out"; } \
+  && ok "nft before-image/候选预检失败 → 非 0 并说明" || bad "7e: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
+  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]] \
+  && [[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$PROFILE_SHA0" ]] \
+  && nft list table inet pdg > /tmp/after.live.nft \
+  && [[ "$(sha256sum /tmp/after.live.nft | cut -d' ' -f1)" == "$LIVE_SHA0" ]]; } \
+  && ok "nft 预检失败后 profile/mosdns/persistent+live nft 都逐字节未变" || bad "7f: 配置被改了"
+
+# 7d. mosdns 起不来 → 用本次事务备份还原(而不是回滚到别的快照)
+reset_cidr
+e2e_svc_crash mosdns
+out=$(detect); rc=$?
+e2e_svc_heal mosdns
+{ [[ "$rc" != 0 ]] && grep -q 'mosdns' <<<"$out"; } \
+  && ok "mosdns 起不来 → 非 0 并点名" || bad "7g: rc=$rc: $(tail -4 <<<"$out")"
+if [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
+   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]] \
+   && [[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$PROFILE_SHA0" ]] \
+   && nft list table inet pdg > /tmp/after.live.nft \
+   && [[ "$(sha256sum /tmp/after.live.nft | cut -d' ' -f1)" == "$LIVE_SHA0" ]]; then
+  ok "mosdns 失败后 profile/mosdns/persistent+live nft 都逐字节还原"
+else
+  bad "7h: 没还原干净"
+  echo "── 7h nft byte diff ──"
+  diff -u /tmp/pristine.nft /etc/nftables.conf || true
+  echo "── 7h mosdns byte diff ──"
+  diff -u /tmp/pristine.mos /etc/mosdns/config.yaml || true
+  echo "── 7h profile byte diff ──"
+  diff -u /tmp/pristine.profile /etc/privdns-gateway/profile.env || true
+  echo "── 7h live nft byte diff ──"
+  nft list table inet pdg > /tmp/after.live.nft 2>/dev/null || true
+  diff -u /tmp/pristine.live.nft /tmp/after.live.nft || true
+fi
+
+# 7e. 成功路径: 落盘 + 三处复核
+reset_cidr
+out=$(detect); rc=$?
+{ [[ "$rc" == 0 ]] && grep -q '三处一致' <<<"$out"; } \
+  && ok "成功路径: 落盘 + 复核 nft/mosdns/自检三处一致" || bad "7i: rc=$rc: $(tail -4 <<<"$out")"
+grep -q '10.44.0.0/16' /etc/nftables.conf && ok "新网段写进了防火墙" || bad "7j: 防火墙里没有新网段"
+grep -q '10.44.0.0/16' /etc/mosdns/config.yaml && ok "新网段写进了 mosdns" || bad "7k: mosdns 里没有新网段"
+
+# 7f. 幂等: 再跑一次什么都不该改
+NFT_SHA1="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+MOS_SHA1="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
+out=$(detect); rc=$?
+{ [[ "$rc" == 0 ]] && grep -q '与当前一致' <<<"$out"; } \
+  && ok "再跑一次: 与当前一致 → 直接返回" || bad "7l: rc=$rc: $(tail -3 <<<"$out")"
+{ [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA1" ]] \
+  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA1" ]]; } \
+  && ok "幂等: 第二次没有改动任何配置" || bad "7m: 第二次改了配置"
+
+rm -f /tmp/pristine.nft /tmp/pristine.mos /tmp/pristine.profile \
+      /tmp/pristine.live.nft /tmp/after.live.nft \
+      /usr/local/bin/nft.real /usr/local/bin/tar.real
+e2e_summary

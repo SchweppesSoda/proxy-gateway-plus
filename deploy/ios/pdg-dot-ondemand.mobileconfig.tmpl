@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PrivDNS Gateway — iOS/iPadOS DoT 描述文件 (带 OnDemand + 双卡 probe)。
+  通用于单卡/双卡: probe 探到「只有内网卡能收到响应」的端点时才启用 DoT。
+
+  生成真文件时替换 (bot 的「📱 iOS 描述文件」会自动填):
+    __DOT_HOST__  = DoT 主机名 (= 证书 SAN, 如 dot.example.com)
+    __JP_IP__     = 网关公网 IP (DoT 服务器, 如 203.0.113.10)
+    __UUID1__ __UUID2__ = 两个 uuidgen
+
+  前置 (要配 iOS 时在网关上做一次, install.sh / pdg-probe81 已自动配好):
+    1) 开一个探测端点: HTTP :81, GET /probe 返回 200 (iOS 不认 204);
+    2) 防火墙只放行 内网卡来源段 → :81, 其余拒绝/丢弃
+       (这样普通卡探不通、内网卡探得通, 实现双卡区分)。
+
+  Wi-Fi 同样按 :81 探测判定: 只有出网路径能以内网段源 IP 摸到网关的 Wi-Fi
+  (如路由器走专线/插内网卡)才启用 DoT, 普通宽带 Wi-Fi 探不通 → 自动直连。
+  bot 生成时可在 OnDemandRules 最前面插一条 SSIDMatch+Disconnect,
+  把用户指定的 Wi-Fi 强制直连(治 captive portal 假 200 误判)。
+
+  关键: OnDemandRules 与 DNSSettings 平级 (不要嵌进 DNSSettings); WiFi 规则排在 Cellular 之前。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key>    <string>com.apple.dnsSettings.managed</string>
+      <key>PayloadVersion</key> <integer>1</integer>
+      <key>PayloadIdentifier</key> <string>com.privdns.gateway.dot.__UUID1__</string>
+      <key>PayloadUUID</key>    <string>__UUID1__</string>
+      <key>PayloadDisplayName</key> <string>PrivDNS Gateway (DoT)</string>
+
+      <key>DNSSettings</key>
+      <dict>
+        <key>DNSProtocol</key>     <string>TLS</string>
+        <key>ServerName</key>      <string>__DOT_HOST__</string>
+        <key>ServerAddresses</key> <array><string>__JP_IP__</string></array>
+      </dict>
+
+      <!-- OnDemand 与 DNSSettings 平级 -->
+      <key>OnDemandRules</key>
+      <array>
+        <dict>
+          <key>InterfaceTypeMatch</key><string>WiFi</string>
+          <key>Action</key><string>Connect</string>
+          <key>URLStringProbe</key><string>http://__JP_IP__:81/probe</string>
+        </dict>
+        <dict>
+          <key>InterfaceTypeMatch</key><string>WiFi</string>
+          <key>Action</key><string>Disconnect</string>
+        </dict>
+        <dict>
+          <key>InterfaceTypeMatch</key><string>Cellular</string>
+          <key>Action</key><string>Connect</string>
+          <key>URLStringProbe</key><string>http://__JP_IP__:81/probe</string>
+        </dict>
+        <dict>
+          <key>Action</key><string>Disconnect</string>
+        </dict>
+      </array>
+    </dict>
+  </array>
+  <key>PayloadDisplayName</key> <string>PrivDNS Gateway</string>
+  <key>PayloadIdentifier</key>  <string>com.privdns.gateway.__UUID2__</string>
+  <key>PayloadUUID</key>        <string>__UUID2__</string>
+  <key>PayloadType</key>        <string>Configuration</string>
+  <key>PayloadVersion</key>     <integer>1</integer>
+</dict>
+</plist>

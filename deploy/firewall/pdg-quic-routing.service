@@ -1,0 +1,14 @@
+[Unit]
+Description=Proxy Gateway Plus native QUIC policy routing
+After=network-online.target
+Wants=network-online.target
+Before=mihomo.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/pdg-quic-routing.sh apply
+ExecStop=/usr/local/libexec/pdg-quic-routing.sh remove
+
+[Install]
+WantedBy=multi-user.target

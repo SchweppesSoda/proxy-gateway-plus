@@ -1,0 +1,17 @@
+[Unit]
+Description=PrivDNS Gateway Telegram bot
+After=network-online.target mihomo.service mosdns.service
+Wants=network-online.target
+
+[Service]
+# 真实 token / 允许的 user id 放在 /etc/privdns-gateway/bot.env (600, 不进版本库, 不进 unit)。
+# 前缀 '-' = 文件缺失也不报错(此时 bot 读不到 token 会自行退出并提示)。
+EnvironmentFile=-/etc/privdns-gateway/bot.env
+Environment=PDG_CERT=__CERT_DIR__/fullchain.pem
+ExecStart=/usr/bin/python3 /opt/pdg-bot/bot.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
