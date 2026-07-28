@@ -2488,19 +2488,70 @@ cmd_detect_cidr(){
     c_y "❌ 快照失败 → 未改动任何文件(拒绝在没有回退手段的前提下改内网卡段)。"; return 1
   fi
   snap_dir="$_PDG_SNAP_CREATED"
-  # Exact before-images. nft is regenerated centrally from restored profile.
-  local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
-  cp -a "$PROFILE_ENV" "$wd/profile.env" 2>/dev/null \
-    || { rm -rf "$wd"; echo "❌ 读不到 profile"; return 1; }
-  cp -a /etc/mosdns/config.yaml "$wd/config.yaml" 2>/dev/null
+  # Exact before-images: profile/mosdns plus persistent and live nft. Capture
+  # and validate every rollback input before the first write.
+  local wd nft_bak nftexe livebak live_restore tables="" had_live=0
+  wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
+  nft_bak="$wd/nftables.conf.before"
+  livebak="$wd/pdg.live.before"
+  live_restore="$wd/pdg.live.restore"
+  if ! cp -a "$PROFILE_ENV" "$wd/profile.env" 2>/dev/null \
+     || ! cmp -s "$PROFILE_ENV" "$wd/profile.env"; then
+    rm -rf "$wd"; echo "❌ profile before-image 捕获失败 → 未改动任何文件。"; return 1
+  fi
+  if ! cp -a /etc/mosdns/config.yaml "$wd/config.yaml" 2>/dev/null \
+     || ! cmp -s /etc/mosdns/config.yaml "$wd/config.yaml"; then
+    rm -rf "$wd"; echo "❌ mosdns before-image 捕获失败 → 未改动任何文件。"; return 1
+  fi
+  if [[ -e /etc/nftables.conf || -L /etc/nftables.conf ]]; then
+    if [[ ! -f /etc/nftables.conf || -L /etc/nftables.conf || ! -s /etc/nftables.conf ]] \
+       || ! cp -a /etc/nftables.conf "$nft_bak" 2>/dev/null \
+       || ! cmp -s /etc/nftables.conf "$nft_bak"; then
+      rm -rf "$wd"; echo "❌ persistent nft before-image 捕获失败 → 未改动任何文件。"; return 1
+    fi
+  fi
+  nftexe="$(_pdg_nft_bin)"
+  [[ -n "$nftexe" && -x "$nftexe" ]] \
+    || { rm -rf "$wd"; echo "❌ 找不到 nft，无法捕获 live before-image → 未改动任何文件。"; return 1; }
+  if "$nftexe" list table inet pdg >"$livebak" 2>/dev/null; then
+    had_live=1
+    {
+      printf 'table inet pdg\n'
+      printf 'delete table inet pdg\n'
+      cat "$livebak"
+    } >"$live_restore" \
+      || { rm -rf "$wd"; echo "❌ live nft before-image 构造失败 → 未改动任何文件。"; return 1; }
+    "$nftexe" -c -f "$live_restore" >/dev/null 2>&1 \
+      || { rm -rf "$wd"; echo "❌ live nft before-image 预检失败(nft -c) → 未改动任何文件。"; return 1; }
+  else
+    tables="$("$nftexe" list tables 2>/dev/null)" \
+      || { rm -rf "$wd"; echo "❌ 无法确认 live nft inventory → 未改动任何文件。"; return 1; }
+    if grep -Eq '^[[:space:]]*table[[:space:]]+inet[[:space:]]+pdg([[:space:]]|$)' \
+         <<<"$tables"; then
+      rm -rf "$wd"; echo "❌ live inet pdg 存在但无法捕获 → 未改动任何文件。"; return 1
+    fi
+  fi
+  # shellcheck source=lib/nfttxn.sh
+  source "$REPO_DIR/lib/nfttxn.sh" 2>/dev/null \
+    || { rm -rf "$wd"; echo "❌ 读不到 nft transaction helper → 未改动任何文件。"; return 1; }
   local newmos="$wd/mosdns.new"
-  cp -a /etc/mosdns/config.yaml "$newmos" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 mosdns 配置"; return 1; }
+  cp -a "$wd/config.yaml" "$newmos" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 mosdns 配置"; return 1; }
   _dc_restore(){   # 只用本次备份还原, 不碰别的快照
-    [[ -e "$wd/profile.env" ]] && cp -a "$wd/profile.env" "$PROFILE_ENV"
-    [[ -e "$wd/config.yaml" ]] && cp -a "$wd/config.yaml" /etc/mosdns/config.yaml
-    _switchcore_nft mihomo >/dev/null 2>&1 || true
-    systemctl restart mosdns >/dev/null 2>&1 || true
-    c_y "已用本次事务的备份还原(快照留在 $snap_dir, 必要时 sudo pdg rollback --dir $snap_dir)。"
+    local failed=0
+    if ! cp -a "$wd/profile.env" "$PROFILE_ENV" 2>/dev/null \
+       || ! cmp -s "$wd/profile.env" "$PROFILE_ENV"; then failed=1; fi
+    if ! cp -a "$wd/config.yaml" /etc/mosdns/config.yaml 2>/dev/null \
+       || ! cmp -s "$wd/config.yaml" /etc/mosdns/config.yaml; then failed=1; fi
+    _pdg_switchcore_restore_nft_before \
+      "$wd" "$nft_bak" "$nftexe" "$had_live" "$live_restore" "$livebak" || failed=1
+    if ! systemctl restart mosdns >/dev/null 2>&1 \
+       || ! _core_kernel_stable mosdns; then failed=1; fi
+    if [[ "$failed" == 0 ]]; then
+      c_y "已验证恢复本次事务的 profile/mosdns/persistent+live nft before-images(快照留在 $snap_dir)。"
+    else
+      c_y "❌ 本次事务 before-image 回滚不完整，必须人工复核(快照留在 $snap_dir，可 sudo pdg rollback --dir $snap_dir)。"
+    fi
+    return "$failed"
   }
   # mosdns remains a separately owned service config; nft is never edited with
   # sed here and will be rendered from the profile after its atomic upsert.
@@ -2510,14 +2561,19 @@ cmd_detect_cidr(){
   fi
   _profile_set PDG_INTERNAL_CIDR "$det" \
     && cp -a "$newmos" /etc/mosdns/config.yaml || {
-    _dc_restore; rm -rf "$wd"; c_y "❌ 落盘失败, 已还原。"; return 1; }
+    if _dc_restore; then c_y "❌ 落盘失败, 已验证还原。"
+    else c_y "❌ 落盘失败，且回滚不完整，必须人工复核。"; fi
+    rm -rf "$wd"; return 1; }
   if ! _switchcore_nft mihomo; then
-    _dc_restore; rm -rf "$wd"; c_y "❌ profile 防火墙重渲/应用失败, 已还原。"; return 1
+    if _dc_restore; then c_y "❌ profile 防火墙重渲/应用失败, 已验证还原。"
+    else c_y "❌ profile 防火墙重渲/应用失败，且回滚不完整，必须人工复核。"; fi
+    rm -rf "$wd"; return 1
   fi
   systemctl reset-failed mosdns >/dev/null 2>&1 || true
   if ! systemctl restart mosdns || ! _core_kernel_stable mosdns; then
-    _dc_restore; rm -rf "$wd"
-    c_y "❌ mosdns 未能稳定运行, 已还原。近期日志:"
+    if _dc_restore; then c_y "❌ mosdns 未能稳定运行, 已验证还原。近期日志:"
+    else c_y "❌ mosdns 未能稳定运行，且回滚不完整，必须人工复核。近期日志:"; fi
+    rm -rf "$wd"
     journalctl -u mosdns -n 12 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
     return 1
   fi
@@ -2529,8 +2585,12 @@ cmd_detect_cidr(){
   grep -qF "$det" /etc/mosdns/config.yaml || { c_y "⚠️ 复核: mosdns 配置里没有 $det"; dc_ok=0; }
   seen="$(python3 -c 'import sys; sys.path.insert(0,"/opt/pdg-bot"); import checks; print(checks._internal_cidr())' 2>/dev/null)"
   [[ "$seen" == "$det" ]] || { c_y "⚠️ 复核: 自检读到的内网段是「${seen:-空}」, 与 $det 不一致"; dc_ok=0; }
+  if [[ "$dc_ok" != 1 ]]; then
+    if _dc_restore; then c_y "❌ 应用后复核不一致，已验证还原。"
+    else c_y "❌ 应用后复核不一致，且回滚不完整，必须人工复核。"; fi
+    rm -rf "$wd"; return 1
+  fi
   rm -rf "$wd"
-  [[ "$dc_ok" == 1 ]] || { c_y "❌ 改动已应用但复核不一致 → 请运行 sudo pdg doctor 检查。"; return 1; }
   c_g "✅ 内网卡段已更新为 $det, mosdns 已重启, 防火墙/mosdns/自检三处一致。"
 }
 

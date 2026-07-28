@@ -263,9 +263,19 @@ rm -f /tmp/e2e-cli-canonical-profile.env
 echo; echo "── 7. detect-cidr ──"
 cp /etc/nftables.conf /tmp/pristine.nft
 cp /etc/mosdns/config.yaml /tmp/pristine.mos
+cp /etc/privdns-gateway/profile.env /tmp/pristine.profile
+if ! nft list table inet pdg > /tmp/pristine.live.nft; then
+  bad "7 setup: 无法捕获 live inet pdg 基线"
+fi
 NFT_SHA0="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 MOS_SHA0="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
-reset_cidr(){ cp /tmp/pristine.nft /etc/nftables.conf; cp /tmp/pristine.mos /etc/mosdns/config.yaml; }
+PROFILE_SHA0="$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)"
+LIVE_SHA0="$(sha256sum /tmp/pristine.live.nft | cut -d' ' -f1)"
+reset_cidr(){
+  cp /tmp/pristine.nft /etc/nftables.conf
+  cp /tmp/pristine.mos /etc/mosdns/config.yaml
+  nft -f /tmp/pristine.nft
+}
 # 抓包桩: 固定报一个与当前不同的网段; 交互确认自动回 y
 cat > /usr/local/bin/tcpdump <<'S'
 #!/bin/sh
@@ -302,18 +312,22 @@ out=$(detect); rc=$?
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_CUSTOM" ]]; } \
   && ok "不命中时两份配置都没被改" || bad "7d: 配置被改了"
 
-# 7c. nft 校验失败 → 用**本次事务**的备份还原
+# 7c. nft 校验失败可以合法地发生在 live before-image 预检(首写之前)或候选预检；
+# 无论在哪一层失败都必须非 0，且四类事务目标保持零写。
 reset_cidr
 cp /usr/local/bin/nft /usr/local/bin/nft.real
 printf '#!/bin/sh\n[ "$1" = "-c" ] && exit 1\nexec /usr/local/bin/nft.real "$@"\n' > /usr/local/bin/nft
 chmod 755 /usr/local/bin/nft
 out=$(detect); rc=$?
 cp -f /usr/local/bin/nft.real /usr/local/bin/nft
-{ [[ "$rc" != 0 ]] && grep -q 'nft -c' <<<"$out"; } \
-  && ok "nft 校验失败 → 非 0 并说明" || bad "7e: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$rc" != 0 ]] && grep -qE 'nft -c|live nft before-image.*预检' <<<"$out"; } \
+  && ok "nft before-image/候选预检失败 → 非 0 并说明" || bad "7e: rc=$rc: $(tail -4 <<<"$out")"
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
-  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
-  && ok "nft 校验失败后两份配置都逐字节未变" || bad "7f: 配置被改了"
+  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]] \
+  && [[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$PROFILE_SHA0" ]] \
+  && nft list table inet pdg > /tmp/after.live.nft \
+  && [[ "$(sha256sum /tmp/after.live.nft | cut -d' ' -f1)" == "$LIVE_SHA0" ]]; } \
+  && ok "nft 预检失败后 profile/mosdns/persistent+live nft 都逐字节未变" || bad "7f: 配置被改了"
 
 # 7d. mosdns 起不来 → 用本次事务备份还原(而不是回滚到别的快照)
 reset_cidr
@@ -322,9 +336,24 @@ out=$(detect); rc=$?
 e2e_svc_heal mosdns
 { [[ "$rc" != 0 ]] && grep -q 'mosdns' <<<"$out"; } \
   && ok "mosdns 起不来 → 非 0 并点名" || bad "7g: rc=$rc: $(tail -4 <<<"$out")"
-{ [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
-  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
-  && ok "mosdns 失败后用本次事务备份还原(两份配置回到原样)" || bad "7h: 没还原干净"
+if [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
+   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]] \
+   && [[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$PROFILE_SHA0" ]] \
+   && nft list table inet pdg > /tmp/after.live.nft \
+   && [[ "$(sha256sum /tmp/after.live.nft | cut -d' ' -f1)" == "$LIVE_SHA0" ]]; then
+  ok "mosdns 失败后 profile/mosdns/persistent+live nft 都逐字节还原"
+else
+  bad "7h: 没还原干净"
+  echo "── 7h nft byte diff ──"
+  diff -u /tmp/pristine.nft /etc/nftables.conf || true
+  echo "── 7h mosdns byte diff ──"
+  diff -u /tmp/pristine.mos /etc/mosdns/config.yaml || true
+  echo "── 7h profile byte diff ──"
+  diff -u /tmp/pristine.profile /etc/privdns-gateway/profile.env || true
+  echo "── 7h live nft byte diff ──"
+  nft list table inet pdg > /tmp/after.live.nft 2>/dev/null || true
+  diff -u /tmp/pristine.live.nft /tmp/after.live.nft || true
+fi
 
 # 7e. 成功路径: 落盘 + 三处复核
 reset_cidr
@@ -344,5 +373,7 @@ out=$(detect); rc=$?
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA1" ]]; } \
   && ok "幂等: 第二次没有改动任何配置" || bad "7m: 第二次改了配置"
 
-rm -f /tmp/pristine.nft /tmp/pristine.mos /usr/local/bin/nft.real /usr/local/bin/tar.real
+rm -f /tmp/pristine.nft /tmp/pristine.mos /tmp/pristine.profile \
+      /tmp/pristine.live.nft /tmp/after.live.nft \
+      /usr/local/bin/nft.real /usr/local/bin/tar.real
 e2e_summary
