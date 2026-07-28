@@ -240,12 +240,17 @@ PY
 }
 
 e2e_stub_system(){
+  local shape="${1:-live}"
   mkdir -p /tmp/e2e-svc
   e2e_tx_probes || echo "[!] 事务硬门探针没起来, 相关用例会如实失败"
   # 真机上做变更时 mosdns/mihomo 本来就在跑; 沙箱的假 systemd 默认全 inactive, 会让事务的
   # 基线门(操作前组件必须是好的)正确地拒掉一切普通变更。这里把它们置为 active, 让沙箱与
   # 真机同形态 —— 判据没动, 只是把"现场"补齐。
-  printf 1 > /tmp/e2e-svc/mosdns.ac; printf 1 > /tmp/e2e-svc/mihomo.ac
+  if [[ "$shape" == fresh ]]; then
+    printf 0 > /tmp/e2e-svc/mosdns.ac; printf 0 > /tmp/e2e-svc/mihomo.ac
+  else
+    printf 1 > /tmp/e2e-svc/mosdns.ac; printf 1 > /tmp/e2e-svc/mihomo.ac
+  fi
   # 有状态的假 systemd: 记录每个 unit 的 active/enabled。切核纪律(旧核必须真的 inactive
   # 且 disabled)只有靠状态机才验得出来 —— 无脑回 active 的桩会把 activate 判成失败。
   cat > /usr/local/bin/systemctl <<'S'
@@ -256,22 +261,23 @@ verb="$1"; shift
 now=0; [ "$1" = "--now" ] && { now=1; shift; }
 case "$verb" in
   daemon-reload|reset-failed|preset|mask|unmask) exit 0;;
-  enable)  for u in "$@"; do echo 1 > "$D/${u}.en"
+  enable)  for u in "$@"; do u=${u%.service}; echo 1 > "$D/${u}.en"
              # .fail 标记 = 这个 unit "起得来但立刻崩" → 起完仍是 inactive
              if [ "$now" = 1 ]; then [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"; fi
            done; exit 0;;
-  disable) for u in "$@"; do echo 0 > "$D/${u}.en"; [ "$now" = 1 ] && echo 0 > "$D/${u}.ac"; done; exit 0;;
+  disable) for u in "$@"; do u=${u%.service}; echo 0 > "$D/${u}.en"; [ "$now" = 1 ] && echo 0 > "$D/${u}.ac"; done; exit 0;;
   start|restart) for u in "$@"; do
+                   u=${u%.service}
                    [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"
                  done; exit 0;;
-  stop)    for u in "$@"; do echo 0 > "$D/${u}.ac"; done; exit 0;;
+  stop)    for u in "$@"; do u=${u%.service}; echo 0 > "$D/${u}.ac"; done; exit 0;;
   is-active)
-      u="$1"; v=$(cat "$D/${u}.ac" 2>/dev/null)
+      u="${1%.service}"; v=$(cat "$D/${u}.ac" 2>/dev/null)
       # 没记录过的: 有 unit 文件就当它在跑(模拟装好即运行), 否则 inactive
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       [ "$v" = 1 ] && { echo active; exit 0; }; echo inactive; exit 3;;
   is-enabled)
-      u="$1"; v=$(cat "$D/${u}.en" 2>/dev/null)
+      u="${1%.service}"; v=$(cat "$D/${u}.en" 2>/dev/null)
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       [ "$v" = 1 ] && { echo enabled; exit 0; }; echo disabled; exit 1;;
   show)
@@ -281,10 +287,19 @@ case "$verb" in
       for a in "$@"; do
         case "$a" in -p) ;; --value) ;; ActiveState|NRestarts|UnitFileState|LoadState) prop="$a";; *) u="$a";; esac
       done
+      u=${u%.service}
       if [ "$prop" = ActiveState ]; then
         v=$(cat "$D/${u}.ac" 2>/dev/null)
         [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
         [ "$v" = 1 ] && echo active || echo inactive
+        exit 0
+      fi
+      if [ "$prop" = LoadState ]; then
+        [ -f "/etc/systemd/system/${u%.service}.service" ] && echo loaded || echo not-found
+        exit 0
+      fi
+      if [ "$prop" = UnitFileState ]; then
+        v=$(cat "$D/${u}.en" 2>/dev/null); [ "$v" = 1 ] && echo enabled || echo disabled
         exit 0
       fi
       echo 0; exit 0;;
@@ -335,7 +350,16 @@ e2e_fetch_mihomo(){
   chmod 755 /usr/local/bin/mihomo
 }
 e2e_fetch_mosdns(){
-  command -v mosdns >/dev/null 2>&1 && return 0
+  if [[ -f /usr/local/bin/mosdns \
+        && "$(stat -c %s /usr/local/bin/mosdns 2>/dev/null || echo 0)" -ge 1000000 ]]; then
+    return 0
+  fi
+  rm -f /usr/local/bin/mosdns 2>/dev/null || true
+  if [[ -f /usr/local/bin/mosdns.e2e-real \
+        && "$(stat -c %s /usr/local/bin/mosdns.e2e-real 2>/dev/null || echo 0)" -ge 1000000 ]]; then
+    mv -f /usr/local/bin/mosdns.e2e-real /usr/local/bin/mosdns
+    return 0
+  fi
   # shellcheck source=/dev/null
   . "$E2E_ROOT/lib/versions.sh"
   curl -fsSL --retry 2 -m 120 \
@@ -357,12 +381,33 @@ e2e_seed_install(){
   local f; for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
   install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
   printf 'PDG_BOT_TOKEN=x\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
+  # Migration tests do not exercise MosDNS networking, but the real migration
+  # now has a hard flavor/provenance gate. Preserve any downloaded real binary
+  # for tests that need it, and seed an attested exact-marker stand-in here.
+  if [[ -f /usr/local/bin/mosdns \
+        && "$(stat -c %s /usr/local/bin/mosdns 2>/dev/null || echo 0)" -ge 1000000 ]]; then
+    mv -f /usr/local/bin/mosdns /usr/local/bin/mosdns.e2e-real
+  fi
+  # shellcheck source=/dev/null
+  . "$E2E_ROOT/lib/versions.sh"
+  # shellcheck source=/dev/null
+  . "$E2E_ROOT/lib/mosdns-artifact.sh"
+  cat > /usr/local/bin/mosdns <<EOF
+#!/bin/sh
+[ "\$1" = version ] && echo "$MOSDNS_BUILD_VERSION"
+exit 0
+EOF
+  chmod 755 /usr/local/bin/mosdns
+  local mos_sha
+  mos_sha="$(sha256sum /usr/local/bin/mosdns | awk '{print $1}')"
+  pdg_write_mosdns_attestation /etc/privdns-gateway/mosdns-build.env \
+    amd64 "$mos_sha" "$mos_sha" local
 }
 
 # 渲染 mosdns 配置 + 规则文件。$1=劫持模式(all|gfw)
 e2e_seed_mosdns(){
   local mode="${1:-all}" f
-  for f in geosite_cn geosite_apple custom_direct custom_hijack unlock mitm_hijack \
+  for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_direct unlock mitm_hijack \
            geosite_gfw 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
   printf 'domain:baidu.com\n' > /etc/mosdns/rules/geosite_cn.txt
   printf 'domain:blocked.test\n' > /etc/mosdns/rules/geosite_gfw.txt

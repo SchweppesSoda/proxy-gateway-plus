@@ -16,6 +16,8 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 # shellcheck source=lib/versions.sh
 source "$ROOT/lib/versions.sh"
+# shellcheck source=lib/mosdns-artifact.sh
+source "$ROOT/lib/mosdns-artifact.sh"
 
 mkbin(){   # $1=假 mihomo 报告的版本串
   mkdir -p "$WORK/bin"
@@ -75,11 +77,19 @@ else
   ok "install.sh / pdg.sh 已无 mihomo 版本子串判断"
 fi
 
-# ── 8. mosdns 同样要按版本判定, 不能"装了就算数" ──
+# ── 8. mosdns 的语义版本解析仍须精确；生产判定还必须区分 flavor ──
 # 旧 install.sh 是 `command -v mosdns` —— PATH 上有任何一个 mosdns(第三方/老版)就跳过下载,
 # 于是既不升到钉死版, 也**跳过了 SHA256 供应链校验**, 网关跑着来路不明的解析器。
 mkmosdns v5.3.4
 pdg_mosdns_is_version v5.3.4  && ok "mosdns: 版本相同 → 判定为已是目标版本" || bad "mosdns 相同版本判成不同"
+pdg_mosdns_binary_is_target "$WORK/bin/mosdns" \
+  && bad "mosdns: stock v5.3.4 被当成 no-ticket flavor" \
+  || ok "mosdns: stock v5.3.4 与 no-ticket flavor 明确区分"
+mkmosdns "$MOSDNS_BUILD_VERSION"
+pdg_mosdns_binary_is_target "$WORK/bin/mosdns" \
+  && ok "mosdns: 精确 build marker → 判定为目标 flavor" \
+  || bad "mosdns: no-ticket build marker 未被识别"
+mkmosdns v5.3.4
 pdg_mosdns_is_version v5.3.40 && bad "mosdns: v5.3.40 匹配了 v5.3.4" || ok "mosdns: v5.3.4 不匹配 v5.3.40"
 mkmosdns v5.3.1
 pdg_mosdns_is_version v5.3.4 && bad "mosdns: 老版 v5.3.1 被当成 v5.3.4(会跳过升级)" \
@@ -88,11 +98,13 @@ pdg_mosdns_is_version v5.3.4 && bad "mosdns: 老版 v5.3.1 被当成 v5.3.4(会�
 ( PATH="$NOBIN"; pdg_mosdns_is_version v5.3.4 ) \
   && bad "mosdns 不存在却判成已是目标版本" || ok "mosdns 未安装 → 判为非目标版本"
 
-# ── 9. install.sh 的 mosdns 判定不得只看"存在" ──
-if grep -qE '^\s*if ! command -v mosdns' "$ROOT/install.sh"; then
-  bad "install.sh 仍用 \`command -v mosdns\` 判定(任何版本都会跳过下载与 SHA 校验)"
+# ── 9. install.sh 必须用 flavor/provenance，不得只看存在或语义版本 ──
+if grep -qE '^\s*if ! (command -v mosdns|pdg_mosdns_is_version)' "$ROOT/install.sh"; then
+  bad "install.sh 仍只按存在/语义版本判定(stock v5.3.4 会跳过修补)"
+elif grep -q 'pdg_mosdns_is_project_build' "$ROOT/install.sh"; then
+  ok "install.sh 的 mosdns 判定要求精确 flavor/provenance"
 else
-  ok "install.sh 的 mosdns 判定已改为按版本"
+  bad "install.sh 未调用 MosDNS 精确 flavor/provenance 判据"
 fi
 
 echo "────────────────────────────────────────"

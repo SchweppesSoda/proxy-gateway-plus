@@ -33,14 +33,22 @@ REPO="$WORK/repo"; mkdir -p "$REPO"
   && echo v1 > f && git add f && git commit -qm c1 && echo v2 > f && git add f && git commit -qm c2 )
 GOOD_REF=$(git -C "$REPO" rev-parse HEAD~1)   # 第一提交
 HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
+# cmd_rollback 的真实 nft 定位助手会从 REPO_DIR 读取同源判据；给假仓库补齐该只读依赖。
+mkdir -p "$REPO/lib"
+cp "$ROOT/lib/nftbin.sh" "$REPO/lib/nftbin.sh"
 
 # ── 抽取 cmd_rollback + 打桩 ──────────────────────────────────────────────────
-sed -n '/^cmd_rollback(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/rollback.sh"
+for fn in _pdg_nft_bin cmd_rollback; do
+  sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
+done | sed 's#> /etc/privdns-gateway/backend#> "$SB/etc/privdns-gateway/backend"#' \
+  > "$WORK/rollback.sh"
 # 快照里不含 etc/sing-box/config.json 与 etc/nftables.conf → 内核/nft 校验分支被跳过,
 # 无需真 sing-box/mihomo/nft 二进制(也就不必打桩带连字符的函数名)。
+SB="$WORK/root"; mkdir -p "$SB/etc/privdns-gateway"
 cat > "$WORK/harness.sh" <<EOF
 SNAP_DIR="$SNAP"
 REPO_DIR="$REPO"
+SB="$SB"
 need_root(){ :; }; _lock(){ :; }
 c_g(){ echo "\$*"; }; c_y(){ echo "\$*"; }
 _pdg_core(){ echo singbox; }

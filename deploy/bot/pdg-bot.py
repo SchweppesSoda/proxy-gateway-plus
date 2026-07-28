@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, contextlib, fcntl, hashlib, http.client, io, json, os, plistlib, re, shutil, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
+import base64, contextlib, fcntl, hashlib, http.client, io, json, os, plistlib, posixpath, re, shutil, socket, stat, subprocess, sys, tarfile, tempfile, threading, time, uuid
 import concurrent.futures
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
@@ -29,6 +29,7 @@ MIHOMO_DIR = "/etc/mihomo"
 MIHOMO_CFG = MIHOMO_DIR + "/config.yaml"
 MIHOMO_BIN = "mihomo"
 MIHOMO_REDIR = 7893
+MIHOMO_TPROXY = 7895
 MITM_PORT = 7894                                  # MITM 服务(socks5)监听; mihomo 把接管域名路由到这
 MITM_HIJACK_FILE = "/etc/mosdns/rules/mitm_hijack.txt"   # 接管域名(mosdns 强制劫持集, 与 mihomo 路由同源)
 # mihomo 有路径安全限制: external-ui 等文件路径须在工作目录(-d)下或 SAFE_PATHS 白名单内。
@@ -39,6 +40,7 @@ BACKEND_MARKER = "/etc/privdns-gateway/backend"   # 内容 mihomo / singbox; 读
 PROFILE_ENV = "/etc/privdns-gateway/profile.env"  # 持久化开关(PDG_LOWMEM / PDG_TFO 等)
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
 MOSDNS_DIRECT = "/etc/mosdns/rules/custom_direct.txt"
+MOSDNS_RULESET_DIRECT = "/etc/mosdns/rules/ruleset_direct.txt"
 MOSDNS_HIJACK = "/etc/mosdns/rules/custom_hijack.txt"   # 指到出口的域名: 必须劫持才进得了代理
 RS_META = "/opt/pdg-bot/rulesets.json"
 UPDATE_SCRIPT = "/opt/pdg-bot/update-rules.sh"
@@ -461,6 +463,11 @@ def _mihomo_rulesets(meta=None):
     except Exception:  # noqa: BLE001
         return out
     for name, info in meta.items():
+        # literal direct 是“让手机拿真实 DNS 地址后本地直连”，不属于到达 VPS 后再由
+        # Mihomo 选择的出口。它只进入 MosDNS 的 ruleset_direct 聚合，不能渲染成
+        # Mihomo rule-provider（内建 direct-type tag，例如 jp，才是 VPS 本机直出）。
+        if info.get("outbound") == "direct":
+            continue
         low = str(info.get("url", "")).lower().split("?", 1)[0]
         if low.endswith(".srs") or str(info.get("format", "")) == "binary":
             continue
@@ -1036,11 +1043,10 @@ def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
     mitm_domains: 显式给出接管域名(WLOC 事务用**候选** mitm.json 推出来的那一份)。不给就读
     生产的 mitm_hijack.txt —— 那是"这次不改 MITM"的路径才成立的默认值。"""
     import sb2mihomo
-    tls_ports = [443] if _platform() == "ios" else None
     cfg, meta = sb2mihomo.singbox_to_mihomo(
         model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(rs_meta),
         mitm_domains=_mitm_domains() if mitm_domains is None else mitm_domains,
-        mitm_port=MITM_PORT, tls_ports=tls_ports,
+        mitm_port=MITM_PORT, **_mihomo_dataplane_args(),
         **_panel_render_args(model))
     return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"), meta
 
@@ -1050,11 +1056,10 @@ def _render_mihomo_file():
     仍供 pdg.sh 的平台切换等 CLI 路径调用(那些路径由 CLI 侧事务覆盖)。"""
     import sb2mihomo
     model = load()
-    # iOS: 嗅探端口不含 GMS 5228-5230(iOS 走 APNs); Android 用默认(含 GMS)。两平台 canonical/内核均无 GMS 残留。
-    tls_ports = [443] if _platform() == "ios" else None
     cfg, meta = sb2mihomo.singbox_to_mihomo(
         model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(),
-        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, tls_ports=tls_ports, **_panel_render_args(model))
+        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT,
+        **_mihomo_dataplane_args(), **_panel_render_args(model))
     _write_mihomo(cfg)
     return meta
 
@@ -1109,7 +1114,7 @@ def _mihomo_derive(staged):
 
 
 def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode="normal",
-             warnings=()):
+             warnings=(), ruleset_direct=False, file_expects=None):
     """Bot 侧所有生产写入的**唯一**入口: 一笔事务把 model、mosdns 规则、profile 等一起落盘。
 
     以前是"model 走 apply_sb(锁内), mosdns 文件在锁外再补一刀" —— 于是内核里有规则、DNS 侧
@@ -1119,6 +1124,8 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
     files:      {逻辑目标名: bytes|None} 需要与 model 一起原子落盘的其它目标
     services:   额外要重启的服务(model 变更会自动带上 mihomo)
     tfo_intent: 指定本次 TFO 意图(set_tfo 用); None = 沿用 profile.env 里的当前意图
+    file_expects: {逻辑目标名: sha256|None}。候选内容基于较早读取的文件生成时必须传入，
+                  避免 stage 时才取基线而覆盖并发提交；None 表示读取候选时文件不存在。
     返回 (ok, msg)
     """
     tx = _pdgtx()
@@ -1142,11 +1149,24 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
             svc.add("mihomo")
 
             t.derive("mihomo_cfg", _mihomo_derive)
+        unknown_expects = set(file_expects or {}) - set(files or {})
+        if unknown_expects:
+            raise tx.TxRefused(
+                "文件前置条件没有对应候选目标: %s" % ", ".join(sorted(unknown_expects))
+            )
         for name, data in (files or {}).items():
-            t.stage(name, data)
+            if name in (file_expects or {}):
+                t.stage(name, data, expect=file_expects[name])
+            else:
+                t.stage(name, data)
             s2 = tx.target_service(name)
             if s2:
                 svc.add(s2)
+        if ruleset_direct:
+            if "rs_meta" not in (files or {}):
+                raise tx.TxRefused("规则集手机直连派生缺少候选 rs_meta")
+            _register_ruleset_direct_derive(t, files or {})
+            svc.add("mosdns")
         for u in sorted(svc):
             t.service("restart:" + u)
         if "sysctl_tfo" in (files or {}):
@@ -1208,31 +1228,41 @@ def deletable_tags(c):
 def _tag(name, host, port):
     return re.sub(r"[^A-Za-z0-9_.-]", "-", (name or f"{host}:{port}"))[:40] or "exit"
 
+
+_RESERVED_EXIT_TAGS = {"direct", "直连", "block", "dns-out"}
+
+
 # ── 链接解析 (ss/vmess/trojan/vless) ──
 def parse_link(link):
     link = link.strip()
     if link.startswith("ss://"):
-        return _parse_ss(link)
-    if link.startswith("vmess://"):
-        return _parse_vmess(link)
-    if link.startswith("trojan://"):
-        return _parse_trojan(link)
-    if link.startswith("vless://"):
-        return _parse_vless(link)                     # 含 reality/flow
-    if link.startswith(("hysteria2://", "hy2://")):
-        return _parse_hysteria2(link)
-    if link.startswith("tuic://"):
-        return _parse_tuic(link)
-    if link.startswith("anytls://"):
-        return _parse_anytls(link)
-    if link.startswith(("socks://", "socks5://")):
-        return _parse_socks(link)
-    if link.startswith(("http://", "https://")):
-        return _parse_http(link)
-    if re.search(r"=\s*ss\s*,", link, re.I):          # Surge 代理行: 名字 = ss, 服务器, 端口, encrypt-method=…, password=…
-        return _parse_surge(link)
-    raise ValueError("支持: ss:// / vmess:// / trojan:// / vless://(含 reality)/ hysteria2:// / tuic:// / "
-                     "anytls:// / socks5:// / http:// 链接, 或 Surge 的 ss 行(名字 = ss, …)")
+        outbound = _parse_ss(link)
+    elif link.startswith("vmess://"):
+        outbound = _parse_vmess(link)
+    elif link.startswith("trojan://"):
+        outbound = _parse_trojan(link)
+    elif link.startswith("vless://"):
+        outbound = _parse_vless(link)                 # 含 reality/flow
+    elif link.startswith(("hysteria2://", "hy2://")):
+        outbound = _parse_hysteria2(link)
+    elif link.startswith("tuic://"):
+        outbound = _parse_tuic(link)
+    elif link.startswith("anytls://"):
+        outbound = _parse_anytls(link)
+    elif link.startswith(("socks://", "socks5://")):
+        outbound = _parse_socks(link)
+    elif link.startswith(("http://", "https://")):
+        outbound = _parse_http(link)
+    elif re.search(r"=\s*ss\s*,", link, re.I):        # Surge 代理行: 名字 = ss, 服务器, 端口, …
+        outbound = _parse_surge(link)
+    else:
+        raise ValueError(
+            "支持: ss:// / vmess:// / trojan:// / vless://(含 reality)/ hysteria2:// / tuic:// / "
+            "anytls:// / socks5:// / http:// 链接, 或 Surge 的 ss 行(名字 = ss, …)"
+        )
+    if outbound.get("tag") in _RESERVED_EXIT_TAGS:
+        raise ValueError("出口名 %s 是保留字" % outbound["tag"])
+    return outbound
 
 def _b64(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "ignore")
@@ -1415,6 +1445,8 @@ def add_group(name, members):
     c = load(); cands = concrete_tags(c)
     members = [m for m in members if m]
     name = _tag(name, "", "")
+    if name in _RESERVED_EXIT_TAGS:
+        return False, f"组名 {name} 是保留字, 换个名字"
     if name in cands:
         return False, f"组名 {name} 和现有出口冲突, 换个名字"
     bad = [m for m in members if m not in cands]
@@ -1435,11 +1467,24 @@ def add_group(name, members):
                 "按探测延迟选择出口，并在出口不可用时切换。可在「🎯 设默认出口」或分流规则里选它。" if ok else msg)
 
 # ── 直连表 (mosdns) ──
+def _domain_file_snapshot(path):
+    """从同一份 raw bytes 返回 ``(domains, sha256|None)``，供候选与 CAS 共用。"""
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read()
+    except FileNotFoundError:
+        return [], None
+    text = raw.decode("utf-8")
+    domains = [
+        line.strip().replace("domain:", "")
+        for line in text.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    return domains, hashlib.sha256(raw).hexdigest()
+
+
 def _read_direct():
-    if not os.path.exists(MOSDNS_DIRECT):
-        return []
-    return [l.strip().replace("domain:", "") for l in open(MOSDNS_DIRECT)
-            if l.strip() and not l.startswith("#")]
+    return _domain_file_snapshot(MOSDNS_DIRECT)[0]
 
 def _direct_text(domains):
     """直连表内容(不落盘)。落盘与 mosdns 重启由事务统一做 —— 以前这里自己写自己重启,
@@ -1450,10 +1495,7 @@ def _direct_text(domains):
 def _read_hijack():
     """指到出口的域名劫持表。mosdns 的 hijack_set 只装 geosite 策展分类, 不含任意个人域名 ——
     不把这些域名劫持到网关, 手机会拿到真实 IP 直连, 内核里的出口规则永远不会被命中。"""
-    if not os.path.exists(MOSDNS_HIJACK):
-        return []
-    return [l.strip().replace("domain:", "") for l in open(MOSDNS_HIJACK)
-            if l.strip() and not l.startswith("#")]
+    return _domain_file_snapshot(MOSDNS_HIJACK)[0]
 
 def _hijack_text(domains):
     """出口域名劫持表内容(不落盘)。domain_set 只在 mosdns 启动时加载, 故事务里必带 restart。"""
@@ -1623,7 +1665,7 @@ def set_wda_mode(on):
         c["route"]["rules"] = [r for r in c["route"]["rules"] if r.get("rule_set") != "unlock"]
         if on:
             c["route"]["rule_set"].append({"tag": "unlock", "type": "local", "format": "source",
-                                           "path": os.path.join(RS_DIR, "unlock.json")})
+                                           "path": posixpath.join(RS_DIR, "unlock.json")})
             idx = 1 if c["route"]["rules"] and c["route"]["rules"][0].get("action") == "reject" else 0
             c["route"]["rules"].insert(idx, {"rule_set": "unlock", "outbound": "jp"})
 
@@ -1641,6 +1683,26 @@ def set_wda_mode(on):
 
 
 # ── 持久化开关 (profile.env: PDG_LOWMEM / PDG_TFO …) ──
+def _profile_dataplane_values():
+    """Read the shared strict profile; retained as a compatibility test seam."""
+    import pdgprofile
+    values = pdgprofile.read_values(PROFILE_ENV)
+    return {key: values[key] for key in pdgprofile.DATA_KEYS if key in values}
+
+
+def _mihomo_dataplane_args():
+    """从持久 profile 构造每次 Mihomo render 共用的严格参数。"""
+    import pdgprofile
+    config = pdgprofile.resolve(
+        PROFILE_ENV, platform=_platform(), environ={})
+    return {
+        "quic_mode": config["quic_mode"],
+        "tproxy_port": config["tproxy_port"],
+        "tls_ports": config["tls_ports"],
+        "http_ports": config["http_ports"],
+    }
+
+
 def _profile_get(key, default=""):
     try:
         for line in open(PROFILE_ENV, encoding="utf-8"):
@@ -2045,8 +2107,10 @@ def _panel_autoclose(generation=None):
         send_plain(chat, "⏱ 自动关闭观测面板失败,将在 60 秒后重试: " + msg)
 
 def _panel_arm(chat, link_mid, ttl):
-    """记录新会话并按 ttl 排自动关闭；重新开启会删旧链接。ttl<=0 为常开。"""
+    """记录临时会话并排自动关闭；重新开启会删除旧链接。"""
     global _panel_timer, _panel_link, _panel_chat, _panel_generation
+    if ttl <= 0:
+        raise ValueError("观测面板必须设置正数自动关闭时长")
     with _panel_state_lock:
         old_timer, old_link = _panel_timer, _panel_link
         _panel_generation += 1
@@ -2054,15 +2118,13 @@ def _panel_arm(chat, link_mid, ttl):
         new_link = (chat, link_mid) if link_mid else None
         _panel_link = new_link
         _panel_chat = chat
-        timer = threading.Timer(ttl, _panel_autoclose, args=(current,)) if ttl > 0 else None
-        if timer:
-            timer.daemon = True
+        timer = threading.Timer(ttl, _panel_autoclose, args=(current,))
+        timer.daemon = True
         _panel_timer = timer
     _cancel_timer_obj(old_timer)
     if old_link and old_link != new_link:
         delete_message(*old_link)
-    if timer:
-        timer.start()
+    timer.start()
 
 def _panel_close(chat=None):
     """手动关闭：成功后才清理链接；失败时保留并补重试计时器。"""
@@ -2111,15 +2173,31 @@ def send_get_mid(chat, text):
 
 # ── 规则集 (Surge .list -> sing-box local rule_set) ──
 def _rs_meta():
-    if os.path.exists(RS_META):
-        return json.load(open(RS_META))
-    return {}
+    return _rs_meta_snapshot()[0]
 
-def _fetch_surge(url):
+
+def _rs_meta_snapshot():
+    """读取生成候选所依据的元数据及其 sha；不存在时 sha=None。
+
+    不能在生成完候选以后再让 ``stage`` 读取基线：两次读取之间若有另一笔规则集事务提交，
+    后者会被当作我们的“旧值”并被无声覆盖。
+    """
+    try:
+        with open(RS_META, "rb") as stream:
+            raw = stream.read()
+    except FileNotFoundError:
+        return {}, None
+    meta = json.loads(raw.decode("utf-8"))
+    if not isinstance(meta, dict):
+        raise ValueError("规则集元数据顶层必须是对象")
+    return meta, hashlib.sha256(raw).hexdigest()
+
+def _fetch_surge(url, *, phone_direct=False):
     req = urllib.request.Request(url, headers={"User-Agent": "pdg-bot"})
     with urllib.request.urlopen(req, timeout=30) as r:
         text = r.read().decode("utf-8", "ignore")
     dom, suf, kw, ip = [], [], [], []
+    unsupported = []
     for line in text.splitlines():
         line = line.split("#", 1)[0].split("//", 1)[0].strip()
         if not line:
@@ -2150,6 +2228,17 @@ def _fetch_surge(url):
             kw.append(p[1])
         elif t in ("IP-CIDR", "IP-CIDR6") and len(p) > 1:
             ip.append(p[1])
+        elif phone_direct and re.match(r"^[A-Z][A-Z0-9-]*$", t):
+            unsupported.append(t)
+    if phone_direct and ip:
+        raise ValueError(
+            "手机本地直连规则集不能含 IP-CIDR/IP-CIDR6：DNS 层无法兑现 IP 规则语义"
+        )
+    if phone_direct and unsupported:
+        raise ValueError(
+            "手机本地直连只支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD；"
+            "不支持: %s" % ", ".join(sorted(set(unsupported)))
+        )
     return dom, suf, kw, ip
 
 def _fetch_bytes(url):
@@ -2157,9 +2246,9 @@ def _fetch_bytes(url):
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read()
 
-def _build_source(url, path):
+def _build_source(url, path, *, phone_direct=False):
     """下载 Surge/Clash 文本 → 写 sing-box source rule_set。返回 (条数, 是否纯IP)。"""
-    dom, suf, kw, ip = _fetch_surge(url)
+    dom, suf, kw, ip = _fetch_surge(url, phone_direct=phone_direct)
     if not (dom or suf or kw or ip):
         raise ValueError("没解析出规则(支持 DOMAIN/-SUFFIX/-KEYWORD/IP-CIDR)")
     rule = {}
@@ -2173,6 +2262,355 @@ def _build_source(url, path):
         rule["ip_cidr"] = ip
     json.dump({"version": 1, "rules": [rule]}, open(path, "w"), ensure_ascii=False)
     return len(dom) + len(suf) + len(kw) + len(ip), (len(dom) + len(suf) + len(kw) == 0)
+
+
+_PHONE_DIRECT_DOMAIN_RE = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
+_PHONE_DIRECT_KEYS = {"domain", "domain_suffix", "domain_keyword"}
+
+
+def _phone_direct_values(value, field, ruleset):
+    if not isinstance(value, list):
+        raise _pdgtx().TxRefused(
+            "手机直连规则集 %s 的 %s 必须是数组" % (ruleset, field)
+        )
+    result = []
+    for raw in value:
+        if not isinstance(raw, str) or not raw or len(raw.encode("utf-8")) > 253:
+            raise _pdgtx().TxRefused(
+                "手机直连规则集 %s 的 %s 含空值或超长值" % (ruleset, field)
+            )
+        if any(ord(char) < 0x21 or ord(char) == 0x7f for char in raw):
+            raise _pdgtx().TxRefused(
+                "手机直连规则集 %s 的 %s 含空白/控制字符" % (ruleset, field)
+            )
+        if field in ("domain", "domain_suffix"):
+            if raw.lower() != raw or not _PHONE_DIRECT_DOMAIN_RE.fullmatch(raw):
+                raise _pdgtx().TxRefused(
+                    "手机直连规则集 %s 含非 canonical hostname: %s"
+                    % (ruleset, raw[:80])
+                )
+        result.append(raw)
+    return result
+
+
+def _phone_direct_entries(data, ruleset):
+    """把一个 source JSON 无损展开为 MosDNS domain_set 行；不支持的语义一律拒绝。"""
+    refused = _pdgtx().TxRefused
+    try:
+        source = json.loads(data.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise refused("手机直连规则集 %s 不是合法 source JSON" % ruleset) from exc
+    if (
+        not isinstance(source, dict)
+        or source.get("version") != 1
+        or set(source) != {"version", "rules"}
+        or not isinstance(source.get("rules"), list)
+    ):
+        raise refused("手机直连规则集 %s 必须是 version=1 的 source JSON" % ruleset)
+    entries = {"full": set(), "domain": set(), "keyword": set()}
+    mapping = {
+        "domain": "full",
+        "domain_suffix": "domain",
+        "domain_keyword": "keyword",
+    }
+    for rule in source["rules"]:
+        if not isinstance(rule, dict):
+            raise refused("手机直连规则集 %s 的 rule 不是对象" % ruleset)
+        # “含任何 ip_cidr”按字段存在即拒绝，包括空数组；否则一个上游刷新从空变非空时
+        # 会悄悄改变产品语义。
+        if "ip_cidr" in rule:
+            raise refused(
+                "手机直连规则集 %s 含 ip_cidr；DNS 层无法兑现完整 IP 规则语义" % ruleset
+            )
+        unknown = set(rule) - _PHONE_DIRECT_KEYS
+        if unknown:
+            raise refused(
+                "手机直连规则集 %s 含不可展开字段: %s"
+                % (ruleset, ", ".join(sorted(unknown)))
+            )
+        for field, prefix in mapping.items():
+            for item in _phone_direct_values(rule.get(field, []), field, ruleset):
+                entries[prefix].add(item)
+    return entries
+
+
+def _ruleset_direct_bytes(meta, staged, watched):
+    """基于候选 rs_meta + 候选/受 watch 保护的 source JSON 派生独立聚合。"""
+    try:
+        managed = _managed_rulesets(meta)
+    except ValueError as exc:
+        raise _pdgtx().TxRefused(str(exc)) from exc
+    combined = {"full": set(), "domain": set(), "keyword": set()}
+    for name, info in sorted((meta or {}).items()):
+        if info.get("outbound") != "direct":
+            continue
+        leaf = managed[name]
+        if not leaf.endswith(".json") or info.get("format") not in ("source", "text", ""):
+            raise _pdgtx().TxRefused(
+                "规则集 %s 指向手机本地直连时只支持可展开的 source JSON；.mrs/.srs 不支持"
+                % (info.get("label") or name)
+            )
+        target = "ruleset:" + leaf
+        data = staged.get(target, watched.get(target))
+        if data is None:
+            raise _pdgtx().TxRefused("手机直连规则集 %s 缺少 source JSON" % name)
+        entries = _phone_direct_entries(data, info.get("label") or name)
+        for prefix in combined:
+            combined[prefix].update(entries[prefix])
+    lines = ["# pdg-bot 规则集手机本地直连聚合（事务派生；不要手工编辑）\n"]
+    for prefix in ("full", "domain", "keyword"):
+        lines.extend("%s:%s\n" % (prefix, item) for item in sorted(combined[prefix]))
+    return "".join(lines).encode("utf-8")
+
+
+def _register_ruleset_direct_derive(t, staged_files):
+    """登记 aggregate deriver；所有未 stage 的派生依赖都用 watch 防止候选期间丢更新。"""
+    try:
+        meta = json.loads(staged_files["rs_meta"].decode("utf-8"))
+        managed = _managed_rulesets(meta)
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _pdgtx().TxRefused("候选规则集元数据无法派生手机直连聚合") from exc
+    has_direct = any(
+        info.get("outbound") == "direct" for info in (meta or {}).values()
+    )
+    # aggregate 是否真的会被 MosDNS 使用，也是 direct 候选语义的一部分。恢复若同时带入
+    # config.yaml，必须校验那份候选；普通增删/刷新则 watch 现网配置，避免预检之后被并发换掉。
+    if "mosdns_conf" in staged_files:
+        mosdns_conf = staged_files["mosdns_conf"]
+        if mosdns_conf is None:
+            raise _pdgtx().TxRefused("不能在启用规则集手机直连时删除 MosDNS 配置")
+    elif has_direct:
+        mosdns_conf = t.watch("mosdns_conf")
+    else:
+        mosdns_conf = None
+    if has_direct:
+        _ruleset_direct_interface_bytes(mosdns_conf)
+    watched = {}
+    for name, info in sorted((meta or {}).items()):
+        if info.get("outbound") != "direct":
+            continue
+        target = "ruleset:" + managed[name]
+        if target not in staged_files:
+            watched[target] = t.watch(target)
+    t.derive(
+        "ruleset_direct",
+        lambda staged: _ruleset_direct_bytes(
+            json.loads(staged["rs_meta"].decode("utf-8")), staged, watched
+        ),
+    )
+
+
+def _mosdns_plugin_block(text, tag):
+    """取唯一的标准 MosDNS plugin 块；重复 tag 与非标准形状都拒绝。"""
+    pattern = re.compile(
+        r"(?m)^  - tag:[ \t]*" + re.escape(tag)
+        + r"[ \t]*(?:#[^\r\n]*)?\r?\n"
+        r"(?:(?!^  - tag:)[\s\S])*(?=^  - tag:|\Z)"
+    )
+    blocks = pattern.findall(text)
+    if len(blocks) != 1:
+        raise _pdgtx().TxRefused("MosDNS 候选缺少唯一的 %s plugin" % tag)
+    return blocks[0]
+
+
+def _mosdns_sequence_rule(block, matcher, execution):
+    pattern = re.compile(
+        r"(?m)^[ \t]*- matches:\s*" + re.escape(matcher)
+        + r"[ \t]*(?:#[^\r\n]*)?\r?\n[ \t]+exec:\s*" + re.escape(execution)
+        + r"[ \t]*(?:#[^\r\n]*)?\r?$"
+    )
+    match = pattern.search(block)
+    return -1 if match is None else match.start()
+
+
+def _mosdns_domain_set_loads(block, path):
+    """只认实际 args/files 中的精确双引号路径；注释里的文字不算已加载。"""
+    active = "\n".join(line.split("#", 1)[0].rstrip() for line in block.splitlines())
+    match = re.search(
+        r"(?m)^[ \t]*args:\s*\{\s*files:\s*\[([^\]]*)\]\s*\}\s*$",
+        active,
+    )
+    if match is None:
+        return False
+    return path in re.findall(r'"([^"\r\n]+)"', match.group(1))
+
+
+def _ruleset_direct_interface_bytes(data):
+    """验证候选 MosDNS 确实兑现“真实地址本地直连 + 显式代理优先”的接口。"""
+    refused = _pdgtx().TxRefused
+    try:
+        text = data.decode("utf-8")
+    except (AttributeError, UnicodeDecodeError) as exc:
+        raise refused("MosDNS 候选配置不是 UTF-8") from exc
+    geosite = _mosdns_plugin_block(text, "geosite_cn")
+    explicit_set = _mosdns_plugin_block(text, "explicit_hijack")
+    internal = _mosdns_plugin_block(text, "internal_sequence")
+    force_seq = _mosdns_plugin_block(text, "force_hijack_seq")
+    if (
+        not _mosdns_domain_set_loads(
+            geosite, "/etc/mosdns/rules/ruleset_direct.txt"
+        )
+        or not re.search(r"(?m)^[ \t]*type:\s*domain_set\s*(?:#.*)?$", geosite)
+    ):
+        raise refused("MosDNS geosite_cn 未加载 ruleset_direct 聚合")
+    if (
+        not _mosdns_domain_set_loads(
+            explicit_set, "/etc/mosdns/rules/custom_hijack.txt"
+        )
+        or not re.search(r"(?m)^[ \t]*type:\s*domain_set\s*(?:#.*)?$", explicit_set)
+    ):
+        raise refused("MosDNS explicit_hijack 未加载 custom_hijack")
+    explicit = _mosdns_sequence_rule(
+        internal, "qname $explicit_hijack", "goto force_hijack_seq"
+    )
+    broad = _mosdns_sequence_rule(internal, "qname $geosite_cn", "$ecs_china")
+    if broad < 0:
+        broad = _mosdns_sequence_rule(
+            internal, "qname $geosite_cn", "$local_upstream"
+        )
+    if explicit < 0 or broad < 0 or explicit >= broad:
+        raise refused("MosDNS 显式代理覆盖必须在宽泛手机直连规则之前")
+    if not re.search(
+        r"(?m)^[ \t]*exec:\s*black_hole(?:\s+|$)", force_seq
+    ):
+        raise refused("MosDNS force_hijack_seq 未配置 A 记录劫持")
+    return True
+
+
+def _snapshot_tree_regular(root, relative, required=False):
+    """返回候选树内普通文件路径；逐层 lstat，绝不跟随归档制造的链接。"""
+    root = os.path.abspath(root)
+    try:
+        root_st = os.lstat(root)
+    except OSError as exc:
+        raise ValueError("候选树不存在") from exc
+    if not stat.S_ISDIR(root_st.st_mode) or stat.S_ISLNK(root_st.st_mode):
+        raise ValueError("候选树根不是可信目录")
+    parts = relative.split("/")
+    current = root
+    for index, part in enumerate(parts):
+        if not part or part in (".", ".."):
+            raise ValueError("候选树相对路径无效")
+        current = os.path.join(current, part)
+        try:
+            item_st = os.lstat(current)
+        except FileNotFoundError:
+            if not required:
+                return None
+            raise ValueError("候选树缺少 %s" % relative)
+        if stat.S_ISLNK(item_st.st_mode):
+            raise ValueError("候选树路径 %s 含链接" % relative)
+        if index < len(parts) - 1:
+            if not stat.S_ISDIR(item_st.st_mode):
+                raise ValueError("候选树路径 %s 的父级不是目录" % relative)
+        elif not stat.S_ISREG(item_st.st_mode):
+            raise ValueError("候选树路径 %s 不是普通文件" % relative)
+    return current
+
+
+def _snapshot_tree_atomic_write(root, relative, data):
+    parent_relative = posixpath.dirname(relative)
+    parent = _snapshot_tree_regular(root, parent_relative + "/.probe", required=False)
+    # ``.probe`` 本来就应不存在；上面的逐层检查会验证完整父目录链，返回 None 即为正常。
+    if parent is not None:
+        raise ValueError("候选树聚合临时探针意外存在")
+    directory = os.path.join(os.path.abspath(root), *parent_relative.split("/"))
+    fd, tmp = tempfile.mkstemp(prefix=".ruleset_direct.", dir=directory)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(directory, posixpath.basename(relative)))
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def _derive_ruleset_direct_tree(tree):
+    """CLI rollback 使用的可信重建器；归档里的 aggregate 永远只当不可信缓存。
+
+    返回候选树最终是否应包含 ``ruleset_direct.txt``。有 direct 元数据时同时校验候选
+    MosDNS 接口并从候选 source JSON 重建；无 direct 元数据但配置仍引用该文件时生成空聚合；
+    两者都没有时删除归档可能夹带的聚合。
+    """
+    meta_path = _snapshot_tree_regular(
+        tree, "opt/pdg-bot/rulesets.json", required=False
+    )
+    if meta_path is None:
+        meta = {}
+    else:
+        with open(meta_path, "rb") as stream:
+            raw_meta = stream.read()
+        try:
+            meta = json.loads(raw_meta.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("候选规则集元数据无法解析") from exc
+        if not isinstance(meta, dict):
+            raise ValueError("候选规则集元数据顶层必须是对象")
+    managed = _managed_rulesets(meta)
+    direct_names = [
+        name for name, info in sorted(meta.items())
+        if info.get("outbound") == "direct"
+    ]
+    conf_path = _snapshot_tree_regular(
+        tree, "etc/mosdns/config.yaml", required=bool(direct_names)
+    )
+    conf_data = None
+    if conf_path is not None:
+        with open(conf_path, "rb") as stream:
+            conf_data = stream.read()
+    staged = {}
+    for name in direct_names:
+        leaf = managed[name]
+        source_path = _snapshot_tree_regular(
+            tree, "etc/sing-box/rs/" + leaf, required=True
+        )
+        with open(source_path, "rb") as stream:
+            staged["ruleset:" + leaf] = stream.read()
+    aggregate_relative = "etc/mosdns/rules/ruleset_direct.txt"
+    aggregate_path = _snapshot_tree_regular(
+        tree, aggregate_relative, required=False
+    )
+    referenced = False
+    if conf_data is not None:
+        try:
+            conf_text = conf_data.decode("utf-8")
+            referenced = _mosdns_domain_set_loads(
+                _mosdns_plugin_block(conf_text, "geosite_cn"),
+                "/etc/mosdns/rules/ruleset_direct.txt",
+            )
+        except (UnicodeDecodeError, _pdgtx().TxRefused):
+            referenced = False
+    if direct_names:
+        _ruleset_direct_interface_bytes(conf_data)
+    if direct_names or referenced:
+        aggregate = _ruleset_direct_bytes(meta, staged, {})
+        _snapshot_tree_atomic_write(tree, aggregate_relative, aggregate)
+        return True
+    if aggregate_path is not None:
+        os.unlink(aggregate_path)
+    return False
+
+
+def _ruleset_direct_interface_ready():
+    """确认 MosDNS 已接入 aggregate，且显式代理覆盖位于宽泛手机直连集合之前。"""
+    try:
+        with open(MOSDNS_CONF, "rb") as stream:
+            data = stream.read()
+        _ruleset_direct_interface_bytes(data)
+    except (OSError, _pdgtx().TxRefused):
+        return False
+    return True
 
 # mihomo 的 .mrs 只有这两种 behavior —— classical 连它自己的 convert-ruleset 都会崩,
 # 收下等于配出一份内核加载不了的规则集。
@@ -2280,14 +2718,28 @@ def _mrs_behavior_of_file(path):
 
 def add_ruleset(url, target, label="", behavior=""):
     c = load()
-    if target not in exit_tags(c):
-        return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))}"
+    if target not in exit_tags(c) and target != "direct":
+        return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))} 或 direct"
     low = url.lower().split("?", 1)[0]
+    if target == "direct" and not _ruleset_direct_interface_ready():
+        return False, (
+            "MosDNS 规则集手机直连接口尚未就绪；请先运行 sudo pdg update（或 sudo pdg migrate）。"
+        )
+    if target == "direct" and low.endswith((".mrs", ".srs")):
+        return False, (
+            "规则集 target=direct 表示让手机取得真实地址后本地直连，只支持可展开的文本 "
+            "DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD；.mrs/.srs 无法安全展开。"
+        )
     # .srs 是 sing-box 的二进制规则集, mihomo 消费不了 —— 收下它只会在渲染时被丢弃, 而用户
     # 以为分流已生效。入口就拒, 并指出可用的替代格式(不再"接受成功, 背地丢弃")。
     if low.endswith(".srs"):
         return False, (".srs 是 sing-box 二进制规则集, mihomo 无法读取(收下也不会进运行配置)。\n"
                        "请改用 .list / .txt 文本规则、.yaml provider, 或 mihomo 原生 .mrs。")
+    try:
+        m, meta_sha = _rs_meta_snapshot()
+    except Exception as e:  # noqa: BLE001
+        return False, "规则集元数据无法读取(%s)" % type(e).__name__
+    m = dict(m)
     name = "rs_" + hashlib.sha1(url.encode()).hexdigest()[:8]
     # 下载与解析全在**候选**阶段: 提交之前一个字节都不写进 RS_DIR。旧实现先落盘再 apply_sb,
     # 失败还要自己回退文件与元数据 —— 中间任何异常都会留下半截。
@@ -2296,7 +2748,7 @@ def add_ruleset(url, target, label="", behavior=""):
             # mihomo 原生二进制规则集: 直接存盘, 由 rule-provider 按 mrs 格式加载。
             # behavior 先从文件二进制头**认**(文件就是事实), 认不出才要求用户显式声明 ——
             # 一律按 domain 猜, 猜错就是"规则看着加了却永不命中"。
-            path = os.path.join(RS_DIR, name + ".mrs"); fmt = "mrs"
+            path = posixpath.join(RS_DIR, name + ".mrs"); fmt = "mrs"
             data = _fetch_bytes(url)
             if not data:
                 raise ValueError("下载到空的 .mrs(源站异常?)")
@@ -2314,11 +2766,13 @@ def add_ruleset(url, target, label="", behavior=""):
                                + _mrs_unreadable_hint())
             count = None
         else:
-            path = os.path.join(RS_DIR, name + ".json"); fmt = "source"
+            path = posixpath.join(RS_DIR, name + ".json"); fmt = "source"
             _tmpd = tempfile.mkdtemp(prefix="pdgrs-add.")
             try:
                 _tmp = os.path.join(_tmpd, name + ".json")
-                count, ip_only = _build_source(url, _tmp)
+                count, ip_only = _build_source(
+                    url, _tmp, phone_direct=(target == "direct")
+                )
                 try:
                     with open(_tmp, "rb") as _f:
                         data = _f.read()
@@ -2336,15 +2790,26 @@ def add_ruleset(url, target, label="", behavior=""):
     def mod(cc):
         cc["route"].setdefault("rule_set", [])
         cc["route"]["rule_set"] = [r for r in cc["route"]["rule_set"] if r.get("tag") != name]
-        cc["route"]["rule_set"].append({"tag": name, "type": "local", "format": fmt, "path": path})
         cc["route"]["rules"] = [r for r in cc["route"]["rules"] if r.get("rule_set") != name]
-        idx = 1 if cc["route"]["rules"] and cc["route"]["rules"][0].get("action") == "reject" else 0
-        cc["route"]["rules"].insert(idx, {"rule_set": name, "outbound": target})
+        if target != "direct":
+            cc["route"]["rule_set"].append(
+                {"tag": name, "type": "local", "format": fmt, "path": path}
+            )
+            idx = (
+                1
+                if cc["route"]["rules"]
+                and cc["route"]["rules"][0].get("action") == "reject"
+                else 0
+            )
+            cc["route"]["rules"].insert(idx, {"rule_set": name, "outbound": target})
 
     # 元数据必须**先**落地: mihomo 的 rule-providers 是从 RS_META 生成的, 后写就意味着本次
     # 渲染看不到这个规则集 —— 规则会被当成"翻译不了"丢掉, 而用户已经收到"已添加"。
     # 失败则把元数据与下载的文件一并回退, 不留半截。
-    m = dict(_rs_meta())
+    direct_changed = (
+        target == "direct"
+        or (m.get(name) or {}).get("outbound") == "direct"
+    )
     m[name] = {"url": url, "outbound": target, "format": fmt, "path": path, "count": count}
     if behavior in MRS_BEHAVIORS:
         m[name]["behavior"] = behavior
@@ -2353,16 +2818,25 @@ def add_ruleset(url, target, label="", behavior=""):
     # model / 规则集文件 / 元数据 一次提交: 渲染派生时读的是**这份 staged 元数据**, 所以
     # 不再需要"元数据必须先落地"那种取巧, 也不会出现"文件在、元数据不在"的中间态。
     ok, msg = tx_apply("ruleset_add", model_mod=mod, files={
-        "ruleset:" + os.path.basename(path): data,
-        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")})
+        "ruleset:" + posixpath.basename(path): data,
+        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")},
+        ruleset_direct=direct_changed, file_expects={"rs_meta": meta_sha})
     if ok:
         cntdesc = f"{count} 条" if count is not None else "mihomo .mrs"
-        return True, f"规则集已添加 → {target}（{cntdesc}，{label.strip() or name}）" + warn
+        meaning = (
+            "手机本地直连（MosDNS 返回真实地址，不经 VPS）"
+            if target == "direct"
+            else target
+        )
+        return True, f"规则集已添加 → {meaning}（{cntdesc}，{label.strip() or name}）" + warn
     return False, msg
 
 def set_ruleset_label(name, label):
     """给规则集设个看得懂的显示名(备注), 只改 bot 显示, 不动 sing-box 内部 tag/文件。"""
-    m = _rs_meta()
+    try:
+        m, meta_sha = _rs_meta_snapshot()
+    except Exception as e:  # noqa: BLE001
+        return False, "规则集元数据无法读取(%s)" % type(e).__name__
     if name not in m:
         return False, "规则集不存在(可能已删), 重开列表再试"
     label = label.strip()[:40]
@@ -2371,7 +2845,8 @@ def set_ruleset_label(name, label):
     else:
         m[name].pop("label", None)
     ok, msg = tx_apply("ruleset_label", files={
-        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")})
+        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")},
+        file_expects={"rs_meta": meta_sha})
     return (True, f"✅ 规则集名称已设为「{label or name}」") if ok else (False, msg)
 
 def _rs_items():
@@ -2383,7 +2858,11 @@ def del_ruleset(name):
 
     旧实现是 apply_sb 成功之后才去删文件与元数据 —— 中间失败就会留下"内核已经不引用它了,
     文件和元数据还在"的残留, 下次渲染又把它算进来。"""
-    m = _rs_meta(); info = m.get(name, {}); path = info.get("path")
+    try:
+        m, meta_sha = _rs_meta_snapshot()
+    except Exception as e:  # noqa: BLE001
+        return False, "规则集元数据无法读取(%s)" % type(e).__name__
+    info = m.get(name, {}); path = info.get("path")
     label = info.get("label") or name              # 删前取显示名(删完 meta 就没了)
 
     def mod(cc):
@@ -2391,12 +2870,22 @@ def del_ruleset(name):
         cc["route"]["rules"] = [r for r in cc["route"]["rules"] if r.get("rule_set") != name]
 
     files = {}
-    for p_ in {path, os.path.join(RS_DIR, name + ".json"), os.path.join(RS_DIR, name + ".mrs")}:
-        if p_ and os.path.dirname(p_) == RS_DIR and os.path.exists(p_):
-            files["ruleset:" + os.path.basename(p_)] = None      # None = 本次要删掉它
+    for p_ in {
+        path,
+        posixpath.join(RS_DIR, name + ".json"),
+        posixpath.join(RS_DIR, name + ".mrs"),
+    }:
+        if p_ and posixpath.dirname(p_) == RS_DIR:
+            files["ruleset:" + posixpath.basename(p_)] = None      # None = 本次要删掉它
     m2 = dict(m); m2.pop(name, None)
     files["rs_meta"] = json.dumps(m2, ensure_ascii=False, indent=2).encode("utf-8")
-    ok, msg = tx_apply("ruleset_del", model_mod=mod, files=files)
+    ok, msg = tx_apply(
+        "ruleset_del",
+        model_mod=mod,
+        files=files,
+        ruleset_direct=(info.get("outbound") == "direct"),
+        file_expects={"rs_meta": meta_sha},
+    )
     return (True, f"已删除规则集 {label}") if ok else (False, msg)
 
 
@@ -2411,7 +2900,10 @@ def refresh_rulesets():
         "带警告的提交"这种中间状态;
       · **零成功不提交**: 一个源都没下来时直接返回, 不空跑一笔事务, 更不谎报"已更新"。
     """
-    m = _rs_meta()
+    try:
+        m, meta_sha = _rs_meta_snapshot()
+    except Exception as e:  # noqa: BLE001
+        return 0, ["规则集元数据无法读取(%s)" % type(e).__name__]
     if not m:
         return 0, []
     files, failed, n = {}, [], 0
@@ -2420,8 +2912,9 @@ def refresh_rulesets():
         for name, info in m.items():
             # 兼容早期缺 format/path 的旧条目(按 name 回填, 否则刷新会 KeyError)
             info.setdefault("format", "binary" if str(info.get("path", "")).endswith(".srs") else "source")
-            info.setdefault("path", os.path.join(RS_DIR, name + (".srs" if info["format"] == "binary" else ".json")))
-            leaf = os.path.basename(info["path"])
+            info.setdefault("path", posixpath.join(
+                RS_DIR, name + (".srs" if info["format"] == "binary" else ".json")))
+            leaf = posixpath.basename(info["path"])
             if leaf.endswith(".srs"):
                 # sing-box 二进制规则集: mihomo 读不了, 早已在入口被拒。老机器上残留的这种
                 # 条目不刷新也不删 —— doctor 会点名让用户换掉。
@@ -2438,7 +2931,11 @@ def refresh_rulesets():
                             info["behavior"] = bh
                 else:
                     tmp = os.path.join(tmpd, leaf)
-                    info["count"] = _build_source(info["url"], tmp)[0]
+                    info["count"] = _build_source(
+                        info["url"],
+                        tmp,
+                        phone_direct=(info.get("outbound") == "direct"),
+                    )[0]
                     with open(tmp, "rb") as f:
                         data = f.read()
                 files["ruleset:" + leaf] = data
@@ -2451,7 +2948,10 @@ def refresh_rulesets():
         # model 不变, 但仍走一遍派生渲染: 规则集进不了 mihomo 运行配置(dropped)这类问题要在
         # **候选阶段**就被挡下, 与 _mihomo_derive 同一判据; 文件真坏则由重启观察期兜住。
         ok, msg = tx_apply("rulesets_refresh", model_mod=lambda c: None, files=files,
-                           services=("mihomo",), warnings=failed)
+                           services=("mihomo",), warnings=failed,
+                           ruleset_direct=any(
+                               info.get("outbound") == "direct" for info in m.values()
+                           ), file_expects={"rs_meta": meta_sha})
         if not ok:
             return 0, failed + ["整批未更新(全部保留上一份好档): " + msg]
         return n, failed
@@ -2621,11 +3121,24 @@ def add_rule(domain, target):
     if not re.match(r"^[a-z0-9.-]+$", domain):
         return False, "域名格式不对"
     if target in ("direct", "直连"):
-        files = {"mosdns_rule:custom_direct.txt": _direct_text(_read_direct() + [domain])}
-        if domain in _read_hijack():                 # 改判直连: 必须同时撤掉劫持, 否则仍被劫进代理
-            files["mosdns_rule:custom_hijack.txt"] = _hijack_text(
-                [d for d in _read_hijack() if d != domain])
-        ok, msg = tx_apply("rule_add_direct", files=files)
+        direct, direct_sha = _domain_file_snapshot(MOSDNS_DIRECT)
+        hijack, hijack_sha = _domain_file_snapshot(MOSDNS_HIJACK)
+        # 两个集合共同决定“手机真实地址直连”的语义；即使 hijack 当时不含该域名，也要
+        # stage 候选空集并绑定同一 raw 的 SHA，避免并发新增劫持项在 read→stage 窗口丢失。
+        files = {
+            "mosdns_rule:custom_direct.txt": _direct_text(direct + [domain]),
+            "mosdns_rule:custom_hijack.txt": _hijack_text(
+                [item for item in hijack if item != domain]
+            ),
+        }
+        ok, msg = tx_apply(
+            "rule_add_direct",
+            files=files,
+            file_expects={
+                "mosdns_rule:custom_direct.txt": direct_sha,
+                "mosdns_rule:custom_hijack.txt": hijack_sha,
+            },
+        )
         return ok, (f"已把 {domain} 设为直连" if ok else msg)
     c = load()
     if target not in exit_tags(c):
@@ -2641,15 +3154,23 @@ def add_rule(domain, target):
         idx = 1 if cc["route"]["rules"] and cc["route"]["rules"][0].get("action") == "reject" else 0
         cc["route"]["rules"].insert(idx, {"domain_suffix": [domain], "outbound": target})
     # 内核规则与 mosdns 劫持表**同一笔事务**: 少了劫持这条规则就是死的, 分两步写迟早半套
-    files = {}
-    if domain not in _read_hijack():
-        files["mosdns_rule:custom_hijack.txt"] = _hijack_text(_read_hijack() + [domain])
-    ok, msg = tx_apply("rule_add", model_mod=mod, files=files)
+    hijack, hijack_sha = _domain_file_snapshot(MOSDNS_HIJACK)
+    files = {
+        "mosdns_rule:custom_hijack.txt": _hijack_text(hijack + [domain])
+    }
+    ok, msg = tx_apply(
+        "rule_add",
+        model_mod=mod,
+        files=files,
+        file_expects={"mosdns_rule:custom_hijack.txt": hijack_sha},
+    )
     return ok, (f"已把 {domain} → {target}" if ok else msg)
 
 def del_rule(domain):
     domain = domain.strip().lstrip(".").lower(); removed = []
     c = load()
+    direct, direct_sha = _domain_file_snapshot(MOSDNS_DIRECT)
+    hijack, hijack_sha = _domain_file_snapshot(MOSDNS_HIJACK)
     if any(domain in r.get(k, []) for r in c["route"]["rules"] for k in ("domain_suffix", "domain")):
         def mod(cc):
             for r in cc["route"]["rules"]:
@@ -2660,25 +3181,50 @@ def del_rule(domain):
                                     if r.get("action") or "outbound" not in r or r.get("rule_set")
                                     or r.get("domain_suffix") or r.get("domain")
                                     or r.get("domain_keyword") or r.get("ip_cidr")]
-        files = {}
-        if domain in _read_hijack():
-            files["mosdns_rule:custom_hijack.txt"] = _hijack_text(
-                [d for d in _read_hijack() if d != domain])
-        if domain in _read_direct():
-            files["mosdns_rule:custom_direct.txt"] = _direct_text(
-                [d for d in _read_direct() if d != domain])
+        files = {
+            "mosdns_rule:custom_hijack.txt": _hijack_text(
+                [item for item in hijack if item != domain]
+            ),
+            "mosdns_rule:custom_direct.txt": _direct_text(
+                [item for item in direct if item != domain]
+            ),
+        }
+        if domain in direct:
             removed.append("直连表")
-        ok, msg = tx_apply("rule_del", model_mod=mod, files=files)
+        ok, msg = tx_apply(
+            "rule_del",
+            model_mod=mod,
+            files=files,
+            file_expects={
+                "mosdns_rule:custom_direct.txt": direct_sha,
+                "mosdns_rule:custom_hijack.txt": hijack_sha,
+            },
+        )
         if not ok:
             return False, msg
         removed.append("出口规则")
-    elif domain in _read_direct():
-        ok, msg = tx_apply("rule_del_direct", files={
-            "mosdns_rule:custom_direct.txt": _direct_text(
-                [d for d in _read_direct() if d != domain])})
+    elif domain in direct or domain in hijack:
+        ok, msg = tx_apply(
+            "rule_del_direct",
+            files={
+                "mosdns_rule:custom_direct.txt": _direct_text(
+                    [item for item in direct if item != domain]
+                ),
+                "mosdns_rule:custom_hijack.txt": _hijack_text(
+                    [item for item in hijack if item != domain]
+                ),
+            },
+            file_expects={
+                "mosdns_rule:custom_direct.txt": direct_sha,
+                "mosdns_rule:custom_hijack.txt": hijack_sha,
+            },
+        )
         if not ok:
             return False, msg
-        removed.append("直连表")
+        if domain in direct:
+            removed.append("直连表")
+        if domain in hijack:
+            removed.append("劫持表")
     return (bool(removed), f"已删除 {domain} ({'+'.join(removed)})" if removed else f"未找到含 {domain} 的规则")
 
 def deletable_domains():
@@ -2707,14 +3253,26 @@ def del_rules_bulk(domains):
                                 if r.get("action") or "outbound" not in r or r.get("rule_set")
                                 or r.get("domain_suffix") or r.get("domain")
                                 or r.get("domain_keyword") or r.get("ip_cidr")]
-    cur = _read_direct(); hit = [x for x in cur if x in domains]
-    hj = _read_hijack()
-    files = {}
-    if hit:
-        files["mosdns_rule:custom_direct.txt"] = _direct_text([x for x in cur if x not in domains])
-    if any(x in domains for x in hj):
-        files["mosdns_rule:custom_hijack.txt"] = _hijack_text([x for x in hj if x not in domains])
-    ok, msg = tx_apply("rule_del_bulk", model_mod=mod, files=files)
+    cur, direct_sha = _domain_file_snapshot(MOSDNS_DIRECT)
+    hj, hijack_sha = _domain_file_snapshot(MOSDNS_HIJACK)
+    hit = [x for x in cur if x in domains]
+    files = {
+        "mosdns_rule:custom_direct.txt": _direct_text(
+            [x for x in cur if x not in domains]
+        ),
+        "mosdns_rule:custom_hijack.txt": _hijack_text(
+            [x for x in hj if x not in domains]
+        ),
+    }
+    ok, msg = tx_apply(
+        "rule_del_bulk",
+        model_mod=mod,
+        files=files,
+        file_expects={
+            "mosdns_rule:custom_direct.txt": direct_sha,
+            "mosdns_rule:custom_hijack.txt": hijack_sha,
+        },
+    )
     if not ok:
         return False, msg
     return True, f"✅ 已删除 {len(domains)} 个域名" + (f"(含直连 {len(hit)} 个)" if hit else "")
@@ -2819,14 +3377,22 @@ def rename_exit(old, new):
         if cc["route"].get("final") == old:
             cc["route"]["final"] = new
     # 规则集元数据也记着目标出口 —— 与 model 同一笔事务改, 免得内核改完名、元数据还指着旧的
-    rsm = _rs_meta(); dirty = False
+    try:
+        rsm, meta_sha = _rs_meta_snapshot()
+    except Exception as e:  # noqa: BLE001
+        return False, "规则集元数据无法读取(%s)" % type(e).__name__
+    dirty = False
     for k, v in rsm.items():
         if v.get("outbound") == old:
             v["outbound"] = new; dirty = True
     files = {}
+    file_expects = {}
     if dirty:
         files["rs_meta"] = json.dumps(rsm, ensure_ascii=False, indent=2).encode("utf-8")
-    ok, msg = tx_apply("exit_rename", model_mod=mod, files=files)
+        file_expects["rs_meta"] = meta_sha
+    ok, msg = tx_apply(
+        "exit_rename", model_mod=mod, files=files, file_expects=file_expects
+    )
     if not ok:
         return False, msg
     return True, f"✅ 出口 <b>{old}</b> 已改名 <b>{new}</b>, 分流规则/故障组/默认出口里的引用已同步。"
@@ -2871,7 +3437,7 @@ def _internal_probe_ip():
     return ""
 
 def _match_ruleset(name, d, sufs):
-    p = os.path.join(RS_DIR, name + ".json")
+    p = posixpath.join(RS_DIR, name + ".json")
     if not os.path.exists(p):
         return False  # .srs 二进制无法解析
     try:
@@ -3019,11 +3585,19 @@ def _ios_profile(ssids=()):
     return plistlib.dumps(p)
 
 # ── 配置备份 / 恢复 ──
-BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META]
+BACKUP_FILES = [
+    SB,
+    MOSDNS_CONF,
+    MOSDNS_DIRECT,
+    MOSDNS_RULESET_DIRECT,
+    MOSDNS_HIJACK,
+    RS_META,
+]
 RESTORE_MAP = {
     "etc/sing-box/config.json": SB,
     "etc/mosdns/config.yaml": MOSDNS_CONF,
     "etc/mosdns/rules/custom_direct.txt": MOSDNS_DIRECT,
+    "etc/mosdns/rules/ruleset_direct.txt": MOSDNS_RULESET_DIRECT,
     "etc/mosdns/rules/custom_hijack.txt": MOSDNS_HIJACK,
     "opt/pdg-bot/rulesets.json": RS_META,
 }
@@ -3282,7 +3856,7 @@ def _managed_rulesets(meta):
         if not isinstance(info, dict):
             raise ValueError("规则集 %s 的元数据不是对象" % name)
         fmt = str(info.get("format") or "")
-        leaf = os.path.basename(str(info.get("path") or ""))
+        leaf = posixpath.basename(str(info.get("path") or ""))
         if not leaf:
             leaf = name + (".mrs" if fmt == "mrs" else ".json")
         raw = str(info.get("path") or "")
@@ -3294,12 +3868,12 @@ def _managed_rulesets(meta):
                 raise ValueError("规则集 %s 的路径含反斜杠, 拒绝" % name)
             if any(seg == ".." for seg in raw.split("/")):
                 raise ValueError("规则集 %s 的路径含 .., 拒绝" % name)
-            if "//" in raw or raw != os.path.normpath(raw):
+            if "//" in raw or raw != posixpath.normpath(raw):
                 raise ValueError("规则集 %s 的路径不是规范化形态(%s), 拒绝" % (name, raw))
             # 目录部分必须**正好**是生产规范目录, 或本机 RS_DIR(测试/镜像沙箱把整棵树挪了根)。
             # 只用 endswith 会放过 /evil/etc/sing-box/rs/foo.json 这种"看起来像"的路径。
-            d = os.path.dirname(raw)
-            if d not in (_RS_DIR_CANON, RS_DIR.rstrip("/")) or os.path.basename(raw) != leaf:
+            d = posixpath.dirname(raw)
+            if d not in (_RS_DIR_CANON, RS_DIR.rstrip("/")) or posixpath.basename(raw) != leaf:
                 raise ValueError("规则集 %s 的路径不是「规则集目录 + 单个文件名」, 拒绝" % name)
         if not _RS_LEAF_RE.match(leaf):
             raise ValueError("规则集 %s 的文件 %s 不是当前支持的 .json/.mrs" % (name, leaf))
@@ -3390,6 +3964,18 @@ def _restore_commit(tmp):
         cur_sb, sb_sha = t.read_for_update("model")
         cur_mos, mos_sha = t.read_for_update("mosdns_conf")
         cur_meta_raw, meta_sha = t.read_for_update("rs_meta")
+        watched_meta = t.watch("rs_meta", optional=True)
+        watched_meta_sha = (
+            hashlib.sha256(watched_meta).hexdigest() if watched_meta is not None else None
+        )
+        if watched_meta_sha != meta_sha:
+            raise tx.TxRefused("PRECONDITION_FAILED: rs_meta 在组装恢复候选时已变化")
+        try:
+            cur_meta = json.loads(cur_meta_raw.decode("utf-8")) if cur_meta_raw else {}
+            if not isinstance(cur_meta, dict):
+                raise ValueError("顶层不是对象")
+        except Exception as exc:  # noqa: BLE001
+            raise tx.TxRefused("现网规则集元数据损坏，无法安全恢复") from exc
         # 机器感知: 用「本机」身份覆盖备份带来的 server_ip / 内网卡段 / 证书路径。这样跨机导入
         # 只搬出口+分流+规则集, 不会把别人的 IP/证书路径搬来搞错位。现网那一份取自
         # read_for_update 的内容(带前置 sha), 不再单独读文件。
@@ -3438,8 +4024,8 @@ def _restore_commit(tmp):
                 bak_meta_raw = f.read()
             try:
                 bak_meta = json.loads(bak_meta_raw.decode("utf-8"))
-                cur_meta = json.loads(cur_meta_raw.decode("utf-8")) if cur_meta_raw else {}
-                plan, notes = _restore_ruleset_plan(tmp, cur_meta, bak_meta)
+                plan, plan_notes = _restore_ruleset_plan(tmp, cur_meta, bak_meta)
+                notes.extend(plan_notes)
             except ValueError as e:
                 return False, "备份里的规则集不能恢复: %s" % e
             except Exception as e:  # noqa: BLE001
@@ -3448,8 +4034,28 @@ def _restore_commit(tmp):
             restored.append("rulesets.json")
             for leaf, blob in sorted(plan.items()):
                 t.stage("ruleset:" + leaf, blob)
+            if (
+                any(i.get("outbound") == "direct" for i in bak_meta.values())
+                or any(i.get("outbound") == "direct" for i in cur_meta.values())
+            ):
+                # 归档里的 aggregate 仅用于备份完整性/审计；恢复时永远从候选元数据与
+                # 候选 source JSON 重派生，绝不信任可能过期或被篡改的聚合内容。
+                staged_for_direct = {
+                    "rs_meta": bak_meta_raw,
+                    **{"ruleset:" + leaf: blob for leaf, blob in plan.items()},
+                }
+                if mos_new is not None:
+                    staged_for_direct["mosdns_conf"] = mos_new
+                _register_ruleset_direct_derive(t, staged_for_direct)
+                restored.append("ruleset_direct.txt（重新派生）")
             n_del = sum(1 for v in plan.values() if v is None)
             restored.append("规则集 %d 个(删除 %d 个)" % (len(plan) - n_del, n_del))
+        elif mos_new is not None and any(
+            i.get("outbound") == "direct" for i in cur_meta.values()
+        ):
+            # 备份不带规则集元数据时保持现网 meta/source/aggregate；但若同时替换 MosDNS
+            # 配置，仍必须验证候选配置不会让现有手机直连规则失效。
+            _ruleset_direct_interface_bytes(mos_new)
         t.derive("mihomo_cfg", _mihomo_derive)
         t.service("restart:mihomo")
         t.service("restart:mosdns")
@@ -3690,10 +4296,12 @@ def handle_cb(chat, mid, data):
     if data == "add_rs":
         state[chat] = "add_rs"
         edit(chat, mid, "发「<b>规则集URL 出口 [名称]</b>」(后缀 .list / .txt / .yaml / .mrs)。\n"
-             f"出口: {', '.join(exit_tags(load()))}\n名称可留空(之后用「✏️ 改规则集名」改)。\n"
+             f"出口: {', '.join(exit_tags(load()))}，或 direct（手机取得真实地址后本地直连，不经 VPS）。\n"
+             "注意：direct-type 出口（如 jp）表示流量已到 VPS 后由 VPS 本机直出，与 literal direct 不同。\n"
+             "名称可留空(之后用「✏️ 改规则集名」改)。\n"
              "例: <code>https://.../Binance.list tw 币安</code>\n"
-             "· .mrs 需在末尾补类型: <code>https://.../geo.mrs tw 名称 domain</code>"
-             "(可选 domain / ipcidr / classical —— 二进制规则集判不出来, 猜错会让规则永不命中)\n"
+             "· .mrs 认不出类型时需在末尾补: <code>https://.../geo.mrs tw 名称 domain</code>"
+             "（可选 domain / ipcidr；不能用于 literal direct）\n"
              "/cancel 取消。", RULE_BACK); return
     if data == "del_rs":
         if not _rs_meta():
@@ -3882,20 +4490,22 @@ def handle_cb(chat, mid, data):
              "选自动关闭时长: 到点自动关面板 + 删掉含密钥的链接(忘了关也有暴露上限)。\n"
              "⚠️ HTTP 明文、链接含密钥(别转发)。",
              {"inline_keyboard": [[{"text": "⏱ 开10分", "callback_data": "panel:on:10"},
-                                   {"text": "⏱ 开30分", "callback_data": "panel:on:30"},
-                                   {"text": "🔓 常开", "callback_data": "panel:on:0"}],
+                                   {"text": "⏱ 开30分", "callback_data": "panel:on:30"}],
                                   [{"text": "🔒 关闭", "callback_data": "panel:off"}],
                                   [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}],
                                   [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data.startswith("panel:on:"):
-        mins = int(data.rsplit(":", 1)[1]) if data.rsplit(":", 1)[1].isdigit() else 10
+        raw_mins = data.rsplit(":", 1)[1]
+        if raw_mins not in ("10", "30"):  # 旧消息里的 panel:on:0 也必须由后端拒绝
+            edit(chat, mid, "❌ 面板只允许临时开启 10 或 30 分钟。", OPS_BACK)
+            return
+        mins = int(raw_mins)
         edit(chat, mid, "正在开启观测面板(首次会下载 zashboard、改 clash_api、放行内网 9090)…", OPS_BACK)
         ok, res = set_panel(True)
         if ok:
             published, publish_msg = _panel_publish(chat, res, mins * 60)
             if published:
-                tip = (f"⏱ {mins} 分钟后自动关闭并删除上面的链接。" if mins > 0
-                       else "🔓 常开模式: 不自动关闭, 看完请手动点「🔒 关闭」。")
+                tip = f"⏱ {mins} 分钟后自动关闭并删除上面的链接。"
                 edit(chat, mid, "✅ 已开启，含密钥链接已单独发送。" + tip + "\n"
                                 "⚠️ 链接含密钥别转发。首次打不开多半是手机没走内网卡到 9090, 换内网卡/专线再试。", OPS_BACK)
             else:
@@ -3981,8 +4591,13 @@ def handle_text(chat, text, mid=None):
         if cmd == "/delrule":
             state[chat] = "del_rule"; send(chat, "发要删除的域名。/cancel 取消。", BACK); return
         if cmd == "/addrs":
-            state[chat] = "add_rs"; send(chat, "发「<b>规则集URL 出口 [名称] [类型]</b>」（支持 .list / .txt / .yaml / .mrs；"
-                       ".mrs 类型一般自动识别，认不出时再补 domain/ipcidr）。/cancel 取消。", BACK); return
+            state[chat] = "add_rs"; send(
+                chat,
+                "发「<b>规则集URL 出口 [名称] [类型]</b>」（支持 .list / .txt / .yaml / .mrs；"
+                "出口也可填 direct=手机本地直连，不经 VPS；.mrs 不能用于 direct，类型一般自动识别，"
+                "认不出时再补 domain/ipcidr）。/cancel 取消。",
+                BACK,
+            ); return
         if cmd == "/delexit":
             tags = deletable_tags(load())
             send(chat, "选择删除的出口/组：" if tags else "无可删出口", kb_pick("delx", tags) if tags else BACK); return
@@ -4149,7 +4764,10 @@ def main():
     cmds = [
         {"command": "start", "description": "打开菜单 / 状态"},
         {"command": "cancel", "description": "取消当前输入"}]
-    post("setMyCommands", {"commands": cmds})
+    # 旧版曾注册 default scope，导致群聊也展示管理命令。先清掉 default/群聊 scope，
+    # 只给所有私聊注册；群聊 update 本身仍在任何操作前被拒绝。
+    post("deleteMyCommands", {"scope": {"type": "default"}})
+    post("deleteMyCommands", {"scope": {"type": "all_group_chats"}})
     post("setMyCommands", {"commands": cmds, "scope": {"type": "all_private_chats"}})
     print("pdg-bot v3 started, allowed:", ALLOWED, flush=True)
     try:                                   # 兜底: bot 重启后核验并收回本项目遗留的临时面板
@@ -4167,6 +4785,10 @@ def main():
             try:
                 if "message" in u:
                     m = u["message"]
+                    # 管理凭据、备份和临时面板链接绝不能回复进群聊。先做 chat 边界检查，
+                    # 再检查 allowed user，最后才进入任何 handler。
+                    if m.get("chat", {}).get("type") != "private":
+                        continue
                     if m["from"]["id"] not in ALLOWED:
                         continue
                     if "text" in m:
@@ -4175,10 +4797,13 @@ def main():
                         handle_document(m["chat"]["id"], m["document"])
                 elif "callback_query" in u:
                     q = u["callback_query"]
+                    message = q.get("message") or {}
+                    if message.get("chat", {}).get("type") != "private":
+                        continue
                     # 先停按钮转圈, 再跑可能较慢的 handle_cb(检查更新/测出口/自检等)。
                     answer_cb_async(q["id"])
                     if q["from"]["id"] in ALLOWED:
-                        handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"])
+                        handle_cb(message["chat"]["id"], message["message_id"], q["data"])
             except Exception as e:  # noqa: BLE001
                 print("handle err", e, flush=True)
 

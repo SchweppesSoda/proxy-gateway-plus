@@ -76,7 +76,7 @@ def main():
     assert "===== sing-box 版本 =====" not in text; ok("mihomo: 报告不含 'sing-box 版本' 小节")
     svcs = journal_svcs(cmds)
     assert "mihomo" in svcs and "sing-box" not in svcs, svcs; ok("mihomo: journalctl 取 mihomo 日志(不取 sing-box)")
-    assert "/ mihomo, 80 行)" in text, text[:400]; ok("mihomo: 日志小节标题与内核一致")
+    assert "/ mihomo / QUIC route, 80 行)" in text, text[:400]; ok("mihomo: 日志小节标题含当前内核与 QUIC route")
 
     # ── 旧机器 backend 标记里仍写着 singbox: 报告也只认 mihomo(v1.6.0 唯一内核) ──
     text, cmds = collect("singbox")

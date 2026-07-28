@@ -2,6 +2,19 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-28 — 未发布（MosDNS DoT 禁用 TLS 会话恢复）
+
+- MosDNS 保持官方 v5.3.4 源码 pin，但生产二进制改为可跟踪的
+  `v5.3.4-pdg-notickets.1` flavor；`tcp_server` 的 `tls.Config` 设置
+  `SessionTicketsDisabled=true`。stock v5.3.4 即使版本字符串相同也会被安装、更新与
+  doctor 拒绝。
+- 新增精确上游 commit、patch SHA256、Go 1.24.9 与 raw binary 产物契约；构建脚本和
+  GitHub Actions 对 amd64 / arm64 做双构建逐字节复现。当前无自有 release asset 时默认
+  fail closed，只允许操作者提供绝对路径 KFC 产物和独立记录的 SHA256，不在 VPS 安装 Go。
+- 安装与更新覆盖前保留旧 MosDNS；候选 hash/marker、安装证明、重启或稳定门失败会恢复旧
+  二进制和证明，更新快照也纳入二进制。常规 doctor 校验 flavor/provenance；deep doctor
+  用系统 CA 做 chain + SAN-only 验证，并以两次真实 DoT 查询确认 SSLSession 恢复未被接受。
+
 ## 2026-07-26 — v1.6.2(安全边界与失败可见性:出事要么不动手,要么说清楚)
 
 本版没有新功能,集中修一类问题:**出错时看起来成功**。更新、回滚、恢复、装机、平台切换都做了同样的收口 —— 要么在改动现网之前中止,要么完整回滚并说出真实原因。

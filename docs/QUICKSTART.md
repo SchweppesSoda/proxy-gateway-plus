@@ -70,11 +70,17 @@ VPS 用的是 **kfchost** — 官网:<https://kfchost.com/center/> · 邀请注�
 
 ## 4. 一键安装
 
-SSH 登录 VPS,跑:
+派生仓库目前还没有兼容的 `v*` 发布 tag。SSH 登录 VPS 后,克隆当前默认分支并显式
+跳过发布 tag 自举:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/install.sh | sudo bash
+git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
+cd proxy-gateway-plus
+sudo PDG_TAG_BOOTSTRAPPED=1 ./install.sh
 ```
+
+> `PDG_TAG_BOOTSTRAPPED=1` 只用于首次派生版本发布前的开发验证。首个派生 `v*` tag
+> 创建后,标准安装入口会恢复为“自举并切到最新发布 tag”。
 
 过程中它会:**①** 自动检测公网 IP、SSH 端口、内网卡来源段(抓包识别,期间用手机走这张 SIM 访问一次本机);**②** 让你填 bot token / 你的 user id / DoT 域名(token 可留空,装完再设);**③** 确认 A 记录生效后自动签 Let's Encrypt 证书,起服务、应用防火墙。
 
@@ -84,6 +90,10 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/ins
 </p>
 
 > 抓内网卡段那步若没抓到:先随便填(如 `172.22.0.0/16`),装完用 `sudo pdg detect-cidr` 从容重测并写回。
+>
+> 默认 `PDG_FIREWALL_MODE=managed`,由项目维护 source-aware input policy。若整机防火墙
+> 已由 `vps-toolkit` 等上层编排管理,应使用 `PDG_FIREWALL_MODE=external`;此模式只安装
+> 网关自己的透明代理数据面,不会替你开放或关闭任何公网端口。
 
 ---
 
@@ -158,10 +168,19 @@ sudo pdg report       # 生成脱敏诊断报告(贴出来求助用)
 
 ## 9. 局限与补丁
 
-「DNS + SNI」这套只兜走 **80 / 443、能按域名/SNI 判定**的流量。下面这些天生不走这套,属正常:
+「DNS + Mihomo」只处理被 MosDNS 引回网关、且命中已配置数据面端口的流量。TCP 默认
+接管 HTTP `:80`、TLS `:443`（Android 还包含 GMS/FCM `:5228-5230`），按内网卡来源段
+REDIRECT 到同一个 Mihomo `:7893`。下面这些边界属正常:
 
 - **Speedtest 测速 / 纯 UDP(游戏联机、WebRTC)/ 直连 IP 的 App**:可在手机上常备一个 iOS 自带的**全局 VPN(IKEv2)**作兜底,要用时一键开、不用时关。
-- **QUIC / HTTP3**:网关已 reject 手机源 UDP/443,逼客户端回落 TCP/443(才能被嗅 SNI 分流)。
+- **QUIC / HTTP3**:默认 `PDG_QUIC_MODE=tproxy`,内网卡来源 UDP/443 由 nft TPROXY 到
+  同一个 Mihomo 的 `:7895`,再按 QUIC 域名分流。只有显式使用
+  `PDG_QUIC_MODE=reject` 时才禁用这条原生 QUIC 数据面;`managed` 防火墙会拒绝
+  UDP/443 促使客户端回落 TCP,`external` 模式则由外部防火墙决定。
+- **非标准 TCP 端口**:先看域名是否本应直连。例如某个应直连的网站使用 TLS `:10443`,
+  却因 DNS 漏分流拿到网关 IP,应在 bot「📑 分流管理」把域名指到 `direct`;这会写入
+  `custom_direct.txt`,让手机取得真实 IP。只有业务确实要经过代理时,才在安装参数里把
+  `:10443` 纳入 `PDG_HIJACK_TLS_TCP_PORTS`。端口变量是完整集合,不是增量追加。
 - **Telegram App**:走直连 IP,不吃 DNS+SNI 分流。已内置一个**仅内网卡可达的 SOCKS5(网关 IP:8445)**:在 Telegram「设置 → 数据和存储 → 代理」加 SOCKS5、填 `网关IP:8445`(无需账号密码)即可。出口可在 bot **📱 客户端 → ✈️ Telegram 出口** 单独选(默认跟随「默认出口」);想走 hk 就选 hk。
 
 ---

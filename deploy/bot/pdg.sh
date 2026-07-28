@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # PrivDNS Gateway 管理命令。直接 `sudo pdg` 进菜单, 或 pdg <子命令>。
-#   pdg [menu] | status | update | token | restart | log [n] | uninstall [--purge]
-# 设计: 生命周期(装/更新/卸载/token/状态/日志)走这里; 出口/分流/DNS上游 走 Telegram bot。
+#   pdg [menu] | status | update | web <action> | token | restart | log [n] | uninstall [--purge]
+# 设计: 生命周期(装/更新/卸载/Web/token/状态/日志)走这里; 出口/分流/DNS上游 走管理面。
 set -uo pipefail
-REPO_URL="https://github.com/misaka-cpu/privdns-gateway.git"
+REPO_URL="${PDG_REPO_URL:-https://github.com/SchweppesSoda/proxy-gateway-plus.git}"
 REPO_DIR="/opt/privdns-gateway"
 SVC="/etc/systemd/system/pdg-bot.service"
 ENVD="/etc/privdns-gateway"
@@ -24,14 +24,14 @@ _pdg_platform(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[
 _pdg_platform_present(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[ "$p" == ios || "$p" == android ]]; }
 # 展示用的服务集(status 逐个列状态): 恒含 pdg-bot —— 用户想看到它在不在跑, 哪怕没配凭据。
 # pdg-probe81 仍是 iOS 专属。
-_pdg_svcs(){ local s; s="mosdns $(_pdg_core_svc) pdg-bot"; [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"; echo "$s"; }
+_pdg_svcs(){ local s; s="pdg-quic-routing mosdns $(_pdg_core_svc) pdg-bot"; [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"; echo "$s"; }
 
 # **必需**服务集(校验门用): 与 checks.expected_services() 同语义 —— bot.env 两项都空是合法的
 # "这台机器不用 Telegram 管理", pdg-bot 不运行属正常禁用态, 不该把它算成必须在跑的服务。
 # 以前平台切换直接用 _pdg_svcs 校验, 于是没配 bot 的机器 `pdg platform ios` 必然卡在
 # "pdg-bot 未稳定运行"并整体回滚 —— 而那台机器本来就没打算起 bot。
 _pdg_required_svcs(){
-  local s; s="mosdns $(_pdg_core_svc)"
+  local s; s="pdg-quic-routing mosdns $(_pdg_core_svc)"
   [[ "$(_pdg_bot_cred)" == ready ]] && s="$s pdg-bot"
   [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"
   echo "$s"
@@ -46,6 +46,157 @@ _pdg_nft_bin(){
   pdg_nft_bin || true
 }
 
+_pdg_profile_tool(){
+  local p
+  for p in /opt/pdg-bot/pdgprofile.py "$REPO_DIR/deploy/bot/pdgprofile.py"; do
+    [[ -f "$p" ]] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+_pdg_quic_helper(){
+  local p
+  for p in /usr/local/libexec/pdg-quic-routing.sh \
+           "$REPO_DIR/deploy/firewall/pdg-quic-routing.sh"; do
+    [[ -f "$p" ]] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+# Strict single-value profile read. Duplicate/invalid managed keys fail.
+_pdg_profile_get(){
+  local key="$1" tool
+  tool="$(_pdg_profile_tool)" || return 1
+  _pdg_profile_get_from "$tool" "$key"
+}
+
+_pdg_profile_get_from(){
+  local tool="$1" key="$2"
+  python3 - "$tool" "$PROFILE_ENV" "$key" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+tool, profile, key = sys.argv[1:]
+sys.path.insert(0, str(Path(tool).resolve().parent))
+spec = importlib.util.spec_from_file_location("pdgprofile_pdg_cli", tool)
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+values = mod.read_values(profile)
+if key not in values:
+    raise SystemExit(1)
+print(values[key])
+PY
+}
+
+_pdg_firewall_mode(){
+  local mode marker=""
+  mode="$(_pdg_profile_get PDG_FIREWALL_MODE)" || return 1
+  [[ "$mode" == managed || "$mode" == external ]] || return 1
+  [[ ! -e /etc/privdns-gateway/firewall-mode ]] \
+    || marker="$(cat /etc/privdns-gateway/firewall-mode 2>/dev/null)"
+  [[ -z "$marker" || "$marker" == "$mode" ]] || {
+    echo "firewall-mode state 与 profile.env 不一致" >&2; return 1; }
+  printf '%s\n' "$mode"
+}
+
+_pdg_render_mihomo_candidate(){
+  local out="$1" bundle="${2:-/opt/pdg-bot}"
+  ( cd "$bundle" && python3 - "$out" "$bundle" <<'PY'
+import importlib.util, os, sys
+from pathlib import Path
+dst, root = sys.argv[1:]
+root = str(Path(root).resolve())
+sys.path.insert(0, root)
+source = Path(root, "bot.py")
+if not source.is_file():
+    source = Path(root, "pdg-bot.py")
+if not source.is_file():
+    raise SystemExit("bundle lacks bot.py/pdg-bot.py: " + root)
+spec = importlib.util.spec_from_file_location("bot", str(source))
+bot = importlib.util.module_from_spec(spec)
+sys.modules["bot"] = bot
+spec.loader.exec_module(bot)
+model = bot.load()
+data, meta = bot._render_mihomo_bytes(model)
+if meta.get("unknown_proxies"):
+    raise SystemExit("unknown proxies: " + ",".join(meta["unknown_proxies"]))
+with open(dst, "wb") as fh:
+    fh.write(data)
+os.chmod(dst, 0o600)
+PY
+  )
+}
+
+_pdg_atomic_install_file(){
+  local source="$1" target="$2" mode="${3:-600}" dir tmp
+  [[ -s "$source" ]] || return 1
+  dir="$(dirname "$target")"; mkdir -p "$dir" || return 1
+  tmp="$(mktemp "$dir/.pdg-file.XXXXXX")" || return 1
+  if ! cp "$source" "$tmp" || ! cmp -s "$source" "$tmp" \
+     || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$target"; then
+    rm -f "$tmp"; return 1
+  fi
+}
+
+# 用 before-image 的 mode/uid/gid 原子恢复目标；数据与目录均 fsync 后才算成功。
+_pdg_atomic_restore_file(){
+  local source="$1" target="$2"
+  [[ -f "$source" && ! -L "$source" && -d "$(dirname "$target")" ]] || return 1
+  python3 - "$source" "$target" <<'PY'
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+source, target = sys.argv[1:]
+st = os.lstat(source)
+if not stat.S_ISREG(st.st_mode):
+    raise SystemExit("before-image is not regular")
+directory = os.path.dirname(target)
+fd, tmp = tempfile.mkstemp(prefix=".pdg-restore.", dir=directory)
+try:
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, stat.S_IMODE(st.st_mode))
+    if hasattr(os, "fchown"):
+        os.fchown(fd, st.st_uid, st.st_gid)
+    with os.fdopen(fd, "wb") as out, open(source, "rb") as inp:
+        fd = -1
+        shutil.copyfileobj(inp, out)
+        out.flush()
+        os.fsync(out.fileno())
+    os.chmod(tmp, stat.S_IMODE(st.st_mode))
+    os.replace(tmp, target)
+    if os.name != "nt":
+        dfd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+_pdg_ensure_ruleset_direct_file(){
+  local target="$1" seed=""
+  if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+    return 1
+  fi
+  [[ -f "$target" ]] && return 0
+  seed="$(mktemp)" || return 1
+  if ! printf '%s\n' \
+      '# pdg-bot 规则集手机本地直连聚合（事务派生；不要手工编辑）' >"$seed" \
+     || ! _pdg_atomic_install_file "$seed" "$target" 644 \
+     || [[ ! -f "$target" || -L "$target" ]]; then
+    rm -f "$seed"; return 1
+  fi
+  rm -f "$seed"
+}
+
 # ── sing-box 文件归属 ────────────────────────────────────────────────────────
 # 判据集中在 lib/singbox.sh(install/uninstall/pdg 共用), 详见该文件注释:
 # 只有可信归属标记, 或"完整匹配历史 PDG unit 形态 + 现场另有本项目特征", 才算自家的。
@@ -57,9 +208,12 @@ _pdg_singbox_is_ours(){
 }
 
 _pdg_drop_singbox_files(){
-  local why="${1:-}" pfx="${PDG_ROOT_PREFIX:-}"
-  local unit="$pfx/etc/systemd/system/sing-box.service" bin="$pfx/usr/local/bin/sing-box"
-  [[ -e "$unit" || -e "$bin" ]] || return 0
+  local why="${1:-}" require_drop="${2:-0}" expected_root="${3:-}"
+  local pfx="${PDG_ROOT_PREFIX:-}" state
+  local unit="$pfx/etc/systemd/system/sing-box.service"
+  local bin="$pfx/usr/local/bin/sing-box"
+  local marker="$pfx/etc/privdns-gateway/singbox.pdg-owned"
+  [[ -e "$unit" || -L "$unit" || -e "$bin" || -L "$bin" ]] || return 0
   if ! _pdg_singbox_is_ours "$unit"; then
     local kept reason
     kept="$(pdg_singbox_kept_paths 2>/dev/null)"
@@ -68,24 +222,59 @@ _pdg_drop_singbox_files(){
     [[ -n "$kept" ]] && printf '%s\n' "$kept" | sed 's/^/      /'
     c_y "  判不出归属的原因: ${reason:-未知}"
     c_y "  (确认它无用可自行清理: systemctl disable --now sing-box; rm -f $unit $bin)"
+    [[ "$require_drop" == 1 ]] && return 1
     return 0
+  fi
+  if [[ "$require_drop" == 1 ]]; then
+    [[ -n "$expected_root" \
+       && -f "$expected_root/etc/systemd/system/sing-box.service" \
+       && -f "$expected_root/usr/local/bin/sing-box" ]] || return 1
+    cmp -s "$expected_root/etc/systemd/system/sing-box.service" "$unit" \
+      && cmp -s "$expected_root/usr/local/bin/sing-box" "$bin" || {
+        c_y "  sing-box 运行时在 capture 后发生漂移，拒绝删除。"
+        return 1
+      }
   fi
   # 确认是自家的 → 先落一份可信标记再动手: 中途崩了(断电/被杀)下次仍认得出是本项目所有,
   # 不至于因为 unit 已删、判据失效而退化成"证明不了", 从此再也清不掉残留。
   # shellcheck source=lib/singbox.sh
-  source "$REPO_DIR/lib/singbox.sh" 2>/dev/null && pdg_singbox_mark_owned
-  systemctl disable --now sing-box >/dev/null 2>&1 || true
-  rm -f "$unit" "$bin" "${PDG_ROOT_PREFIX:-}/etc/privdns-gateway/singbox.pdg-owned"
-  return 0
+  if ! source "$REPO_DIR/lib/singbox.sh" 2>/dev/null \
+     || ! pdg_singbox_mark_owned; then
+    c_y "  sing-box 归属标记写入失败，未删除运行时。"
+    return 1
+  fi
+  if ! systemctl disable --now sing-box >/dev/null 2>&1; then
+    c_y "  sing-box 停用失败，未删除运行时。"
+    return 1
+  fi
+  state="$(systemctl is-active sing-box 2>/dev/null)"
+  [[ "$state" != active ]] || return 1
+  state="$(systemctl is-enabled sing-box 2>/dev/null)"
+  [[ "$state" != enabled && "$state" != enabled-runtime ]] || return 1
+  if [[ "$require_drop" == 1 ]]; then
+    cmp -s "$expected_root/etc/systemd/system/sing-box.service" "$unit" \
+      && cmp -s "$expected_root/usr/local/bin/sing-box" "$bin" || {
+        c_y "  sing-box 运行时在停用后发生漂移，拒绝删除。"
+        return 1
+      }
+  fi
+  if ! rm -f "$unit" "$bin" "$marker"; then
+    c_y "  sing-box 运行时删除失败。"
+    return 1
+  fi
+  if [[ -e "$unit" || -L "$unit" || -e "$bin" || -L "$bin" \
+        || -e "$marker" || -L "$marker" ]]; then
+    c_y "  sing-box 运行时删除后 read-back 仍存在。"
+    return 1
+  fi
+  state="$(systemctl is-active sing-box 2>/dev/null)"
+  [[ "$state" != active ]] || return 1
+  state="$(systemctl is-enabled sing-box 2>/dev/null)"
+  [[ "$state" != enabled && "$state" != enabled-runtime ]]
 }
 # iOS: 从已渲染的 nft 移除 GMS 5228-5230(iOS 走 APNs, 不需要)。nft 模板对两平台通用 —— 装机/切核
 # 渲染后在 iOS 上剥掉, 免得 iOS 带上 GMS(或切核后 GMS 复活)。$1=nft 文件; 非 iOS 或文件不存在=空操作。
-_pdg_nft_strip_gms(){
-  local f="$1"
-  [[ "$(_pdg_platform)" == ios && -f "$f" ]] || return 0
-  sed -E -i 's#(tcp dport [{] 53, 80, 81, 443, 853), 5228-5230, 8445 [}] accept#\1, 8445 } accept#' "$f"  # sing-box 端口集
-  sed -E -i 's#(tcp dport [{] 80, 443), 5228-5230 [}] redirect#\1 } redirect#' "$f"                        # mihomo REDIRECT
-}
+_pdg_nft_strip_gms(){ :; } # compatibility seam; platform-aware profile rendering replaced fixed sed rewrites.
 
 # 串行化"会写配置/重启服务"的操作(update/rollback/snapshot), 防 bot 更新按钮与命令行并发。
 # 嵌套调用(update→snapshot)只锁一次。read-only 操作(status/doctor/report/log)不加锁。
@@ -264,13 +453,18 @@ pdg_fetch_release_tags(){
 }
 
 cmd_status(){
+  local status_failed=0
   c_g "== 服务 =="
   local core; core="$(_pdg_core)"
-  local s
+  local s required_svcs
   # shellcheck disable=SC2046  # _pdg_svcs 输出有意按空白分词
   local _cred; _cred="$(_pdg_bot_cred)"
+  required_svcs="$(_pdg_required_svcs)"
   for s in $(_pdg_svcs); do   # 按平台: pdg-probe81 仅 iOS
     local _st; _st="$(systemctl is-active "$s" 2>/dev/null)"
+    if [[ " $required_svcs " == *" $s "* && "$_st" != active ]]; then
+      status_failed=1
+    fi
     if [[ "$s" == pdg-bot && "$_cred" != ready ]]; then
       # 合法禁用态不是故障: 两项都空 = 这台机器不用 Telegram 管理; 只配一半才是配置错误
       [[ "$_cred" == partial ]] \
@@ -285,13 +479,60 @@ cmd_status(){
   echo "  内核后端     $core$([[ "$core" == mihomo ]] && echo "(版本随项目发布更新)" || echo "(固定 1.12.x)")"
   if _pdg_platform_present; then echo "  手机平台     $(_pdg_platform)"
   else echo "  手机平台     android(⚠️ 平台标记缺失, 按 Android 安全回退; 运行 sudo pdg 触发迁移落定)"; fi
+  local dptool dpline
+  if dptool="$(_pdg_profile_tool)" \
+    && dpline="$(python3 - "$dptool" "$PROFILE_ENV" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+tool, profile = sys.argv[1:]
+sys.path.insert(0, str(Path(tool).resolve().parent))
+spec = importlib.util.spec_from_file_location("pdgprofile_status", tool)
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+values = mod.read_values(profile, missing_ok=False)
+c = mod.resolve(profile, platform=values.get("PDG_PLATFORM"), environ={},
+                ssh_port=values.get("PDG_SSH_PORT"))
+print("%s|%s|%s|%s/%s|%s|%s" % (
+    c["quic_mode"], ",".join(map(str, c["tls_ports"])),
+    ",".join(map(str, c["http_ports"])), c["mark_text"], c["mask_text"],
+    c["route_table"], c["rule_priority"]))
+PY
+)" ; then
+    IFS='|' read -r _qm _tls _http _mark _table _prio <<<"$dpline"
+    echo "  QUIC 模式     $_qm"
+    echo "  TCP 劫持      TLS=$_tls HTTP=$_http"
+    echo "  QUIC 路由     mark=$_mark table=$_table priority=$_prio"
+    if [[ -x /usr/local/libexec/pdg-quic-routing.sh ]]; then
+      echo "  路由复核      $(/usr/local/libexec/pdg-quic-routing.sh status 2>&1 || echo FAILED)"
+    else
+      echo "  路由复核      FAILED(helper missing)"
+    fi
+  else
+    echo "  透明数据面   ⚠️ profile 缺失/重复/非法"
+    status_failed=1
+  fi
+  local dpcheck="" dpstate="" dpmsg=""
+  dpcheck="$(python3 - <<'PY'
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import checks
+state, title, message = checks.check_dataplane_profile()
+print(state + "|" + title + "|" + message)
+PY
+)" || dpcheck="fail|透明数据面|无法运行共享 checks.check_dataplane_profile"
+  dpstate="${dpcheck%%|*}"; dpmsg="${dpcheck#*|}"; dpmsg="${dpmsg#*|}"
+  if [[ "$dpstate" == ok ]]; then
+    echo "  数据面复核   OK($dpmsg)"
+  else
+    echo "  数据面复核   FAILED($dpmsg)"
+    status_failed=1
+  fi
   echo "  DoT 域名     $(cat /opt/pdg-bot/dot-domain 2>/dev/null || echo ?)"
   local ports p9090="9090(local clash_api)"
   if jq -e '.experimental.clash_api as $c | $c.external_controller == "0.0.0.0:9090" and $c.external_ui == "/etc/sing-box/ui/dist" and (($c.secret // "") | length > 0)' /etc/sing-box/config.json >/dev/null 2>&1; then
     p9090="9090(panel临时内网)"
   fi
   # mihomo 模式 443/80 由 nft 转到 7893(redir), 故把 7893 一并纳入端口展示
-  ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|7893|8445|9090)\b' | sed 's/^://' | sort -u | sed "s|^9090$|$p9090|" | tr '\n' ' ')
+  ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|7893|7895|8445|9090)\b' | sed 's/^://' | sort -u | sed "s|^9090$|$p9090|" | tr '\n' ' ')
   echo "  监听端口     $ports"
   # 读不到就说读不到 —— 以前 describe 失败(仓库损坏 / dubious ownership)时这里输出一个空值,
   # 看起来像"版本号是空的", 排错方向全歪。
@@ -307,6 +548,7 @@ cmd_status(){
   fi
   local lm cache; lm="$(pdg_lowmem_current)"; cache="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' /etc/mosdns/config.yaml 2>/dev/null)"
   echo "  内存模式     $([[ "$lm" == 1 ]] && echo 低内存 || echo 标准)(mosdns cache=${cache:-?})"
+  return "$status_failed"
 }
 
 cmd_doctor(){ python3 /opt/pdg-bot/doctor.py "$@"; }
@@ -553,32 +795,9 @@ PY
 # $1 可指定文件(供测试), 默认 /etc/nftables.conf; 测试时 nft 可用函数打桩。
 # shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
 migrate_fw_gms(){
-  local f="${1:-/etc/nftables.conf}"
-  [[ "$(_pdg_platform 2>/dev/null)" == ios ]] && return 0     # GMS/FCM 仅 Android; iOS 不放行 5228-5230
-  [[ -f "$f" ]] || return 0
-  grep -q 'table inet pdg' "$f" || return 0                   # 未迁到 inet pdg 的先走 migrate_firewall_to_pdg, 下次再补
-  grep -qE 'tcp dport [{][^}]*5228' "$f" && return 0          # 已有 → 幂等退出
-  if ! grep -qE 'ip saddr [0-9./]+ tcp dport [{] 53, 80, 81, 443, 853, 8445 [}] accept' "$f"; then
-    c_y "防火墙端口集非原装形态, 不自动加 GMS 推送端口。可手动把 5228-5230 加进内网 tcp 放行集。"
-    return 0
-  fi
-  c_g "检测到防火墙缺 GMS 推送端口 → 内网放行集补 5228-5230…"
-  local bak; bak="$f.pregms.$(date +%s)"
-  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
-    c_y "  备份失败(磁盘满?), 中止、不动现网。"; rm -f "$bak" 2>/dev/null; return 0
-  fi
-  sed -E -i 's#(ip saddr [0-9./]+ tcp dport [{] 53, 80, 81, 443, 853), 8445 [}] accept#\1, 5228-5230, 8445 } accept#' "$f"
-  if ! grep -qE 'tcp dport [{][^}]*5228-5230' "$f"; then
-    c_y "  改写未生效 → 还原。"; cp -a "$bak" "$f"; return 0
-  fi
-  if ! nft -c -f "$f" >/dev/null 2>&1; then
-    c_y "  nft -c 校验未过 → 还原、内核未动。"; cp -a "$bak" "$f"; return 0
-  fi
-  if nft -f "$f" 2>/dev/null; then
-    c_g "  ✅ 已放行 5228-5230(仅内网卡来源)。"
-  else
-    c_y "  ⚠️ 加载失败 → 还原配置(内核里旧规则仍在生效)。"; cp -a "$bak" "$f"
-  fi
+  # Superseded by pdgprofile platform defaults and the central render/apply
+  # transaction. Never mutate generated nft output with a fixed sed rewrite.
+  return 0
 }
 
 # 返回一个已创建的非空临时目录；失败不输出路径。供 snapshot/rollback 共用，避免空路径退化到 /etc。
@@ -598,6 +817,488 @@ _pdg_apply_snapshot_tree(){
     tar --no-recursion -cf - -C "$tree" -T "$members" 2>/dev/null \
       | tar xpf - -C "$dest" 2>/dev/null
   )
+}
+
+# CLI 回滚绝不信任快照里的 ruleset_direct 聚合。调用当前仓库的可信 Bot 实现，
+# 从候选元数据 + 候选 source JSON 重建，并同时验证候选 MosDNS 接口。
+_pdg_snapshot_rederive_ruleset_direct(){
+  local tree="$1" source="$REPO_DIR/deploy/bot/pdg-bot.py"
+  [[ -d "$tree" && -f "$source" ]] || return 1
+  python3 - "$source" "$tree" <<'PY'
+import importlib.util
+import os
+import sys
+
+source, tree = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("pdg_bot_snapshot_rederive", source)
+module = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(module)
+    present = module._derive_ruleset_direct_tree(tree)
+except Exception as exc:
+    print("ruleset_direct 候选重建失败(%s)" % type(exc).__name__, file=sys.stderr)
+    raise SystemExit(1)
+print("present" if present else "absent")
+PY
+}
+
+_pdg_ruleset_direct_interface_ready_file(){
+  local config="$1" source="$REPO_DIR/deploy/bot/pdg-bot.py"
+  [[ -f "$config" && ! -L "$config" && -f "$source" ]] || return 1
+  python3 - "$source" "$config" <<'PY'
+import importlib.util
+import sys
+
+source, config = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("pdg_bot_interface_ready", source)
+module = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(module)
+    with open(config, "rb") as stream:
+        module._ruleset_direct_interface_bytes(stream.read())
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+_pdg_legacy_snapshot_mihomo_prove(){
+  local tree="$1" work="$2" expected=""
+  [[ -f "$tree/etc/sing-box/config.json" \
+     && -f "$tree/etc/systemd/system/sing-box.service" \
+     && -x "$tree/usr/local/bin/sing-box" \
+     && ! -e "$tree/etc/mihomo/config.yaml" \
+     && ! -e "$tree/etc/systemd/system/mihomo.service" ]] || {
+    echo "旧 sing-box 快照缺 unit/bin/model，无法建立失败恢复路径" >&2
+    return 1
+  }
+  if [[ -e /etc/mihomo/config.yaml ]]; then
+    expected="$work/current-managed-mihomo.yaml"
+    _pdg_render_mihomo_candidate "$expected" "$REPO_DIR/deploy/bot" \
+      && cmp -s "$expected" /etc/mihomo/config.yaml \
+      || { echo "当前 Mihomo config 无法证明为本项目生成，拒绝删除" >&2; return 2; }
+    : >"$work/remove-mihomo-config"
+  fi
+  if [[ -e /etc/systemd/system/mihomo.service ]]; then
+    expected="$work/current-managed-mihomo.service"
+    # shellcheck source=lib/units.sh
+    source "$REPO_DIR/lib/units.sh" 2>/dev/null \
+      && pdg_unit_mihomo >"$expected" \
+      && cmp -s "$expected" /etc/systemd/system/mihomo.service \
+      || { echo "当前 Mihomo unit 无法证明为本项目生成，拒绝删除" >&2; return 2; }
+    : >"$work/remove-mihomo-unit"
+  fi
+}
+
+_pdg_legacy_snapshot_mihomo_remove(){
+  local work="$1"
+  if [[ -e "$work/remove-mihomo-config" ]]; then
+    cmp -s "$work/current-managed-mihomo.yaml" /etc/mihomo/config.yaml \
+      || { echo "Mihomo config 在证明后发生漂移，拒绝删除" >&2; return 1; }
+    rm -f /etc/mihomo/config.yaml || return 1
+  fi
+  if [[ -e "$work/remove-mihomo-unit" ]]; then
+    cmp -s "$work/current-managed-mihomo.service" \
+      /etc/systemd/system/mihomo.service \
+      || { echo "Mihomo unit 在证明后发生漂移，拒绝删除" >&2; return 1; }
+    rm -f /etc/systemd/system/mihomo.service || return 1
+  fi
+}
+
+_pdg_snapshot_restore_managed_files(){
+  local tree="$1" manifest="$2" failed=0 present path src dir tmp target
+  local pfx="${PDG_ROOT_PREFIX:-}"
+  [[ -d "$tree" && -f "$manifest" ]] || return 1
+  while IFS='|' read -r present path; do
+    [[ "$present" == 0 || "$present" == 1 ]] || { failed=1; continue; }
+    [[ "$path" =~ ^(etc|opt|usr/local/(bin|libexec))/ \
+       && "$path" != *".."* && "$path" != */ ]] || { failed=1; continue; }
+    if [[ "$present" == 1 ]]; then
+      src="$tree/$path"; target="$pfx/$path"; dir="$(dirname "$target")"
+      [[ -f "$src" ]] || { failed=1; continue; }
+      mkdir -p "$dir" || { failed=1; continue; }
+      tmp="$(mktemp "$dir/.pdg-snapshot-restore.XXXXXX")" \
+        || { failed=1; continue; }
+      if ! cp -a "$src" "$tmp" || ! cmp -s "$src" "$tmp" \
+         || ! mv -f "$tmp" "$target" || ! cmp -s "$src" "$target"; then
+        rm -f "$tmp"; failed=1
+      fi
+    else
+      target="$pfx/$path"
+      rm -f -- "$target" || failed=1
+      [[ ! -e "$target" ]] || failed=1
+    fi
+  done <"$manifest"
+  return "$failed"
+}
+
+_pdg_snapshot_failure_restore(){
+  local tmp="$1" qbefore="$2" captured_helper="$3" captured_tool="$4"
+  local nftexe="$5" had_live="$6" failed=0
+  local pfx="${PDG_ROOT_PREFIX:-}"
+  local nft_target="${PDG_NFT_CONF:-$pfx/etc/nftables.conf}"
+  if [[ -n "$captured_helper" ]]; then
+    PDG_QUIC_STATE="$pfx/etc/privdns-gateway/quic-routing.state" \
+      PDG_PROFILE_TOOL="$captured_tool" bash "$captured_helper" \
+        rollback-state "$qbefore" >/dev/null 2>&1 || failed=1
+  fi
+  _pdg_snapshot_restore_managed_files \
+    "$tmp/current-managed" "$tmp/current-managed.manifest" || failed=1
+  if [[ -n "$nftexe" ]]; then
+    # shellcheck source=lib/nfttxn.sh
+    if source "$tmp/nfttxn.current.sh" 2>/dev/null \
+       && declare -F pdg_nft_atomic_install >/dev/null; then
+      _pdg_switchcore_restore_nft_before \
+        "$tmp" "$tmp/nftables.current.before" "$nftexe" "$had_live" \
+        "$tmp/pdg.live.current.restore" "$tmp/pdg.live.current.before" \
+        || failed=1
+    else
+      failed=1
+    fi
+  else
+    [[ ! -e "$nft_target" ]] || failed=1
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || failed=1
+  if [[ -e "$tmp/quic-service.existed" ]]; then
+    if [[ -e "$tmp/quic-service.was-enabled" ]]; then
+      systemctl enable pdg-quic-routing >/dev/null 2>&1 || failed=1
+      systemctl is-enabled pdg-quic-routing >/dev/null 2>&1 || failed=1
+    else
+      systemctl disable pdg-quic-routing >/dev/null 2>&1 || failed=1
+      systemctl is-enabled pdg-quic-routing >/dev/null 2>&1 && failed=1
+    fi
+    if [[ -e "$tmp/quic-service.was-active" ]]; then
+      systemctl start pdg-quic-routing >/dev/null 2>&1 || failed=1
+      systemctl is-active pdg-quic-routing >/dev/null 2>&1 || failed=1
+    else
+      systemctl stop pdg-quic-routing >/dev/null 2>&1 || failed=1
+      systemctl is-active pdg-quic-routing >/dev/null 2>&1 && failed=1
+    fi
+  fi
+  if [[ -n "$captured_helper" ]]; then
+    PDG_PROFILE="$pfx/etc/privdns-gateway/profile.env" \
+      PDG_QUIC_STATE="$pfx/etc/privdns-gateway/quic-routing.state" \
+      PDG_PROFILE_TOOL="$captured_tool" bash "$captured_helper" status \
+        >/dev/null 2>&1 || failed=1
+  fi
+  return "$failed"
+}
+
+_pdg_snapshot_abort(){
+  local tmp="$1" qbefore="$2" captured_helper="$3" captured_tool="$4"
+  local nftexe="$5" had_live="$6" reason="$7" restore_rc=0
+  _pdg_snapshot_failure_restore \
+    "$tmp" "$qbefore" "$captured_helper" "$captured_tool" \
+    "$nftexe" "$had_live" || restore_rc=1
+  if [[ "$restore_rc" == 0 ]]; then
+    echo "❌ $reason；已验证恢复当前 route/files/persistent+live nft before-images" >&2
+  else
+    echo "❌ $reason；事务回滚不完整，必须人工复核" >&2
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
+_pdg_capture_managed_files(){
+  local tree="$1" manifest="$2" pfx="${PDG_ROOT_PREFIX:-}" path target
+  shift 2
+  mkdir -p "$tree" || return 1
+  : >"$manifest" || return 1
+  for path in "$@"; do
+    [[ "$path" =~ ^(etc|opt|usr/local/(bin|libexec))/ \
+       && "$path" != *".."* && "$path" != */ ]] || return 1
+    target="$pfx/$path"
+    if [[ -f "$target" && ! -L "$target" ]]; then
+      mkdir -p "$tree/$(dirname "$path")" \
+        && cp -a "$target" "$tree/$path" \
+        && cmp -s "$target" "$tree/$path" \
+        && printf '1|%s\n' "$path" >>"$manifest" \
+        || return 1
+    elif [[ -e "$target" || -L "$target" ]]; then
+      echo "legacy migration 受管路径不是普通文件: $target" >&2
+      return 1
+    else
+      printf '0|%s\n' "$path" >>"$manifest" || return 1
+    fi
+  done
+}
+
+_pdg_legacy_quiesce_new_dataplane(){
+  local svc state failed=0
+  for svc in pdg-quic-routing mihomo; do
+    systemctl disable --now "$svc" >/dev/null 2>&1 || true
+    state="$(systemctl is-active "$svc" 2>/dev/null)"
+    [[ "$state" != active ]] || failed=1
+    state="$(systemctl is-enabled "$svc" 2>/dev/null)"
+    [[ "$state" != enabled && "$state" != enabled-runtime ]] || failed=1
+  done
+  return "$failed"
+}
+
+_pdg_legacy_activate_singbox(){
+  local pfx="${PDG_ROOT_PREFIX:-}" state
+  [[ -f "$pfx/etc/systemd/system/sing-box.service" \
+     && -x "$pfx/usr/local/bin/sing-box" \
+     && -f "$pfx/etc/sing-box/config.json" ]] || {
+    echo "legacy sing-box unit/bin/model 不完整" >&2; return 1; }
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+  systemctl enable --now sing-box >/dev/null 2>&1 || return 1
+  state="$(systemctl is-active sing-box 2>/dev/null)"
+  [[ "$state" == active ]] || return 1
+  state="$(systemctl is-enabled sing-box 2>/dev/null)"
+  [[ "$state" == enabled || "$state" == enabled-runtime ]]
+}
+
+_pdg_legacy_migration_capture(){
+  local work="$1" nftexe="$2" pfx="${PDG_ROOT_PREFIX:-}"
+  local nft_target="${PDG_NFT_CONF:-$pfx/etc/nftables.conf}"
+  local paths=(
+    etc/privdns-gateway/profile.env
+    etc/privdns-gateway/firewall-mode
+    etc/privdns-gateway/backend
+    etc/privdns-gateway/quic-routing.state
+    etc/systemd/system/pdg-quic-routing.service
+    usr/local/libexec/pdg-quic-routing.sh
+    opt/pdg-bot/bot.py
+    opt/pdg-bot/sb2mihomo.py
+    opt/pdg-bot/pdgprofile.py
+    etc/mihomo/config.yaml
+    etc/systemd/system/mihomo.service
+    etc/sing-box/config.json
+    etc/systemd/system/sing-box.service
+    usr/local/bin/sing-box
+    etc/privdns-gateway/singbox.pdg-owned
+  )
+  local tables=""
+  [[ -n "$nftexe" && -x "$nftexe" ]] || return 1
+  _pdg_capture_managed_files "$work/files" "$work/files.manifest" \
+    "${paths[@]}" || return 1
+  mkdir -p "$work/source" || return 1
+  cp -a "$REPO_DIR/deploy/firewall/pdg-quic-routing.sh" \
+    "$work/source/pdg-quic-routing.sh" \
+    && cp -a "$REPO_DIR/deploy/bot/pdgprofile.py" \
+      "$work/source/pdgprofile.py" \
+    && cp -a "$REPO_DIR/deploy/bot/sb2mihomo.py" \
+      "$work/source/sb2mihomo.py" \
+    && cp -a "$REPO_DIR/lib/nfttxn.sh" "$work/source/nfttxn.sh" \
+    && cmp -s "$REPO_DIR/deploy/firewall/pdg-quic-routing.sh" \
+      "$work/source/pdg-quic-routing.sh" \
+    && cmp -s "$REPO_DIR/deploy/bot/pdgprofile.py" \
+      "$work/source/pdgprofile.py" \
+    && cmp -s "$REPO_DIR/deploy/bot/sb2mihomo.py" \
+      "$work/source/sb2mihomo.py" \
+    && cmp -s "$REPO_DIR/lib/nfttxn.sh" "$work/source/nfttxn.sh" \
+    || return 1
+  if [[ -f "$nft_target" ]]; then
+    cp -a "$nft_target" "$work/nftables.before" \
+      && cmp -s "$nft_target" "$work/nftables.before" || return 1
+  elif [[ -e "$nft_target" || -L "$nft_target" ]]; then
+    return 1
+  fi
+  PDG_LEGACY_HAD_LIVE=0
+  if "$nftexe" list table inet pdg >"$work/pdg.live.before" 2>/dev/null; then
+    PDG_LEGACY_HAD_LIVE=1
+    {
+      printf 'table inet pdg\n'
+      printf 'delete table inet pdg\n'
+      cat "$work/pdg.live.before"
+    } >"$work/pdg.live.restore" || return 1
+    "$nftexe" -c -f "$work/pdg.live.restore" >/dev/null 2>&1 || return 1
+  else
+    tables="$("$nftexe" list tables 2>/dev/null)" || return 1
+    if grep -Eq \
+        '^[[:space:]]*table[[:space:]]+inet[[:space:]]+pdg([[:space:]]|$)' \
+        <<<"$tables"; then
+      return 1
+    fi
+    : >"$work/pdg.live.before"; : >"$work/pdg.live.restore"
+  fi
+  PDG_LEGACY_QBEFORE=-
+  if [[ -f "$pfx/etc/privdns-gateway/quic-routing.state" ]]; then
+    cp -a "$pfx/etc/privdns-gateway/quic-routing.state" \
+      "$work/quic.state.before" \
+      && cmp -s "$pfx/etc/privdns-gateway/quic-routing.state" \
+        "$work/quic.state.before" || return 1
+    PDG_LEGACY_QBEFORE="$work/quic.state.before"
+  fi
+}
+
+_pdg_legacy_migration_restore(){
+  local work="$1" nftexe="$2" had_live="$3" qbefore="$4"
+  local pfx="${PDG_ROOT_PREFIX:-}" failed=0
+  _pdg_legacy_quiesce_new_dataplane || failed=1
+  PDG_QUIC_STATE="$pfx/etc/privdns-gateway/quic-routing.state" \
+    PDG_PROFILE_TOOL="$work/source/pdgprofile.py" \
+    bash "$work/source/pdg-quic-routing.sh" rollback-state "$qbefore" \
+      >/dev/null 2>&1 || failed=1
+  _pdg_snapshot_restore_managed_files \
+    "$work/files" "$work/files.manifest" || failed=1
+  # shellcheck source=lib/nfttxn.sh
+  if source "$work/source/nfttxn.sh" 2>/dev/null \
+     && declare -F pdg_nft_atomic_install >/dev/null; then
+    _pdg_switchcore_restore_nft_before \
+      "$work" "$work/nftables.before" "$nftexe" "$had_live" \
+      "$work/pdg.live.restore" "$work/pdg.live.before" || failed=1
+  else
+    failed=1
+  fi
+  _pdg_legacy_quiesce_new_dataplane || failed=1
+  _pdg_legacy_activate_singbox || failed=1
+  return "$failed"
+}
+
+_pdg_legacy_new_unit_ready(){
+  local work="$1" pfx="${PDG_ROOT_PREFIX:-}"
+  local unit="$pfx/etc/systemd/system/mihomo.service"
+  [[ -f "$unit" && -s "$unit" ]] || return 1
+  # shellcheck source=lib/units.sh
+  source "$REPO_DIR/lib/units.sh" 2>/dev/null \
+    && pdg_unit_mihomo >"$work/mihomo.expected.service" \
+    && [[ -s "$work/mihomo.expected.service" ]] \
+    && cmp -s "$work/mihomo.expected.service" "$unit" || return 1
+  systemctl daemon-reload >/dev/null 2>&1 || return 1
+}
+
+_pdg_legacy_quic_ready(){
+  local pfx="${PDG_ROOT_PREFIX:-}" state
+  local unit="$pfx/etc/systemd/system/pdg-quic-routing.service"
+  local helper="$pfx/usr/local/libexec/pdg-quic-routing.sh"
+  local profile="$pfx/etc/privdns-gateway/profile.env"
+  local qstate="$pfx/etc/privdns-gateway/quic-routing.state"
+  local tool="$pfx/opt/pdg-bot/pdgprofile.py"
+  [[ -f "$unit" && -s "$unit" && -x "$helper" \
+     && -f "$profile" && -f "$tool" ]] || return 1
+  cmp -s "$REPO_DIR/deploy/firewall/pdg-quic-routing.service" "$unit" \
+    && cmp -s "$REPO_DIR/deploy/firewall/pdg-quic-routing.sh" "$helper" \
+    || return 1
+  systemctl enable --now pdg-quic-routing >/dev/null 2>&1 || return 1
+  state="$(systemctl is-active pdg-quic-routing 2>/dev/null)"
+  [[ "$state" == active ]] || return 1
+  state="$(systemctl is-enabled pdg-quic-routing 2>/dev/null)"
+  [[ "$state" == enabled || "$state" == enabled-runtime ]] || return 1
+  PDG_PROFILE="$profile" PDG_QUIC_STATE="$qstate" \
+    PDG_PROFILE_TOOL="$tool" bash "$helper" status >/dev/null 2>&1
+}
+
+_pdg_legacy_dataplane_equivalent(){
+  local source_root="$REPO_DIR/deploy/bot"
+  [[ -f "$source_root/checks.py" && -f "$source_root/nftscan.py" \
+     && -f "$source_root/pdgprofile.py" ]] || return 1
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$source_root" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import checks
+raise SystemExit(0 if checks.check_dataplane_profile()[0] == "ok" else 1)
+PY
+}
+
+_pdg_legacy_singbox_commit_proven(){
+  local work="$1" pfx="${PDG_ROOT_PREFIX:-}"
+  local unit="$pfx/etc/systemd/system/sing-box.service"
+  local bin="$pfx/usr/local/bin/sing-box"
+  [[ -f "$work/files/etc/systemd/system/sing-box.service" \
+     && -f "$work/files/usr/local/bin/sing-box" ]] || return 1
+  _pdg_singbox_is_ours "$unit" || return 1
+  cmp -s "$work/files/etc/systemd/system/sing-box.service" "$unit" \
+    && cmp -s "$work/files/usr/local/bin/sing-box" "$bin"
+}
+
+_pdg_legacy_transaction_abort(){
+  local work="$1" nftexe="$2" had_live="$3" qbefore="$4" reason="$5"
+  if _pdg_legacy_migration_restore \
+      "$work" "$nftexe" "$had_live" "$qbefore"; then
+    PDG_LEGACY_TX_RECOVERY=ok
+    echo "legacy transaction 在「$reason」失败；已验证恢复迁移前 legacy target 并启动 sing-box" >&2
+    rm -rf "$work" \
+      || echo "legacy target 已恢复，但 before-image 清理失败并保留于 $work" >&2
+  else
+    PDG_LEGACY_TX_RECOVERY=failed
+    echo "legacy transaction 在「$reason」失败且恢复不完整；before-image 保留于 $work" >&2
+  fi
+  return 1
+}
+
+PDG_LEGACY_TX_RECOVERY=not-run
+_pdg_legacy_migrate_transaction(){
+  local work="" nftexe="" had_live=0 qbefore=- pfx="${PDG_ROOT_PREFIX:-}"
+  local backend_source="" backend_target=""
+  PDG_LEGACY_TX_RECOVERY=not-run
+  if ! _pdg_legacy_quiesce_new_dataplane; then
+    echo "无法停用回滚前 Mihomo/QUIC，拒绝迁移旧快照" >&2
+    _pdg_legacy_activate_singbox \
+      && PDG_LEGACY_TX_RECOVERY=ok || PDG_LEGACY_TX_RECOVERY=failed
+    return 1
+  fi
+  if ! work="$(_pdg_mktemp_dir)"; then
+    _pdg_legacy_activate_singbox \
+      && PDG_LEGACY_TX_RECOVERY=ok || PDG_LEGACY_TX_RECOVERY=failed
+    return 1
+  fi
+  nftexe="$(_pdg_nft_bin)"
+  if ! _pdg_legacy_migration_capture "$work" "$nftexe"; then
+    echo "legacy target before-image capture 失败，未运行迁移" >&2
+    _pdg_legacy_activate_singbox \
+      && PDG_LEGACY_TX_RECOVERY=ok || PDG_LEGACY_TX_RECOVERY=failed
+    rm -rf "$work"
+    return 1
+  fi
+  had_live="$PDG_LEGACY_HAD_LIVE"; qbefore="$PDG_LEGACY_QBEFORE"
+  if ! migrate_dataplane_profile; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" "数据面迁移"
+    return 1
+  fi
+  if ! _pdg_legacy_new_unit_ready "$work"; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" "Mihomo unit prepare/read-back"
+    return 1
+  fi
+  if ! _pdg_legacy_quic_ready; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" "QUIC service/status"
+    return 1
+  fi
+  if ! _pdg_legacy_dataplane_equivalent; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" \
+      "profile/persistent/live nft 与 Mihomo 等价性"
+    return 1
+  fi
+  if ! _pdg_legacy_singbox_commit_proven "$work"; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" \
+      "sing-box ownership/capture proof"
+    return 1
+  fi
+  if ! _core_kernel_activate mihomo sing-box \
+     || ! _core_kernel_stable mihomo; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" "Mihomo stable activation"
+    return 1
+  fi
+  backend_source="$work/backend.mihomo"
+  backend_target="$pfx/etc/privdns-gateway/backend"
+  if ! printf 'mihomo\n' >"$backend_source" \
+     || ! _pdg_atomic_install_file "$backend_source" "$backend_target" 600; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" "backend atomic write"
+    return 1
+  fi
+  if ! cmp -s "$backend_source" "$backend_target"; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" "backend read-back"
+    return 1
+  fi
+  if ! _pdg_drop_singbox_files "legacy transaction commit" 1 "$work/files" \
+     || ! systemctl daemon-reload >/dev/null 2>&1; then
+    _pdg_legacy_transaction_abort \
+      "$work" "$nftexe" "$had_live" "$qbefore" "sing-box owned runtime drop"
+    return 1
+  fi
+  PDG_LEGACY_TX_RECOVERY=committed
+  rm -rf "$work" \
+    || c_y "  commit 已完成，但 legacy before-image 清理失败并保留于 $work"
+  c_g "  legacy target 已完整迁移并提交到 Mihomo+QUIC；旧 PDG sing-box 运行时已移除。"
+  return 0
 }
 
 # 面板临时态净化(与 bot backup_blob/restore_from 对称): 快照/回滚不持久化面板的公网监听+密钥+UI。
@@ -645,16 +1346,19 @@ cmd_snapshot(){
   # 整机配置 + 防火墙 + bot.env(含 token)+ service + journald 封顶(含历史错路径)(相对 / 打包, 回滚 -C / 解开)
   # 含: 已安装脚本(pdg / pdg-set-token / cert hook)+ 全部 pdg unit —— 升级会改它们, 回滚要一并还原。
   # 只打包"存在的"路径 —— 历史错路径可能已被迁移清掉, 无条件列进去会让 tar 报 Cannot stat 并返 2。
-  local cand=(etc/mosdns etc/sing-box etc/mihomo opt/pdg-bot etc/privdns-gateway etc/nftables.conf
+  local cand=(etc/mosdns etc/sing-box etc/mihomo opt/pdg-bot opt/pdg-web etc/privdns-gateway etc/nftables.conf
               etc/systemd/system/pdg-bot.service etc/systemd/journald.conf.d/50-pdg.conf
               etc/systemd/system/journald.conf.d/50-pdg.conf
               etc/systemd/system/mihomo.service etc/systemd/system/sing-box.service
               etc/systemd/system/pdg-mitm.service etc/systemd/system/pdg-probe81.service
               etc/systemd/system/pdg-rules-update.service etc/systemd/system/pdg-rules-update.timer
               etc/systemd/system/pdg-health.service etc/systemd/system/pdg-health.timer
+              etc/systemd/system/pdg-quic-routing.service
+              etc/systemd/system/pdg-web.service
               etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
-              usr/local/bin/pdg usr/local/bin/pdg-set-token
-              usr/local/bin/mihomo usr/local/bin/sing-box
+              usr/local/bin/pdg usr/local/bin/pdg-set-token usr/local/bin/pdg-webctl
+              usr/local/bin/mosdns usr/local/bin/mihomo usr/local/bin/sing-box
+              usr/local/libexec/pdg-quic-routing.sh
               usr/local/bin/proxy-gateway-open-cert-http.sh usr/local/bin/proxy-gateway-restore-firewall.sh)
   local items=(); local p; for p in "${cand[@]}"; do [[ -e "/$p" ]] && items+=("$p"); done
   # 面板受管开启态: 用净化后的 config 入档(排除真实 config.json, 追加净化版), 快照不含临时监听/密钥/UI。
@@ -710,13 +1414,17 @@ cmd_rollback(){
   local f="$target/snap.tar.gz"
   [[ -f "$f" ]] || { echo "快照文件缺失: $f"; return 1; }
   # 先完整解包、净化并校验临时树，再把同一棵树落盘；坏包/净化失败不碰现网。
-  local tmp="" tree="" members="" panel_sanitized=0
+  local tmp="" tree="" members="" apply_members="" panel_sanitized=0 rb_nft=""
+  local legacy_singbox_snapshot=0 legacy_migration_ok=1
+  local legacy_migration_committed=0
+  local txn_nftexe="" current_had_live=0 captured_helper="" captured_tool=""
   if ! tmp="$(_pdg_mktemp_dir)"; then echo "❌ 无法创建回滚临时目录"; return 1; fi
-  tree="$tmp/tree"; members="$tmp/members"
+  tree="$tmp/tree"; members="$tmp/members"; apply_members="$tmp/apply-members"
   if ! mkdir -p "$tree" || ! tar tzf "$f" > "$members" 2>/dev/null || [[ ! -s "$members" ]]; then
     echo "❌ 快照目录或成员清单读取失败, 中止"; rm -rf "$tmp"; return 1
   fi
-  if grep -Eq '(^/|(^|/)\.\.(/|$))' "$members" || grep -Evq '^(etc|opt|usr/local/bin)(/|$)' "$members"; then
+  if grep -Eq '(^/|(^|/)\.\.(/|$))' "$members" \
+     || grep -Evq '^(etc|opt|usr/local/bin)(/|$)|^usr/local/libexec/pdg-quic-routing[.]sh$' "$members"; then
     echo "❌ 快照含越界路径, 中止"; rm -rf "$tmp"; return 1
   fi
   if ! tar xzf "$f" -C "$tree" 2>/dev/null; then
@@ -728,6 +1436,21 @@ cmd_rollback(){
     fi
     panel_sanitized=1
   fi
+  local rsdirect_member="etc/mosdns/rules/ruleset_direct.txt"
+  local rsdirect_members="$tmp/members-ruleset-direct"
+  if ! _pdg_snapshot_rederive_ruleset_direct "$tree" >/dev/null; then
+    echo "❌ 快照的规则集手机直连候选无法可信重建, 中止"
+    rm -rf "$tmp"; return 1
+  fi
+  if ! awk -v p="$rsdirect_member" '$0 != p' "$members" >"$rsdirect_members"; then
+    echo "❌ 无法重建回滚成员清单, 中止"; rm -rf "$tmp"; return 1
+  fi
+  if [[ -f "$tree/$rsdirect_member" ]]; then
+    printf '%s\n' "$rsdirect_member" >>"$rsdirect_members" \
+      || { echo "❌ 无法登记重建后的规则集聚合, 中止"; rm -rf "$tmp"; return 1; }
+  fi
+  mv -f "$rsdirect_members" "$members" \
+    || { echo "❌ 无法提交回滚成员清单, 中止"; rm -rf "$tmp"; return 1; }
   # 内核配置校验(v1.6.0 只剩 mihomo)。快照带 mihomo 配置就用 mihomo 校验(优先用快照自带的
   # mihomo 二进制 —— 拿刚升上来的新核校验旧配置可能误挡回滚)。迁移前(singbox)快照没有 mihomo
   # 配置, 此处不拦, 留待落盘后从还原出的 config.json 现渲染再核验(见下方内核收尾)。
@@ -737,43 +1460,415 @@ cmd_rollback(){
     "${snap_mbin:-mihomo}" -t -d "$tree/etc/mihomo" -f "$tree/etc/mihomo/config.yaml" >/dev/null 2>&1 \
       || { echo "❌ 快照的 mihomo 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }
   fi
-  [[ -f "$tree/etc/nftables.conf" ]] && { nft -c -f "$tree/etc/nftables.conf" >/dev/null 2>&1 || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }; }
+  if [[ -f "$tree/etc/nftables.conf" ]]; then
+    rb_nft="$(_pdg_nft_bin)"
+    [[ -n "$rb_nft" ]] \
+      || { echo "❌ 找不到 nft，无法验证快照"; rm -rf "$tmp"; return 1; }
+    "$rb_nft" -c -f "$tree/etc/nftables.conf" >/dev/null 2>&1 \
+      || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }
+  fi
+  if [[ -f "$tree/etc/sing-box/config.json" \
+        && ! -e "$tree/etc/mihomo/config.yaml" \
+        && ! -e "$tree/etc/systemd/system/mihomo.service" ]]; then
+    _pdg_legacy_snapshot_mihomo_prove "$tree" "$tmp" \
+      || { echo "❌ 旧 sing-box 快照的较新 Mihomo 资产归属不可信"; rm -rf "$tmp"; return 1; }
+    legacy_singbox_snapshot=1
+  fi
+  local current_managed=(
+    etc/systemd/system/pdg-quic-routing.service
+    usr/local/libexec/pdg-quic-routing.sh
+    usr/local/bin/pdg
+    usr/local/bin/mosdns
+    usr/local/bin/proxy-gateway-restore-firewall.sh
+    etc/privdns-gateway/quic-routing.state
+    etc/privdns-gateway/profile.env
+    etc/privdns-gateway/firewall-mode
+    etc/privdns-gateway/backend
+    etc/privdns-gateway/mosdns-build.env
+    etc/mosdns/rules/ruleset_direct.txt
+    opt/pdg-bot/pdgprofile.py
+    opt/pdg-bot/sb2mihomo.py
+    opt/pdg-bot/bot.py
+    opt/pdg-bot/checks.py
+    opt/pdg-bot/report.py
+    opt/pdg-bot/nftscan.py
+    opt/pdg-bot/nftmerge.py
+    opt/pdg-web/pdg-web.py
+    opt/pdg-web/pdgcontrol.py
+    opt/pdg-web/pdg-web-setup.py
+    opt/pdg-web/pdgwebconfig.py
+    opt/pdg-web/static/index.html
+    opt/pdg-web/static/app.js
+    opt/pdg-web/static/style.css
+    opt/pdg-web/static/manifest.webmanifest
+    opt/pdg-web/static/icon.svg
+    usr/local/bin/pdg-webctl
+    etc/systemd/system/pdg-web.service
+    etc/privdns-gateway/web.json
+    etc/mihomo/config.yaml
+    etc/systemd/system/mihomo.service
+  ) cp_path
+  mkdir -p "$tmp/current-managed" || { rm -rf "$tmp"; return 1; }
+  : >"$tmp/current-managed.manifest" || { rm -rf "$tmp"; return 1; }
+  for cp_path in "${current_managed[@]}"; do
+    if [[ -f "/$cp_path" && ! -L "/$cp_path" ]]; then
+      mkdir -p "$tmp/current-managed/$(dirname "$cp_path")" \
+        && cp -a "/$cp_path" "$tmp/current-managed/$cp_path" \
+        && cmp -s "/$cp_path" "$tmp/current-managed/$cp_path" \
+        || { echo "❌ 当前 managed file before-image 失败: /$cp_path"; rm -rf "$tmp"; return 1; }
+      printf '1|%s\n' "$cp_path" >>"$tmp/current-managed.manifest" \
+        || { rm -rf "$tmp"; return 1; }
+    elif [[ -e "/$cp_path" || -L "/$cp_path" ]]; then
+      echo "❌ 受管路径不是普通文件，拒绝回滚: /$cp_path"
+      rm -rf "$tmp"; return 1
+    else
+      printf '0|%s\n' "$cp_path" >>"$tmp/current-managed.manifest" \
+        || { rm -rf "$tmp"; return 1; }
+    fi
+  done
+  captured_helper="$tmp/current-managed/usr/local/libexec/pdg-quic-routing.sh"
+  captured_tool="$tmp/current-managed/opt/pdg-bot/pdgprofile.py"
+  [[ -f "$captured_helper" ]] || captured_helper=""
+  [[ -f "$captured_tool" ]] || captured_tool="$REPO_DIR/deploy/bot/pdgprofile.py"
+  if [[ -f /etc/systemd/system/pdg-quic-routing.service ]]; then
+    : >"$tmp/quic-service.existed"
+    systemctl is-enabled pdg-quic-routing >/dev/null 2>&1 \
+      && : >"$tmp/quic-service.was-enabled"
+    systemctl is-active pdg-quic-routing >/dev/null 2>&1 \
+      && : >"$tmp/quic-service.was-active"
+  fi
+  if [[ -f /etc/nftables.conf ]]; then
+    cp -a /etc/nftables.conf "$tmp/nftables.current.before" \
+      && cmp -s /etc/nftables.conf "$tmp/nftables.current.before" \
+      || { echo "❌ 当前 persistent nft before-image 失败"; rm -rf "$tmp"; return 1; }
+  fi
+  txn_nftexe="$(_pdg_nft_bin)"
+  if [[ -n "$txn_nftexe" ]]; then
+    cp -a "$REPO_DIR/lib/nfttxn.sh" "$tmp/nfttxn.current.sh" \
+      && cmp -s "$REPO_DIR/lib/nfttxn.sh" "$tmp/nfttxn.current.sh" \
+      || { echo "❌ 当前 nft transaction helper before-image 失败"; rm -rf "$tmp"; return 1; }
+    if "$txn_nftexe" list table inet pdg \
+        >"$tmp/pdg.live.current.before" 2>/dev/null; then
+      current_had_live=1
+      {
+        printf 'table inet pdg\n'
+        printf 'delete table inet pdg\n'
+        cat "$tmp/pdg.live.current.before"
+      } >"$tmp/pdg.live.current.restore" \
+        || { rm -rf "$tmp"; return 1; }
+      "$txn_nftexe" -c -f "$tmp/pdg.live.current.restore" >/dev/null 2>&1 \
+        || { echo "❌ 当前 live nft before-image 无法校验"; rm -rf "$tmp"; return 1; }
+    else
+      local current_tables=""
+      current_tables="$("$txn_nftexe" list tables 2>/dev/null)" \
+        || { echo "❌ 无法 capture live nft inventory"; rm -rf "$tmp"; return 1; }
+      if grep -Eq \
+          '^[[:space:]]*table[[:space:]]+inet[[:space:]]+pdg([[:space:]]|$)' \
+          <<<"$current_tables"; then
+        echo "❌ live PDG table 存在但无法 capture"; rm -rf "$tmp"; return 1
+      fi
+      : >"$tmp/pdg.live.current.before"
+      : >"$tmp/pdg.live.current.restore"
+    fi
+  elif [[ -f /etc/nftables.conf ]]; then
+    echo "❌ 当前 persistent nft 存在但找不到 nft binary"
+    rm -rf "$tmp"; return 1
+  fi
+  # Prove and remove the current trusted tuple before profile/state/helper files
+  # are overwritten. This prevents a current tuple B becoming an unowned
+  # kernel orphan when an older snapshot A is restored.
+  local cur_qhelper=/usr/local/libexec/pdg-quic-routing.sh q_current_before="-"
+  if [[ -x "$cur_qhelper" ]]; then
+    if [[ -e /etc/privdns-gateway/quic-routing.state ]]; then
+      cp -a /etc/privdns-gateway/quic-routing.state "$tmp/quic-current.state" \
+        && cmp -s /etc/privdns-gateway/quic-routing.state "$tmp/quic-current.state" \
+        || { echo "❌ 当前 QUIC state before-image 失败"; rm -rf "$tmp"; return 1; }
+      q_current_before="$tmp/quic-current.state"
+      "$cur_qhelper" status >/dev/null 2>&1 \
+        || { echo "❌ 当前 QUIC tuple/state 不可信，拒绝回滚"; rm -rf "$tmp"; return 1; }
+    else
+      "$cur_qhelper" cleanup-status >/dev/null 2>&1 \
+        || { echo "❌ 无 state 时无法证明当前 profile tuple 未占用"; rm -rf "$tmp"; return 1; }
+    fi
+    if ! "$cur_qhelper" remove >/dev/null 2>&1 \
+       || ! "$cur_qhelper" cleanup-status >/dev/null 2>&1; then
+      _pdg_snapshot_abort "$tmp" "$q_current_before" \
+        "$captured_helper" "$captured_tool" "$txn_nftexe" \
+        "$current_had_live" "当前 QUIC tuple 清理失败"
+      return $?
+    fi
+  elif [[ -e /etc/privdns-gateway/quic-routing.state ]] \
+       || grep -q '^PDG_QUIC_MODE=' "$PROFILE_ENV" 2>/dev/null; then
+    echo "❌ 当前安装声明 QUIC 数据面但 helper 缺失，拒绝产生 orphan"
+    rm -rf "$tmp"; return 1
+  fi
+  if grep -q '^PDG_QUIC_MODE=' "$tree/etc/privdns-gateway/profile.env" 2>/dev/null; then
+    local snap_qhelper="$tree/usr/local/libexec/pdg-quic-routing.sh"
+    local snap_qtool="$tree/opt/pdg-bot/pdgprofile.py"
+    if [[ ! -f "$snap_qhelper" || ! -f "$snap_qtool" ]] \
+       || ! PDG_PROFILE="$tree/etc/privdns-gateway/profile.env" \
+            PDG_QUIC_STATE="$tree/etc/privdns-gateway/quic-routing.state" \
+            PDG_PROFILE_TOOL="$snap_qtool" bash "$snap_qhelper" preflight \
+              >/dev/null 2>&1; then
+      _pdg_snapshot_abort "$tmp" "$q_current_before" \
+        "$captured_helper" "$captured_tool" "$txn_nftexe" \
+        "$current_had_live" "snapshot QUIC profile/state/target preflight 失败"
+      return $?
+    fi
+  fi
+  if [[ "$legacy_singbox_snapshot" == 1 ]]; then
+    _pdg_legacy_snapshot_mihomo_remove "$tmp" \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "较新受管 Mihomo 资产删除失败"
+        return $?
+      }
+  fi
+  # Tar extraction does not delete newer optional managed files. Remove only
+  # this exact Phase-3 manifest when the older snapshot did not contain them.
+  # Restoring a snapshot from before the optional Web UI must not leave its newer root service,
+  # authentication config or expected project files active. Disable first; remove only this exact
+  # managed manifest and preserve any unexpected file in /opt/pdg-web.
+  if [[ ( ! -e "$tree/etc/systemd/system/pdg-web.service" \
+          || ! -e "$tree/etc/privdns-gateway/web.json" ) ]] \
+     && { systemctl is-enabled pdg-web >/dev/null 2>&1 \
+          || systemctl is-active pdg-web >/dev/null 2>&1; }; then
+    if ! systemctl disable --now pdg-web >/dev/null 2>&1; then
+      _pdg_snapshot_abort "$tmp" "$q_current_before" \
+        "$captured_helper" "$captured_tool" "$txn_nftexe" \
+        "$current_had_live" "无法停用快照中不存在的 pdg-web service"
+      return $?
+    fi
+  fi
+  local managed_optional=(
+    etc/mosdns/rules/ruleset_direct.txt
+    etc/systemd/system/pdg-quic-routing.service
+    usr/local/libexec/pdg-quic-routing.sh
+    etc/privdns-gateway/quic-routing.state
+    opt/pdg-bot/pdgprofile.py
+    etc/systemd/system/pdg-web.service
+    etc/privdns-gateway/web.json
+    usr/local/bin/pdg-webctl
+    opt/pdg-web/pdg-web.py
+    opt/pdg-web/pdgcontrol.py
+    opt/pdg-web/pdg-web-setup.py
+    opt/pdg-web/pdgwebconfig.py
+    opt/pdg-web/static/index.html
+    opt/pdg-web/static/app.js
+    opt/pdg-web/static/style.css
+    opt/pdg-web/static/manifest.webmanifest
+    opt/pdg-web/static/icon.svg
+  ) mp
+  for mp in "${managed_optional[@]}"; do
+    if [[ ! -e "$tree/$mp" ]]; then
+      if [[ "$mp" == etc/systemd/system/pdg-quic-routing.service ]] \
+         && ! systemctl disable --now pdg-quic-routing >/dev/null 2>&1; then
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "无法停用快照中不存在的 QUIC routing service"
+        return $?
+      fi
+      rm -f -- "/$mp" \
+        || {
+          _pdg_snapshot_abort "$tmp" "$q_current_before" \
+            "$captured_helper" "$captured_tool" "$txn_nftexe" \
+            "$current_had_live" "无法移除快照中不存在的受管文件 /$mp"
+          return $?
+        }
+    fi
+  done
+  rmdir /opt/pdg-web/static /opt/pdg-web 2>/dev/null || true
+  if ! awk '$0 !~ /^etc[/]nftables[.]conf$/' "$members" >"$apply_members"; then
+    _pdg_snapshot_abort "$tmp" "$q_current_before" \
+      "$captured_helper" "$captured_tool" "$txn_nftexe" \
+      "$current_had_live" "无法生成 snapshot tree apply manifest"
+    return $?
+  fi
   echo "回滚到 $(basename "$target") …"
-  if ! _pdg_apply_snapshot_tree "$tree" "$members" /; then
-    echo "❌ 快照落盘失败, 系统可能已部分恢复, 请立即检查"; rm -rf "$tmp"; return 1
+  if [[ -s "$apply_members" ]] && ! _pdg_apply_snapshot_tree "$tree" "$apply_members" /; then
+    _pdg_snapshot_abort "$tmp" "$q_current_before" \
+      "$captured_helper" "$captured_tool" "$txn_nftexe" \
+      "$current_had_live" "快照 tree apply 失败"
+    return $?
+  fi
+  if [[ -f "$tree/etc/nftables.conf" ]]; then
+    [[ -n "$rb_nft" ]] || rb_nft="$(_pdg_nft_bin)"
+    # shellcheck source=lib/nfttxn.sh
+    source "$REPO_DIR/lib/nfttxn.sh" 2>/dev/null || {
+      _pdg_snapshot_abort "$tmp" "$q_current_before" \
+        "$captured_helper" "$captured_tool" "$txn_nftexe" \
+        "$current_had_live" "缺 nft atomic helper"
+      return $?
+    }
+    pdg_nft_atomic_install "$tree/etc/nftables.conf" /etc/nftables.conf "$rb_nft" \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "snapshot persistent nft install 失败"
+        return $?
+      }
+    "$rb_nft" -f /etc/nftables.conf >/dev/null 2>&1 \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "snapshot live nft apply 失败"
+        return $?
+      }
+  elif [[ -f /etc/nftables.conf ]]; then
+    # Snapshot predates the managed PDG table. Remove only the strictly
+    # marker-validated owned block; retain every foreign/VPN/NAT table.
+    rb_nft="$(_pdg_nft_bin)"
+    [[ -n "$rb_nft" ]] \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "找不到 nft"
+        return $?
+      }
+    local no_pdg="$tmp/nftables.without-pdg"
+    python3 "$REPO_DIR/deploy/bot/nftmerge.py" --remove \
+      /etc/nftables.conf "$no_pdg" \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "persistent PDG 表归属不可信"
+        return $?
+      }
+    # shellcheck source=lib/nfttxn.sh
+    source "$REPO_DIR/lib/nfttxn.sh" 2>/dev/null \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "缺 nft atomic helper"
+        return $?
+      }
+    pdg_nft_atomic_install "$no_pdg" /etc/nftables.conf "$rb_nft" \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "移除受管 persistent PDG 表失败"
+        return $?
+      }
+    if "$rb_nft" list table inet pdg >"$tmp/live-pdg.current" 2>/dev/null; then
+      if ! python3 - "$tmp/live-pdg.current" "$REPO_DIR/deploy/bot" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+import nftscan
+text = open(sys.argv[1], encoding="utf-8").read()
+raise SystemExit(0 if nftscan.pdg_table_status(text).startswith("owned-") else 1)
+PY
+      then
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "live PDG 表归属不可信"
+        return $?
+      fi
+      "$rb_nft" delete table inet pdg >/dev/null 2>&1 \
+        || {
+          _pdg_snapshot_abort "$tmp" "$q_current_before" \
+            "$captured_helper" "$captured_tool" "$txn_nftexe" \
+            "$current_had_live" "删除 snapshot 不存在的 live PDG 表失败"
+          return $?
+        }
+    fi
+    local live_tables=""
+    live_tables="$("$rb_nft" list tables 2>/dev/null)" \
+      || {
+        _pdg_snapshot_abort "$tmp" "$q_current_before" \
+          "$captured_helper" "$captured_tool" "$txn_nftexe" \
+          "$current_had_live" "无法 read-back live table inventory"
+        return $?
+      }
+    if grep -Eq \
+        '^[[:space:]]*table[[:space:]]+inet[[:space:]]+pdg([[:space:]]|$)' \
+        <<<"$live_tables"; then
+      _pdg_snapshot_abort "$tmp" "$q_current_before" \
+        "$captured_helper" "$captured_tool" "$txn_nftexe" \
+        "$current_had_live" "live PDG 表删除后仍存在"
+      return $?
+    fi
   fi
   rm -rf "$tmp"
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
   systemctl daemon-reload || unrestored+=("daemon-reload")
-  nft -f /etc/nftables.conf 2>/dev/null || true
-  # v1.6.0: mihomo 是唯一内核。无论快照记录的是 mihomo 还是迁移前的 singbox, 一律起 mihomo ——
-  # config.json 是核无关数据模型, mihomo 总能从它渲染。并清掉快照可能带回来的 sing-box 残留。
+  local rb_nft_runtime; rb_nft_runtime="$(_pdg_nft_bin)"
+  if [[ -f /etc/nftables.conf ]]; then
+    [[ -n "$rb_nft_runtime" ]] \
+      && "$rb_nft_runtime" -f /etc/nftables.conf >/dev/null 2>&1 \
+      || unrestored+=("live nft apply")
+  fi
+  # v1.6.0: mihomo 是唯一当前内核。迁移前的 sing-box 快照只有在完整兼容迁移成功后才提交
+  # backend 标记、清理旧资产并起 Mihomo；失败时旧 sing-box 恢复资产必须留在原位。
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/units.sh" 2>/dev/null || true
-  if [[ ! -f /etc/mihomo/config.yaml ]] && [[ -f /etc/sing-box/config.json ]]; then
+  if [[ "$legacy_singbox_snapshot" == 1 ]]; then
+    legacy_migration_ok=0
+    if _pdg_legacy_migrate_transaction; then
+      legacy_migration_ok=1
+      legacy_migration_committed=1
+    else
+      unrestored+=("旧 sing-box model → 当前单 Mihomo+QUIC 兼容迁移")
+      [[ "$PDG_LEGACY_TX_RECOVERY" == ok ]] \
+        || unrestored+=("旧 sing-box target 事务恢复/激活")
+    fi
+  elif [[ ! -f /etc/mihomo/config.yaml ]] && [[ -f /etc/sing-box/config.json ]]; then
     install -d -m700 /etc/mihomo                # 迁移前快照只有 config.json → 现渲染 mihomo 配置
     (cd /opt/pdg-bot && python3 -c 'import sys;sys.path.insert(0,"/opt/pdg-bot");import bot;bot._render_mihomo_file()') 2>/dev/null \
       || unrestored+=("mihomo配置渲染")
   fi
-  printf 'mihomo\n' > /etc/privdns-gateway/backend
-  # 快照里已经带回 unit 的就别再重生成 —— 快照那份才是"回滚目标状态"的权威。
-  # 只有快照没有(或空文件)时才用模板补一份, 免得回滚顺手把状态又改成了当前版本的样子。
-  if [[ ! -s /etc/systemd/system/mihomo.service ]]; then
-    pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service \
-      || unrestored+=("mihomo.service 生成")
-  fi
-  # sing-box 残留只清"项目自己装的"(见 _pdg_singbox_is_ours), 第三方的原样保留
-  _pdg_drop_singbox_files "快照带回的"
-  systemctl daemon-reload || unrestored+=("daemon-reload(清理后)")
-  # 激活失败必须计入 unrestored: 内核没起来就不是"已回滚", 不能只 warn 后照报成功。
-  if ! _core_kernel_activate mihomo sing-box; then
-    c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
-    unrestored+=("内核激活(mihomo)")
+  if [[ "$legacy_migration_committed" == 1 ]]; then
+    : # complete legacy prepare/validate/commit already owns backend/drop/activation
+  elif [[ "$legacy_migration_ok" == 1 ]]; then
+    printf 'mihomo\n' > /etc/privdns-gateway/backend \
+      || unrestored+=("backend 标记")
+    # 快照里已经带回 unit 的就别再重生成 —— 快照那份才是"回滚目标状态"的权威。
+    # 只有快照没有(或空文件)时才用模板补一份, 免得回滚顺手把状态又改成了当前版本的样子。
+    if [[ ! -s /etc/systemd/system/mihomo.service ]]; then
+      pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service \
+        || unrestored+=("mihomo.service 生成")
+    fi
+    # sing-box 残留只清"项目自己装的"(见 _pdg_singbox_is_ours), 第三方的原样保留
+    _pdg_drop_singbox_files "快照带回的"
+    systemctl daemon-reload || unrestored+=("daemon-reload(清理后)")
+    if [[ -x /usr/local/libexec/pdg-quic-routing.sh ]]; then
+      systemctl enable --now pdg-quic-routing >/dev/null 2>&1 \
+        && /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1 \
+        || unrestored+=("QUIC routing恢复")
+    elif grep -q '^PDG_QUIC_MODE=' "$PROFILE_ENV" 2>/dev/null; then
+      unrestored+=("QUIC routing helper缺失")
+    fi
+    if grep -q '^PDG_QUIC_MODE=' "$PROFILE_ENV" 2>/dev/null; then
+      local dpstate=""
+      dpstate="$(python3 - <<'PY'
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import checks
+print(checks.check_dataplane_profile()[0])
+PY
+)" || dpstate=fail
+      [[ "$dpstate" == ok ]] || unrestored+=("persistent/live nft 与 Mihomo/profile 等价性")
+    fi
+    # 激活失败必须计入 unrestored: 内核没起来就不是"已回滚", 不能只 warn 后照报成功。
+    if ! _core_kernel_activate mihomo sing-box; then
+      c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
+      unrestored+=("内核激活(mihomo)")
+    fi
+  else
+    c_y "  旧 sing-box 快照迁移失败：保留原 backend/unit/bin/model，未尝试提交或激活 Mihomo"
   fi
   systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
   systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
+  if [[ -f /etc/systemd/system/pdg-web.service \
+        && -f /etc/privdns-gateway/web.json ]] \
+     && { systemctl is-enabled pdg-web >/dev/null 2>&1 \
+          || systemctl is-active pdg-web >/dev/null 2>&1; }; then
+    systemctl restart pdg-web >/dev/null 2>&1 \
+      && systemctl is-active --quiet pdg-web \
+      || unrestored+=("pdg-web 恢复")
+  fi
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   # 仓库 Git 复位(update 回滚: 让 REPO_DIR 与还原出的旧脚本版本一致); 记录未能恢复项, 不谎报"完全回滚"
   if [[ -n "$git_ref" ]]; then
@@ -905,6 +2000,120 @@ _update_core_binary(){
   rm -rf "$tmp"
 }
 
+# Restore the MosDNS binary + provenance file saved by
+# _mosdns_swap_verify. Every move is followed by a SHA read-back before the
+# old service is considered recovered.
+_mosdns_restore_prev(){
+  local bin="$1" bin_pre="$2" bin_bak="$3" bin_sha="$4"
+  local attest="$5" attest_pre="$6" attest_bak="$7" attest_sha="$8"
+  local failed=0
+  if [[ "$bin_pre" == 1 ]]; then
+    [[ -f "$bin_bak" ]] && mv -f "$bin_bak" "$bin" \
+      && [[ "$(_pdg_sha "$bin")" == "$bin_sha" ]] || failed=1
+  else
+    rm -f "$bin" || failed=1
+  fi
+  if [[ "$attest_pre" == 1 ]]; then
+    [[ -f "$attest_bak" ]] && mv -f "$attest_bak" "$attest" \
+      && [[ "$(_pdg_sha "$attest")" == "$attest_sha" ]] || failed=1
+  else
+    rm -f "$attest" || failed=1
+  fi
+  if [[ "$bin_pre" == 1 ]]; then
+    systemctl restart mosdns >/dev/null 2>&1 || failed=1
+    _core_kernel_stable mosdns || failed=1
+  else
+    systemctl stop mosdns >/dev/null 2>&1 || true
+  fi
+  [[ "$failed" == 0 ]]
+}
+
+# Hot-swap a fully verified patched candidate. The outer update snapshot is a
+# second safety net; this local transaction immediately restores stock/custom
+# MosDNS bytes if install, attestation, restart, or stability checks fail.
+_mosdns_swap_verify(){
+  local newbin="$1" arch="$2" artifact_sha="$3" binary_sha="$4" channel="$5"
+  local bin="${PDG_MOSDNS_BIN:-/usr/local/bin/mosdns}"
+  local attest="${PDG_MOSDNS_ATTESTATION:-/etc/privdns-gateway/mosdns-build.env}"
+  local bindir bin_pre=0 bin_bak="" bin_sha=""
+  local attest_pre=0 attest_bak="" attest_sha="" stash
+  bindir="$(dirname "$bin")"
+  if [[ -e "$attest" || -L "$attest" ]]; then
+    [[ -f "$attest" && ! -L "$attest" ]] \
+      || { c_y "  MosDNS provenance 路径不是普通文件, 拒绝覆盖"; return 1; }
+    attest_pre=1
+    attest_sha="$(_pdg_sha "$attest")"; [[ -n "$attest_sha" ]] || return 1
+    attest_bak="$(mktemp "$(dirname "$attest")/.mosdns-build.pdg-prev.XXXXXX")" \
+      || return 1
+    if ! cp -a "$attest" "$attest_bak" \
+       || [[ "$(_pdg_sha "$attest_bak")" != "$attest_sha" ]]; then
+      rm -f "$attest_bak"
+      c_y "  备份 MosDNS provenance 失败 → 中止换版"
+      return 1
+    fi
+  fi
+  [[ -e "$bin" ]] && bin_pre=1
+  if ! stash="$(_core_stash_kernel mosdns "$bindir")"; then
+    rm -f "$attest_bak"
+    c_y "  备份现有 MosDNS 失败 → 中止换版"
+    return 1
+  fi
+  IFS='|' read -r bin_bak bin_sha <<<"$stash"
+
+  if ! install -m755 "$newbin" "$bin" \
+     || ! pdg_write_mosdns_attestation "$attest" "$arch" \
+          "$artifact_sha" "$binary_sha" "$channel" \
+     || ! pdg_mosdns_is_project_build "$bin" "$attest" "$arch"; then
+    c_y "  MosDNS 候选安装/provenance 复核失败，恢复旧版"
+    _mosdns_restore_prev "$bin" "$bin_pre" "$bin_bak" "$bin_sha" \
+      "$attest" "$attest_pre" "$attest_bak" "$attest_sha" \
+      || c_y "  ⚠️ MosDNS 旧版恢复未达标，请立即运行 pdg doctor"
+    return 1
+  fi
+  systemctl restart mosdns >/dev/null 2>&1 || true
+  if ! _core_kernel_stable mosdns; then
+    c_y "  MosDNS 修补版重启后未稳定，恢复旧版"
+    _mosdns_restore_prev "$bin" "$bin_pre" "$bin_bak" "$bin_sha" \
+      "$attest" "$attest_pre" "$attest_bak" "$attest_sha" \
+      || c_y "  ⚠️ MosDNS 旧版恢复未达标，请立即运行 pdg doctor"
+    return 1
+  fi
+  rm -f "$bin_bak" "$attest_bak"
+  c_g "  → MosDNS $MOSDNS_BUILD_VERSION 已装并稳定运行"
+}
+
+_update_mosdns_binary(){
+  local arch tmp
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
+    || { c_y "读不到 versions.sh, 无法确认 MosDNS 目标 flavor"; return 1; }
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/mosdns-artifact.sh" 2>/dev/null \
+    || { c_y "读不到 mosdns-artifact.sh, 无法安全获取修补产物"; return 1; }
+  arch="$(pdg_mosdns_arch)" || { c_y "无法识别 MosDNS 架构"; return 1; }
+  pdg_mosdns_is_project_build "${PDG_MOSDNS_BIN:-/usr/local/bin/mosdns}" \
+    "${PDG_MOSDNS_ATTESTATION:-/etc/privdns-gateway/mosdns-build.env}" "$arch" \
+    && return 0
+  tmp="$(mktemp -d)" || return 1
+  c_g "更新 MosDNS → $MOSDNS_BUILD_VERSION …"
+  if ! pdg_prepare_mosdns_candidate "$arch" "$tmp" \
+     || ! _mosdns_swap_verify "$PDG_MOSDNS_PREPARED_BIN" "$arch" \
+          "$PDG_MOSDNS_PREPARED_ARTIFACT_SHA256" \
+          "$PDG_MOSDNS_PREPARED_BINARY_SHA256" \
+          "$PDG_MOSDNS_PREPARED_CHANNEL"; then
+    rm -rf "$tmp"
+    return 1
+  fi
+  rm -rf "$tmp"
+}
+
+# Runs inside the newly installed pdg script during old-version -> new-version
+# update, closing the gap where the updater process still has old functions in
+# memory and therefore cannot know about the new MosDNS flavor requirement.
+migrate_mosdns_patched_binary(){
+  _update_mosdns_binary
+}
+
 cmd_update(){
   need_root update
   # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
@@ -935,6 +2144,9 @@ cmd_update(){
   fi
   local snap_dir="$_PDG_SNAP_CREATED"                                    # 精确回滚目标(不靠 index 0 猜)
   local pre_sha; pre_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"   # 升级前精确提交, 回滚据此复位仓库
+  local web_was_enabled=0 web_was_active=0
+  systemctl is-enabled pdg-web >/dev/null 2>&1 && web_was_enabled=1
+  systemctl is-active pdg-web >/dev/null 2>&1 && web_was_active=1
   c_g "拉取最新发布 tag…"
   [[ -d "$REPO_DIR/.git" ]] || { rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"; }
   if ! pdg_fetch_release_tags "$REPO_DIR"; then
@@ -950,20 +2162,38 @@ cmd_update(){
   c_g "→ 已切到发布 $tgt"
   c_g "刷新代码(配置/出口/token/证书均不动)…"
   # 必需文件: 任一装失败即立即回滚(拒绝新旧混部)。`! A || ! B` 在首个失败处短路。
-  if   ! install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py           /opt/pdg-bot/bot.py \
+  if   ! install -d -m755 /opt/pdg-web /opt/pdg-web/static \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py           /opt/pdg-bot/bot.py \
     || ! install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py       /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/checks.py            /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/dot_session_probe.py /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py             /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/doctor.py            /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/pdgprofile.py       /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/nftscan.py          /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/nftmerge.py         /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh   /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh     /usr/local/bin/pdg-set-token \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/pdg.sh               /usr/local/bin/pdg; then
+    || ! install -m755 "$REPO_DIR"/deploy/bot/pdg.sh               /usr/local/bin/pdg \
+    || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web.py           /opt/pdg-web/ \
+    || ! install -m755 "$REPO_DIR"/deploy/web/pdgcontrol.py        /opt/pdg-web/ \
+    || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web-setup.py     /opt/pdg-web/ \
+    || ! install -m644 "$REPO_DIR"/deploy/web/pdgwebconfig.py      /opt/pdg-web/ \
+    || ! install -m644 "$REPO_DIR"/deploy/web/static/index.html    /opt/pdg-web/static/ \
+    || ! install -m644 "$REPO_DIR"/deploy/web/static/app.js        /opt/pdg-web/static/ \
+    || ! install -m644 "$REPO_DIR"/deploy/web/static/style.css     /opt/pdg-web/static/ \
+    || ! install -m644 "$REPO_DIR"/deploy/web/static/manifest.webmanifest /opt/pdg-web/static/ \
+    || ! install -m644 "$REPO_DIR"/deploy/web/static/icon.svg      /opt/pdg-web/static/ \
+    || ! install -m755 "$REPO_DIR"/deploy/web/pdg-webctl.sh        /usr/local/bin/pdg-webctl \
+    || ! install -m644 "$REPO_DIR"/deploy/web/pdg-web.service      /etc/systemd/system/pdg-web.service \
+    || ! install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh \
+          /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh; then
     c_y "必需文件安装失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
   # iOS 专属组件按平台部署: Android 更新不把 iOS 文件装回来(migrate_android_cleanup 亦会清残留)。
@@ -981,20 +2211,29 @@ cmd_update(){
   fi
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.service  /etc/systemd/system/ 2>/dev/null || true
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer    /etc/systemd/system/ 2>/dev/null || true
-  install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh     /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh 2>/dev/null || true
   # 迁移用"刚装好的新脚本"跑(本进程还是旧 bash, 直接调会用旧版函数 → 新迁移要等下次命令才生效)。
   if ! bash /usr/local/bin/pdg __migrate; then
     c_y "迁移(__migrate)失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
-  # 内核二进制: mihomo 按 versions.sh 钉死版本更新。
+  # 二进制: MosDNS 要求精确 no-ticket flavor；mihomo 按 versions.sh 钉死版本。
+  # 新版 __migrate 已处理 MosDNS(兼容旧 updater 仍在内存); 此处再做幂等硬门。
+  if ! _update_mosdns_binary; then
+    c_y "MosDNS 修补版更新失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+  fi
   if ! _update_core_binary; then
     c_y "内核二进制更新失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
 
   # ── 更新后校验门: 任一硬校验失败即回滚到更新前快照 ──
   c_g "校验新版本…"
-  if ! python3 -m py_compile /opt/pdg-bot/*.py 2>/dev/null; then
+  if ! python3 -m py_compile /opt/pdg-bot/*.py /opt/pdg-web/*.py 2>/dev/null; then
     c_y "Python 语法错误, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+  fi
+  if [[ ( -e /etc/privdns-gateway/web.json \
+          || -L /etc/privdns-gateway/web.json ) ]] \
+     && ! python3 /opt/pdg-web/pdg-web-setup.py --validate-only >/dev/null 2>&1; then
+    c_y "pdg-web 配置/TLS 校验失败, 回滚到更新前快照…"
+    cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
   if ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
     c_y "mihomo 配置 check 失败, 回滚…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
@@ -1005,9 +2244,30 @@ cmd_update(){
   if ! systemctl daemon-reload; then
     c_y "systemctl daemon-reload 失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
+  # Route ownership is a hard prerequisite of the Mihomo unit (Requires+After).
+  # Re-apply it on every update and restart Mihomo only after exact status
+  # verification, so a profile tuple change cannot leave a stale data plane.
+  if ! systemctl enable --now pdg-quic-routing >/dev/null 2>&1 \
+    || ! /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1; then
+    c_y "QUIC routing 前置单元未能应用/复核, 回滚到更新前快照…"
+    cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+  fi
+  if ! systemctl restart mihomo >/dev/null 2>&1; then
+    c_y "mihomo 未能按新 data-plane 重启, 回滚…"
+    cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+  fi
   systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true   # 老装升级时补上健康自检
   systemctl restart pdg-bot pdg-probe81 2>/dev/null || true
   systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 载新插件代码, 否则 doctor 判 pdg-mitm 未运行而误回滚
+  # Web 是可选且默认禁用；更新绝不替用户启用。只恢复更新前已经 enabled/active 的实例。
+  if [[ "$web_was_enabled" == 1 || "$web_was_active" == 1 ]]; then
+    if [[ ! -f /etc/privdns-gateway/web.json ]] \
+       || ! systemctl restart pdg-web >/dev/null 2>&1 \
+       || ! systemctl is-active --quiet pdg-web; then
+      c_y "pdg-web 更新后未能恢复运行, 回滚到更新前快照…"
+      cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+    fi
+  fi
   sleep 2
 
   # token 是否已配置(未配则 pdg-bot 不在跑属正常, 不据此回滚)
@@ -1072,6 +2332,12 @@ for x in warns: print("  ⚠️ %s: %s" % (x.get("check"), x.get("detail")))
 
 cmd_token(){ need_root token; pdg-set-token; }   # 不 exec, 设完/取消都回菜单
 
+cmd_web(){
+  local ctl=/usr/local/bin/pdg-webctl
+  [[ -x "$ctl" ]] || { c_y "❌ 找不到 $ctl；请先运行 sudo pdg update"; return 1; }
+  "$ctl" "$@"
+}
+
 # shellcheck disable=SC2086  # $svcs 是有意按空白分词的服务名列表
 # Bot 凭据状态: ready | unset | partial。判据在 checks.bot_credentials(单一来源),
 # 读不到 checks 时按最保守的 unset 处理(不因为拿不到判断就去要求 pdg-bot 必须在跑)。
@@ -1085,13 +2351,53 @@ _pdg_bot_cred(){
 # 用户以为好了, 实际整条链是断的。
 cmd_restart(){
   need_root restart
+  _lock
   local core; core="$(_pdg_core_svc)"
   local cred; cred="$(_pdg_bot_cred)"
+  if ! systemctl enable --now pdg-quic-routing >/dev/null 2>&1 \
+    || ! /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1; then
+    c_y "❌ QUIC routing 前置单元未就绪 → 没有改写配置或重启服务。"
+    return 1
+  fi
+  # Validate the generated core candidate before touching live config.
+  local rwd cand
+  rwd="$(mktemp -d)" || return 1; cand="$rwd/config.yaml"
+  [[ -e /etc/mihomo/config.yaml ]] && {
+    : >"$rwd/had-config"
+    cp -a /etc/mihomo/config.yaml "$rwd/config.before" || {
+      rm -rf "$rwd"; return 1; }; }
+  [[ -e /etc/nftables.conf ]] && {
+    : >"$rwd/had-nft"
+    cp -a /etc/nftables.conf "$rwd/nft.before" \
+      && cmp -s /etc/nftables.conf "$rwd/nft.before" || {
+        rm -rf "$rwd"; return 1; }; }
+  [[ -e /etc/privdns-gateway/quic-routing.state ]] && {
+    : >"$rwd/had-state"
+    cp -a /etc/privdns-gateway/quic-routing.state "$rwd/state.before" \
+      && cmp -s /etc/privdns-gateway/quic-routing.state "$rwd/state.before" || {
+        rm -rf "$rwd"; return 1; }; }
+  if ! _pdg_render_mihomo_candidate "$cand" \
+    || ! mihomo -t -d /etc/mihomo -f "$cand" >/dev/null 2>&1; then
+    rm -rf "$rwd"
+    c_y "❌ profile data-plane 候选渲染/校验失败 → 未改写任何 live 配置。"
+    return 1
+  fi
+  if ! _pdg_atomic_install_file "$cand" /etc/mihomo/config.yaml 600 \
+    || ! _switchcore_nft mihomo; then
+    _pdg_restart_restore_before "$rwd" \
+      || c_y "⚠️ restart before-image 回滚不完整，必须运行 pdg doctor 人工复核。"
+    rm -rf "$rwd"
+    c_y "❌ profile data-plane 渲染/QUIC routing 复核失败 → 没有重启服务。"
+    return 1
+  fi
   # 1) 先校验内核配置: 配置本身不合法的话重启只会换来一个起不来的服务, 不如当场说清楚
   if command -v mihomo >/dev/null 2>&1 && [[ -f /etc/mihomo/config.yaml ]]; then
     if ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
       c_y "❌ mihomo 配置校验(mihomo -t)未过 → 没有重启任何服务。"
       mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml 2>&1 | tail -5 | sed 's/^/    /'
+      _pdg_restart_restore_before "$rwd" \
+        || c_y "⚠️ restart before-image 回滚不完整，必须运行 pdg doctor 人工复核。"
+      rm -rf "$rwd"
       return 1
     fi
   fi
@@ -1123,8 +2429,12 @@ cmd_restart(){
       echo "  ── $s 最近日志 ──"
       journalctl -u "$s" -n 12 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
     done
+    _pdg_restart_restore_before "$rwd" \
+      || c_y "⚠️ restart before-image 回滚不完整，必须运行 pdg doctor 人工复核。"
+    rm -rf "$rwd"
     return 1
   fi
+  rm -rf "$rwd"
   c_g "✅ 已重启并确认运行: ${want[*]}"
 }
 
@@ -1150,7 +2460,8 @@ cmd_detect_cidr(){
   if ! pdg_cidr_valid "$det"; then
     c_y "「$det」不是合法网段(形如 172.22.0.0/16), 未改动。"; return 1
   fi
-  cur=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
+  cur="$(_pdg_profile_get PDG_INTERNAL_CIDR 2>/dev/null)" || {
+    c_y "profile 缺失/重复 PDG_INTERNAL_CIDR，拒绝从渲染产物反推后继续写。"; return 1; }
   echo "  检测到内网卡段: $det"
   echo "  当前配置:       ${cur:-未知}"
   [[ "$det" == "$cur" ]] && { c_g "✅ 与当前一致, 无需改动。"; return 0; }
@@ -1168,37 +2479,32 @@ cmd_detect_cidr(){
     c_y "❌ 快照失败 → 未改动任何文件(拒绝在没有回退手段的前提下改内网卡段)。"; return 1
   fi
   snap_dir="$_PDG_SNAP_CREATED"
-  # 本次事务的精确备份(回滚只用它, 不用模糊的 index)
+  # Exact before-images. nft is regenerated centrally from restored profile.
   local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
-  cp -a /etc/nftables.conf "$wd/nftables.conf" 2>/dev/null
+  cp -a "$PROFILE_ENV" "$wd/profile.env" 2>/dev/null \
+    || { rm -rf "$wd"; echo "❌ 读不到 profile"; return 1; }
   cp -a /etc/mosdns/config.yaml "$wd/config.yaml" 2>/dev/null
-  local newnft="$wd/nftables.new" newmos="$wd/mosdns.new"
-  cp -a /etc/nftables.conf "$newnft" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 /etc/nftables.conf"; return 1; }
+  local newmos="$wd/mosdns.new"
   cp -a /etc/mosdns/config.yaml "$newmos" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 mosdns 配置"; return 1; }
   _dc_restore(){   # 只用本次备份还原, 不碰别的快照
-    [[ -e "$wd/nftables.conf" ]] && cp -a "$wd/nftables.conf" /etc/nftables.conf
+    [[ -e "$wd/profile.env" ]] && cp -a "$wd/profile.env" "$PROFILE_ENV"
     [[ -e "$wd/config.yaml" ]] && cp -a "$wd/config.yaml" /etc/mosdns/config.yaml
-    nft -f /etc/nftables.conf 2>/dev/null || true
+    _switchcore_nft mihomo >/dev/null 2>&1 || true
     systemctl restart mosdns >/dev/null 2>&1 || true
     c_y "已用本次事务的备份还原(快照留在 $snap_dir, 必要时 sudo pdg rollback --dir $snap_dir)。"
   }
-  # 改**临时文件**, 并复核新网段真的写进去了 —— sed 没命中时旧写法一声不吭继续往下走,
-  # 最后还打印"✅ 已更新", 而两份配置一个字都没变。
-  [[ -n "$cur" ]] && sed -i "s#${cur//./\\.}#$det#g" "$newnft"
+  # mosdns remains a separately owned service config; nft is never edited with
+  # sed here and will be rendered from the profile after its atomic upsert.
   sed -i -E "s#(ips:[[:space:]]*\[[[:space:]]*\")[0-9./]+(\")#\1$det\2#" "$newmos"
-  if ! grep -qF "$det" "$newnft"; then
-    rm -rf "$wd"; c_y "❌ nftables 配置里没找到可替换的内网卡段(自定义形态?) → 未改动任何文件。"; return 1
-  fi
   if ! grep -qE "ips:[[:space:]]*\[[[:space:]]*\"${det//./\\.}\"" "$newmos"; then
     rm -rf "$wd"; c_y "❌ mosdns 配置里的 ips 段未能替换(自定义形态?) → 未改动任何文件。"; return 1
   fi
-  if ! nft -c -f "$newnft" >/dev/null 2>&1; then
-    rm -rf "$wd"; c_y "❌ 新防火墙配置校验(nft -c)未过 → 未改动任何文件。"; return 1
-  fi
-  # 校验都过了才落盘
-  cp -a "$newnft" /etc/nftables.conf && cp -a "$newmos" /etc/mosdns/config.yaml || {
+  _profile_set PDG_INTERNAL_CIDR "$det" \
+    && cp -a "$newmos" /etc/mosdns/config.yaml || {
     _dc_restore; rm -rf "$wd"; c_y "❌ 落盘失败, 已还原。"; return 1; }
-  if ! nft -f /etc/nftables.conf; then _dc_restore; rm -rf "$wd"; c_y "❌ 应用防火墙失败, 已还原。"; return 1; fi
+  if ! _switchcore_nft mihomo; then
+    _dc_restore; rm -rf "$wd"; c_y "❌ profile 防火墙重渲/应用失败, 已还原。"; return 1
+  fi
   systemctl reset-failed mosdns >/dev/null 2>&1 || true
   if ! systemctl restart mosdns || ! _core_kernel_stable mosdns; then
     _dc_restore; rm -rf "$wd"
@@ -1208,7 +2514,9 @@ cmd_detect_cidr(){
   fi
   # 成功后三处复核一致: 防火墙文件 / mosdns 配置 / doctor 读到的内网段
   local dc_ok=1 seen
-  grep -qF "$det" /etc/nftables.conf || { c_y "⚠️ 复核: nftables 里没有 $det"; dc_ok=0; }
+  [[ "$(_pdg_profile_get PDG_INTERNAL_CIDR 2>/dev/null)" == "$det" ]] \
+    || { c_y "⚠️ 复核: profile 未持久化 $det"; dc_ok=0; }
+  grep -qF "$det" /etc/nftables.conf || { c_y "⚠️ 复核: nftables 渲染产物里没有 $det"; dc_ok=0; }
   grep -qF "$det" /etc/mosdns/config.yaml || { c_y "⚠️ 复核: mosdns 配置里没有 $det"; dc_ok=0; }
   seen="$(python3 -c 'import sys; sys.path.insert(0,"/opt/pdg-bot"); import checks; print(checks._internal_cidr())' 2>/dev/null)"
   [[ "$seen" == "$det" ]] || { c_y "⚠️ 复核: 自检读到的内网段是「${seen:-空}」, 与 $det 不一致"; dc_ok=0; }
@@ -1293,6 +2601,7 @@ menu(){
     echo " 11) 诊断报告 (脱敏)"
     echo " 12) 识别内网卡段"
     echo " 13) 卸载"
+    echo " 14) Web 管理面 (默认禁用)"
     echo "  0) 退出"
     echo "  下次打开本菜单命令: pdg"
     printf "选择: "
@@ -1312,6 +2621,10 @@ menu(){
       12) cmd_detect_cidr;;
       13) read -rp "卸载: 留空取消 / yes 仅卸载 / purge 连配置一起删: " x
          case "$x" in yes) cmd_uninstall;; purge) cmd_uninstall --purge;; *) echo "已取消";; esac;;
+      14) cmd_web status
+          echo "  setup / enable / disable / status / password"
+          read -rp "Web 操作(留空返回): " w
+          [[ -z "$w" ]] || cmd_web "$w";;
       0|q) exit 0;;
       *) echo "无效选择";;
     esac
@@ -1842,6 +3155,185 @@ MIGPY
   fi
 }
 
+# 规则集 target=direct 的 MosDNS 接口：独立 ruleset_direct 聚合并入 geosite_cn，同时让显式
+# custom_hijack 单域名覆盖在 CN/宽泛 direct 规则集之前进入 fake/SNI 序列。只改本项目标准
+# 形态；自定义配置不猜。配置备份、文件创建、重启核验与失败还原在本函数内闭合。
+migrate_ruleset_phone_direct(){
+  local mc=/etc/mosdns/config.yaml agg=/etc/mosdns/rules/ruleset_direct.txt
+  [[ -e "$mc" || -L "$mc" ]] || return 0
+  [[ -f "$mc" && ! -L "$mc" ]] \
+    || { c_y "  ⛔ [规则集手机直连] MosDNS 配置不是普通文件，拒绝迁移。"; return 1; }
+  # early-return 与 Bot 入口共用同一份严格判据；注释里的路径/标签不能让迁移误以为已就绪。
+  if _pdg_ruleset_direct_interface_ready_file "$mc"; then
+    _pdg_ensure_ruleset_direct_file "$agg" \
+      || { c_y "  ⛔ [规则集手机直连] 聚合目标不是可信普通文件。"; return 1; }
+    return 0
+  fi
+  grep -q 'tag: internal_sequence' "$mc" \
+    && grep -q 'tag: geosite_cn' "$mc" \
+    && grep -q 'tag: force_hijack_seq' "$mc" \
+    || { c_y "  [规则集手机直连] MosDNS 是自定义形态，未猜测改写；target=direct 会拒绝直到接口就绪。"; return 0; }
+  local bak agg_pre=0
+  bak="$mc.prersdirect.$(date +%s)"
+  if [[ -L "$agg" || ( -e "$agg" && ! -f "$agg" ) ]]; then
+    c_y "  ⛔ [规则集手机直连] 聚合目标不是普通文件，拒绝迁移。"; return 1
+  fi
+  [[ -f "$agg" ]] && agg_pre=1
+  cp -a "$mc" "$bak" 2>/dev/null && cmp -s "$mc" "$bak" \
+    || { c_y "  [规则集手机直连] 配置备份失败，未改动。"; rm -f "$bak"; return 0; }
+  install -d -m755 /etc/mosdns/rules 2>/dev/null || true
+  _pdg_ensure_ruleset_direct_file "$agg" \
+    || { c_y "  [规则集手机直连] 聚合文件创建失败，未改动配置。"; rm -f "$bak"; return 1; }
+  if ! python3 - "$mc" "$agg" <<'RSDIRECTPY'
+import os
+import re
+import stat
+import sys
+import tempfile
+
+mc, agg = sys.argv[1:]
+s = open(mc, encoding="utf-8").read()
+
+def ensure_domain_set_file(text, tag, path):
+    pattern = re.compile(
+        r"(?m)(^  - tag:\s*" + re.escape(tag)
+        + r"\s*$\n(?:(?!^  - tag:)[\s\S])*?"
+        + r"^[ \t]*args:\s*\{\s*files:\s*\[)([^\]]*)(\])"
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
+        raise SystemExit(tag + " shape unknown")
+    match = matches[0]
+    # `# "...path..."` 是注释，不是 files 元素；若注释出现在同一行，重写时一并去掉。
+    files = match.group(2).split("#", 1)[0].rstrip()
+    loaded = path in re.findall(r'"([^"\r\n]+)"', files)
+    if loaded:
+        return text
+    separator = "," if files.strip() else ""
+    files += separator + '"' + path + '"'
+    return text[:match.start(2)] + files + text[match.end(2):]
+
+if "  - tag: explicit_hijack\n" not in s:
+    marker = "  - tag: hijack_set\n"
+    if s.count(marker) != 1:
+        raise SystemExit("hijack_set shape unknown")
+    plugin = (
+        "  - tag: explicit_hijack\n"
+        "    type: domain_set\n"
+        '    args: { files: ["/etc/mosdns/rules/custom_hijack.txt"] }\n'
+    )
+    s = s.replace(marker, plugin + marker, 1)
+
+s = ensure_domain_set_file(s, "geosite_cn", agg)
+s = ensure_domain_set_file(
+    s, "explicit_hijack", "/etc/mosdns/rules/custom_hijack.txt"
+)
+
+marker = "      - matches: qname $geosite_cn\n"
+if s.count(marker) < 1:
+    raise SystemExit("geosite_cn sequence shape unknown")
+rule = (
+    "      - matches: qname $explicit_hijack\n"
+    "        exec: goto force_hijack_seq\n"
+)
+active_s = "\n".join(line.split("#", 1)[0] for line in s.splitlines())
+if "qname $explicit_hijack" in active_s and rule not in s:
+    raise SystemExit("explicit_hijack sequence shape unknown")
+if rule in s:
+    if s.count(rule) != 1:
+        raise SystemExit("duplicate explicit_hijack sequence")
+    # 旧迁移只检查“存在”，可能把显式代理规则留在宽泛 direct 后面；移除标准块后按
+    # 当前 geosite_cn 的首条规则重新插入，错误顺序可自愈。
+    s = s.replace(rule, "", 1)
+s = s.replace(marker, rule + marker, 1)
+
+st = os.lstat(mc)
+if not stat.S_ISREG(st.st_mode):
+    raise SystemExit("mosdns config is not regular")
+directory = os.path.dirname(mc)
+fd, tmp = tempfile.mkstemp(prefix=".pdg-rsdirect.", dir=directory)
+try:
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, stat.S_IMODE(st.st_mode))
+    if hasattr(os, "fchown"):
+        os.fchown(fd, st.st_uid, st.st_gid)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        fd = -1
+        stream.write(s)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(tmp, stat.S_IMODE(st.st_mode))
+    os.replace(tmp, mc)
+    if os.name != "nt":
+        dfd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+RSDIRECTPY
+  then
+    c_y "  [规则集手机直连] 生成失败，正在原子还原配置。"
+    local generate_rb_failed=0
+    _pdg_atomic_restore_file "$bak" "$mc" 2>/dev/null \
+      && cmp -s "$bak" "$mc" || generate_rb_failed=1
+    if [[ "$agg_pre" != 1 ]]; then
+      rm -f "$agg" 2>/dev/null || generate_rb_failed=1
+    fi
+    if [[ "$generate_rb_failed" == 0 ]]; then
+      rm -f "$bak"
+      c_y "  [规则集手机直连] 生成失败，磁盘配置已还原；MosDNS 运行态未重启。"
+      return 0
+    fi
+    c_y "  ⛔ [规则集手机直连] 生成失败且还原不完整；before-image 保留在 $bak"
+    return 1
+  fi
+  # 生成器只负责标准形态改写；提交前仍须调用 Bot 的同一严格接口判据。校验失败时
+  # 只恢复磁盘候选，绝不把无效配置交给 MosDNS restart。
+  if ! _pdg_ruleset_direct_interface_ready_file "$mc"; then
+    c_y "  [规则集手机直连] 生成后的严格接口校验失败，正在原子还原；未重启 MosDNS。"
+    local validate_rb_failed=0
+    _pdg_atomic_restore_file "$bak" "$mc" 2>/dev/null \
+      && cmp -s "$bak" "$mc" || validate_rb_failed=1
+    if [[ "$agg_pre" != 1 ]]; then
+      rm -f "$agg" 2>/dev/null || validate_rb_failed=1
+    fi
+    if [[ "$validate_rb_failed" == 0 ]]; then
+      rm -f "$bak"
+      return 1
+    fi
+    c_y "  ⛔ [规则集手机直连] 严格校验失败且还原不完整；before-image 保留在 $bak"
+    return 1
+  fi
+  if systemctl restart mosdns 2>/dev/null && _core_kernel_stable mosdns; then
+    c_g "  已接入规则集手机本地直连聚合，并建立显式单域名代理优先级。"
+    rm -f "$bak"
+    return 0
+  fi
+  c_y "  [规则集手机直连] MosDNS 重启后未稳定，正在原子还原。"
+  local runtime_rb_failed=0
+  _pdg_atomic_restore_file "$bak" "$mc" 2>/dev/null \
+    && cmp -s "$bak" "$mc" || runtime_rb_failed=1
+  if [[ "$agg_pre" != 1 ]]; then
+    rm -f "$agg" 2>/dev/null || runtime_rb_failed=1
+  fi
+  if [[ "$runtime_rb_failed" == 0 ]] \
+     && systemctl restart mosdns 2>/dev/null \
+     && _core_kernel_stable mosdns; then
+    rm -f "$bak"
+    c_y "  [规则集手机直连] 新接口未提交；旧配置已还原并确认稳定。"
+    return 0
+  fi
+  c_y "  ⛔ [规则集手机直连] 旧配置还原后 MosDNS 仍未稳定；before-image 保留在 $bak"
+  return 1
+}
+
 # 把已有机器的 mosdns 劫持形态归一到"与 PDG_HIJACK_MODE 一致"。两类机器都要修:
 #   · 老形态(无 hijack_set, 排除式): 补上 hijack_set 插件, 获得 gfw 能力; all 语义不变。
 #   · 新形态(有劫持门)但模式是 all: 去掉那道门 —— 它把 all 悄悄退化成了"只劫持 geosite
@@ -1888,22 +3380,198 @@ migrate_backend_marker(){
     && c_g "  补内核标记: $core(据现场证据; 老装此前一直靠默认值兜底)。"
 }
 
+_pdg_install_dataplane_bundle(){
+  # Install bot + converter + strict profile parser as one validated version
+  # set.  Renames are per-file atomic; a mid-set failure restores every file
+  # already touched before returning.
+  local source_root="$1" dst=/opt/pdg-bot wd name src target restore_name
+  wd="$(mktemp -d)" || return 1
+  mkdir -p "$dst" || { rm -rf "$wd"; return 1; }
+  for name in bot.py sb2mihomo.py pdgprofile.py; do
+    case "$name" in
+      bot.py) src="$source_root/pdg-bot.py";;
+      *) src="$source_root/$name";;
+    esac
+    [[ -f "$src" ]] || { rm -rf "$wd"; return 1; }
+    cp "$src" "$wd/$name" || { rm -rf "$wd"; return 1; }
+    if [[ -e "$dst/$name" ]]; then
+      cp -a "$dst/$name" "$wd/$name.before" || { rm -rf "$wd"; return 1; }
+      : >"$wd/$name.existed"
+    fi
+  done
+  PYTHONPYCACHEPREFIX="$wd/pycache" python3 -m py_compile \
+    "$wd/bot.py" "$wd/sb2mihomo.py" "$wd/pdgprofile.py" \
+    || { rm -rf "$wd"; return 1; }
+  for name in bot.py sb2mihomo.py pdgprofile.py; do
+    if ! _pdg_atomic_install_file "$wd/$name" "$dst/$name" 755; then
+      for restore_name in bot.py sb2mihomo.py pdgprofile.py; do
+        target="$dst/$restore_name"
+        if [[ -e "$wd/$restore_name.existed" ]]; then
+          _pdg_atomic_install_file \
+            "$wd/$restore_name.before" "$target" 755 || true
+        else
+          rm -f "$target"
+        fi
+      done
+      rm -rf "$wd"; return 1
+    fi
+  done
+  rm -rf "$wd"
+}
+
+_pdg_restart_restore_before(){
+  local wd="$1" qhelper nftexe failed=0
+  qhelper="$(_pdg_quic_helper)" || return 1
+  # Restore dependencies before the on-disk core config. The running Mihomo
+  # process still has its previous in-memory config, so route -> nft -> config
+  # avoids presenting an old config with a new route tuple if rollback stalls.
+  if [[ -e "$wd/had-state" ]]; then
+    bash "$qhelper" rollback-state "$wd/state.before" >/dev/null 2>&1 \
+      || failed=1
+  else
+    bash "$qhelper" rollback-state - >/dev/null 2>&1 || failed=1
+  fi
+  nftexe="$(_pdg_nft_bin)"
+  if [[ -e "$wd/had-nft" ]]; then
+    # shellcheck source=lib/nfttxn.sh
+    if source "$REPO_DIR/lib/nfttxn.sh" 2>/dev/null; then
+      pdg_nft_atomic_install "$wd/nft.before" /etc/nftables.conf "$nftexe" \
+        && "$nftexe" -f /etc/nftables.conf || failed=1
+    else
+      failed=1
+    fi
+  else
+    rm -f /etc/nftables.conf || failed=1
+    [[ -n "$nftexe" ]] && "$nftexe" delete table inet pdg 2>/dev/null || true
+  fi
+  if [[ -e "$wd/had-config" ]]; then
+    _pdg_atomic_install_file "$wd/config.before" /etc/mihomo/config.yaml 600 \
+      || failed=1
+  else
+    rm -f /etc/mihomo/config.yaml || failed=1
+  fi
+  return "$failed"
+}
+
+migrate_dataplane_profile(){
+  local tool mode="" marker="" cidr="" sshp="" line key value
+  # An update may be running with an old /opt runtime bundle.  Migration must
+  # consume one coherent checked-out bundle, never import old bot/sb2mihomo
+  # before copying the new files.
+  tool="$REPO_DIR/deploy/bot/pdgprofile.py"
+  [[ -f "$tool" && -f "$REPO_DIR/deploy/bot/pdg-bot.py" \
+     && -f "$REPO_DIR/deploy/bot/sb2mihomo.py" ]] \
+    || { echo "checked-out data-plane bundle 不完整"; return 1; }
+  install -d -m700 /etc/privdns-gateway || return 1
+
+  # Canonicalize pre-profile releases from explicit deployed evidence only.
+  if ! mode="$(_pdg_profile_get PDG_FIREWALL_MODE 2>/dev/null)"; then
+    marker="$(cat /etc/privdns-gateway/firewall-mode 2>/dev/null)"
+    if [[ "$marker" == managed || "$marker" == external ]]; then mode="$marker"
+    elif grep -q 'mode=external' /etc/nftables.conf 2>/dev/null; then mode=external
+    elif grep -q 'mode=managed' /etc/nftables.conf 2>/dev/null \
+      || grep -qE 'table inet (pdg|filter)' /etc/nftables.conf 2>/dev/null; then
+      mode=managed
+      c_y "  老版本无 firewall mode，按其带 input 防火墙的现场证据迁移为 managed。"
+    else
+      echo "无法从可信现场证据确定 firewall mode，拒绝默认 managed" >&2
+      return 1
+    fi
+    _profile_set PDG_FIREWALL_MODE "$mode" || return 1
+  fi
+  [[ "$mode" == managed || "$mode" == external ]] || return 1
+  if [[ -e /etc/privdns-gateway/firewall-mode ]]; then
+    marker="$(cat /etc/privdns-gateway/firewall-mode 2>/dev/null)"
+    [[ "$marker" == "$mode" ]] || {
+      echo "firewall-mode state/profile 冲突" >&2; return 1; }
+  else
+    local mt
+    mt="$(mktemp /etc/privdns-gateway/.firewall-mode.XXXXXX)" || return 1
+    printf '%s\n' "$mode" >"$mt" && chmod 600 "$mt" \
+      && mv -f "$mt" /etc/privdns-gateway/firewall-mode || { rm -f "$mt"; return 1; }
+  fi
+
+  cidr="$(_pdg_profile_get PDG_INTERNAL_CIDR 2>/dev/null)" || true
+  if [[ -z "$cidr" ]]; then
+    cidr="$(python3 -c 'import sys;sys.path.insert(0,"/opt/pdg-bot");import checks;print(checks._internal_cidr())' 2>/dev/null)"
+    [[ -n "$cidr" ]] || cidr="$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')"
+    [[ -n "$cidr" ]] || { echo "无法迁移 PDG_INTERNAL_CIDR"; return 1; }
+    _profile_set PDG_INTERNAL_CIDR "$cidr" || return 1
+  fi
+  sshp="$(_pdg_profile_get PDG_SSH_PORT 2>/dev/null)" || true
+  if [[ -z "$sshp" ]]; then
+    sshp="$(ss -lntpH 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}')"
+    sshp="${sshp:-22}"
+    _profile_set PDG_SSH_PORT "$sshp" || return 1
+  fi
+  _profile_set PDG_PLATFORM "$(_pdg_platform)" || return 1
+
+  # Resolve the whole group before writing any one of it. Invalid/duplicate
+  # existing keys abort; missing keys receive this fork's explicit defaults.
+  local lines
+  lines="$(python3 "$tool" --profile "$PROFILE_ENV" --profile-only \
+    --platform "$(_pdg_platform)" --ssh-port "$sshp" lines)" || return 1
+  while IFS='=' read -r key value; do
+    [[ -n "$key" ]] || continue
+    _profile_set "$key" "$value" || return 1
+  done <<<"$lines"
+
+  # Deploy source helper + boot unit as hard lifecycle prerequisites.
+  install -d -m755 /usr/local/libexec /opt/pdg-bot || return 1
+  _pdg_install_dataplane_bundle "$REPO_DIR/deploy/bot" || return 1
+  install -m755 "$REPO_DIR/deploy/firewall/pdg-quic-routing.sh" \
+    /usr/local/libexec/pdg-quic-routing.sh || return 1
+  install -m644 "$REPO_DIR/deploy/firewall/pdg-quic-routing.service" \
+    /etc/systemd/system/pdg-quic-routing.service || return 1
+  # shellcheck source=lib/units.sh
+  source "$REPO_DIR/lib/units.sh" || return 1
+  pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service || return 1
+  systemctl daemon-reload || return 1
+  systemctl enable pdg-quic-routing >/dev/null 2>&1 || return 1
+
+  local mwd mcand
+  mwd="$(mktemp -d)" || return 1; mcand="$mwd/config.yaml"
+  if ! _pdg_render_mihomo_candidate "$mcand" "$REPO_DIR/deploy/bot"; then
+    rm -rf "$mwd"; return 1
+  fi
+  if command -v mihomo >/dev/null 2>&1 \
+    && ! mihomo -t -d /etc/mihomo -f "$mcand" >/dev/null 2>&1; then
+    rm -rf "$mwd"; return 1
+  fi
+  if ! _pdg_atomic_install_file "$mcand" /etc/mihomo/config.yaml 600 \
+    || ! _switchcore_nft mihomo "$REPO_DIR"; then
+    rm -rf "$mwd"; return 1
+  fi
+  rm -rf "$mwd"
+  systemctl enable --now pdg-quic-routing >/dev/null 2>&1 || return 1
+  /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1 || return 1
+  systemctl restart mihomo >/dev/null 2>&1 || return 1
+  [[ "$(systemctl is-active pdg-quic-routing 2>/dev/null)" == active \
+     && "$(systemctl is-active mihomo 2>/dev/null)" == active ]] || return 1
+}
+
 run_all_migrations(){
   local rc=0
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
+  migrate_dataplane_profile || rc=1
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true; migrate_deploy_units || true
   migrate_mosdns_hijack_shape || true
   migrate_custom_hijack || true
-  migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
+  migrate_mosdns_mitm || true
+  migrate_ruleset_phone_direct || rc=1
+  migrate_pdg_mitm_service || true
   migrate_android_cleanup || true
   # iOS GMS 清理**失败必须传出**: 它会动 model + 内核配置 + 防火墙三样, 失败即现网可能与
   # 期望形态不一致(它自己会完整回滚, 但回滚不完整时更要让上层知道)。以前是 `|| true`,
   # 于是 cmd_update / cmd_migrate / cmd_platform 全都收不到这条失败。
   migrate_ios_gms_cleanup || rc=1
+  # MosDNS stock v5.3.4 与修补版共用上游版本号，必须在新版脚本进程内按精确
+  # flavor/provenance 更新；失败必须传给 update 触发其精确快照回滚。
+  migrate_mosdns_patched_binary || rc=1
   # 内核迁移放最后: 上面的 config.json / mosdns / 防火墙 迁移都先按老路子跑完(它们只动数据模型
   # 与 nft, 与内核无关), 这里再把**最终形态的** config.json 转 mihomo 并移除 sing-box 运行时。
   # 唯一"失败必须传出"的迁移 —— 失败即让 __migrate 返回非0,
@@ -1916,7 +3584,7 @@ run_all_migrations(){
 # 全不动(model 共用)。$1 目前恒为 mihomo(唯一内核), 保留形参以兼容 _activate_mihomo_core 调用。
 # 找出**除 table inet pdg 之外**挂在 `hook input` 上的 base chain。
 # 为什么这条是硬门槛: PDG 的 input chain 是 `policy drop`, 而 nftables 里同一 hook 上的多个
-# base chain **都会执行** —— 任一条判 drop, 包就没了。于是用户自己的 input chain 里对 9443 /
+# base chain **都会执行** —— 任一条判 drop, 包就没了。于是用户自己的 input chain 里对 10443 /
 # WireGuard 的 accept 会被 PDG 这条 drop 架空: 配置文本还在, 端口实际已经不通, 而迁移还报成功。
 # 这种"看着保留、其实失效"比直接报错危险得多, 故一律中止, 交由用户手工合并。
 # 检测同时看**配置文件**与**当前运行 ruleset**(两边都可能只有一侧有), 宁可保守中止。
@@ -1940,34 +3608,89 @@ _pdg_nft_foreign_input_chains(){
 # 无法证明能安全合并(pdg 块括号不配平 / 文件里有 flush ruleset 又还有别的表)→ 返回非 0,
 # 调用方必须在改动运行环境**之前**中止 —— 整文件覆盖会把用户的 VPN/NAT/转发/开放端口抹掉。
 _pdg_nft_splice(){
-  local m
+  local m mode="${4:-}"
   for m in "${REPO_DIR:-/opt/privdns-gateway}/deploy/bot/nftmerge.py" /opt/pdg-bot/nftmerge.py; do
     [[ -f "$m" ]] || continue
-    python3 "$m" "$1" "$2" "$3"
+    if [[ -n "$mode" ]]; then python3 "$m" --mode "$mode" "$1" "$2" "$3"
+    else python3 "$m" "$1" "$2" "$3"; fi
     return $?
   done
   echo "找不到 nftmerge.py(合并脚本缺失), 拒绝合并防火墙配置" >&2
   return 1
 }
 
-_switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 SSH端口/内网段)
-  local target="$1" sshp icidr
-  [[ "$target" == mihomo ]] || { echo "内部错误: _switchcore_nft 只支持 mihomo(收到 $target)"; return 1; }
-  sshp=$(grep -oP '^\s*tcp dport \{ \K[0-9]+(?= \} accept)' /etc/nftables.conf | head -1)
-  # 现网 nft 认不出 SSH 端口时(自定义/异形防火墙)不能直接判死 —— 这条路现在跑在**自动迁移**里,
-  # 硬失败会把用户永久挡在旧版上。退回问 sshd 实际在听哪个口, 再退回 22(与装机探测同口径)。
-  if [[ -z "$sshp" ]]; then
-    sshp=$(ss -lntpH 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}')
-    sshp="${sshp:-22}"
-    c_y "  未能从 /etc/nftables.conf 认出 SSH 端口 → 按实际监听/默认值取 $sshp(新防火墙会放行它)。"
+_pdg_switchcore_restore_nft_before(){
+  local wd="$1" bak="$2" nftexe="$3" had_live="$4"
+  local live_restore="$5" livebak="$6"
+  local failed=0 now="$wd/pdg.live.after-restore"
+  local nft_target="${PDG_NFT_CONF:-/etc/nftables.conf}"
+  if [[ -e "$bak" ]]; then
+    pdg_nft_atomic_install "$bak" "$nft_target" "$nftexe" || failed=1
+    [[ "$failed" == 0 ]] && cmp -s "$bak" "$nft_target" || failed=1
+  else
+    rm -f "$nft_target" || failed=1
+    [[ ! -e "$nft_target" ]] || failed=1
   fi
-  icidr=$(python3 -c "import sys;sys.path.insert(0,'/opt/pdg-bot');import checks;print(checks._internal_cidr())" 2>/dev/null)
-  [[ -n "$sshp" && -n "$icidr" ]] || { echo "提取 SSH端口/内网段失败(ssh=$sshp cidr=$icidr)"; return 1; }
+  if [[ "$had_live" == 1 ]]; then
+    "$nftexe" -f "$live_restore" >/dev/null 2>&1 || failed=1
+    "$nftexe" list table inet pdg >"$now" 2>/dev/null || failed=1
+    cmp -s "$livebak" "$now" || failed=1
+  else
+    if ! "$nftexe" delete table inet pdg >/dev/null 2>&1; then
+      # ENOENT is acceptable only after a read-back proof of absence.
+      local tables=""
+      tables="$("$nftexe" list tables 2>/dev/null)" || failed=1
+      if [[ "$failed" == 0 ]] && grep -Eq \
+          '^[[:space:]]*table[[:space:]]+inet[[:space:]]+pdg([[:space:]]|$)' \
+          <<<"$tables"; then failed=1; fi
+    fi
+    local tables_after=""
+    tables_after="$("$nftexe" list tables 2>/dev/null)" || failed=1
+    if [[ "$failed" == 0 ]] && grep -Eq \
+        '^[[:space:]]*table[[:space:]]+inet[[:space:]]+pdg([[:space:]]|$)' \
+        <<<"$tables_after"; then failed=1; fi
+  fi
+  return "$failed"
+}
+
+_switchcore_nft(){   # Render/apply the complete profile-owned data plane.
+  local target="$1" source_repo="${2:-}" sshp icidr mode tool qhelper nftexe
+  [[ "$target" == mihomo ]] || { echo "内部错误: _switchcore_nft 只支持 mihomo(收到 $target)"; return 1; }
+  if [[ -n "$source_repo" ]]; then
+    tool="$source_repo/deploy/bot/pdgprofile.py"
+    qhelper="$source_repo/deploy/firewall/pdg-quic-routing.sh"
+    [[ -f "$tool" && -f "$qhelper" ]] \
+      || { echo "checked-out profile/QUIC helper bundle 不完整"; return 1; }
+  else
+    tool="$(_pdg_profile_tool)" || { echo "缺 pdgprofile.py"; return 1; }
+    qhelper="$(_pdg_quic_helper)" || { echo "缺 QUIC routing helper"; return 1; }
+  fi
+  if [[ -n "$source_repo" ]]; then
+    mode="$(_pdg_profile_get_from "$tool" PDG_FIREWALL_MODE)" \
+      || { echo "profile 防火墙模式缺失/重复"; return 1; }
+    local state_mode=""
+    [[ ! -e /etc/privdns-gateway/firewall-mode ]] \
+      || state_mode="$(cat /etc/privdns-gateway/firewall-mode 2>/dev/null)"
+    [[ -z "$state_mode" || "$state_mode" == "$mode" ]] \
+      || { echo "firewall mode state/profile 冲突"; return 1; }
+    sshp="$(_pdg_profile_get_from "$tool" PDG_SSH_PORT)" \
+      || { echo "profile 缺 PDG_SSH_PORT"; return 1; }
+    icidr="$(_pdg_profile_get_from "$tool" PDG_INTERNAL_CIDR)" \
+      || { echo "profile 缺 PDG_INTERNAL_CIDR"; return 1; }
+  else
+    mode="$(_pdg_firewall_mode)" \
+      || { echo "profile 防火墙模式缺失/重复/冲突"; return 1; }
+    sshp="$(_pdg_profile_get PDG_SSH_PORT)" \
+      || { echo "profile 缺 PDG_SSH_PORT"; return 1; }
+    icidr="$(_pdg_profile_get PDG_INTERNAL_CIDR)" \
+      || { echo "profile 缺 PDG_INTERNAL_CIDR"; return 1; }
+  fi
   [[ -f "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" ]] || { echo "缺 nftables-mihomo.conf(先 pdg update)"; return 1; }
   # 兜底(调用方本应已在更早处拦下): 别的 input base chain 与 PDG 的 policy drop 不兼容,
   # 在写文件/执行 nft 之前中止, 免得"文本保留、端口失效"。
   local _fic2 _frc2
-  _fic2="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; _frc2=$?
+  _fic2="$(python3 "$REPO_DIR/deploy/bot/nftscan.py" --mode "$mode" \
+    /etc/nftables.conf)"; _frc2=$?
   if [[ "$_frc2" == 0 ]]; then
     echo "检测到自定义 input base chain, 与 PDG 的 policy drop 不兼容 → 未改动防火墙:"
     printf '%s\n' "$_fic2" | sed 's/^/    /'
@@ -1978,12 +3701,15 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
     printf '%s\n' "$_fic2" | sed 's/^/    /'
     return 1
   fi
-  local wd rendered merged bak rc
+  local wd rendered merged bak rc qbak qbefore="-" livebak live_restore had_live=0
   wd="$(mktemp -d)" || { echo "无法创建临时目录"; return 1; }
   rendered="$wd/pdg.nft"; merged="$wd/merged.conf"; bak="$wd/nftables.conf.bak"
-  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \
-      "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$rendered"
-  _pdg_nft_strip_gms "$rendered"          # iOS: 渲染后剥掉 GMS 5228-5230
+  livebak="$wd/pdg.live.before"; live_restore="$wd/pdg.live.restore"
+  python3 "$tool" --profile "$PROFILE_ENV" --profile-only \
+    --platform "$(_pdg_platform)" --ssh-port "$sshp" --listener-preflight render-nft \
+    --template "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" \
+    --internal-cidr "$icidr" --firewall-mode "$mode" >"$rendered" \
+    || { rm -rf "$wd"; echo "按 profile 渲染 nft 失败"; return 1; }
   # 备份必须先成立(逐字节校验): 后面任何一步失败都要靠它把现网原样放回去
   if [[ -e /etc/nftables.conf ]]; then
     if ! cp -a /etc/nftables.conf "$bak" 2>/dev/null || ! cmp -s /etc/nftables.conf "$bak"; then
@@ -1992,27 +3718,68 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   fi
   # 只替换本项目管理区(table inet pdg), 用户的额外表/VPN/NAT/转发/开放端口原样保留。
   # 合并不了(块不配平 / flush ruleset 与别的表共存)→ 在改动运行环境之前就中止。
-  if ! _pdg_nft_splice "$rendered" /etc/nftables.conf "$merged"; then
+  if ! _pdg_nft_splice "$rendered" /etc/nftables.conf "$merged" "$mode"; then
     rm -rf "$wd"
     echo "无法安全合并防火墙配置 → 未改动 /etc/nftables.conf(见上方冲突位置)"
     echo "  请把本项目所需规则手工并入 table inet pdg 后重试, 或先备份并清理冲突配置。"
     return 1
   fi
-  if ! nft -c -f "$merged" >/dev/null 2>&1; then
-    rm -rf "$wd"; echo "合并后的 nftables 配置校验(nft -c)未过, 未改动防火墙"; return 1
+  nftexe="$(_pdg_nft_bin)"; [[ -n "$nftexe" ]] \
+    || { rm -rf "$wd"; echo "找不到 nft，拒绝未校验写入"; return 1; }
+  if "$nftexe" list table inet pdg >"$livebak" 2>/dev/null; then
+    had_live=1
+    {
+      printf 'table inet pdg\n'
+      printf 'delete table inet pdg\n'
+      cat "$livebak"
+    } >"$live_restore" || { rm -rf "$wd"; return 1; }
+    "$nftexe" -c -f "$live_restore" >/dev/null 2>&1 \
+      || { rm -rf "$wd"; echo "无法构造 live nft before-image"; return 1; }
   fi
-  if ! cp -f "$merged" /etc/nftables.conf 2>/dev/null || ! cmp -s "$merged" /etc/nftables.conf; then
-    [[ -e "$bak" ]] && cp -a "$bak" /etc/nftables.conf 2>/dev/null
-    rm -rf "$wd"; echo "写入 /etc/nftables.conf 失败(磁盘满?), 已还原"; return 1
+  PDG_PROFILE="$PROFILE_ENV" PDG_PROFILE_TOOL="$tool" bash "$qhelper" preflight \
+    || { rm -rf "$wd"; echo "QUIC routing 预检失败，未写 nft"; return 1; }
+  qbak="$wd/quic-routing.state.before"
+  if [[ -e /etc/privdns-gateway/quic-routing.state ]]; then
+    if ! cp -a /etc/privdns-gateway/quic-routing.state "$qbak" 2>/dev/null \
+      || ! cmp -s /etc/privdns-gateway/quic-routing.state "$qbak"; then
+      rm -rf "$wd"; echo "QUIC routing state 备份失败，未写 nft"; return 1
+    fi
+    qbefore="$qbak"
   fi
-  if ! nft -f /etc/nftables.conf; then
+  # shellcheck source=lib/nftbin.sh
+  source "$REPO_DIR/lib/nftbin.sh" 2>/dev/null || { rm -rf "$wd"; return 1; }
+  # shellcheck source=lib/nfttxn.sh
+  source "$REPO_DIR/lib/nfttxn.sh" 2>/dev/null || { rm -rf "$wd"; return 1; }
+  if ! pdg_nft_atomic_install "$merged" /etc/nftables.conf "$nftexe"; then
+    rm -rf "$wd"; echo "原子安装 nftables.conf 失败"; return 1
+  fi
+  if ! "$nftexe" -f /etc/nftables.conf; then
     rc=1
-    if [[ -e "$bak" ]]; then
-      cp -a "$bak" /etc/nftables.conf 2>/dev/null
-      nft -f /etc/nftables.conf 2>/dev/null || true
-      echo "应用新防火墙失败 → 已还原并重新应用原配置"
+    if _pdg_switchcore_restore_nft_before \
+        "$wd" "$bak" "$nftexe" "$had_live" "$live_restore" "$livebak"; then
+      echo "应用新防火墙失败 → 已验证还原 persistent/live nft before-image"
+    else
+      echo "应用新防火墙失败，且 persistent/live nft before-image 恢复不完整，必须人工复核" >&2
     fi
     rm -rf "$wd"; return "$rc"
+  fi
+  # Runtime nft is now known-good. The routing helper is internally
+  # rollback-safe; if it cannot apply/status, restore old nft persistent+live.
+  if ! PDG_PROFILE="$PROFILE_ENV" PDG_PROFILE_TOOL="$tool" bash "$qhelper" apply \
+    || ! PDG_PROFILE="$PROFILE_ENV" PDG_PROFILE_TOOL="$tool" bash "$qhelper" status \
+       >/dev/null; then
+    local qrb=0
+    PDG_PROFILE_TOOL="$tool" bash "$qhelper" rollback-state "$qbefore" \
+      >/dev/null 2>&1 || qrb=1
+    local nrb=0
+    _pdg_switchcore_restore_nft_before \
+      "$wd" "$bak" "$nftexe" "$had_live" "$live_restore" "$livebak" || nrb=1
+    if [[ "$qrb" == 0 && "$nrb" == 0 ]]; then
+      echo "QUIC routing apply/status 失败，已验证恢复旧 route state 与 persistent/live nft"
+    else
+      echo "QUIC routing apply/status 失败；before-image 回滚不完整(route=$qrb nft=$nrb)，必须人工复核" >&2
+    fi
+    rm -rf "$wd"; return 1
   fi
   rm -rf "$wd"
 }
@@ -2056,6 +3823,14 @@ _activate_mihomo_core(){
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/units.sh"   2>/dev/null || { echo "❌ 读不到 units.sh"; return 1; }
   cp /etc/nftables.conf /etc/nftables.conf.scbak 2>/dev/null
+  _restore_sc_nft(){
+    local nx; nx="$(_pdg_nft_bin)"
+    # shellcheck source=lib/nfttxn.sh
+    source "$REPO_DIR/lib/nfttxn.sh" 2>/dev/null || return 1
+    [[ -f /etc/nftables.conf.scbak ]] || return 0
+    pdg_nft_atomic_install /etc/nftables.conf.scbak /etc/nftables.conf "$nx" \
+      && "$nx" -f /etc/nftables.conf
+  }
 
   if ! pdg_mihomo_is_version "$MIHOMO_VER"; then
     c_g "下载 mihomo $MIHOMO_VER…"; t=$(mktemp -d)
@@ -2101,11 +3876,11 @@ SCPY
   pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service   # 与装机同源(含 SAFE_PATHS)
   [[ "$plat" == ios ]] && pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
   systemctl daemon-reload
-  _switchcore_nft mihomo || { printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
+  _switchcore_nft mihomo || { printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; echo "❌ nft 应用失败, 已回滚"; return 1; }
   if ! _core_kernel_activate mihomo sing-box; then
     c_y "mihomo 启动/自启核验失败 → 回滚"
     printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
-    [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
+    _restore_sc_nft >/dev/null 2>&1 || c_y "旧 nft 原子恢复失败，请立即检查"
     _core_kernel_restore mihomo sing-box; rm -f /etc/nftables.conf.scbak
     echo "❌ 迁移失败, 已回滚。mihomo 最近日志:"
     journalctl -u mihomo -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
@@ -2301,7 +4076,13 @@ cmd_platform(){
     for g in platform profile.env mitm.json nftables.conf config.yaml mitm_hijack.txt; do
       case "$g" in
         platform|profile.env|mitm.json) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" "/etc/privdns-gateway/$g";;
-        nftables.conf) [[ -e "$wd/$g" ]] && { cp -a "$wd/$g" /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null || true; };;
+        nftables.conf) if [[ -e "$wd/$g" ]]; then
+          local pnx; pnx="$(_pdg_nft_bin)"
+          # shellcheck source=lib/nfttxn.sh
+          source "$REPO_DIR/lib/nfttxn.sh" 2>/dev/null \
+            && pdg_nft_atomic_install "$wd/$g" /etc/nftables.conf "$pnx" \
+            && "$pnx" -f /etc/nftables.conf >/dev/null 2>&1 || true
+        fi;;
         config.yaml)   [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mihomo/config.yaml;;
         mitm_hijack.txt) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mosdns/rules/mitm_hijack.txt;;
       esac
@@ -2334,6 +4115,9 @@ cmd_platform(){
       fi
     done <<< "$_pstate"
     _plat_write_profile "$cur" >/dev/null 2>&1 || true
+    [[ -x /usr/local/libexec/pdg-quic-routing.sh ]] \
+      && /usr/local/libexec/pdg-quic-routing.sh apply >/dev/null 2>&1 \
+      && /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1 || true
     systemctl restart "$(_pdg_core_svc)" mosdns >/dev/null 2>&1 || true
     c_y "已恢复到原平台 $cur 与原配置(含平台专属文件与服务状态; 快照仍在, 必要时可 sudo pdg rollback)。"
   }
@@ -2360,15 +4144,18 @@ cmd_platform(){
     _plat_rollback; rm -rf "$wd"; return 1
   fi
 
-  # 6) 重渲内核配置: iOS→Android 要把 MITM-OUT 出站/路由去掉(接管域名已空), 反向则补上
-  if ! ( cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1; then
-    echo "❌ 重新渲染 mihomo 配置失败"
+  # 6) Generate and validate before atomically installing the core candidate.
+  local pcand="$wd/mihomo.candidate"
+  if ! _pdg_render_mihomo_candidate "$pcand"; then
+    echo "❌ 重新渲染 mihomo candidate 失败"
     _plat_rollback; rm -rf "$wd"; return 1
   fi
-  if command -v mihomo >/dev/null 2>&1 && ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
+  if command -v mihomo >/dev/null 2>&1 && ! mihomo -t -d /etc/mihomo -f "$pcand" >/dev/null 2>&1; then
     echo "❌ 新平台的 mihomo 配置校验(mihomo -t)未过"
     _plat_rollback; rm -rf "$wd"; return 1
   fi
+  _pdg_atomic_install_file "$pcand" /etc/mihomo/config.yaml 600 \
+    || { echo "❌ Mihomo candidate 原子落盘失败"; _plat_rollback; rm -rf "$wd"; return 1; }
   systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 || true
   systemctl restart mosdns >/dev/null 2>&1 || true
 
@@ -2380,6 +4167,10 @@ cmd_platform(){
     echo "❌ 切换后的 nftables 配置校验未过"
     _plat_rollback; rm -rf "$wd"; return 1
   fi
+  /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1 || {
+    echo "❌ 切换后的 QUIC routing/profile 不一致"
+    _plat_rollback; rm -rf "$wd"; return 1
+  }
   if [[ "$(_pdg_bot_cred)" == partial ]]; then
     echo "❌ Bot 凭据只配了一项(token 与允许 id 必须成对)—— 这是配置错误, 先用 pdg-set-token"
     echo "   补齐或把两项都留空(彻底禁用 bot), 再切平台。"
@@ -2537,8 +4328,12 @@ case "${1:-menu}" in
   update|up)     shift || true; cmd_update "${1:-}";;
   migrate-fw)    need_root migrate-fw; migrate_firewall_to_pdg;;
   snapshot|snap) cmd_snapshot;;
-  rollback)      shift || true; cmd_rollback "${1:-0}";;
+  rollback)
+    shift || true
+    if [[ $# -gt 0 ]]; then cmd_rollback "$@"; else cmd_rollback 0; fi
+    ;;
   token)         cmd_token;;
+  web)           shift || true; cmd_web "${1:-status}" "${@:2}";;
   restart)       cmd_restart;;
   log|logs)      shift || true; cmd_log "${1:-40}";;
   traffic|tr)    cmd_traffic;;
@@ -2548,5 +4343,5 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|web <setup|enable|disable|status|password>|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
 esac

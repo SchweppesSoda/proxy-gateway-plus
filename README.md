@@ -1,8 +1,13 @@
-# PrivDNS Gateway
+# proxy-gateway-plus
 
-PrivDNS Gateway 是一个基于系统私密 DNS（DoT）的域名分流网关。手机端只需配置 DoT，网关根据域名决定直连，或把流量交给指定出口。手机不需要安装 VPN、Clash 或 sing-box 客户端。
+proxy-gateway-plus 基于 PrivDNS Gateway，是一个使用系统私密 DNS（DoT）的域名分流网关。手机端只需配置 DoT，网关根据域名决定直连，或把流量交给指定出口。手机不需要安装 VPN、Clash 或 sing-box 客户端。
 
 > 第一次部署可参考图文教程：[docs/QUICKSTART.md](docs/QUICKSTART.md)。
+>
+> 当前根架构派生自 Misaka 的 PrivDNS Gateway 固定提交
+> `eff3668c5873a7fce6b2c1663056b7d7bf1a7beb`；导入基线与同步规则见
+> [UPSTREAM_BASE.md](UPSTREAM_BASE.md)，导入前的旧架构保存在
+> [`legacy/current-architecture/`](legacy/current-architecture/)。
 
 ## 1. 项目简介
 
@@ -16,21 +21,32 @@ PrivDNS Gateway 是一个基于系统私密 DNS（DoT）的域名分流网关。
 ## 2. 工作原理
 
 ```
-手机（Android 私密 DNS / iOS 描述文件，仅 DoT）
+手机（Android 私密 DNS / iOS 描述文件）
    │  DoT :853
    ▼
-网关 VPS
-   ├─ mosdns：国内域名返回真实 IP（直连）
-   │           代理域名把 A 记录改写为网关 IP，AAAA / HTTPS 置空
-   │
-   ▼  入站 :80 / :443 等，按 SNI / Host 嗅探
-流量内核（mihomo / clash.meta）
-   └─ 按域名分流：指定域名 → 落地 A / 落地 B；其余国际 → 本机直出
+MosDNS
+   ├─ 直连域名：返回真实 IP ────────────────────────→ 手机直连
+   └─ 代理域名：A 改写为网关 IP，AAAA / HTTPS 置空
+                     │
+          ┌──────────┴─────────────────────────┐
+          │ TCP（配置的 HTTP/TLS 目的端口）     │ UDP/443（默认）
+          ▼                                    ▼
+   nft source-scoped REDIRECT → :7893   nft TPROXY → :7895
+          └──────────────┬─────────────────────┘
+                         ▼
+                单个 Mihomo（clash.meta）
+                         │ SNI / Host / QUIC 嗅探与规则
+                         ▼
+                 指定出口 / 故障组 / 本机直出
 ```
 
-- DNS 层用 mosdns：按来源 IP 判断是否属于内网卡，再决定国内直连、代理域名劫持到网关、或抑制 AAAA / HTTPS。
-- 流量层用 mihomo（clash.meta）：嗅探连接的域名后按规则分流。
-- mosdns 只对内网卡来源段生效，其他来源的 DNS 查询不受影响。
+- DNS 层使用 MosDNS：只对安装时识别的内网卡来源段执行直连、劫持以及 AAAA / HTTPS
+  抑制策略，其他来源的 DNS 查询走普通解析分支。
+- TCP 数据面由 nftables 按来源段和目的端口执行 `REDIRECT`，统一进入 Mihomo
+  `redir-port :7893`。默认端口按手机平台生成，也可以通过严格校验的 profile 扩展。
+- UDP/443 默认使用 Mihomo 原生 `tproxy-port :7895`；同一台机器只运行一个 Mihomo，
+  没有 TUN、第二内核或第二透明代理进程。
+- REDIRECT / TPROXY 都限定内网卡来源段，不会把公网访问同端口的流量无差别送进 Mihomo。
 
 ## 3. 使用前提
 
@@ -44,27 +60,69 @@ PrivDNS Gateway 是一个基于系统私密 DNS（DoT）的域名分流网关。
 
 ## 4. 安装
 
-Debian 12+ / Ubuntu 22+，需要 root。
+Debian 12+ / Ubuntu 22+，需要 root。派生仓库目前还没有兼容的 `v*` 发布 tag；
+首次派生版本发布前，请克隆当前默认分支并显式跳过发布 tag 自举：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/install.sh | sudo bash
+git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
+cd proxy-gateway-plus
+sudo env \
+  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
+  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
+  PDG_TAG_BOOTSTRAPPED=1 \
+  ./install.sh
 ```
 
-入口脚本只负责自举，实际安装会切到最新的 `v*` 发布 tag，不安装 main 上未发布的中间提交。
+`PDG_TAG_BOOTSTRAPPED=1` 只用于这段首次发布前的开发验证。创建首个派生 `v*` tag 后，
+标准入口脚本会自动切到最新发布 tag，不安装 main 上未发布的中间提交。
+
+MosDNS 使用本项目的 v5.3.4 no-session-ticket 修补 flavor，stock v5.3.4 不会被接受。
+当前尚未发布自有长期 release asset；开发部署须先在可信构建机上可复现构建 raw binary，
+通过可信通道把 binary 与预先取得的仓库 pin 交给安装器。不能在目标机下载后再“现算现信”，
+VPS 也不安装 Go。完整步骤见
+[MosDNS 修补版构建与部署](docs/MOSDNS-PATCHED-BUILD.md)。
+
+已经安装 stock MosDNS 或其他非项目 flavor 的机器在执行更新时，同样须显式提供产物：
+
+```bash
+sudo env \
+  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
+  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
+  pdg update
+```
+
+路径必须是普通文件而不是符号链接。产物 SHA256 必须与 `lib/versions.sh` 中对应架构的
+`mosdns-pdg-*` pin 完全一致；SHA、build marker 或 provenance 任一不符，安装和更新都会
+中止，绝不回退 stock。GitHub Actions 的短期 candidate artifact 也不是长期安装 URL。
 
 安装会部署 mosdns、mihomo 内核、管理 Bot、防火墙和证书，自动识别公网 IP 和内网卡来源段，再交互填写 DoT 域名（Bot token 可以留空，装完后随时用 `sudo pdg-set-token` 设置并启用）。域名的 A 记录需要你自己指向本机，脚本会等你确认后再签发证书。
 
-也可以克隆后运行（便于先查看代码）：
-
-```bash
-git clone https://github.com/misaka-cpu/privdns-gateway.git
-cd privdns-gateway
-git fetch --tags
-git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)"
-sudo ./install.sh
-```
-
 更多安装细节见 [docs/INSTALL.md](docs/INSTALL.md)。卸载：`sudo ./uninstall.sh`（加 `--purge` 连配置一起删除）。
+
+### Android DoT 与 TLS 1.3 会话恢复
+
+在本项目实测的 Android 私密 DNS 链路上，stock MosDNS v5.3.4 存在 TLS 1.3
+会话恢复兼容性故障：首次完整握手和 DoT 查询可以成功，服务端随后签发 session ticket；
+Android 在后续连接提供该 SSLSession、服务端接受恢复后，客户端不再完成握手和 DNS
+查询。此时包括 Google 和本应境内直连的网站在内，都会因尚未取得 DNS 结果而显示
+`ERR_NAME_NOT_RESOLVED`，流量根本没有进入 Mihomo，因此不是出口路由或域名 SNI
+规则导致的故障。
+
+抓包确认 ClientHello 的 SNI 和证书域名正确。独立双连接探针在 stock 上得到
+`has_ticket=true`、`session_reused=true`，修补版则均为 `false`，两次真实 DoT
+查询都正常返回。上游 v5.3.4 的 `tcp_server` 使用 Go 默认 `tls.Config`，本项目只增加
+`SessionTicketsDisabled=true`；TLS 1.3、证书校验和其他 DNS 逻辑保持不变。这是目标
+链路的兼容性约束，不表示 Android 或 TLS 1.3 通常不能使用会话恢复。
+
+修补版使用精确 marker `v5.3.4-pdg-notickets.1`。构建信任锚集中在
+`lib/versions.sh`，包括上游 commit、patch SHA256、Go 1.24.9 和 amd64/arm64 raw
+binary SHA256；`tools/build-mosdns-patched.sh` 与 GitHub Actions 使用同一构建契约，
+CI 对每个架构构建两次并逐字节比较。
+
+部署后运行 `sudo pdg doctor --deep`：常规检查验证精确 marker、钉死 hash/provenance；
+深度检查使用系统 CA 验证证书链与 DNS SAN，并完成两次真实 DoT 查询。第二次握手若出现
+`session_reused=true` 即判失败。安装证明写入、服务重启或稳定门失败时，会同时恢复旧
+MosDNS binary 和 attestation。
 
 ## 5. 手机平台选择
 
@@ -75,9 +133,47 @@ sudo ./install.sh
 
 ## 6. 流量内核（mihomo）
 
-流量层统一使用 mihomo（clash.meta）：nft REDIRECT 入站 + redir 监听 + SNI 嗅探；提供 clash_api，可开观测面板。内核版本由 `pdg update` 随 PrivDNS Gateway 发布版指定并校验后安装。
+流量层统一使用 Mihomo（clash.meta）。TCP 从 source-scoped nft REDIRECT 进入
+`:7893`，UDP/443 默认从原生 TPROXY 进入同一进程的 `:7895`；Mihomo 再按嗅探到的
+SNI / Host / QUIC 与规则选择出口。提供 clash_api，可按需临时开启观测面板。内核版本由
+`pdg update` 随项目发布版指定并校验后安装。
 
 > 早期版本曾支持 sing-box / mihomo 二选一。sing-box 1.13 移除了本网关依赖的 `sniff_override_destination`、被钉死在 1.12.x 死胡同，因此 **v1.6.0 起已彻底移除 sing-box 运行时**，mihomo 成为唯一内核。旧的 sing-box 机器执行 `sudo pdg update` 时会自动迁移到 mihomo（出口、分流、证书、DoT 全部保留；若有 mihomo 无法转换的出口，更新会中止并回滚，提示先在 Bot 里处理该出口）。
+
+### 直连例外与非标准端口
+
+先判断域名究竟应该直连还是经过网关：
+
+- 本应直连的网站若因劫持模式而拿到网关 IP，应在 Bot「📑 分流管理」里把域名指向
+  `direct`。Bot 会事务化写入 MosDNS 的 `custom_direct.txt` 并撤销冲突的自定义劫持，
+  手机随后取得真实 IP。不要为了修复这种漏分流而扩展劫持端口。
+- 规则集的目标也可写 literal `direct`：Bot 将可无损展开的 `DOMAIN`、`DOMAIN-SUFFIX`、
+  `DOMAIN-KEYWORD` 在同一配置事务中派生到独立
+  `/etc/mosdns/rules/ruleset_direct.txt`，MosDNS 返回真实地址，手机不经 VPS。含
+  `IP-CIDR/IP-CIDR6` 的规则集以及 `.mrs/.srs` 无法在 DNS 层兑现完整语义，会被明确拒绝。
+  内建 direct-type 出口（例如默认 `jp`）含义不同：流量已经到达 VPS，再由 VPS 本机直出。
+- 显式单域名代理规则优先于宽泛手机直连规则集。例如 `example.com` 在 direct 规则集中时，
+  仍可将 `api.example.com` 显式指向 `hk`；MosDNS 会先匹配 `custom_hijack.txt` 并送入代理。
+- 只有确实需要代理、且业务使用非标准 HTTP/TLS 端口时，才扩展
+  `PDG_HIJACK_HTTP_TCP_PORTS` 或 `PDG_HIJACK_TLS_TCP_PORTS`。例如代理一个使用
+  TLS `:10443` 的测试服务，可以在非交互安装参数里使用
+  `PDG_HIJACK_TLS_TCP_PORTS=443,10443`。变量表示完整端口集合而不是“追加值”，应保留
+  当前平台需要的默认端口，并先确认端口不与 SSH、DNS、Mihomo API 等本机监听冲突。
+
+安装器将这两个 TCP 端口集合同时持久化并渲染到 nft 与 Mihomo sniffer；任一非法、
+重叠、重复 profile 键或本机监听冲突都会 fail closed。扩展端口前还应确认网关或所选出口
+能够访问目标的该端口，否则透明接管只会把流量送入一条不可达的网关出站路径。
+
+### QUIC 与防火墙模式
+
+- `PDG_QUIC_MODE=tproxy` 是默认值：内网卡来源的 UDP/443 经 nft TPROXY、fwmark 与
+  专用 policy route 进入 Mihomo `:7895`，sniffer 同时启用 QUIC。
+- `PDG_QUIC_MODE=reject` 不创建 QUIC TPROXY 链，也不让 Mihomo 监听 `:7895`。在
+  `managed` 防火墙模式下，网关拒绝内网卡来源 UDP/443，使支持的客户端回落 TCP；
+  在 `external` 模式下是否拒绝由外部防火墙决定。
+- `PDG_FIREWALL_MODE=managed` 由本项目维护带 `policy drop` 的 source-aware input
+  链；`external` 只保留本项目自有、source-scoped 的 REDIRECT / TPROXY 数据面，
+  不创建 input hook，不声明主机公网开放端口，也不替代云安全组或外部防火墙。
 
 ## 7. 手机接入
 
@@ -98,16 +194,57 @@ sudo ./install.sh
 
 Telegram 出口（Bot 内置 SOCKS5，端口 8445）用于给手机上的 Telegram 单独指定出口，在客户端菜单里配置。
 
+### 可选 Web 管理面（默认禁用）
+
+安装和更新会部署 Web 管理面代码，但不会创建认证配置，也不会启用或启动服务。首次使用：
+
+```bash
+sudo pdg web setup       # 交互填写监听地址、端口、域名、可信 CIDR 和管理员密码
+sudo pdg web enable      # 校验配置和证书后显式启用
+sudo pdg web status
+```
+
+其他生命周期命令为 `sudo pdg web disable` 和 `sudo pdg web password`。配置保存在
+`/etc/privdns-gateway/web.json`，目录和文件分别强制为 `root:root 0700`、`root:root 0600`；
+密码只保存为至少 600,000 次 PBKDF2-SHA256 派生值，会话密钥随机生成。服务只接受配置中
+精确列出的 HTTPS Host、Origin 和可信来源 CIDR，生产访问不提供明文 HTTP 降级。Telegram
+Bot 同样只处理私聊；它的 Zashboard 观测面板仍是 10/30 分钟的临时诊断入口，不是这个常驻
+管理面。
+
+setup 要求证书和私钥最终指向由 root 拥有的普通文件，私钥必须保持 owner-only 权限；允许
+certbot 常见的 `/etc/letsencrypt/live/...` root-owned 符号链接，但整条链接链及解析后的
+父目录必须由 root 控制且不可被 group/world 写入。证书必须已生效、尚未过期、覆盖访问
+域名并与私钥匹配。若 Web 原本正在运行，setup/password 写入新配置后会等待服务稳定；
+重启或绑定失败时会原子还原旧配置并确认旧服务恢复，不会打印认证材料。
+
+默认监听 `127.0.0.1:9091`，推荐通过 SSH 隧道访问。证书签给域名时，直接打开
+`https://127.0.0.1:9091` 会因证书名称不匹配而失败；建立隧道后，应在管理电脑的 hosts
+中把配置域名临时指到 `127.0.0.1`，再打开 `https://配置域名:9091`，或者使用一个证书名称
+一致、仅可信网络可达的私有域名入口。setup 会始终把精确 loopback CIDR 加进可信来源，
+浏览器 Host（包括非 443 端口）仍须与配置完全一致。
+
+Web 按 TCP socket 的真实对端地址校验可信 CIDR，并忽略 `X-Forwarded-For`。因此 loopback
+反向代理会让 Web 只看到 `127.0.0.1`，不能靠 Web 自身限制真实客户端；如另设反向代理，
+代理必须独立执行来源 ACL。默认支持路径仍是 loopback + SSH 隧道。
+
+若改为非 loopback 直连，`pdg web` 只报告实际 service interface 和可信 CIDR，绝不会改
+nftables、云安全组或整机 input policy。非 loopback 入口只在
+`PDG_FIREWALL_MODE=external` 下由外部防火墙/管理员负责接入；默认 `managed` 的
+`inet pdg input policy drop` 不会自动放行 Web，官方路径仍是 loopback + SSH 隧道，除非
+管理员明确把所报告接口集成进整机策略。任何编排都不能把示例 9091 或某台机器的端口硬编码
+进仓库。
+
 ## 9. 日常管理命令
 
 ```bash
 sudo pdg            # 进管理菜单
 sudo pdg status     # 状态
-sudo pdg doctor     # 自检（只读）；--json 可脚本化；--deep 加端到端检查
+sudo pdg doctor     # 自检（只读）；--deep 含 DoT chain/SAN 与两次握手会话恢复检查
 sudo pdg update     # 更新（更新前自动快照，失败自动回滚；--dry-run 查看待更新）
 sudo pdg snapshot   # 手动留一份配置快照
 sudo pdg rollback   # 回滚到最近快照
 sudo pdg token      # 设置 / 更换 Bot token
+sudo pdg web status # 可选 Web 管理面；setup|enable|disable|status|password
 sudo pdg restart    # 重启服务
 sudo pdg log [n]    # 查看日志
 sudo pdg traffic    # 网卡流量（vnstat）
@@ -118,7 +255,7 @@ sudo pdg hijack-mode <all|gfw>          # 切换劫持模式
 sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 ```
 
-`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置在 Telegram Bot 里。
+`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）主要用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置可在 Telegram Bot 或可选 PDG Web 中管理。首版 Web 覆盖出口与默认出口、故障组、单域名规则、规则集、DNS 上游、TFO、状态/日志/流量查看、服务重启、规则库更新、本机配置快照与回滚，以及软件更新。Web 的本机快照不是可下载的完整配置备份包；DoT 域名和证书签发、配置包备份/恢复、iOS 描述文件、WLOC、平台切换、安装/卸载和 Bot token 管理仍仅通过 SSH 下的 `pdg` 或 Telegram Bot 完成。
 
 ## 10. iOS 位置改写（WLOC，可选）
 
@@ -153,19 +290,21 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 
 | 层 | 组件 | 说明 |
 |---|---|---|
-| DNS | mosdns v5 | 国内直连；代理域名 A 记录劫持到本机、AAAA / HTTPS 置空；按来源 IP 分支；ECS 处理；缓存；DoT（853）；可选 GFWList 劫持模式 |
-| 流量 | mihomo（clash.meta） | nft REDIRECT 入站 + redir 监听 + SNI 嗅探。多出口故障切换；提供 clash_api（观测面板）。改配置前先校验，失败回滚 |
-| 管理 | Telegram Bot（Python 标准库） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；改配置前先校验，失败回滚 |
+| DNS | mosdns v5.3.4 no-ticket 修补版 | 关闭 DoT session ticket/恢复；国内直连；代理域名 A 记录劫持到本机、AAAA / HTTPS 置空；按来源 IP 分支；ECS 处理；缓存；DoT（853）；可选 GFWList 劫持模式 |
+| 流量 | mihomo（clash.meta） | 单进程；TCP source-scoped REDIRECT → `:7893`，UDP/443 默认 TPROXY → `:7895`；按域名规则支持多出口与故障组；提供 clash_api（观测面板） |
+| 管理 | Telegram Bot + 可选 Web 管理面（Python 标准库） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；Web 默认禁用并使用独立 root-only 认证配置；事务管理的变更先校验候选并支持失败回滚 |
 | 位置改写 | pdg-mitm（可选，iOS） | 自签 CA + 终止 TLS + 转发并替换 `gs-loc` 响应坐标 |
 | 证书 | certbot standalone | Let's Encrypt，自动续期 |
-| 防火墙 | nftables | 对全网只放行 SSH；DNS、数据、探测端口只放行内网卡来源段；mihomo 用 REDIRECT 入站，同样限内网卡来源 |
+| 防火墙 | nftables | `managed` 维护 source-aware input policy；`external` 不创建 input hook。两种模式的数据面均只按内网卡来源段透明接管 |
 
 内核版本由 `pdg update` 随 PrivDNS Gateway 发布版指定并逐字节校验（SHA256）后安装。
 
-**配置写入统一走事务。** 出口、分流、规则集、DNS 上游、防火墙、TFO、证书、WLOC 开关、备份恢复
-等所有会改动生产配置的操作，都在一笔配置事务里完成：候选先校验，再原子落盘，然后按目标状态
-拉起/停掉服务并观察健康门，任一步失败整体回滚；进程被杀也能用 `sudo pdg tx recover <id>` 收尾，
-`sudo pdg doctor` 会点名未完成的事务。两处**受控例外**：
+**配置事务有明确边界。** 已接入统一配置事务入口的 Bot / `pdg` 变更，会先校验候选，
+再原子落盘、按目标状态调整服务并观察健康门；这些事务管理的路径在失败时执行回滚，
+进程被杀后可用 `sudo pdg tx recover <id>` 收尾，`sudo pdg doctor` 会点名未完成的事务。
+这项保证不覆盖手工改文件、独立维护脚本或 `external` 模式下的主机 input policy /
+公网暴露控制。非事务路径应先留快照，并用 `sudo pdg doctor`、`sudo pdg report` 与对应的
+人工恢复步骤确认和修复状态。两个采用专门一致性机制的例子：
 
 - **WLOC 切地点 / 改坐标**：只改一个文件（`mitm.json`）、一次原子替换、不动任何服务
   （pdg-mitm 在下一次 WLOC 请求开始时读当前配置），没有多组件半成功的可能，因此走快路径以保证
@@ -174,17 +313,32 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 - **观测面板前端资源（zashboard）**：固定版本 + SHA256 校验 + 暂存目录 + 原子替换，属于静态
   缓存资源，不是 DNS/分流生产配置，因此不纳入配置事务。
 
-## 12. 文档
+## 12. 部署与整机编排边界
+
+本仓库负责网关应用本身，提供可重复调用的标准部署入口：非交互 `install.sh`、`pdg update`、
+显式迁移、快照/回滚、状态和 doctor。安装器与迁移脚本对自有配置采用 ownership marker、
+候选校验、原子替换和幂等迁移，便于上层自动化复用。
+
+SSH 加固、系统通用防火墙、其他应用、机器清单和跨主机发布等整机编排属于
+`vps-toolkit`。上层编排应调用本仓库接口，不应把私有机器信息或一份平行的 MosDNS /
+Mihomo / nft 模板复制进本仓库；使用 `PDG_FIREWALL_MODE=external` 时，上层还必须明确
+承担主机 input policy 与公网暴露控制。Web 管理面需要直连时，上层还应读取其实际配置，
+按所选端口和可信 CIDR 声明 service interface；直连入口要求
+`PDG_FIREWALL_MODE=external`，仓库不会假定或硬编码一个公网管理端口。`managed` 模式的
+默认支持路径是 loopback + SSH 隧道。
+
+## 13. 文档
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — 新手图文教程
 - [docs/INSTALL.md](docs/INSTALL.md) — 安装细节 / DNS 配置 / 端口 / 版本说明
+- [docs/MOSDNS-PATCHED-BUILD.md](docs/MOSDNS-PATCHED-BUILD.md) — MosDNS 修补版 provenance / 可复现构建 / KFC 部署
 - [docs/TROUBLESHOOTING-PLAYBOOK.md](docs/TROUBLESHOOTING-PLAYBOOK.md) — 排障手册（症状 → 排查 → 修复）
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与已知问题
 - [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — iOS 位置改写（WLOC）设计与原理
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
-## 13. 免责声明与 License
+## 14. 免责声明与 License
 
 本项目仅供学习与合法网络管理用途。请遵守你所在地的法律法规，使用者自行承担责任，作者不对使用后果负责。
 

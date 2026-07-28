@@ -1,0 +1,22 @@
+{
+  "name": "PDG 控制台",
+  "short_name": "PDG",
+  "description": "PrivDNS Gateway 原生管理控制台",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#071117",
+  "theme_color": "#0b1720",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

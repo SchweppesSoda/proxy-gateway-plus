@@ -34,6 +34,36 @@ from txbox import Box, load_tx  # noqa: E402
 MODEL = json.dumps({"outbounds": [{"type": "direct", "tag": "direct"}],
                     "route": {"rules": []}, "inbounds": []}).encode()
 
+PROFILE_SENTINEL_TLS_PORTS = [443, 10443]
+PROFILE_FIXTURE = (
+    "PDG_PLATFORM=android\n"
+    "PDG_QUIC_MODE=tproxy\n"
+    "PDG_HIJACK_TLS_TCP_PORTS=443,10443\n"
+    "PDG_HIJACK_HTTP_TCP_PORTS=80\n"
+    "PDG_QUIC_MARK=0x504447\n"
+    "PDG_QUIC_MARK_MASK=0xffffffff\n"
+    "PDG_QUIC_ROUTE_TABLE=7895\n"
+    "PDG_QUIC_RULE_PRIORITY=17895\n"
+).encode()
+
+
+def _isolate_bot_runtime(bot, box):
+    """Keep Bot-derived config reads inside the transaction sandbox."""
+    profile = box.put(
+        "/etc/privdns-gateway/profile.env", PROFILE_FIXTURE, 0o600
+    )
+    box.put("/etc/privdns-gateway/backend", b"mihomo\n", 0o644)
+    box.put("/etc/privdns-gateway/platform", b"android\n", 0o644)
+    bot.PROFILE_ENV = profile
+    bot.BACKEND_MARKER = box.path("/etc/privdns-gateway/backend")
+    # _platform currently has no path constant, so replace that read seam directly.
+    bot._platform = lambda: "android"
+    assert Path(bot.PROFILE_ENV).resolve() == Path(profile).resolve()
+    assert (
+        bot._mihomo_dataplane_args()["tls_ports"]
+        == PROFILE_SENTINEL_TLS_PORTS
+    ), "Bot resolver escaped the sandbox profile"
+
 
 def main():
     # ── 1. 状态机(用一次性沙箱: 这里会故意把事务停在 APPLYING, 那是"待恢复"状态,
@@ -313,18 +343,24 @@ def main():
     b.SB = box8.path("/etc/sing-box/config.json")
     b.MIHOMO_CFG = box8.path("/etc/mihomo/config.yaml")
     b.LOCKFILE = box8.env["PDG_LOCKFILE"]
+    _isolate_bot_runtime(b, box8)
     os.makedirs(b.RS_DIR, exist_ok=True)
-    box8.put("/etc/sing-box/config.json", MODEL)
+    ruleset_model = json.dumps(
+        {"outbounds": [{"type": "direct", "tag": "jp"}],
+         "route": {"rules": []}, "inbounds": []}
+    ).encode()
+    box8.put("/etc/sing-box/config.json", ruleset_model)
     good_old, bad_old = b"OLD-GOOD\n", b"OLD-BAD\n"
     box8.put("/etc/sing-box/rs/rs_good.json", good_old, 0o644)
     box8.put("/etc/sing-box/rs/rs_bad.json", bad_old, 0o644)
-    meta = {"rs_good": {"url": "https://x/good.list", "outbound": "direct", "format": "source",
+    meta = {"rs_good": {"url": "https://x/good.list", "outbound": "jp", "format": "source",
                         "path": b.RS_DIR + "/rs_good.json", "label": "好源"},
-            "rs_bad": {"url": "https://x/bad.list", "outbound": "direct", "format": "source",
+            "rs_bad": {"url": "https://x/bad.list", "outbound": "jp", "format": "source",
                        "path": b.RS_DIR + "/rs_bad.json", "label": "坏源"}}
     box8.put("/opt/pdg-bot/rulesets.json", json.dumps(meta).encode(), 0o644)
 
-    def _build(url, path):
+    def _build(url, path, *, phone_direct=False):
+        assert phone_direct is False, "normal provider unexpectedly used phone-direct parser"
         if "bad" in url:
             raise ValueError("下载失败")
         with open(path, "wb") as f:
@@ -356,8 +392,9 @@ def main():
                       ("MIHOMO_CFG", box9.path("/etc/mihomo/config.yaml")),
                       ("LOCKFILE", box9.env["PDG_LOCKFILE"])):
         setattr(b2, attr, val)
+    _isolate_bot_runtime(b2, box9)
     os.makedirs(b2.RS_DIR, exist_ok=True)
-    box9.put("/etc/sing-box/config.json", MODEL)
+    box9.put("/etc/sing-box/config.json", ruleset_model)
     box9.put("/etc/sing-box/rs/rs_good.json", good_old, 0o644)
     meta2 = {"rs_good": dict(meta["rs_good"], path=b2.RS_DIR + "/rs_good.json")}
     box9.put("/opt/pdg-bot/rulesets.json", json.dumps(meta2).encode(), 0o644)
@@ -376,7 +413,9 @@ def main():
     # 零成功 → 不提交空事务
     _txr = box9.env["PDG_TX_ROOT"]
     before = len(os.listdir(_txr)) if os.path.isdir(_txr) else 0
-    b2._build_source = lambda url, path: (_ for _ in ()).throw(ValueError("全挂"))
+    b2._build_source = lambda url, path, *, phone_direct=False: (
+        (_ for _ in ()).throw(ValueError("全挂"))
+    )
     n, failed = b2.refresh_rulesets()
     after = len(os.listdir(_txr)) if os.path.isdir(_txr) else 0
     if n == 0 and after == before:

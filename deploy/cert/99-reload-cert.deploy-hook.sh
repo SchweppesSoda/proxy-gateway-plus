@@ -3,6 +3,18 @@
 # 续期/签发后把证书拷到 mosdns(853 DoT) 读取的位置并重载 mosdns。
 # 选哪张证书: 优先 certbot 注入的 RENEWED_LINEAGE; 否则 /opt/pdg-bot/dot-domain 指定的活动域名; 再否则最近的 live。
 set -e
+
+# Web 服务直接在进程启动时加载 TLS 证书；续期后若它已配置且正在运行，必须重启才能拿到
+# 新证书。未配置/未启用是正常默认态，不启动它，也不改变 enable 状态。
+_pdg_web_tls_reload(){
+    [[ -f /etc/privdns-gateway/web.json && ! -L /etc/privdns-gateway/web.json ]] || return 0
+    systemctl is-active --quiet pdg-web 2>/dev/null || return 0
+    systemctl restart pdg-web
+    systemctl is-active --quiet pdg-web \
+        || { echo "[x] 新证书已部署，但 pdg-web 未能重启加载它" >&2; return 1; }
+    echo "pdg-web 已重启并加载续期后的 TLS 证书"
+}
+
 # 活动 DoT 域名优先 (/opt/pdg-bot/dot-domain): 多域名时, 即便续期的是另一张证书,
 # 也只把"当前生效域名"的证书部署给 mosdns, 否则旧域名续期会把活动证书覆盖掉 → DoT 不匹配。
 DOMAIN_FILE=/opt/pdg-bot/dot-domain
@@ -50,6 +62,7 @@ if [[ -n "$TX" ]]; then
         echo "[x] 登记服务动作失败(事务 $ID): 未改动生产证书。" >&2; exit 1
     fi
     if python3 "$TX" apply --tx "$ID" >/dev/null; then
+        _pdg_web_tls_reload
         echo "新证书已部署并重载 mosdns (事务 $ID)"
         exit 0
     fi
@@ -64,8 +77,10 @@ echo "[!] legacy 路径: 本机没有事务核心(pdgtx.py), 直接部署证书(
 mkdir -p "$CERT_DIR"
 cp "$LIVE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
 cp "$LIVE_DIR/privkey.pem"   "$CERT_DIR/privkey.pem"
+chown root:root "$CERT_DIR/fullchain.pem" "$CERT_DIR/privkey.pem"
 chmod 644 "$CERT_DIR/fullchain.pem"
 chmod 600 "$CERT_DIR/privkey.pem"
 
 systemctl is-active --quiet mosdns && systemctl restart mosdns
+_pdg_web_tls_reload
 exit 0

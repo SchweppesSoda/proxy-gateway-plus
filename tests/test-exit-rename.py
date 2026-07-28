@@ -51,6 +51,7 @@ bot.apply_sb = lambda mod: fake_tx("apply_sb", model_mod=mod)
 
 meta = {"rs_11111111": {"url": "http://example.com/x.list", "outbound": "hk", "label": "币安"}}
 bot._rs_meta = lambda: copy.deepcopy(meta)
+bot._rs_meta_snapshot = lambda: (copy.deepcopy(meta), "test-meta-sha256")
 def fake_save(m):
     meta.clear(); meta.update(m)
 bot._save_rs_meta = fake_save

@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1720">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-src 'none'">
+  <title>PDG 控制台</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-a" aria-hidden="true"></div>
+  <div class="ambient ambient-b" aria-hidden="true"></div>
+
+  <main id="login-view" class="login-shell">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="brand-mark" aria-hidden="true">P</div>
+      <p class="eyebrow">PRIVDNS GATEWAY</p>
+      <h1 id="login-title">登录 PDG 控制台</h1>
+      <p class="muted">管理出口、分流和网关运行状态。密码只会发送到当前网关。</p>
+      <form id="login-form" autocomplete="off">
+        <label for="login-password">管理密码</label>
+        <div class="field-with-action">
+          <input id="login-password" name="password" type="password" required minlength="12"
+                 autocomplete="current-password" autocapitalize="none" spellcheck="false">
+          <button id="toggle-password" class="field-action" type="button"
+                  aria-label="显示密码" aria-pressed="false">显示</button>
+        </div>
+        <button id="login-submit" class="button primary wide" type="submit" disabled>正在建立安全会话…</button>
+      </form>
+      <p id="login-message" class="form-message" role="alert"></p>
+      <p class="security-note">会话使用 HttpOnly Cookie；配置变更同时校验 CSRF 令牌。</p>
+    </section>
+  </main>
+
+  <div id="app-view" class="app-shell" hidden>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark small" aria-hidden="true">P</div>
+        <div>
+          <p class="eyebrow">PRIVDNS GATEWAY</p>
+          <p class="brand-title">PDG 控制台</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span id="session-state" class="session-state" title="会话状态">已连接</span>
+        <button id="refresh-button" class="icon-button" type="button" aria-label="刷新当前页面" title="刷新">↻</button>
+        <button id="logout-button" class="button ghost compact" type="button">退出</button>
+      </div>
+    </header>
+
+    <nav class="tab-bar" aria-label="主要功能" role="tablist">
+      <button id="tab-overview" class="tab active" type="button" role="tab"
+              aria-selected="true" aria-controls="panel-overview" data-tab="overview">
+        <span aria-hidden="true">◫</span><span>总览</span>
+      </button>
+      <button id="tab-exits" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-exits" tabindex="-1" data-tab="exits">
+        <span aria-hidden="true">⇥</span><span>出口</span>
+      </button>
+      <button id="tab-rules" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-rules" tabindex="-1" data-tab="rules">
+        <span aria-hidden="true">≡</span><span>分流</span>
+      </button>
+      <button id="tab-dns" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-dns" tabindex="-1" data-tab="dns">
+        <span aria-hidden="true">◎</span><span>DNS</span>
+      </button>
+      <button id="tab-runtime" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-runtime" tabindex="-1" data-tab="runtime">
+        <span aria-hidden="true">⌁</span><span>实时</span>
+      </button>
+      <button id="tab-ops" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-ops" tabindex="-1" data-tab="ops">
+        <span aria-hidden="true">⌘</span><span>运维</span>
+      </button>
+    </nav>
+
+    <main class="content">
+      <section id="panel-overview" class="panel" role="tabpanel" aria-labelledby="tab-overview">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow">GATEWAY HEALTH</p>
+            <h1>网关总览</h1>
+          </div>
+          <span id="overview-version" class="chip">版本读取中</span>
+        </div>
+        <div id="overview-cards" class="metric-grid" aria-live="polite">
+          <article class="metric-card skeleton-card"><span></span><span></span></article>
+          <article class="metric-card skeleton-card"><span></span><span></span></article>
+          <article class="metric-card skeleton-card"><span></span><span></span></article>
+          <article class="metric-card skeleton-card"><span></span><span></span></article>
+        </div>
+        <div class="two-column">
+          <section class="surface">
+            <div class="section-heading">
+              <div><p class="eyebrow">SERVICES</p><h2>服务状态</h2></div>
+              <span id="overview-health" class="status-pill neutral">检查中</span>
+            </div>
+            <div id="service-list" class="status-list" aria-live="polite"></div>
+          </section>
+          <section class="surface">
+            <div class="section-heading">
+              <div><p class="eyebrow">DOCTOR</p><h2>自检摘要</h2></div>
+            </div>
+            <div id="doctor-summary" class="prose muted">正在获取自检结果…</div>
+          </section>
+        </div>
+      </section>
+
+      <section id="panel-exits" class="panel" role="tabpanel" aria-labelledby="tab-exits" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">EGRESS</p><h1>出口管理</h1></div>
+          <span id="exit-count" class="chip">0 个出口</span>
+        </div>
+
+        <section class="surface accent-surface">
+          <div class="section-heading">
+            <div><p class="eyebrow">NEW EXIT</p><h2>添加出口</h2></div>
+          </div>
+          <form id="exit-form" autocomplete="off">
+            <label for="exit-link">节点链接</label>
+            <textarea id="exit-link" name="link" rows="3" required
+                      autocomplete="off" autocapitalize="none" spellcheck="false"
+                      placeholder="粘贴节点链接，提交后会立即从页面清除"></textarea>
+            <div class="form-row end">
+              <p class="field-help">支持的协议由服务器校验。页面不会回显或记录原始链接。</p>
+              <button class="button primary" type="submit">安全添加</button>
+            </div>
+          </form>
+        </section>
+
+        <div class="two-column wide-left">
+          <section class="surface">
+            <div class="section-heading">
+              <div><p class="eyebrow">EXITS</p><h2>出口列表</h2></div>
+            </div>
+            <div id="exit-list" class="card-list" aria-live="polite"></div>
+          </section>
+          <div class="stack">
+            <section class="surface">
+              <div class="section-heading"><div><p class="eyebrow">DEFAULT</p><h2>默认出口</h2></div></div>
+              <form id="default-exit-form">
+                <label for="default-exit">其余国际流量</label>
+                <select id="default-exit" name="tag" required></select>
+                <p class="field-help">内建 direct 表示流量先到 VPS，再由 VPS 本机直出；手机本地直连请在“分流”中设置。</p>
+                <button class="button secondary wide" type="submit">保存默认出口</button>
+              </form>
+            </section>
+            <section class="surface">
+              <div class="section-heading">
+                <div><p class="eyebrow">ORDER</p><h2>出口顺序</h2></div>
+                <button id="save-order" class="button ghost compact" type="button" disabled>保存</button>
+              </div>
+              <ol id="exit-order" class="order-list" aria-label="出口顺序"></ol>
+            </section>
+          </div>
+        </div>
+
+        <section class="surface">
+          <div class="section-heading"><div><p class="eyebrow">FAILOVER</p><h2>故障切换组</h2></div></div>
+          <form id="group-form" class="inline-form">
+            <div>
+              <label for="group-name">组名</label>
+              <input id="group-name" name="name" required maxlength="40" pattern="[A-Za-z0-9_.-]+"
+                     autocapitalize="none" spellcheck="false" placeholder="例如 main">
+            </div>
+            <div class="grow">
+              <label for="group-members">成员</label>
+              <input id="group-members" name="members" required
+                     autocapitalize="none" spellcheck="false" placeholder="出口名，用空格分隔">
+            </div>
+            <button class="button secondary" type="submit">新建组</button>
+          </form>
+          <div id="group-list" class="card-list compact-list" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <section id="panel-rules" class="panel" role="tabpanel" aria-labelledby="tab-rules" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">ROUTING</p><h1>分流管理</h1></div>
+          <span id="rule-count" class="chip">0 条规则</span>
+        </div>
+        <div class="two-column">
+          <section class="surface">
+            <div class="section-heading"><div><p class="eyebrow">DOMAIN RULE</p><h2>添加域名规则</h2></div></div>
+            <form id="rule-form" class="inline-form">
+              <div class="grow">
+                <label for="rule-domain">域名</label>
+                <input id="rule-domain" name="domain" type="text" required
+                       autocapitalize="none" spellcheck="false" placeholder="example.com">
+              </div>
+              <div>
+                <label for="rule-target">目标</label>
+                <select id="rule-target" name="target" required></select>
+              </div>
+              <button class="button primary" type="submit">添加规则</button>
+            </form>
+            <p class="field-help">选择“手机直连”时，DNS 返回真实地址，流量不会经过 VPS。</p>
+          </section>
+          <section class="surface">
+            <div class="section-heading"><div><p class="eyebrow">RULESET</p><h2>添加规则集</h2></div></div>
+            <form id="ruleset-form">
+              <label for="ruleset-url">规则集 URL</label>
+              <input id="ruleset-url" name="url" type="url" required
+                     autocapitalize="none" spellcheck="false" placeholder="https://…">
+              <div class="inline-form">
+                <div class="grow">
+                  <label for="ruleset-label">显示名称（可选）</label>
+                  <input id="ruleset-label" name="label" maxlength="40" placeholder="例如 OpenAI">
+                </div>
+                <div>
+                  <label for="ruleset-target">目标</label>
+                  <select id="ruleset-target" name="target" required></select>
+                </div>
+                <div>
+                  <label for="ruleset-behavior">类型</label>
+                  <select id="ruleset-behavior" name="behavior">
+                    <option value="">自动识别</option>
+                    <option value="domain">域名</option>
+                    <option value="ipcidr">IP CIDR</option>
+                    <option value="classical">经典规则</option>
+                  </select>
+                </div>
+                <button class="button secondary" type="submit">添加</button>
+              </div>
+              <p class="field-help">规则集可选“手机直连”：匹配域名由 MosDNS 返回真实地址，手机不会把连接送到 VPS。</p>
+            </form>
+          </section>
+        </div>
+        <section class="surface">
+          <div class="section-heading"><div><p class="eyebrow">RULES</p><h2>域名规则</h2></div></div>
+          <div id="rule-list" class="table-list" aria-live="polite"></div>
+        </section>
+        <section class="surface">
+          <div class="section-heading"><div><p class="eyebrow">RULESETS</p><h2>规则集</h2></div></div>
+          <div id="ruleset-list" class="table-list" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <section id="panel-dns" class="panel" role="tabpanel" aria-labelledby="tab-dns" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">RESOLVERS</p><h1>DNS 上游</h1></div>
+        </div>
+        <div class="two-column">
+          <section class="surface">
+            <div class="section-heading">
+              <div><p class="eyebrow">REMOTE</p><h2>国际解析</h2></div>
+              <span class="status-dot good" aria-label="代理域名使用"></span>
+            </div>
+            <div class="dns-current-block">
+              <p class="dns-current-label">当前配置（只读安全摘要）</p>
+              <div id="dns-current-remote" class="dns-current-list" role="list" aria-live="polite"></div>
+              <p class="field-help">展示值可能省略路径、查询参数或凭据，不能直接用于覆盖配置。</p>
+            </div>
+            <form id="dns-remote-form" class="dns-replace-form" autocomplete="off">
+              <label for="dns-remote">替换为完整地址，每行一个</label>
+              <textarea id="dns-remote" name="addresses" rows="7" required
+                        autocomplete="off" autocapitalize="none" spellcheck="false"
+                        placeholder="留空表示不修改；请手动输入完整地址"></textarea>
+              <p class="field-help">替换框不会由当前摘要自动填充；提交后输入内容立即从页面清除。</p>
+              <button class="button primary wide" type="submit">替换国际上游</button>
+            </form>
+          </section>
+          <section class="surface">
+            <div class="section-heading">
+              <div><p class="eyebrow">LOCAL</p><h2>国内解析</h2></div>
+              <span class="status-dot info" aria-label="直连域名使用"></span>
+            </div>
+            <div class="dns-current-block">
+              <p class="dns-current-label">当前配置（只读安全摘要）</p>
+              <div id="dns-current-local" class="dns-current-list" role="list" aria-live="polite"></div>
+              <p class="field-help">展示值可能省略路径、查询参数或凭据，不能直接用于覆盖配置。</p>
+            </div>
+            <form id="dns-local-form" class="dns-replace-form" autocomplete="off">
+              <label for="dns-local">替换为完整地址，每行一个</label>
+              <textarea id="dns-local" name="addresses" rows="7" required
+                        autocomplete="off" autocapitalize="none" spellcheck="false"
+                        placeholder="留空表示不修改；请手动输入完整地址"></textarea>
+              <p class="field-help">替换框不会由当前摘要自动填充；提交后输入内容立即从页面清除。</p>
+              <button class="button secondary wide" type="submit">替换国内上游</button>
+            </form>
+          </section>
+        </div>
+        <section class="surface explainer">
+          <div>
+            <p class="eyebrow">DIRECT FIRST</p>
+            <h2>直连例外不在这里添加</h2>
+          </div>
+          <p>要让某个境内或特殊端口网站不经过 VPS，请到“分流”新增域名并选择“手机直连”。这会同时更新 DNS 直连表和冲突的劫持规则。</p>
+          <button class="button ghost" type="button" data-go-tab="rules">前往分流</button>
+        </section>
+      </section>
+
+      <section id="panel-runtime" class="panel" role="tabpanel" aria-labelledby="tab-runtime" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">LIVE VIEW</p><h1>实时状态</h1></div>
+          <div class="toolbar">
+            <label class="compact-label" for="log-lines">日志行数</label>
+            <select id="log-lines">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+            </select>
+            <button id="runtime-refresh" class="button secondary compact" type="button">刷新</button>
+          </div>
+        </div>
+        <div class="runtime-grid">
+          <section class="surface">
+            <div class="section-heading"><div><p class="eyebrow">RUNTIME</p><h2>运行摘要</h2></div></div>
+            <div id="runtime-summary" class="kv-list" aria-live="polite"></div>
+          </section>
+          <section class="surface">
+            <div class="section-heading"><div><p class="eyebrow">TRAFFIC</p><h2>流量</h2></div></div>
+            <div id="traffic-summary" class="kv-list" aria-live="polite"></div>
+          </section>
+          <section class="surface logs-surface">
+            <div class="section-heading">
+              <div><p class="eyebrow">SAFE LOGS</p><h2>运行日志</h2></div>
+              <span class="chip subtle">敏感内容已遮盖</span>
+            </div>
+            <pre id="runtime-logs" class="logs" tabindex="0" aria-label="运行日志">等待加载…</pre>
+          </section>
+        </div>
+        <p class="field-help">此页只展示服务器返回的安全摘要，与临时 Zashboard 观测面板相互独立；持久配置仍在本控制台完成。</p>
+      </section>
+
+      <section id="panel-ops" class="panel" role="tabpanel" aria-labelledby="tab-ops" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">OPERATIONS</p><h1>运维操作</h1></div>
+        </div>
+        <div class="two-column">
+          <section class="surface">
+            <div class="section-heading"><div><p class="eyebrow">SETTINGS</p><h2>运行设置</h2></div></div>
+            <div id="settings-summary" class="kv-list"></div>
+            <form id="tfo-form" class="toggle-row">
+              <div>
+                <label for="tfo-enabled">TCP Fast Open</label>
+                <p class="field-help">降低支持端的 TCP 握手延迟，不支持时自动回落。</p>
+              </div>
+              <label class="switch">
+                <input id="tfo-enabled" name="enabled" type="checkbox">
+                <span aria-hidden="true"></span>
+              </label>
+              <button class="button secondary compact" type="submit">应用</button>
+            </form>
+          </section>
+          <section class="surface">
+            <div class="section-heading"><div><p class="eyebrow">MAINTENANCE</p><h2>日常维护</h2></div></div>
+            <div class="action-list">
+              <button class="action-button" type="button" data-operation="restart">
+                <span><b>重启网关服务</b><small>重载 Mihomo 与 MosDNS</small></span><span aria-hidden="true">›</span>
+              </button>
+              <button class="action-button" type="button" data-operation="rules-update">
+                <span><b>更新规则库</b><small>刷新 geosite 和已订阅规则集</small></span><span aria-hidden="true">›</span>
+              </button>
+              <button class="action-button" type="button" data-operation="snapshot">
+                <span><b>创建本机快照</b><small>为维护操作保留恢复点</small></span><span aria-hidden="true">›</span>
+              </button>
+            </div>
+          </section>
+        </div>
+        <div class="two-column">
+          <section class="surface danger-zone">
+            <div class="section-heading"><div><p class="eyebrow">ROLLBACK</p><h2>回滚快照</h2></div></div>
+            <form id="rollback-form" class="inline-form">
+              <div class="grow">
+                <label for="rollback-index">快照序号</label>
+                <input id="rollback-index" name="index" type="number" min="0" step="1" value="0" required>
+                <p class="field-help">0 代表最近一次。回滚会覆盖当前受管配置。</p>
+              </div>
+              <button class="button danger" type="submit">确认回滚</button>
+            </form>
+          </section>
+          <section class="surface upgrade-zone">
+            <div class="section-heading"><div><p class="eyebrow">SOFTWARE</p><h2>软件升级</h2></div></div>
+            <p class="muted">升级到最新发布版本。服务可能短暂中断；服务器会在升级前创建快照并执行健康门检查。</p>
+            <button id="software-update" class="button warning wide" type="button">检查并开始升级</button>
+          </section>
+        </div>
+        <div id="operation-result" class="operation-result" aria-live="polite"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <p class="eyebrow">PLEASE CONFIRM</p>
+      <h2 id="confirm-title">确认操作</h2>
+      <p id="confirm-message" class="muted"></p>
+      <div class="dialog-actions">
+        <button id="confirm-cancel" class="button ghost" value="cancel">取消</button>
+        <button id="confirm-accept" class="button danger" value="confirm">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript>
+    <div class="noscript">PDG 控制台需要启用 JavaScript。</div>
+  </noscript>
+</body>
+</html>

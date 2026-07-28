@@ -30,6 +30,37 @@ def bad(m):
     print("[FAIL] %s" % m); fail_n += 1
 
 
+PROFILE_SENTINEL_TLS_PORTS = [443, 10443]
+PROFILE_FIXTURE = (
+    "PDG_PLATFORM=android\n"
+    "PDG_QUIC_MODE=tproxy\n"
+    "PDG_HIJACK_TLS_TCP_PORTS=443,10443\n"
+    "PDG_HIJACK_HTTP_TCP_PORTS=80\n"
+    "PDG_QUIC_MARK=0x504447\n"
+    "PDG_QUIC_MARK_MASK=0xffffffff\n"
+    "PDG_QUIC_ROUTE_TABLE=7895\n"
+    "PDG_QUIC_RULE_PRIORITY=17895\n"
+).encode()
+
+
+def _isolate_bot_runtime(bot, box):
+    """Keep Bot-derived config reads inside the transaction sandbox."""
+    profile = box.put(
+        "/etc/privdns-gateway/profile.env", PROFILE_FIXTURE, 0o600
+    )
+    box.put("/etc/privdns-gateway/backend", b"mihomo\n", 0o644)
+    box.put("/etc/privdns-gateway/platform", b"android\n", 0o644)
+    bot.PROFILE_ENV = profile
+    bot.BACKEND_MARKER = box.path("/etc/privdns-gateway/backend")
+    # _platform currently has no path constant, so replace that read seam directly.
+    bot._platform = lambda: "android"
+    assert Path(bot.PROFILE_ENV).resolve() == Path(profile).resolve()
+    assert (
+        bot._mihomo_dataplane_args()["tls_ports"]
+        == PROFILE_SENTINEL_TLS_PORTS
+    ), "Bot resolver escaped the sandbox profile"
+
+
 def _unwritable_lock_path(tmp):
     """造一个"锁文件绝对打不开"的路径: 只读目录下的文件。"""
     d = os.path.join(tmp, "ro")
@@ -306,7 +337,44 @@ def main():
     src = src.replace("/opt/pdg-bot/pdgtx.py", os.path.join(hookdir, "nonexistent.py"))
     with open(hook, "w") as f:
         f.write(src)
+    cert_fullchain = os.path.join(certdir, "fullchain.pem")
+    cert_privkey = os.path.join(certdir, "privkey.pem")
+    chown_log = os.path.join(hookdir, "chown.log")
+    chown_stub = os.path.join(binp, "chown")
+    with open(chown_stub, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "[ \"$#\" -eq 3 ] || exit 91\n"
+            "[ \"$1\" = \"root:root\" ] || exit 92\n"
+            "[ \"$2\" = \"$PDG_TEST_CERT_FULLCHAIN\" ] || exit 93\n"
+            "[ \"$3\" = \"$PDG_TEST_CERT_PRIVKEY\" ] || exit 94\n"
+            "printf '%s\\t%s\\t%s\\n' \"$1\" \"$2\" \"$3\""
+            " >> \"$PDG_TEST_CHOWN_LOG\"\n"
+        )
+    os.chmod(chown_stub, 0o755)
+    systemctl_log = os.path.join(hookdir, "systemctl.log")
+    systemctl_stub = os.path.join(binp, "systemctl")
+    with open(systemctl_stub, "w") as f:
+        f.write(
+            "#!/bin/sh\n"
+            "set -eu\n"
+            "printf '%s\\t%s\\t%s\\n' \"${1-}\" \"${2-}\" \"${3-}\""
+            " >> \"$PDG_TEST_SYSTEMCTL_LOG\"\n"
+            "if [ \"$#\" -eq 3 ]"
+            " && [ \"$1\" = \"is-active\" ]"
+            " && [ \"$2\" = \"--quiet\" ]"
+            " && [ \"$3\" = \"mosdns\" ]; then\n"
+            "  exit 1\n"
+            "fi\n"
+            "exit 95\n"
+        )
+    os.chmod(systemctl_stub, 0o755)
     env = dict(os.environ, PDG_CERT_DIR=certdir, RENEWED_LINEAGE=live,
+               PDG_TEST_CERT_FULLCHAIN=cert_fullchain,
+               PDG_TEST_CERT_PRIVKEY=cert_privkey,
+               PDG_TEST_CHOWN_LOG=chown_log,
+               PDG_TEST_SYSTEMCTL_LOG=systemctl_log,
                PATH=binp + os.pathsep + os.environ["PATH"])
     r = subprocess.run(["bash", hook], capture_output=True, text=True, env=env)
     same = (open(os.path.join(certdir, "fullchain.pem"), "rb").read() == OLD_CHAIN
@@ -343,11 +411,38 @@ def main():
     with open(hook2, "w") as f:
         f.write(src2)
     r = subprocess.run(["bash", hook2], capture_output=True, text=True, env=env)
-    if r.returncode == 0 and open(os.path.join(certdir, "fullchain.pem"), "rb").read() == b"NEW-CHAIN\n" \
-            and "legacy" in (r.stdout + r.stderr):
-        ok("hook: 只有事务核心完全不存在时才走 legacy 直接部署, 且明确标注")
+    copied = (
+        open(cert_fullchain, "rb").read() == b"NEW-CHAIN\n"
+        and open(cert_privkey, "rb").read() == b"NEW-KEY\n"
+    )
+    if r.returncode == 0 and copied:
+        ok("hook: legacy 直接部署复制了完整证书与私钥")
     else:
-        bad("legacy 分支不对: rc=%s %s" % (r.returncode, (r.stdout + r.stderr)[:100]))
+        bad("legacy 复制分支不对: rc=%s %s" % (
+            r.returncode, (r.stdout + r.stderr)[:100]))
+    if "legacy" in (r.stdout + r.stderr):
+        ok("hook: 只有事务核心完全不存在时才明确标注 legacy")
+    else:
+        bad("legacy 分支未明确标注: %s" % (r.stdout + r.stderr)[:100])
+    expected_chown = "root:root\t%s\t%s\n" % (
+        cert_fullchain, cert_privkey)
+    got_chown = (
+        Path(chown_log).read_text(encoding="utf-8")
+        if os.path.exists(chown_log) else ""
+    )
+    if got_chown == expected_chown:
+        ok("hook: legacy 路径精确请求 root:root 所有权（仅两个证书目标）")
+    else:
+        bad("legacy chown 意图不精确: %r" % got_chown)
+    expected_systemctl = "is-active\t--quiet\tmosdns\n"
+    got_systemctl = (
+        Path(systemctl_log).read_text(encoding="utf-8")
+        if os.path.exists(systemctl_log) else ""
+    )
+    if got_systemctl == expected_systemctl:
+        ok("hook: legacy 只查询沙箱 mosdns 状态，未调用 host restart/其他 systemctl")
+    else:
+        bad("legacy systemctl 调用不精确: %r" % got_systemctl)
     _sh.rmtree(hookdir, ignore_errors=True)
 
     # ── 10. 丢更新窗口(六): 前置条件必须对应"候选所依据的那一份" ──
@@ -528,8 +623,17 @@ def main():
     b3.MIHOMO_CFG = box8.path("/etc/mihomo/config.yaml")
     b3.LOCKFILE = box8.env["PDG_LOCKFILE"]
     b3.exit_tags = lambda c=None: ["hk"]
-    b3._build_source = lambda url, path: (open(path, "wb").write(
-        b'{"version": 1, "rules": [{"domain": ["added.example"]}]}') and (3, False) or (3, False))
+    _isolate_bot_runtime(b3, box8)
+
+    def _build_normal_provider(url, path, *, phone_direct=False):
+        assert phone_direct is False, "normal provider unexpectedly used phone-direct parser"
+        with open(path, "wb") as stream:
+            stream.write(
+                b'{"version": 1, "rules": [{"domain": ["added.example"]}]}'
+            )
+        return (3, False)
+
+    b3._build_source = _build_normal_provider
     b3._render_mihomo_bytes = lambda model, rs_meta=None: (
         json.dumps({"proxies": [], "rules": [], "rule-providers": rs_meta or {}}).encode(), {})
     bt3 = b3._pdgtx()

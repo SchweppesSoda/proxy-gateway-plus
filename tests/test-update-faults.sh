@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # Issue 2 回归: cmd_update 关键步骤失败必须**立即回滚 + 返回非0 + 不打印"✅ 已更新"**。
-# 覆盖故障注入: git reset 失败 / 必需文件安装失败 / __migrate 非0 / 内核更新失败 /
+# 覆盖故障注入: git reset 失败 / 必需文件安装失败 / __migrate 非0 / MosDNS/内核更新失败 /
 #              daemon-reload 失败; 以及正常路径仍走到"✅ 已更新"。
 # 沙箱化: 抽出 cmd_update, 打桩全部外部副作用(git/install/systemctl/内核/快照/回滚),
 #         用环境开关注入单点故障, 断言"是否调用了 cmd_rollback"与"是否谎报成功"。
@@ -10,11 +10,16 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+REAL_PYTHON="$(command -v python3 2>/dev/null || true)"
+export REAL_PYTHON
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 sed -n '/^cmd_update(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/upd.sh"
+# Redirect the one absolute lifecycle helper to a harness function; all other
+# external effects in this extracted-function test are already command stubs.
+sed -i 's#/usr/local/libexec/pdg-quic-routing[.]sh#_quic_helper#g' "$WORK/upd.sh"
 
 mkdir -p "$WORK/repo/.git"          # 让 [[ -d $REPO_DIR/.git ]] 为真, 跳过 clone
 
@@ -25,6 +30,7 @@ c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 sleep(){ :; }
 _pdg_platform(){ echo "${PLATFORM:-android}"; }
 _pdg_core(){ echo singbox; }
+_pdg_bot_cred(){ echo unset; }
 pdg_fetch_release_tags(){ return 0; }
 # 全桩 git: 只控制 reset 成败, 其余给出稳定输出
 git(){
@@ -43,7 +49,14 @@ install(){ local last="${*: -1}"; [[ -n "${FAIL_INSTALL:-}" && "$*" == *"${FAIL_
 # __migrate 经 `bash /usr/local/bin/pdg __migrate` 调用 → 拦 bash 函数
 bash(){ [[ "$*" == *__migrate* ]] && return "${MIGRATE_RC:-0}"; command bash "$@"; }
 _update_core_binary(){ [[ -n "${FAIL_CORE:-}" ]] && return 1; return 0; }
-systemctl(){ [[ "${1:-}" == daemon-reload && -n "${FAIL_RELOAD:-}" ]] && return 1; return 0; }
+_update_mosdns_binary(){ [[ -n "${FAIL_MOSDNS:-}" ]] && return 1; return 0; }
+_quic_helper(){ return 0; }
+systemctl(){
+  [[ "${1:-}" == is-enabled && "${2:-}" == pdg-web ]] && return 1
+  [[ "${1:-}" == is-active && "${2:-}" == pdg-web ]] && return 1
+  [[ "${1:-}" == daemon-reload && -n "${FAIL_RELOAD:-}" ]] && return 1
+  return 0
+}
 python3(){
   case "$*" in
     *py_compile*) return 0;;
@@ -59,6 +72,22 @@ python3(){
         notarr)  echo '{"level":"ok"}';;
       esac
       return 0;;
+    *"-c"*)
+      if [[ -n "${REAL_PYTHON:-}" ]]; then
+        command "$REAL_PYTHON" "$@"
+        return
+      fi
+      # Git Bash on Windows may have no `python3` in PATH. Keep this extracted
+      # function test portable by reproducing the parser's output contract;
+      # Linux CI still exercises the real Python parser above.
+      case "${DOCTOR_OUT:-ok}" in
+        ok)      printf '0\n@@WARN@@\n';;
+        warn)    printf '0\n@@WARN@@\n  ⚠️ 证书: 30天内到期\n';;
+        fail)    printf '1\n  ❌ 防火墙: 7893 对全网开放\n@@WARN@@\n';;
+        onlybot) printf '1\n  ❌ 服务: 未运行: pdg-bot\n@@WARN@@\n';;
+        *)       return 1;;
+      esac
+      ;;
     *) command python3 "$@";;
   esac
 }
@@ -95,6 +124,7 @@ assert_fail_rollback "必需文件(bot.py)安装失败" "FAIL_INSTALL=/opt/pdg-b
 assert_fail_rollback "必需文件(report.py)安装失败" "FAIL_INSTALL=report.py"
 assert_fail_rollback "必需文件(pdg 主脚本)安装失败" "FAIL_INSTALL=/usr/local/bin/pdg"
 assert_fail_rollback "__migrate 迁移非0"       "MIGRATE_RC=1"
+assert_fail_rollback "MosDNS 修补版更新失败"   "FAIL_MOSDNS=1"
 assert_fail_rollback "内核二进制更新失败"       "FAIL_CORE=1"
 assert_fail_rollback "daemon-reload 失败"      "FAIL_RELOAD=1"
 # ── doctor 校验门: 命令失败/输出不可信一律回滚, 绝不跳过后报成功 ──

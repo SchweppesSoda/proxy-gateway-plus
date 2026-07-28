@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """PrivDNS Gateway 只读检查库。doctor.py 跑全部, healthcheck.py 跑子集。
 每个 check() 返回 (level, label, detail), level ∈ 'ok'|'warn'|'fail'|'info'。只读, 不改任何东西。"""
-import os, re, json, ipaddress, subprocess, sys, urllib.request
+import os, re, json, ipaddress, socket, ssl, subprocess, sys, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nftscan  # noqa: E402  与迁移前置门共用的 input 链冲突判据(单一来源)
+import dot_session_probe  # noqa: E402  DoT TLS session 恢复动态探针
+try:
+    import pdgprofile  # noqa: E402  data-plane profile 单一解析源
+except Exception:  # noqa: BLE001
+    pdgprofile = None
 
 SB = "/etc/sing-box/config.json"
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
@@ -13,6 +18,9 @@ BACKEND_MARKER = "/etc/privdns-gateway/backend"
 MIHOMO_CFG = "/etc/mihomo/config.yaml"
 NFT_CONF = "/etc/nftables.conf"
 PLATFORM_FILE = "/etc/privdns-gateway/platform"
+PROFILE_ENV = "/etc/privdns-gateway/profile.env"
+FIREWALL_MODE_FILE = "/etc/privdns-gateway/firewall-mode"
+QUIC_HELPER = "/usr/local/libexec/pdg-quic-routing.sh"
 PLATFORM_GUESSED = PLATFORM_FILE + ".guessed"   # 存在 = 平台是推测出来的, 没人确认过
 REPO_DIR = "/opt/privdns-gateway"   # 已装仓库(比对部署文件是否与当前发布同版本)
 RS_META = "/opt/pdg-bot/rulesets.json"   # 规则集元数据(与 bot 同源)
@@ -188,7 +196,7 @@ def expected_services():
     未配 bot 凭据时 pdg-bot 不在必需集里 —— 它本来就不该启动。
     CLI/status/report/healthcheck 统一取此。"""
     svc = _core_svc()
-    names = ["mosdns", svc]
+    names = ["pdg-quic-routing", "mosdns", svc]
     if bot_credentials() == "ready":
         names.append("pdg-bot")
     if _platform() == "ios":
@@ -278,6 +286,20 @@ def platform_ports_text():
 
 
 def check_nft():
+    mode = ""
+    if pdgprofile is not None:
+        try:
+            mode = pdgprofile.read_values(PROFILE_ENV, missing_ok=False).get(
+                "PDG_FIREWALL_MODE", "")
+        except Exception:  # noqa: BLE001
+            pass
+    if mode == "external":
+        rc, table, _ = _run(["nft", "list", "table", "inet", "pdg"])
+        if rc != 0:
+            return ("warn", "防火墙", "external 模式但读不到运行中的 table inet pdg")
+        if re.search(r"\bchain\s+input\s*\{", table):
+            return ("fail", "防火墙", "external 模式的 PDG 表不应创建 input chain")
+        return ("ok", "防火墙", "external 模式：PDG 未管理 input 暴露面")
     # 兼容两种表名: 新版独立表 inet pdg; 旧装(尚未迁移)仍是 inet filter。
     _, out, _ = _run(["nft", "list", "chain", "inet", "pdg", "input"])
     if not out:
@@ -347,6 +369,16 @@ def check_redirect():
     专门补的一项: 这条规则曾被 iOS GMS 清理迁移整行删掉, 而 doctor 一路全绿 —— 防火墙那项
     只查"敏感端口有没有对全网开放", 规则整条消失反而更"干净", 于是线上代理断了好几天没人发现。"""
     port = _mihomo_redir_port()
+    if pdgprofile is not None and os.path.exists(PROFILE_ENV):
+        try:
+            values, config, mode = _strict_dataplane_profile()
+            text = open(NFT_CONF, encoding="utf-8").read()
+            _validate_profile_nft(text, values, config, mode, "持久配置")
+            return ("ok", "代理入口",
+                    "profile TCP 端口 %s 已按内网来源 REDIRECT → mihomo :%d"
+                    % (",".join(map(str, config["tcp_ports"])), port))
+        except (OSError, ValueError, TypeError) as error:
+            return ("fail", "代理入口", "profile REDIRECT 核验失败: " + str(error))
 
     def _sources():
         """惰性: 先看本项目自己的链, 命中就不必再整份 dump ruleset; 最后退回 on-disk 配置。"""
@@ -409,6 +441,18 @@ def check_gms():
             return ("warn", "GMS 残留", "iOS 不应有 GMS 5228-5230, 检出于 " + "、".join(residue)
                     + "; 运行 sudo pdg __migrate 清理(自定义防火墙形态需手动移除)。")
         return None
+    if pdgprofile is not None and os.path.exists(PROFILE_ENV):
+        try:
+            _values, config, _mode = _strict_dataplane_profile()
+        except (OSError, ValueError, TypeError) as error:
+            return ("warn", "GMS 推送", "无法解析透明代理 profile: " + str(error))
+        missing = sorted({5228, 5229, 5230} - set(config["tls_ports"]))
+        if not missing:
+            return ("ok", "GMS 推送",
+                    "GMS/FCM 5228-5230 已由 profile TLS set REDIRECT→Mihomo 嗅探")
+        return ("warn", "GMS 推送",
+                "Android profile TLS 端口未含 " + ",".join(map(str, missing))
+                + "（若为有意自定义可忽略）")
     # mihomo(唯一内核): 5228-5230 由 nft prerouting REDIRECT 到 redir 端口 + sniffer 处理, 不在 input accept
     _, pre, _ = _run(["nft", "list", "chain", "inet", "pdg", "prerouting"])
     if not pre:
@@ -466,8 +510,6 @@ def check_mosdns_ratelimit():
         return _RL_WARN
     return ("ok", "限流", "单客户端 QPS 兜底已就位(rate_limiter qps200/burst400, reject 5, 缓存前)")
 
-PROFILE_ENV = "/etc/privdns-gateway/profile.env"
-
 def check_mem():
     """显示当前内存模式 + mosdns cache size(只读, 不写 profile)。始终 ok, 仅信息展示。"""
     mode = None
@@ -507,23 +549,83 @@ def check_core_config():
     return ("ok", "mihomo 配置", "check 通过") if rc == 0 \
         else ("fail", "mihomo 配置", "check 失败: " + (out + err)[-200:])
 
+def check_mosdns_build():
+    """Verify exact no-ticket flavor plus pinned hash/local build attestation."""
+    script = r'''
+repo="$1"
+source "$repo/lib/versions.sh" &&
+source "$repo/lib/mosdns-artifact.sh" &&
+arch="$(pdg_mosdns_arch)" &&
+pdg_mosdns_is_project_build /usr/local/bin/mosdns \
+  /etc/privdns-gateway/mosdns-build.env "$arch" &&
+printf '%s|%s\n' "$MOSDNS_BUILD_VERSION" "$arch"
+'''
+    rc, out, err = _run(["bash", "-c", script, "pdg-doctor", REPO_DIR], t=12)
+    if rc == 0:
+        version, _, arch = out.strip().partition("|")
+        return ("ok", "MosDNS 修补版", f"{version} ({arch}) · flavor/provenance 通过")
+    rc_v, version, _ = _run(["/usr/local/bin/mosdns", "version"])
+    got = version.strip().splitlines()[0] if rc_v == 0 and version.strip() else "不可读"
+    detail = (err.strip().splitlines()[-1] if err.strip() else "")
+    suffix = f" · {detail}" if detail else ""
+    return ("fail", "MosDNS 修补版",
+            f"当前 {got}, 不是本发布钉死的 no-ticket flavor/provenance{suffix}")
+
 # ── 深度(慢速)端到端检查: `pdg doctor --deep` 用, 仍只读 ──
 def check_deep_dot_handshake():
     d = _dot_domain()
+    if not d:
+        return ("fail", "DoT 握手(853)", "读不到 DoT 域名, 无法验证证书 SAN")
     try:
-        p = subprocess.run(["openssl", "s_client", "-connect", "127.0.0.1:853",
-                            "-servername", d or "localhost"],
-                           input="Q\n", capture_output=True, text=True, timeout=12)
-        out = p.stdout + p.stderr
+        context = ssl.create_default_context()
+        # Python/OpenSSL can otherwise fall back to subject CN when SAN is
+        # absent. Private DNS hostname authentication is SAN-only here.
+        if not hasattr(context, "hostname_checks_common_name"):
+            return ("fail", "DoT 握手(853)",
+                    "本机 Python/OpenSSL 不能禁用证书 CN fallback")
+        context.hostname_checks_common_name = False
+        with socket.create_connection(("127.0.0.1", 853), timeout=10) as raw:
+            with context.wrap_socket(raw, server_hostname=d) as tls:
+                cert = tls.getpeercert()
+                version = tls.version() or "?"
     except Exception as e:  # noqa: BLE001
-        return ("fail", "DoT 握手(853)", f"连接失败: {e}")
-    if "BEGIN CERTIFICATE" not in out and "Verify return code" not in out:
-        return ("fail", "DoT 握手(853)", "TLS 握手未完成(mosdns DoT 没起?)")
-    m = re.search(r"subject=.*?CN\s*=\s*([A-Za-z0-9.*-]+)", out)
-    cn = m.group(1) if m else "?"
-    if d and cn not in ("?", d):
-        return ("warn", "DoT 握手(853)", f"握手 OK 但证书 CN={cn} 与 DoT 域名 {d} 不符")
-    return ("ok", "DoT 握手(853)", f"TLS 握手成功, CN={cn}")
+        return ("fail", "DoT 握手(853)",
+                f"TLS chain/SAN 验证失败({d}): {type(e).__name__}: {e}")
+    sans = [value for kind, value in cert.get("subjectAltName", ())
+            if kind == "DNS"]
+    if not sans:
+        return ("fail", "DoT 握手(853)", "证书没有 DNS SAN(CN 不作 fallback)")
+    return ("ok", "DoT 握手(853)",
+            f"TLS chain + SAN 验证成功({version}, SNI={d})")
+
+def check_deep_dot_no_resumption():
+    """Offer the first DoT SSLSession on a second connection; reuse must fail."""
+    d = _dot_domain()
+    if not d:
+        return ("fail", "DoT 会话恢复", "读不到 DoT 域名, 无法设置 TLS SNI")
+    try:
+        evidence = dot_session_probe.probe(
+            "127.0.0.1", 853, d, timeout=8.0, query_name="example.com")
+    except Exception as e:  # noqa: BLE001
+        return ("fail", "DoT 会话恢复", f"两次握手探针失败: {type(e).__name__}: {e}")
+    first = evidence["first"]
+    second = evidence["second"]
+    if evidence["resumption_accepted"]:
+        return (
+            "fail",
+            "DoT 会话恢复",
+            "第二次握手接受了第一次会话"
+            f"(TLS={second['tls_version']}, ticket={first['has_ticket']}, "
+            f"session_reused={second['session_reused']})",
+        )
+    issued = "有 ticket 但恢复被拒绝" if evidence["resumption_offered"] \
+        else "未签发可恢复会话"
+    return (
+        "ok",
+        "DoT 会话恢复",
+        f"两次真实 DoT 握手完成, {issued}"
+        f"(TLS={second['tls_version']}, session_reused={second['session_reused']})",
+    )
 
 def check_deep_probe81():
     if _platform() != "ios":
@@ -778,7 +880,11 @@ def check_nft_input_chains():
     装机/迁移时有前置门挡着, 但那只管当时: 之后用户自己往 filter 表加一条 input 链, 谁也不会
     再提醒 —— 端口看着开着、实际不通, 而且从配置文件上完全看不出问题。判据与迁移前置门共用
     nftscan.py, 不另写一份。"""
-    found, readable = nftscan.scan()
+    try:
+        mode = nftscan.persisted_mode()
+        found, readable = nftscan.scan()
+    except ValueError as error:
+        return ("fail", "input 链冲突", "firewall mode/profile 状态非法: " + str(error))
     if found:
         return ("fail", "input 链冲突",
                 "; ".join(found) + " —— PDG 的 input chain 是 policy drop, 同一 hook 上每条 "
@@ -792,7 +898,215 @@ def check_nft_input_chains():
                "本机 nftables 不可用或未加载(nft list ruleset 失败), 请先确认 nftables 正常")
         return ("warn", "input 链冲突",
                 "读不到运行中的 nftables ruleset, 仅据 " + NFT_CONF + " 判断: 未见冲突。" + how)
-    return ("ok", "input 链冲突", "只有 table inet pdg 挂在 hook input 上")
+    if mode == "external":
+        return ("ok", "input 链冲突",
+                "external 模式：PDG 无 input hook；外部链允许，由外部防火墙负责端口暴露")
+    return ("ok", "input 链冲突", "managed 模式只有 table inet pdg 挂在 hook input 上")
+
+
+def _strict_dataplane_profile():
+    if pdgprofile is None:
+        raise ValueError("pdgprofile.py 缺失或无法导入")
+    values = pdgprofile.read_values(PROFILE_ENV, missing_ok=False)
+    required = ("PDG_FIREWALL_MODE", "PDG_PLATFORM", "PDG_INTERNAL_CIDR",
+                "PDG_SSH_PORT") + tuple(pdgprofile.DATA_KEYS)
+    missing = [key for key in required if not values.get(key)]
+    if missing:
+        raise ValueError("profile 缺受管键: " + ", ".join(missing))
+    mode = values["PDG_FIREWALL_MODE"]
+    if mode not in ("managed", "external"):
+        raise ValueError("PDG_FIREWALL_MODE 非法")
+    if values["PDG_PLATFORM"] not in ("ios", "android"):
+        raise ValueError("PDG_PLATFORM 非法")
+    if values["PDG_PLATFORM"] != _platform():
+        raise ValueError("profile/platform 与 canonical platform marker 不一致")
+    try:
+        ssh_port = int(values["PDG_SSH_PORT"])
+    except ValueError as error:
+        raise ValueError("PDG_SSH_PORT 非十进制端口") from error
+    if not 1 <= ssh_port <= 65535:
+        raise ValueError("PDG_SSH_PORT 超出范围")
+    try:
+        network = ipaddress.ip_network(values["PDG_INTERNAL_CIDR"], strict=False)
+    except ValueError as error:
+        raise ValueError("PDG_INTERNAL_CIDR 非法") from error
+    if network.version != 4 or network.prefixlen == 0:
+        raise ValueError("PDG_INTERNAL_CIDR 必须是非全网 IPv4 CIDR")
+    mos_cidr = _internal_cidr()
+    if mos_cidr and str(ipaddress.ip_network(mos_cidr, strict=False)) != str(network):
+        raise ValueError("profile CIDR 与 mosdns npn_clients 不一致")
+    try:
+        marker = open(FIREWALL_MODE_FILE, encoding="utf-8").read().strip()
+    except OSError:
+        marker = ""
+    if marker != mode:
+        raise ValueError("firewall-mode state 与 profile 不一致或缺失")
+    config = pdgprofile.resolve(
+        PROFILE_ENV, platform=values["PDG_PLATFORM"], environ={},
+        ssh_port=values["PDG_SSH_PORT"])
+    return values, config, mode
+
+
+def _nft_set_ports(text, name):
+    match = re.search(
+        r"\bset\s+" + re.escape(name) + r"\s*\{(.*?)^\s*\}",
+        text, re.S | re.M)
+    if not match:
+        raise ValueError("nft 缺 set " + name)
+    elements = re.search(r"\belements\s*=\s*\{([^}]*)\}", match.group(1), re.S)
+    if not elements:
+        raise ValueError("nft set %s 缺 elements" % name)
+    ports = []
+    for token in elements.group(1).split(","):
+        token = token.strip()
+        if token.isdigit():
+            ports.append(int(token))
+            continue
+        if re.fullmatch(r"\d+\s*-\s*\d+", token):
+            start, end = (int(part.strip()) for part in token.split("-", 1))
+            if not (1 <= start <= end <= 65535):
+                raise ValueError("nft set %s 含非法端口区间" % name)
+            ports.extend(range(start, end + 1))
+            continue
+        raise ValueError("nft set %s 含非法端口" % name)
+    return sorted(set(ports))
+
+
+_NFT_U32 = r"(?:0[xX][0-9a-fA-F]{1,8}|[0-9]{1,10})"
+
+
+def _nft_u32(token):
+    value = int(token, 16 if token.lower().startswith("0x") else 10)
+    if not 0 <= value <= 0xFFFFFFFF:
+        raise ValueError("nft mark 常量超出 32 位")
+    return value
+
+
+def _validate_profile_nft(text, values, config, mode, source, runtime=False):
+    status = nftscan.pdg_table_status(text)
+    if status != "owned-" + mode:
+        raise ValueError("%s table inet pdg owner/schema/mode 非预期(%s)"
+                         % (source, status))
+    blocks = nftscan._pdg_blocks(text)
+    if len(blocks) != 1:
+        raise ValueError(source + " PDG 表数量非 1")
+    block = blocks[0]
+    if _nft_set_ports(block, "pdg_tls_tcp_ports") != config["tls_ports"]:
+        raise ValueError(source + " TLS set 与 profile 不一致")
+    if _nft_set_ports(block, "pdg_http_tcp_ports") != config["http_ports"]:
+        raise ValueError(source + " HTTP set 与 profile 不一致")
+    cidr = re.escape(values["PDG_INTERNAL_CIDR"])
+    for set_name in ("pdg_tls_tcp_ports", "pdg_http_tcp_ports"):
+        if not re.search(
+                r"\bip\s+saddr\s+" + cidr + r"\s+tcp\s+dport\s+@"
+                + set_name + r"\s+redirect\s+to\s+:7893\b", block):
+            raise ValueError("%s 缺 source-scoped %s REDIRECT"
+                             % (source, set_name))
+    has_quic_chain = bool(re.search(
+        r"\bchain\s+pdg_quic_prerouting\s*\{", block))
+    if config["quic_mode"] == "tproxy":
+        if not has_quic_chain:
+            raise ValueError(source + " tproxy 模式缺 QUIC prerouting chain")
+        quic_scope = (
+            r"ip\s+saddr\s+" + cidr + r"\s+udp\s+dport\s+443\s+")
+        bitwise = (
+            quic_scope + r"meta\s+mark\s+set\s+"
+            r"\(*\s*meta\s+mark\s+&\s+(" + _NFT_U32 + r")"
+            r"\s*\)*\s*\|\s*(" + _NFT_U32 + r")"
+            r"\s*\)*\s+tproxy\s+ip\s+to\s+:7895\s+accept")
+        match = re.search(bitwise, block)
+        equivalent = False
+        if match:
+            and_value = _nft_u32(match.group(1))
+            or_value = _nft_u32(match.group(2))
+            # nft optimizes `(mark & clear) | owned-mark` by freely retaining
+            # owned bits in the AND operand: those bits are overwritten by OR
+            # and therefore have no semantic effect. Compare only bits not
+            # forced by B, rather than requiring nft's textual spelling.
+            equivalent = (
+                or_value == config["mark"]
+                and (and_value & ~or_value & 0xFFFFFFFF)
+                == config["mark_clear_mask"])
+        # nft may optimize a full owned mask to a direct assignment when
+        # listing the live ruleset. That is equivalent only when clear-mask=0;
+        # partial masks must retain the read/AND/OR expression.
+        full_mask_assignment = (
+            quic_scope + r"meta\s+mark\s+set\s+(" + _NFT_U32 + r")"
+            r"\s+tproxy\s+ip\s+to\s+:7895\s+accept")
+        if runtime and config["mark_clear_mask"] == 0:
+            assignment = re.search(full_mask_assignment, block)
+            equivalent = equivalent or (
+                bool(assignment)
+                and _nft_u32(assignment.group(1)) == config["mark"])
+        if not equivalent:
+            raise ValueError(source + " QUIC mark/mask/tproxy 表达式与 profile 不一致")
+    elif has_quic_chain:
+        raise ValueError(source + " reject 模式不应含 QUIC tproxy chain")
+    chains = dict(nftscan._named_blocks(block, nftscan._CHAIN_OPEN))
+    if mode == "external":
+        if "input" in chains:
+            raise ValueError(source + " external 模式含 managed input chain")
+    else:
+        body = chains.get("input", "")
+        action = "accept" if config["quic_mode"] == "tproxy" else "reject"
+        if not re.search(r"\bip\s+saddr\s+" + cidr
+                         + r"\s+udp\s+dport\s+443\s+" + action + r"\b", body):
+            raise ValueError(source + " managed UDP/443 action 与 QUIC mode 不一致")
+        ssh = re.escape(values["PDG_SSH_PORT"])
+        if not re.search(r"\btcp\s+dport\s+(?:\{\s*)?" + ssh
+                         + r"(?:\s*\})?\s+accept\b", body):
+            raise ValueError(source + " managed input 缺 SSH accept")
+        local_ports = r"\s*,\s*".join(
+            map(str, config["local_tcp_ports"]))
+        if not re.search(r"\bip\s+saddr\s+" + cidr
+                         + r"\s+tcp\s+dport\s+\{\s*" + local_ports
+                         + r"\s*\}\s+accept\b", body):
+            raise ValueError(source + " managed input local TCP/7893/platform accept 不完整")
+        if not re.search(r"\bip\s+saddr\s+" + cidr
+                         + r"\s+udp\s+dport\s+(?:\{\s*)?53(?:\s*\})?"
+                         + r"\s+accept\b", body):
+            raise ValueError(source + " managed input 缺 source-scoped DNS/53 accept")
+
+
+def check_dataplane_profile():
+    """Profile, Mihomo, nftables and trusted policy-route must be one state."""
+    try:
+        values, config, mode = _strict_dataplane_profile()
+        nft_text = open(NFT_CONF, encoding="utf-8").read()
+        _validate_profile_nft(nft_text, values, config, mode, "持久配置")
+        nft_path = nftscan.nft_bin()
+        if not nft_path:
+            raise ValueError("找不到 nft，无法读取 live table inet pdg")
+        live_rc, live_text, live_err = _run(
+            [nft_path, "list", "table", "inet", "pdg"], t=10)
+        if live_rc != 0 or not live_text.strip():
+            raise ValueError("读不到 live table inet pdg: " + live_err[-120:])
+        _validate_profile_nft(
+            live_text, values, config, mode, "运行态", runtime=True)
+        with open(MIHOMO_CFG, encoding="utf-8") as stream:
+            mihomo = json.load(stream)
+        sniff = (mihomo.get("sniffer") or {}).get("sniff") or {}
+        if ((sniff.get("TLS") or {}).get("ports") != config["tls_ports"]
+                or (sniff.get("HTTP") or {}).get("ports") != config["http_ports"]):
+            raise ValueError("Mihomo TLS/HTTP sniffer 端口与 profile 不一致")
+        if config["quic_mode"] == "tproxy":
+            if mihomo.get("tproxy-port") != 7895 \
+                    or (sniff.get("QUIC") or {}).get("ports") != [443]:
+                raise ValueError("Mihomo 缺 native :7895 QUIC TPROXY/sniffer")
+        elif "tproxy-port" in mihomo or "QUIC" in sniff:
+            raise ValueError("reject 模式 Mihomo 仍含 QUIC TPROXY 配置")
+        if not os.path.isfile(QUIC_HELPER):
+            raise ValueError("QUIC routing helper 缺失")
+        rc, out, err = _run([QUIC_HELPER, "status"], t=10)
+        if rc != 0:
+            raise ValueError("QUIC trusted route status 失败: " + (out + err)[-180:])
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return ("fail", "透明数据面", str(error))
+    return ("ok", "透明数据面",
+            "mode=%s; QUIC=%s; TLS=%s; HTTP=%s; nft/Mihomo/route 一致"
+            % (mode, config["quic_mode"],
+               ",".join(map(str, config["tls_ports"])),
+               ",".join(map(str, config["http_ports"]))))
 
 
 def check_transactions():
@@ -840,13 +1154,17 @@ def check_transactions():
             "<code>sudo pdg tx recover &lt;id&gt;</code> 恢复。" % (len(pend), items))
 
 
-ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
-       check_internal_cidr, check_nft, check_nft_input_chains, check_redirect, check_gms,
+ALL = [check_platform, check_services, check_bot_credentials, check_core_version,
+       check_mosdns_build, check_dot_arecord, check_dot_domain_sync,
+       check_internal_cidr, check_dataplane_profile, check_nft, check_nft_input_chains,
+       check_redirect, check_gms,
        check_mosdns_ratelimit, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
        check_transactions]
-ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
-DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
+ALERT = [check_services, check_dataplane_profile, check_mosdns_build,
+         check_dns, check_cert]  # healthcheck 用的轻量子集
+DEEP = [check_deep_dot_handshake, check_deep_dot_no_resumption,
+        check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加
 
 def run(funcs=None):

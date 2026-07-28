@@ -12,8 +12,9 @@
 pdg_unit_mihomo(){ cat <<'EOF'
 [Unit]
 Description=mihomo (PrivDNS Gateway core)
-After=network-online.target mosdns.service
+After=network-online.target mosdns.service pdg-quic-routing.service
 Wants=network-online.target
+Requires=pdg-quic-routing.service
 [Service]
 ExecStart=/usr/local/bin/mihomo -d /etc/mihomo -f /etc/mihomo/config.yaml
 Environment=SAFE_PATHS=/etc/sing-box/ui/dist

@@ -282,7 +282,7 @@ print("[OK]   链接发送失败 → 立即关闭；关闭失败 → 自动重�
 
 sent_link_text = []
 bot.send_get_mid = lambda chat, text: (sent_link_text.append(text), 88)[1]
-ok, err = bot._panel_publish(9, "secret-link", 0)
+ok, err = bot._panel_publish(9, "secret-link", 600)
 assert ok and "临时观测/控制面板" in sent_link_text[0] and "secret-link" in sent_link_text[0]
 bot._panel_clear_state()
 print("[OK]   成功说明与密钥链接同属一条可自动删除消息")
@@ -435,8 +435,9 @@ src = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
 assert '"callback_data": "panel"' in src, "运维菜单应有观测面板入口"
 for cb in ('if data == "panel":', 'if data.startswith("panel:on:"):', 'if data == "panel:off":'):
     assert cb in src, f"缺回调 {cb}"
-for token in ('"panel:on:10"', '"panel:on:30"', '"panel:on:0"'):
+for token in ('"panel:on:10"', '"panel:on:30"'):
     assert token in src, f"缺时长按钮 {token}"
+assert '"callback_data": "panel:on:0"' not in src, "不得保留常开面板按钮"
 assert "_panel_publish(chat, res" in src and "_panel_startup_cleanup()" in src, "缺安全发链接 / 启动兜底调用"
 print("[OK]   运维菜单 + 时长按钮 + 回调接线 + 启动兜底(含清残留放行)")
 

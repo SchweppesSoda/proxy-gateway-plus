@@ -14,7 +14,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/e2e-lib.sh"
 e2e_enter "$@"
 
 command -v openssl >/dev/null 2>&1 || e2e_skip "无 openssl(自签证书要用)"
-e2e_stub_system
+e2e_stub_system fresh
 
 # 装机会改写 /etc/resolv.conf。容器里那是宿主 bind-mount 进来的, overlay/命名空间都挡不住,
 # 写进去之后同一个 job 里后面的 e2e 就没 DNS 了 → 退出时把内容写回。
@@ -39,6 +39,22 @@ S
 done
 # 内核/解析器二进制: 装机会下载并校验 SHA, 这里用桩替代下载(下载与 SHA 校验有专门单测)
 . "$E2E_ROOT/lib/versions.sh"
+cat > /tmp/e2e-mosdns-pdg <<S
+#!/bin/sh
+case "\$1" in version) echo "$MOSDNS_BUILD_VERSION";; start) sleep 3600;; esac
+exit 0
+S
+chmod 755 /tmp/e2e-mosdns-pdg
+E2E_MOSDNS_SHA="$(sha256sum /tmp/e2e-mosdns-pdg | awk '{print $1}')"
+# This E2E uses a tiny executable stand-in rather than checking a 19 MiB binary
+# into the repository. Work from a private source copy whose architecture pin
+# is the stand-in hash; production source remains pinned to the KFC bytes.
+E2E_INSTALL_ROOT=/tmp/e2e-install-source
+rm -rf "$E2E_INSTALL_ROOT"
+cp -a "$E2E_ROOT" "$E2E_INSTALL_ROOT"
+sed -i -E \
+  "s#(\\[mosdns-pdg-amd64\\]=\")[0-9a-f]+(\".*)#\\1$E2E_MOSDNS_SHA\\2#" \
+  "$E2E_INSTALL_ROOT/lib/versions.sh"
 cat > /usr/local/bin/curl <<S
 #!/bin/sh
 # 只拦内核/规则下载: 造出一个"看起来对"的产物; 其余照常失败即可
@@ -46,6 +62,8 @@ out=""; prev=""
 for a in "\$@"; do [ "\$prev" = "-o" ] && out="\$a"; prev="\$a"; done
 [ -z "\$out" ] && exit 1
 case "\$out" in
+  */geosite.dat)
+    printf '\012\021\012\002CN\022\013\010\002\022\007test.io\012\036\012\017GEOLOCATION-!CN\022\013\010\002\022\007test.io\012\024\012\005APPLE\022\013\010\002\022\007test.io\012\022\012\003GFW\022\013\010\002\022\007test.io' > "\$out";;
   *.zip)  printf 'PK\003\004stub' > "\$out";;
   *.gz|*.tgz|*.tar.gz) printf 'stub' > "\$out";;
   *) printf 'stub' > "\$out";;
@@ -82,18 +100,20 @@ chmod 755 /usr/local/bin/tcpdump
 run_install(){   # $1=额外 env
   # shellcheck disable=SC2086
   env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_MOSDNS_ARTIFACT=/tmp/e2e-mosdns-pdg PDG_MOSDNS_ARTIFACT_SHA256="$E2E_MOSDNS_SHA" \
       PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
       PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaaBBbbCCccDDddEEeeFFffGGgg \
       PDG_ALLOWED=1 PDG_PLATFORM=android $1 \
-      bash "$E2E_ROOT/install.sh" 2>&1
+      bash "$E2E_INSTALL_ROOT/install.sh" 2>&1
 }
 # 交互模式装机: 不预置 PDG_NONINTERACTIVE, 也不预置 CIDR/PLATFORM/TOKEN → 全走交互 read;
 # stdin=/dev/null 且无控制终端 → 每个 read 都撞 EOF/无 tty(等价用户报的现场)。只预置无默认值
 # 的 DOT 域名。这条路专治 issue #2: 平台探测 `cat` 在 set -e 下的致命赋值 + 交互 read 的 EOF 韧性。
 run_install_interactive(){
   env -u PDG_NONINTERACTIVE PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_MOSDNS_ARTIFACT=/tmp/e2e-mosdns-pdg PDG_MOSDNS_ARTIFACT_SHA256="$E2E_MOSDNS_SHA" \
       PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_DOT_DOMAIN=dot.e2e.test \
-      bash "$E2E_ROOT/install.sh" </dev/null 2>&1
+      bash "$E2E_INSTALL_ROOT/install.sh" </dev/null 2>&1
 }
 reset_box(){
   # /opt/privdns-gateway 也要清: 留着它, 后面的安装会走"已有 .git 就不复制"的分支,
@@ -103,11 +123,14 @@ reset_box(){
          /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
          /etc/systemd/system/mosdns.service /etc/systemd/system/sing-box.service
   rm -rf /tmp/e2e-svc; mkdir -p /tmp/e2e-svc
+  printf 0 > /tmp/e2e-svc/mosdns.ac
+  printf 0 > /tmp/e2e-svc/mihomo.ac
 }
 
 # ══ 1. 全新安装应当成功并落地全套 ════════════════════════════════════════════
 echo "── 1. 全新安装 ──"
 reset_box
+e2e_stub_system fresh
 out=$(run_install ""); rc=$?
 [[ "$rc" == 0 ]] && ok "install.sh 全新安装成功(exit 0)" || bad "安装失败 rc=$rc: $(tail -6 <<<"$out")"
 grep -q 'unbound variable' <<<"$out" && bad "出现 unbound variable(正是用户报的那类)" \
@@ -134,7 +157,7 @@ grep -q '__[A-Z_]*__' /etc/mosdns/config.yaml /etc/nftables.conf \
 # 回归点: ① 平台探测 `_ep="$(cat …platform)"` 在全新装(文件不存在)时 cat 返 1 → set -e 致命赋值
 #         → 回滚; ② 任一交互 read 撞 EOF → set -e → 回滚。两者都该被容错掉, 回落到探测值/默认值。
 echo; echo "── 1b. 交互全新装 + 无输入(EOF/无 tty) ──"
-reset_box; e2e_stub_system
+reset_box; e2e_stub_system fresh
 out=$(run_install_interactive); rc=$?
 [[ "$rc" == 0 ]] && ok "交互式安装无输入(EOF)仍成功(exit 0, 未回滚)" \
                  || bad "交互安装挂了 rc=$rc: $(tail -6 <<<"$out")"
@@ -207,7 +230,7 @@ echo; echo "── 4. resolv.conf 不可删(容器/LXC 现场) ──"
 # 机器上只剩 profile.env.new: PDG_HIJACK_MODE 根本没落盘, 下一次 pdg restart 读不到就按默认
 # all 把 mosdns 形态改回去 —— 用户装机时选的 gfw 就这么没了。
 echo; echo "── 6. profile.env 落盘(PDG_HIJACK_MODE=gfw) ──"
-reset_box; e2e_stub_system
+reset_box; e2e_stub_system fresh
 out=$(run_install "PDG_HIJACK_MODE=gfw"); rc=$?
 [[ "$rc" == 0 ]] && ok "gfw 模式全新安装成功" || bad "6: 安装失败 rc=$rc: $(tail -6 <<<"$out")"
 [[ -f /etc/privdns-gateway/profile.env ]] \
@@ -261,13 +284,14 @@ out=$(run_install "PDG_HIJACK_MODE=gfw PDG_FORCE_REINSTALL=1"); rc=$?
 # root 跑 pdg update 时 git 会以 "dubious ownership" 拒绝一切操作 —— 连 describe/tag 都读不到,
 # 表现成"检查不出新版"这种莫名其妙的样子。
 echo; echo "── 6b. 普通用户 clone + sudo 安装 ──"
-reset_box; e2e_stub_system
+reset_box; e2e_stub_system fresh
 if id -u pdguser >/dev/null 2>&1 || useradd -m pdguser 2>/dev/null; then
   USERREPO=/home/pdguser/privdns-gateway
-  rm -rf "$USERREPO"; cp -a "$E2E_ROOT" "$USERREPO"
+  rm -rf "$USERREPO"; cp -a "$E2E_INSTALL_ROOT" "$USERREPO"
   chown -R pdguser:pdguser "$USERREPO" 2>/dev/null || true
   out=$(env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
         PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
+        PDG_MOSDNS_ARTIFACT=/tmp/e2e-mosdns-pdg PDG_MOSDNS_ARTIFACT_SHA256="$E2E_MOSDNS_SHA" \
         PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaaBBbbCCccDDddEEeeFFffGGgg \
         PDG_ALLOWED=1 PDG_PLATFORM=android \
         bash "$USERREPO/install.sh" 2>&1); rc=$?
@@ -290,7 +314,7 @@ fi
 
 # ══ 仓库复制失败必须中止 ═══════════════════════════════════════════════════
 echo; echo "── 6c. /opt 仓库复制失败 ──"
-reset_box; e2e_stub_system
+reset_box; e2e_stub_system fresh
 # 精确挡住"复制仓库"这一步: 在目标路径上挂一个只读 tmpfs —— rm -rf 删不掉(busy),
 # cp -a 也写不进去, 而 /opt 的其它子目录(pdg-bot 等)照常可写, 于是失败必然发生在这一步。
 if mkdir -p /opt/privdns-gateway 2>/dev/null \
@@ -309,7 +333,7 @@ else
 fi
 
 echo; echo "── 7. resolv.conf 不可删(容器/LXC 现场) ──"
-reset_box; e2e_stub_system
+reset_box; e2e_stub_system fresh
 locked=0
 if ! rm -f /etc/resolv.conf 2>/dev/null; then
   locked=1                                        # CI 容器里本来就是 bind mount
@@ -332,7 +356,7 @@ fi
 # 装机那侧已经兼容了(删不掉就原地写内容), 卸载侧却还是直接 rm+mv: 失败也照样宣布"已完成",
 # 而机器上留着指向本机 mosdns 的 resolv.conf —— mosdns 刚被卸载, 整机从此没 DNS。
 echo; echo "── 8. 卸载时 resolv.conf 不可删 ──"
-reset_box; e2e_stub_system
+reset_box; e2e_stub_system fresh
 out=$(run_install ""); rc=$?
 [[ "$rc" == 0 ]] || bad "8: 准备现场的安装失败 rc=$rc"
 printf 'nameserver 9.9.9.9\n' > /etc/resolv.conf.pdg-orig      # 装机留下的备份(上游 DNS)
@@ -348,7 +372,7 @@ if mount --bind /tmp/rc-now /etc/resolv.conf 2>/dev/null; then
   umount /etc/resolv.conf 2>/dev/null
 
   # 连内容都写不进去(整个文件只读)→ 必须明确 warning, 且**保留**备份供用户自救
-  reset_box; e2e_stub_system
+  reset_box; e2e_stub_system fresh
   out=$(run_install ""); rc=$?
   printf 'nameserver 9.9.9.9\n' > /etc/resolv.conf.pdg-orig
   chmod 444 /tmp/rc-now

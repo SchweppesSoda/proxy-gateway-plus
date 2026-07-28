@@ -27,7 +27,7 @@ eval "$(sed -n '/^migrate_mosdns_mitm(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 # ── 规则 fixture(都在 $WORK/rules, 迁移从 geosite_cn 路径推导目录)──
 mkdir -p "$WORK/rules"
 echo "qq.com" > "$WORK/rules/geosite_cn.txt"
-: > "$WORK/rules/geosite_apple.txt"; : > "$WORK/rules/custom_direct.txt"; : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/unlock.txt"
+: > "$WORK/rules/geosite_apple.txt"; : > "$WORK/rules/custom_direct.txt"; : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/ruleset_direct.txt"; : > "$WORK/rules/unlock.txt"
 echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"
 # (mitm_hijack.txt 故意不建: 迁移应自动补)
 

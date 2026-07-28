@@ -21,6 +21,7 @@ mihomo 只吃 YAML;但 YAML 1.2 是 JSON 超集,合法 JSON 即合法 YAML,故�
 """
 from __future__ import annotations
 import json
+import re
 
 # 可作出口的代理协议(与 pdg-bot.py 的 PROXY_TYPES 对齐)
 PROXY_TYPES = ("shadowsocks", "vmess", "trojan", "vless", "hysteria", "hysteria2",
@@ -31,6 +32,41 @@ NON_PROXY_TYPES = ("direct", "block", "dns", "urltest", "selector")
 # 默认劫持端口 → 嗅探类型(原始 dport, 非 redir 端口)
 DEFAULT_TLS_PORTS = [443, 5228, 5229, 5230]
 DEFAULT_HTTP_PORTS = [80]
+QUIC_MODES = ("tproxy", "reject")
+
+
+def parse_port_list(value, *, name="ports"):
+    """严格解析十进制端口列表，返回去重后的数值升序列表。
+
+    profile/env 文本接受逗号或 ASCII 空白分隔；程序接口接受 int 的 list/tuple。
+    空列表、布尔值、非十进制写法及 1..65535 以外的值一律拒绝。
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        sep = r"(?:[\t\r\n ]*,[\t\r\n ]*|[\t\r\n ]+)"
+        if not text or not re.fullmatch(r"[0-9]+(?:%s[0-9]+)*" % sep, text):
+            raise ValueError("%s 必须是十进制端口列表" % name)
+        raw = re.split(r"[,\t\r\n ]+", text)
+        ports = [int(item, 10) for item in raw]
+    elif isinstance(value, (list, tuple)):
+        ports = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError("%s 必须只包含整数端口" % name)
+            ports.append(item)
+    else:
+        raise ValueError("%s 必须是端口列表或文本" % name)
+    if not ports or any(port < 1 or port > 65535 for port in ports):
+        raise ValueError("%s 端口必须在 1..65535" % name)
+    return sorted(set(ports))
+
+
+def parse_quic_mode(value):
+    """严格解析 QUIC data-plane 模式；本 fork 缺省使用原生 TPROXY。"""
+    mode = "tproxy" if value is None else value
+    if not isinstance(mode, str) or mode.strip() not in QUIC_MODES:
+        raise ValueError("PDG_QUIC_MODE 只能是 tproxy 或 reject")
+    return mode.strip()
 
 
 def _tls_common(ob, p):
@@ -263,7 +299,8 @@ def _mixed_listeners(sb, direct_tags):
 def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                       secret=None, external_ui=None, external_ui_url=None,
                       tls_ports=None, http_ports=None, rulesets=None,
-                      mitm_domains=None, mitm_port=7894):
+                      mitm_domains=None, mitm_port=7894,
+                      quic_mode="tproxy", tproxy_port=7895):
     """把 sing-box 配置 dict 翻译成 mihomo 配置 dict。
 
     rulesets: 可选 {name: {url, behavior, format}} —— 提供则渲染 rule-providers + RULE-SET,
@@ -321,8 +358,18 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                         "server": "127.0.0.1", "port": mitm_port, "udp": False})
         rules = rules[:i] + [f"DOMAIN-SUFFIX,{d},MITM-OUT" for d in mitm_domains] + rules[i:]
 
-    tls_ports = tls_ports if tls_ports is not None else DEFAULT_TLS_PORTS
-    http_ports = http_ports if http_ports is not None else DEFAULT_HTTP_PORTS
+    quic_mode = parse_quic_mode(quic_mode)
+    tls_ports = parse_port_list(
+        DEFAULT_TLS_PORTS if tls_ports is None else tls_ports, name="TLS ports")
+    http_ports = parse_port_list(
+        DEFAULT_HTTP_PORTS if http_ports is None else http_ports, name="HTTP ports")
+    sniff = {
+        "TLS": {"ports": tls_ports},
+        "HTTP": {"ports": http_ports},
+    }
+    if quic_mode == "tproxy":
+        tproxy_port = parse_port_list([tproxy_port], name="tproxy port")[0]
+        sniff["QUIC"] = {"ports": [443]}
 
     cfg = {
         "redir-port": redir_port,
@@ -336,14 +383,13 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
             "override-destination": True,
             "force-dns-mapping": True,
             "parse-pure-ip": True,
-            "sniff": {
-                "TLS": {"ports": tls_ports},
-                "HTTP": {"ports": http_ports},
-            },
+            "sniff": sniff,
         },
         "proxies": proxies,
         "proxy-groups": groups,
     }
+    if quic_mode == "tproxy":
+        cfg["tproxy-port"] = tproxy_port
     if listeners:
         cfg["listeners"] = listeners
     if secret:

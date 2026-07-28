@@ -164,9 +164,9 @@ def main():
     got = required_svcs("android", "", "")
     if "pdg-bot" in got:
         bad("未配凭据时 CLI 仍把 pdg-bot 列为必需服务: %s" % got)
-    if got != ["mosdns", "mihomo"]:
+    if got != ["pdg-quic-routing", "mosdns", "mihomo"]:
         bad("未配凭据的 Android 必需服务集不对: %s" % got)
-    ok("CLI 必需服务集(unset/Android): mosdns + mihomo, 不含 pdg-bot")
+    ok("CLI 必需服务集(unset/Android): QUIC route + mosdns + mihomo, 不含 pdg-bot")
 
     got = required_svcs("ios", "", "")
     if "pdg-bot" in got or "pdg-probe81" not in got:
@@ -176,7 +176,7 @@ def main():
     got = required_svcs("ios", "123456:AAaa", "1")
     if "pdg-bot" not in got or "pdg-probe81" not in got:
         bad("凭据 ready 时必需服务集缺项: %s" % got)
-    ok("CLI 必需服务集(ready/iOS): mosdns + mihomo + pdg-bot + pdg-probe81")
+    ok("CLI 必需服务集(ready/iOS): QUIC route + mosdns + mihomo + pdg-bot + pdg-probe81")
 
     got = required_svcs("android", "123456:AAaa", "")     # partial
     if "pdg-bot" in got:

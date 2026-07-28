@@ -5,18 +5,34 @@
 #
 # 升级版本步骤:
 #   1) 改下面的 *_VER;
-#   2) 下载官方 release 重算: sha256sum mosdns-linux-<arch>.zip / mihomo-linux-<arch>-<ver>.gz
+#   2) MosDNS 按 tools/build-mosdns-patched.sh 从钉死 commit 可复现构建;
+#      mihomo 下载官方 release 重算 SHA256;
 #   3) 把哈希同步到 PDG_SHA256(amd64 + arm64)。
-# 哈希取自上游官方 GitHub Release(信任锚 = 官方发布页),装机/测试时逐字节比对,不符即拒装。
+# MosDNS 修补 raw hash 已由 KFC 交叉构建钉死；长期 release URL 发布前故意留空并
+# fail closed，可用显式本地产物通道部署。
 # ─────────────────────────────────────────────────────────────────────────────
 MOSDNS_VER="v5.3.4"
+MOSDNS_UPSTREAM_REPO="https://github.com/IrineSistiana/mosdns.git"
+MOSDNS_UPSTREAM_COMMIT="b7323188bab1ea742538aeccb31b692bc4967d1b"
+MOSDNS_GO_VERSION="1.24.9"
+MOSDNS_PATCH_REV="pdg-notickets.1"
+MOSDNS_BUILD_VERSION="${MOSDNS_VER}-${MOSDNS_PATCH_REV}"
+MOSDNS_PATCH_FILE="patches/mosdns/v5.3.4-session-tickets-disabled.patch"
+# 自有 GitHub Release 产物上线时填写不带末尾 / 的目录。
+# 当前没有 release asset；空值使 installer/update 拒绝回退到存在会话恢复的官方二进制。
+MOSDNS_PDG_ASSET_BASE_URL=""
 MIHOMO_VER="v1.19.29"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
 ZASHBOARD_VER="v3.15.0"       # 观测面板(纯静态前端, 由 external_ui 托管; dist-no-fonts 最小、不依赖 CDN; mihomo 原生 clash 核也可托管)
 
 # key = <name>-<arch>(arch: amd64 / arm64); zashboard 为纯前端, 与架构无关(单一哈希)
 declare -A PDG_SHA256=(
+  # 官方 v5.3.4 release zip: 仅供上游基线/功能测试，不是生产安装产物。
   [mosdns-amd64]="3abcc73080789eb1ccca78dab5049b85ac1e9b8f865ab60158a527b77cd72e85"
   [mosdns-arm64]="82d80a1a21606fca0bc6b65ac6f90d30cff6bb4a19a6ab6a246cf247dbb78bc0"
+  [mosdns-patch]="68979d7da425bff6a858816658e8e3424f684b9dd0063467a91b4e1e18d4e387"
+  # 自有可复现构建的 raw binary。发布 asset 后按架构填写。
+  [mosdns-pdg-amd64]="601788797260769d7dda5aef0041f77ff6981aa4141730cfa14169a32b9411e7"
+  [mosdns-pdg-arm64]="e2c81dea12e0beab8d17581c73a44db7594175f1b652f3d5dfb9f92688939a72"
   # mihomo(流量内核): 官方 release 的 mihomo-linux-<arch>-<ver>.gz
   [mihomo-amd64]="60de76a35a6cbf7b4fa4a20f5c257c24345d1d635ab1aa3877022a1997ef413c"
   [mihomo-arm64]="9a868b5e4e0ad91d9d71e1b41b0cfce78aaba44360c30df74a723f8e3926a86c"

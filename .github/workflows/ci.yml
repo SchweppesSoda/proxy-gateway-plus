@@ -1,6 +1,6 @@
 name: CI
 
-# 纯静态校验: 不启动 mosdns / sing-box / nftables, 只检查能不能编译 / 语法 / 渲染。
+# lint job 只做编译、语法、渲染与本地回归；functional / e2e job 才启动真实组件。
 on:
   push:
     branches: [main]
@@ -17,12 +17,16 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Python 语法 (py_compile)
-        run: python3 -m py_compile deploy/bot/*.py tests/*.py
+        run: python3 -m py_compile deploy/bot/*.py deploy/web/*.py tests/*.py
 
       - name: Shell 语法 (bash -n)
         run: |
           bash -n install.sh uninstall.sh \
-            deploy/bot/*.sh deploy/cert/*.sh lib/*.sh
+            deploy/bot/*.sh deploy/cert/*.sh deploy/firewall/*.sh \
+            deploy/web/*.sh lib/*.sh
+
+      - name: Web 前端 JavaScript 语法
+        run: node --check deploy/web/static/app.js
 
       - name: JSON 模板渲染后可解析
         run: |
@@ -54,11 +58,23 @@ jobs:
           sys.exit(0 if ok else 1)
           PY
 
-      - name: systemd unit 静态检查 (best-effort, 不阻断)
+      - name: Mihomo / QUIC routing systemd 依赖契约
+        run: |
+          set -euo pipefail
+          # mihomo.service 由共享函数生成；先对实际生成结果做阻断式依赖检查。
+          # shellcheck source=lib/units.sh
+          source lib/units.sh
+          pdg_unit_mihomo > "$RUNNER_TEMP/mihomo.service"
+          grep -Fqx 'Requires=pdg-quic-routing.service' "$RUNNER_TEMP/mihomo.service"
+          grep -Eq '^After=.*pdg-quic-routing\.service([[:space:]]|$)' "$RUNNER_TEMP/mihomo.service"
+          grep -Fqx 'Before=mihomo.service' deploy/firewall/pdg-quic-routing.service
+
+      - name: systemd unit 静态检查 (含生成的 Mihomo 与 QUIC routing; best-effort)
         continue-on-error: true
         run: |
           if command -v systemd-analyze >/dev/null; then
             systemd-analyze verify \
+              "$RUNNER_TEMP/mihomo.service" deploy/firewall/pdg-quic-routing.service \
               deploy/bot/pdg-bot.service deploy/bot/pdg-health.service \
               deploy/bot/pdg-rules-update.service deploy/bot/pdg-health.timer \
               deploy/bot/pdg-rules-update.timer deploy/ios/pdg-probe81.service || true
@@ -67,11 +83,121 @@ jobs:
             echo "systemd-analyze 不可用, 跳过"
           fi
 
+      - name: "真实 nftables parser: 四种 profile 渲染后 sudo nft -c"
+        run: |
+          set -euo pipefail
+          if ! command -v nft >/dev/null; then
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q nftables
+          fi
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          printf '#!/usr/sbin/nft -f\n' > "$work/base.nft"
+          for firewall_mode in managed external; do
+            for quic_mode in tproxy reject; do
+              profile="$work/${firewall_mode}-${quic_mode}.env"
+              raw="$work/${firewall_mode}-${quic_mode}.raw.nft"
+              rendered="$work/${firewall_mode}-${quic_mode}.nft"
+              cat > "$profile" <<EOF
+          PDG_FIREWALL_MODE=$firewall_mode
+          PDG_PLATFORM=android
+          PDG_INTERNAL_CIDR=192.0.2.0/24
+          PDG_SSH_PORT=22
+          PDG_QUIC_MODE=$quic_mode
+          PDG_HIJACK_TLS_TCP_PORTS=443,5228,5229,5230
+          PDG_HIJACK_HTTP_TCP_PORTS=80
+          PDG_QUIC_MARK=0x504447
+          PDG_QUIC_MARK_MASK=0xffffffff
+          PDG_QUIC_ROUTE_TABLE=7895
+          PDG_QUIC_RULE_PRIORITY=17895
+          EOF
+              python3 deploy/bot/pdgprofile.py \
+                --profile "$profile" --platform android --ssh-port 22 --profile-only \
+                render-nft --template deploy/firewall/nftables-mihomo.conf \
+                --internal-cidr 192.0.2.0/24 --firewall-mode "$firewall_mode" \
+                > "$raw"
+              python3 deploy/bot/nftmerge.py --mode "$firewall_mode" \
+                "$raw" "$work/base.nft" "$rendered"
+              ! grep -Eq '__[A-Z0-9_]+__' "$rendered"
+              if [[ "$firewall_mode" == managed ]]; then
+                grep -Fq 'hook input' "$rendered"
+              else
+                ! grep -Fq 'hook input' "$rendered"
+              fi
+              # Count only an actual, non-comment nft rule statement. Template
+              # comments intentionally mention "tproxy", so raw substring
+              # greps make the reject combination falsely fail.
+              tproxy_rules="$(
+                awk '
+                  !/^[[:space:]]*#/ &&
+                  /^[[:space:]]*ip[[:space:]]+saddr[[:space:]]+[^[:space:]]+[[:space:]]+udp[[:space:]]+dport[[:space:]]+443/ &&
+                  /[[:space:]]tproxy[[:space:]]+ip[[:space:]]+to[[:space:]]+:7895([[:space:]]|$)/ {
+                    count++
+                  }
+                  END { print count + 0 }
+                ' "$rendered"
+              )"
+              if [[ "$quic_mode" == tproxy ]]; then
+                [[ "$tproxy_rules" -eq 1 ]]
+              else
+                [[ "$tproxy_rules" -eq 0 ]]
+              fi
+              # -c/--check validates the complete kernel transaction but never applies it.
+              sudo nft -c -f "$rendered"
+              echo "OK: $firewall_mode + $quic_mode"
+            done
+          done
+          # A masked mark is a distinct nft expression: verify it is rendered
+          # and accepted by the real parser as well as the full-mask profiles.
+          profile="$work/managed-tproxy-partial-mask.env"
+          raw="$work/managed-tproxy-partial-mask.raw.nft"
+          rendered="$work/managed-tproxy-partial-mask.nft"
+          cat > "$profile" <<EOF
+          PDG_FIREWALL_MODE=managed
+          PDG_PLATFORM=android
+          PDG_INTERNAL_CIDR=192.0.2.0/24
+          PDG_SSH_PORT=22
+          PDG_QUIC_MODE=tproxy
+          PDG_HIJACK_TLS_TCP_PORTS=443,5228,5229,5230
+          PDG_HIJACK_HTTP_TCP_PORTS=80
+          PDG_QUIC_MARK=0x4400
+          PDG_QUIC_MARK_MASK=0xff00
+          PDG_QUIC_ROUTE_TABLE=7895
+          PDG_QUIC_RULE_PRIORITY=17895
+          EOF
+          python3 deploy/bot/pdgprofile.py \
+            --profile "$profile" --platform android --ssh-port 22 --profile-only \
+            render-nft --template deploy/firewall/nftables-mihomo.conf \
+            --internal-cidr 192.0.2.0/24 --firewall-mode managed \
+            > "$raw"
+          python3 deploy/bot/nftmerge.py --mode managed \
+            "$raw" "$work/base.nft" "$rendered"
+          ! grep -Eq '__[A-Z0-9_]+__' "$rendered"
+          grep -Fq \
+            'meta mark set ((meta mark & 0xffff00ff) | 0x4400) tproxy ip to :7895 accept' \
+            "$rendered"
+          sudo nft -c -f "$rendered"
+          echo "OK: managed + tproxy + partial mark/mask"
+
       - name: "ShellCheck (阻断: 有 warning 即失败)"
         run: |
           command -v shellcheck >/dev/null || sudo apt-get install -y -q shellcheck
           shellcheck --severity=warning -e SC1091 \
-            install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh lib/*.sh tests/*.sh
+            install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh \
+            deploy/firewall/*.sh deploy/web/*.sh lib/*.sh tests/*.sh
+
+      - name: "原生 Web API/安全/前端回归"
+        run: |
+          python3 tests/test-web-api.py
+          python3 tests/test-web-adversarial.py
+          python3 tests/test-web-security-static.py
+          python3 tests/test-web-frontend-static.py
+
+      - name: "原生 Web 安装生命周期回归"
+        run: bash tests/test-web-install.sh
+
+      - name: "规则集手机直连完整生命周期回归"
+        run: python3 tests/test-ruleset-phone-direct.py
 
       - name: "防火墙迁移识别回归 (原装应迁移 / 自定义应跳过)"
         run: bash tests/test-fw-migration.sh
@@ -136,8 +262,14 @@ jobs:
       - name: "内核热切回归 (check/重启不稳定均还原旧核; 稳定后才删 .prev; 快照含内核二进制)"
         run: bash tests/test-core-swap.sh
 
-      - name: "install 回滚回归 (set -u 下不因未初始化变量二次崩溃; 系统级还原完整; 只删本次新装)"
+      - name: "Phase3: install 回滚与 QUIC routing 恢复资产保留"
         run: bash tests/test-install-rollback.sh
+
+      - name: "Phase3: 首装 geosite 离线事务与 live updater 硬门"
+        run: bash tests/test-update-rules-bootstrap.sh
+
+      - name: "Phase3: pdgtx 服务 guard 锁内前置与 CLI round-trip"
+        run: python3 tests/test-pdgtx-service-guard.py
 
       - name: "install 二进制事务回归 (备份失败即中止/半截安装可恢复/强制重装也还原/清理失败不假报)"
         run: bash tests/test-install-bintxn.sh
@@ -172,11 +304,47 @@ jobs:
       - name: "iOS 描述文件回归 (Wi-Fi 探测判定 + SSID 直连名单)"
         run: python3 tests/test-ios-ssid.py
 
-      - name: "自检防火墙端口回归"
+      - name: "Phase3: doctor 防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 
-      - name: "nft input 链冲突判据 (单一来源 + 读不到≠没有 + platform 守卫不靠 PATH 找 nft)"
+      - name: "Phase3: nftscan/input 链冲突判据"
         run: python3 tests/test-nft-input-scan.py
+
+      - name: "Phase3: 防火墙 ownership/mode 回归"
+        run: python3 tests/test-firewall-ownership.py
+
+      - name: "Phase3: Mihomo 数据面参数与持久 profile"
+        run: python3 tests/test-mihomo-dataplane.py
+
+      - name: "Phase3: profile / nft / Mihomo / doctor 跨组件一致性"
+        run: python3 tests/test-dataplane-profile.py
+
+      - name: "Phase3: 数据面生命周期顺序与回滚门"
+        run: python3 tests/test-dataplane-lifecycle.py
+
+      - name: "Phase3: status 必需服务活性 (mosdns/Mihomo inactive 必须失败)"
+        run: bash tests/test-status-required-services.sh
+
+      - name: "Phase3: QUIC policy routing ownership 与精确回滚"
+        run: bash tests/test-quic-routing.sh
+
+      - name: "Phase3: 迁移必须使用同一 checked-out 数据面 bundle"
+        run: bash tests/test-migration-dataplane-bundle.sh
+
+      - name: "Phase3: switchcore persistent/live nft 回滚故障必须阻断"
+        run: bash tests/test-switchcore-nft-rollback.sh
+
+      - name: "Phase3: 当前快照五阶段故障必须精确恢复"
+        run: bash tests/test-snapshot-rollback-transaction.sh
+
+      - name: "Phase3: 旧 sing-box 快照清理 Mihomo 残留并重建 QUIC 前置"
+        run: bash tests/test-legacy-snapshot-rollback.sh
+
+      - name: "Phase3: 旧快照兼容迁移四阶段故障恢复"
+        run: bash tests/test-legacy-migration-transaction.sh
+
+      - name: "Phase3: 旧快照迁移后完整事务故障恢复"
+        run: bash tests/test-legacy-post-migration-transaction.sh
 
       - name: "配置事务核心 (状态机/白名单/前置检查/观察期/回滚/审计/runner 固定)"
         run: python3 tests/test-config-transaction.py
@@ -252,17 +420,17 @@ jobs:
         run: python3 tests/test-platform-isolation.py
 
   functional:
-    # 真功能测试: 下载钉死 SHA256 的 sing-box / mosdns, 真起一遍, 验证两层核心链路。
+    # 真功能测试: 下载并校验钉死版本的 Mihomo / MosDNS, 真起一遍验证两层核心链路。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: 流量层 (真起 sing-box 验证按 SNI 分到不同出口 + final 兜底)
+      - name: 流量层 (真起单个 Mihomo 验证 TLS SNI 多出口分流 + final 兜底)
         run: bash tests/functional-test.sh
       - name: DNS 层 (真起 mosdns 验证 A 劫持 / AAAA·HTTPS 置空 / 国内直连 / 按来源门控)
         run: bash tests/dns-policy-test.sh
       - name: DNS 限流 (rate_limiter 迁移幂等 + 真起 mosdns 验证超限 REFUSED + doctor)
         run: bash tests/test-mosdns-ratelimit.sh
-      - name: 出站 schema (锁定版 sing-box check 各协议 parse_link 输出)
+      - name: 数据模型出站 schema (锁定版 sing-box check 验证 parse_link 兼容模型)
         run: bash tests/test-outbound-schema.sh
       - name: 劫持形态 (真起 mosdns 验证 all=排除式劫持 / gfw=白名单放行)
         run: bash tests/test-hijack-shape.sh

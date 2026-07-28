@@ -65,8 +65,9 @@ python3 "$HERE/mock_dns.py" "$UNLOCKP" "$UNLOCK_IP"   & PIDS+=($!)
 mkdir -p "$WORK/rules"
 echo "qq.com" > "$WORK/rules/geosite_cn.txt"
 : > "$WORK/rules/geosite_apple.txt"
-: > "$WORK/rules/custom_direct.txt"
-: > "$WORK/rules/custom_hijack.txt"
+echo "domain:direct.example.com" > "$WORK/rules/custom_direct.txt"
+echo "domain:phone-direct.example.com" > "$WORK/rules/ruleset_direct.txt"
+echo "domain:proxy.phone-direct.example.com" > "$WORK/rules/custom_hijack.txt"
 echo "domain:unlktest.example" > "$WORK/rules/unlock.txt"
 echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"   # 劫持集(all 模式=geolocation-!cn): 代理域名在集内 → 被劫持
 : > "$WORK/rules/mitm_hijack.txt"                                # MITM 接管域名(force_hijack): 本测试无, 留空
@@ -121,6 +122,16 @@ expect_empty   "代理域名 AAAA → mosdns 置空(mock 本会回 AAAA)"   "$(q
 expect_empty   "代理域名 HTTPS(65) → mosdns 置空"     "$(q example.com TYPE65)"
 expect_eq      "国内域名 A → 直连走上游"              "$(q www.qq.com A)"      "$UPSTREAM_IP"
 expect_nonempty "国内域名 AAAA → 不被置空(走上游)"    "$(q www.qq.com AAAA)"
+# direct.example.com 同时被父域 example.com 的劫持集覆盖。custom_direct 合并进
+# geosite_cn，且 CN/direct 分支必须先于 spoof 分支，因此应返回真实上游答案。
+expect_eq      "custom_direct 优先于父域劫持/spoof"     "$(q direct.example.com A)" "$UPSTREAM_IP"
+expect_nonempty "custom_direct AAAA 不被 spoof 抑制"   "$(q direct.example.com AAAA)"
+expect_eq      "ruleset target=direct → 手机取得真实地址" \
+               "$(q phone-direct.example.com A)" "$UPSTREAM_IP"
+expect_eq      "显式代理覆盖宽泛 ruleset direct → 劫持到网关" \
+               "$(q proxy.phone-direct.example.com A)" "$SERVER_IP"
+expect_empty   "显式代理覆盖宽泛 ruleset direct → 抑制 AAAA" \
+               "$(q proxy.phone-direct.example.com AAAA)"
 
 # ── 4b. 非内网来源(内网段不含 127, 故本机 dig 视为"外部")──
 note "渲染(内网段=10.200.0.0/16, 本机=外部来源)并重起 mosdns…"

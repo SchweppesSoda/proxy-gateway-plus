@@ -59,9 +59,9 @@ reset_ev; mk_marker
 [[ "$(cat "$WORK/platform")" == android ]] && ok "无任何证据 → 安全回退 android" || bad "回退未生效"
 
 # ── E. _pdg_svcs(平台服务集)──────────────────────────────────────────────────
-use_fn _pdg_svcs; _pdg_core_svc(){ echo sing-box; }
+use_fn _pdg_svcs; _pdg_core_svc(){ echo mihomo; }
 _pdg_platform(){ echo android; }
-[[ "$(_pdg_svcs)" == "mosdns sing-box pdg-bot" ]] && ok "Android 服务集不含 pdg-probe81" || bad "Android 服务集错: $(_pdg_svcs)"
+[[ "$(_pdg_svcs)" == "pdg-quic-routing mosdns mihomo pdg-bot" ]] && ok "Android 服务集不含 pdg-probe81" || bad "Android 服务集错: $(_pdg_svcs)"
 _pdg_platform(){ echo ios; }
 [[ "$(_pdg_svcs)" == *pdg-probe81* ]] && ok "iOS 服务集含 pdg-probe81" || bad "iOS 服务集缺 pdg-probe81"
 
@@ -155,7 +155,7 @@ snapb="$(cat "$WORK/nf")"
 run_ok "migrate_fw_gms(幂等)" migrate_fw_gms "$WORK/nf"
 [[ "$(cat "$WORK/nf")" == "$snapb" ]] && ok "migrate_fw_gms: 已有 5228 → 幂等不再改" || bad "二跑又改了防火墙配置"
 # 自定义端口集不认: 宁可提示手动加, 也不猜着改用户的规则
-printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 443, 9443 } accept\n}\n' > "$WORK/nfcust"
+printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 443, 10443 } accept\n}\n' > "$WORK/nfcust"
 snapb="$(cat "$WORK/nfcust")"
 run_ok "migrate_fw_gms(自定义)" migrate_fw_gms "$WORK/nfcust"
 [[ "$(cat "$WORK/nfcust")" == "$snapb" ]] && ok "migrate_fw_gms: 非原装端口集不自动改写" || bad "改写了自定义端口集"

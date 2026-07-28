@@ -1,6 +1,6 @@
 # 新手上手图文教程
 
-面向**第一次部署**的人,一步步带你装好、连上、配好。已经熟悉的直接看 [INSTALL.md](https://github.com/misaka-cpu/privdns-gateway/blob/main/docs/INSTALL.md) 就行。
+面向**第一次部署**的人,一步步带你装好、连上、配好。已经熟悉的直接看 [INSTALL.md](https://github.com/SchweppesSoda/proxy-gateway-plus/blob/main/docs/INSTALL.md) 就行。
 
 > 文中配图均为**示意图**(示例数据,非真实截图):域名按 `dot.example.com`、IP 按 `203.0.113.x`、手机号按 `187****1234`。
 
@@ -30,7 +30,7 @@ VPS 用的是 **kfchost** — 官网:<https://kfchost.com/center/> · 邀请注�
 - 等生效:`dig +short dot.example.com` 能返回你的 IP 再继续。
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/dns.png" alt="DNS 控制台加 A 记录" width="520"><br>
+  <img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/dns.png" alt="DNS 控制台加 A 记录" width="520"><br>
   <sub>在域名控制台把子域 A 记录指向 VPS 公网 IP(仅 DNS)</sub>
 </p>
 
@@ -44,7 +44,7 @@ VPS 用的是 **kfchost** — 官网:<https://kfchost.com/center/> · 邀请注�
 **① 在 kfchost 生成门户链接** — 登录 [kfchost 控制台](https://kfchost.com/center/) → 打开你的 VPS → 下方「**增值服务 → 5GPN**」→「**生成链接**」→「**打开门户**」。
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/5gpn-portal.png" alt="kfchost 5GPN 生成链接" width="640"><br>
+  <img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/5gpn-portal.png" alt="kfchost 5GPN 生成链接" width="640"><br>
   <sub>kfchost 控制台:增值服务 → 5GPN → 生成链接 → 打开门户</sub>
 </p>
 
@@ -59,7 +59,7 @@ VPS 用的是 **kfchost** — 官网:<https://kfchost.com/center/> · 邀请注�
 5. **专网检测**:用这张联通卡的 **5G 网络**(关 WiFi)打开门户,确认显示「专网内」。
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/5gpn-bind.png" alt="5GPN 客户门户" width="680"><br>
+  <img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/5gpn-bind.png" alt="5GPN 客户门户" width="680"><br>
   <sub>5GPN 客户门户:手机号绑定 / 外站绑定(VPS)/ 专网检测</sub>
 </p>
 
@@ -70,20 +70,30 @@ VPS 用的是 **kfchost** — 官网:<https://kfchost.com/center/> · 邀请注�
 
 ## 4. 一键安装
 
-SSH 登录 VPS,跑:
+派生仓库目前还没有兼容的 `v*` 发布 tag。SSH 登录 VPS 后,克隆当前默认分支并显式
+跳过发布 tag 自举:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/install.sh | sudo bash
+git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
+cd proxy-gateway-plus
+sudo PDG_TAG_BOOTSTRAPPED=1 ./install.sh
 ```
+
+> `PDG_TAG_BOOTSTRAPPED=1` 只用于首次派生版本发布前的开发验证。首个派生 `v*` tag
+> 创建后,标准安装入口会恢复为“自举并切到最新发布 tag”。
 
 过程中它会:**①** 自动检测公网 IP、SSH 端口、内网卡来源段(抓包识别,期间用手机走这张 SIM 访问一次本机);**②** 让你填 bot token / 你的 user id / DoT 域名(token 可留空,装完再设);**③** 确认 A 记录生效后自动签 Let's Encrypt 证书,起服务、应用防火墙。
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/install.png" alt="安装过程" width="600"><br>
+  <img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/install.png" alt="安装过程" width="600"><br>
   <sub>install.sh 运行过程</sub>
 </p>
 
 > 抓内网卡段那步若没抓到:先随便填(如 `172.22.0.0/16`),装完用 `sudo pdg detect-cidr` 从容重测并写回。
+>
+> 默认 `PDG_FIREWALL_MODE=managed`;若整机防火墙由 `vps-toolkit` 等上层编排管理,
+> 使用 `external`。后者只保留网关自己的 source-scoped 数据面,不声明 input policy 或
+> 公网开放端口。
 
 ---
 
@@ -106,8 +116,8 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/ins
 
 <table align="center">
   <tr>
-    <td align="center"><img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/android-dns.png" alt="Android 私人 DNS" width="240"><br><sub>Android 私人 DNS 填域名</sub></td>
-    <td align="center"><img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/ios-profile.png" alt="iOS 描述文件" width="240"><br><sub>iOS 安装描述文件</sub></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/android-dns.png" alt="Android 私人 DNS" width="240"><br><sub>Android 私人 DNS 填域名</sub></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/ios-profile.png" alt="iOS 描述文件" width="240"><br><sub>iOS 安装描述文件</sub></td>
   </tr>
 </table>
 
@@ -118,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/ins
 Telegram 给 bot 发 `/start`,出现主菜单:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/bot-menu.png" alt="bot 主菜单" width="280"><br>
+  <img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/bot-menu.png" alt="bot 主菜单" width="280"><br>
   <sub>bot <code>/start</code> 主菜单</sub>
 </p>
 
@@ -129,9 +139,9 @@ Telegram 给 bot 发 `/start`,出现主菜单:
 
 <table align="center">
   <tr>
-    <td align="center"><img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/add-exit.png" alt="添加出口" width="240"><br><sub>添加出口</sub></td>
-    <td align="center"><img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/rules.png" alt="分流管理" width="240"><br><sub>分流管理</sub></td>
-    <td align="center"><img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/test.png" alt="测出口" width="240"><br><sub>测出口</sub></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/add-exit.png" alt="添加出口" width="240"><br><sub>添加出口</sub></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/rules.png" alt="分流管理" width="240"><br><sub>分流管理</sub></td>
+    <td align="center"><img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/test.png" alt="测出口" width="240"><br><sub>测出口</sub></td>
   </tr>
 </table>
 
@@ -142,7 +152,7 @@ Telegram 给 bot 发 `/start`,出现主菜单:
 VPS 上 `sudo pdg` 进管理菜单(状态 / 自检 / 更新 / 快照回滚 / 换 token / 日志 / 流量 / 识别内网卡段 / 卸载):
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/docs/images/pdg-menu.png" alt="pdg 管理菜单" width="440"><br>
+  <img src="https://raw.githubusercontent.com/SchweppesSoda/proxy-gateway-plus/main/docs/images/pdg-menu.png" alt="pdg 管理菜单" width="440"><br>
   <sub><code>sudo pdg</code> 管理菜单</sub>
 </p>
 
@@ -158,10 +168,16 @@ sudo pdg report       # 生成脱敏诊断报告(贴出来求助用)
 
 ## 9. 局限与补丁
 
-「DNS + SNI」这套只兜走 **80 / 443、能按域名/SNI 判定**的流量。下面这些天生不走这套,属正常:
+「DNS + Mihomo」只处理被 MosDNS 引回网关、且命中配置数据面端口的流量。TCP 按
+内网卡来源段 REDIRECT 到单个 Mihomo `:7893`;端口集合可严格扩展。
 
 - **Speedtest 测速 / 纯 UDP(游戏联机、WebRTC)/ 直连 IP 的 App**:可在手机上常备一个 iOS 自带的**全局 VPN(IKEv2)**作兜底,要用时一键开、不用时关。
-- **QUIC / HTTP3**:网关已 reject 手机源 UDP/443,逼客户端回落 TCP/443(才能被嗅 SNI 分流)。
+- **QUIC / HTTP3**:默认 `PDG_QUIC_MODE=tproxy`,内网卡来源 UDP/443 经 nft TPROXY
+  到同一 Mihomo `:7895`。显式 `reject` 才禁用原生 QUIC;`external` 模式下具体
+  input 动作由外部防火墙决定。
+- **非标准 TCP 端口**:若网站本应直连却被漏分流,在 bot 把域名指到 `direct`,写入
+  `custom_direct.txt` 后返回真实 IP。只有确需代理的非标准 TLS 才扩展
+  `PDG_HIJACK_TLS_TCP_PORTS`,例如测试服务 `:10443`;该变量是完整集合,不是追加值。
 - **Telegram App**:走直连 IP,不吃 DNS+SNI 分流。已内置一个**仅内网卡可达的 SOCKS5(网关 IP:8445)**:在 Telegram「设置 → 数据和存储 → 代理」加 SOCKS5、填 `网关IP:8445`(无需账号密码)即可。出口可在 bot **📱 客户端 → ✈️ Telegram 出口** 单独选(默认跟随「默认出口」);想走 hk 就选 hk。
 
 ---
@@ -171,7 +187,7 @@ sudo pdg report       # 生成脱敏诊断报告(贴出来求助用)
 - **手机完全没网** → 多半 mosdns 没应答:`sudo pdg doctor` 看「服务 / 本机DNS」。
 - **某域名没生效** → bot **📑 分流管理 → 🔎 测域名**,看它命中哪条规则/出口。
 - **iOS 蜂窝下不激活** → 删旧描述文件重装(新版探测 `:81` 已配好),开关一次飞行模式。
-- 更多见 [排障手册](https://github.com/misaka-cpu/privdns-gateway/blob/main/docs/TROUBLESHOOTING-PLAYBOOK.md)。
+- 更多见 [排障手册](https://github.com/SchweppesSoda/proxy-gateway-plus/blob/main/docs/TROUBLESHOOTING-PLAYBOOK.md)。
 
 ---
 

@@ -19,6 +19,9 @@ venv/
 
 # 机密: 真实 IP / 密码 / 证书不要进版本库
 config/pdg.local.conf
+.env
+.env.*
+!.env.example
 *.pem
 *.key
 tls/

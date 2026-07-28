@@ -95,23 +95,50 @@ def main():
         if checks._platform() == "ios":
             _svcs.append("pdg-mitm")
     else:
-        _svcs = ["mosdns", "mihomo", "pdg-bot"]
+        _svcs = ["pdg-quic-routing", "mosdns", "mihomo", "pdg-bot"]
     _svcs += ["pdg-rules-update.timer", "pdg-health.timer", "vnstat"]
     parts.append(section("服务状态", "\n".join(
         f"  {s:<14}{run(['systemctl', 'is-active', s])}" for s in _svcs)))
     # 内核版本: v1.6.0 起恒 mihomo(已彻底移除 sing-box 运行时)。
     parts.append(section("mihomo 版本", run(["mihomo", "-v"])))
     parts.append(section("监听端口 (ss -lntu)", run(["ss", "-lntu"])))
+    route_table = "7895"
+    if checks is not None:
+        try:
+            values, cfg, fw_mode = checks._strict_dataplane_profile()
+            route_table = str(cfg["route_table"])
+            profile_text = (
+                "firewall=%s platform=%s cidr=%s ssh=%s\n"
+                "QUIC=%s TLS=%s HTTP=%s\n"
+                "mark=%s/%s table=%s priority=%s"
+                % (fw_mode, values["PDG_PLATFORM"],
+                   values["PDG_INTERNAL_CIDR"], values["PDG_SSH_PORT"],
+                   cfg["quic_mode"], ",".join(map(str, cfg["tls_ports"])),
+                   ",".join(map(str, cfg["http_ports"])),
+                   cfg["mark_text"], cfg["mask_text"], cfg["route_table"],
+                   cfg["rule_priority"]))
+        except Exception as error:  # noqa: BLE001
+            profile_text = "(严格 profile 解析失败: %s)" % error
+    else:
+        profile_text = "(checks 不可用)"
+    parts.append(section("透明数据面 profile（仅安全字段）", profile_text))
+    parts.append(section("QUIC 路由 helper status",
+                         run(["/usr/local/libexec/pdg-quic-routing.sh", "status"])))
+    parts.append(section("IPv4 policy rules / QUIC route table",
+                         run(["ip", "-4", "rule", "show"]) + "\n--- table "
+                         + route_table + " ---\n"
+                         + run(["ip", "-4", "route", "show", "table", route_table])))
     parts.append(section("证书 (CN / 有效期)",
                          run(["openssl", "x509", "-in", cert, "-noout", "-subject", "-enddate"])))
     parts.append(section(f"DoT A 记录 ({dom or '?'} @1.1.1.1, 本机应为 {sip or '?'})",
                          run(["dig", "+short", dom, "@1.1.1.1"]) if dom else "(未知 DoT 域名)"))
-    fw_rc, fw = run_rc(["nft", "list", "chain", "inet", "pdg", "input"])
+    fw_rc, fw = run_rc(["nft", "list", "table", "inet", "pdg"])
     if fw_rc != 0:
         fw = run(["nft", "list", "chain", "inet", "filter", "input"])
-    parts.append(section("防火墙 input 链", fw))
-    parts.append(section("最近日志 (pdg-bot / mosdns / mihomo, 80 行)",
+    parts.append(section("防火墙 PDG 表", fw))
+    parts.append(section("最近日志 (pdg-bot / mosdns / mihomo / QUIC route, 80 行)",
                          run(["journalctl", "-u", "pdg-bot", "-u", "mosdns", "-u", "mihomo",
+                              "-u", "pdg-quic-routing",
                               "-n", "80", "--no-pager", "-o", "short-iso"], t=20)))
 
     text = "".join(parts)

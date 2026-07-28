@@ -41,6 +41,7 @@ def main():
             "APPLE": "geosite_apple.txt",
             "GFW": "geosite_gfw.txt"}          # GFWList: 只劫持真被墙的域名(gfw 劫持模式用)
     res = {k: [] for k in want}
+    seen = set()
     data = open(dat, "rb").read()
     for fn, wt, val in _fields(data):           # GeoSiteList.entry = 1
         if fn != 1 or wt != 2:
@@ -59,11 +60,15 @@ def main():
                 if dv is not None:
                     doms.append((dt, dv))
         if cc in want:
+            seen.add(cc)
             res[cc] = doms
+    bad = [cc for cc in want if cc not in seen or not res[cc]]
+    if bad:
+        raise ValueError("geosite.dat 缺失或类别为空: " + ", ".join(bad))
     pref = {0: "keyword:", 1: "regexp:", 2: "domain:", 3: "full:"}
     os.makedirs(outdir, exist_ok=True)
     for cc, fname in want.items():
-        with open(os.path.join(outdir, fname), "w") as f:
+        with open(os.path.join(outdir, fname), "w", encoding="utf-8") as f:
             for dt, dv in res[cc]:
                 f.write(pref.get(dt, "domain:") + dv + "\n")
         print(fname, len(res[cc]))

@@ -13,7 +13,14 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"
+MOCK_PID=""
+cleanup(){
+  [[ -f "$WORK/pid" ]] && kill "$(cat "$WORK/pid")" 2>/dev/null || true
+  [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
@@ -73,12 +80,16 @@ fi
 mkrules(){ mkdir -p "$WORK/rules"
   printf 'domain:cn-site.test\n'  > "$WORK/rules/geosite_cn.txt"
   : > "$WORK/rules/geosite_apple.txt"; : > "$WORK/rules/custom_direct.txt"
-  : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/mitm_hijack.txt"
+  : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/ruleset_direct.txt"
+  : > "$WORK/rules/mitm_hijack.txt"
   : > "$WORK/rules/unlock.txt"
   printf 'domain:blocked.test\n' > "$WORK/rules/geosite_gfw.txt"
   printf 'domain:listed-oversea.test\n' > "$WORK/rules/geosite_geolocation-!cn.txt"
 }
 mkrules
+MOCKP=15999
+REAL_A=198.51.100.77
+REAL_AAAA=2001:db8::1
 serve(){  # $1=mode $2=劫持集文件名
   local cfg="$WORK/config.yaml"
   # 先归一化(它写 /etc/mosdns/rules 绝对路径), 再按 dns-policy-test 那套配方落到沙箱
@@ -86,9 +97,9 @@ serve(){  # $1=mode $2=劫持集文件名
   _mosdns_hijack_shape "$1" "$cfg" "$2" >/dev/null
   sed -i -e "s#/etc/mosdns/rules/#$WORK/rules/#g" \
          -e "s#0.0.0.0:53#127.0.0.1:15353#g" \
-         -e "s#^\([[:space:]]*\)args: {.*1\.1\.1\.1.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:15999\"} ] }#" \
-         -e "s#^\([[:space:]]*\)args: {.*223\.5\.5\.5.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:15999\"} ] }#" \
-         -e "s#^\([[:space:]]*\)args: {.*22\.22\.22\.22.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:15999\"} ] }#" \
+         -e "s#^\([[:space:]]*\)args: {.*1\.1\.1\.1.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:$MOCKP\"} ] }#" \
+         -e "s#^\([[:space:]]*\)args: {.*223\.5\.5\.5.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:$MOCKP\"} ] }#" \
+         -e "s#^\([[:space:]]*\)args: {.*22\.22\.22\.22.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:$MOCKP\"} ] }#" \
          -e "/- tag: dot_server/,\$d" "$cfg"
   local leftover; leftover="$(grep -oE '__[A-Z_]+__' "$cfg" | sort -u | tr '\n' ' ')"
   [[ -z "$leftover" ]] || bad "渲染后残留占位符: $leftover"
@@ -101,11 +112,16 @@ serve(){  # $1=mode $2=劫持集文件名
   return 0
 }
 stop(){ [[ -f "$WORK/pid" ]] && kill "$(cat "$WORK/pid")" 2>/dev/null; sleep 0.3; rm -f "$WORK/pid"; }
-q(){ dig +short +time=2 +tries=1 @127.0.0.1 -p 15353 "$1" A 2>/dev/null | head -1; }
+q(){ dig +short +time=2 +tries=1 @127.0.0.1 -p 15353 "$1" "${2:-A}" 2>/dev/null | head -1; }
 
-if ! command -v dig >/dev/null 2>&1; then
-  ok "真起 mosdns 验证(无 dig, 跳过)"
+if ! command -v dig >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+  ok "真起 mosdns 验证(无 dig/python3, 跳过)"
 else
+  python3 "$ROOT/tests/mock_dns.py" "$MOCKP" "$REAL_A" >"$WORK/mock-dns.log" 2>&1 &
+  MOCK_PID=$!
+  sleep 0.1
+  kill -0 "$MOCK_PID" 2>/dev/null || bad "mock DNS 未启动: $(cat "$WORK/mock-dns.log")"
+
   serve all 'geosite_geolocation-!cn.txt'
   if grep -qE '^Error:|FATAL' "$WORK/mosdns.log"; then
     bad "4: all 模式 mosdns 起不来: $(tail -3 "$WORK/mosdns.log")"
@@ -122,8 +138,14 @@ else
     bad "5: gfw 模式 mosdns 起不来: $(tail -3 "$WORK/mosdns.log")"
   else
     [[ "$(q blocked.test)" == "$SIP" ]] && ok "gfw: 劫持集内域名 → 劫持到网关" || bad "5a: blocked → $(q blocked.test)"
-    [[ "$(q unlisted-personal.test)" != "$SIP" ]] \
-      && ok "gfw: 集外海外域名 → 不劫持(走真实解析, 修 SSH/直连被劫持)" || bad "5b"
+    actual_a="$(q unlisted-personal.test A)"
+    [[ "$actual_a" == "$REAL_A" ]] \
+      && ok "gfw: 集外海外域名 A → 固定真实解析" \
+      || bad "5b: 集外 A 期望 $REAL_A, 实得 ${actual_a:-<空>}"
+    actual_aaaa="$(q unlisted-personal.test AAAA)"
+    [[ "$actual_aaaa" == "$REAL_AAAA" ]] \
+      && ok "gfw: 集外海外域名 AAAA → 固定真实解析" \
+      || bad "5c: 集外 AAAA 期望 $REAL_AAAA, 实得 ${actual_aaaa:-<空>}"
   fi
   stop
 fi

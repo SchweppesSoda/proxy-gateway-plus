@@ -13,6 +13,7 @@
 import importlib.util
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -36,12 +37,19 @@ def ok(msg):
 
 # ── "nft 在, 但不在 PATH 上"这套现场的搭件(第 10~12 段共用)────────────────────
 def _shim_repo(tmp, candidates=()):
-    """影子仓库: nftscan.py 是真实文件的原样拷贝, 只改 NFT_CANDIDATES 这一处常量(它就是为
-    "测试可以指到别处"留的); lib/ 直接软链回真仓库。python 侧(--nft-path)与 shell 侧(没有
-    python3 时按文本读)因此永远读到同一份清单 —— 被测的是真代码, 不是复刻。"""
+    """影子仓库: nftscan.py 和 lib/ 来自真实仓库，只改测试注入的路径与状态位置。
+    python 侧(--nft-path)与 shell 侧(没有 python3 时按文本读)因此永远读到同一份清单
+    —— 被测的是真代码, 不是复刻。"""
     repo = os.path.join(tmp, "repo")
     os.makedirs(os.path.join(repo, "deploy", "bot"))
-    os.symlink(str(ROOT / "lib"), os.path.join(repo, "lib"))
+    shutil.copytree(str(ROOT / "lib"), os.path.join(repo, "lib"))
+    # 隔离目标机可能已经存在的 /opt/pdg-bot runtime fallback；否则“删掉影子仓库
+    # nftscan.py”的负向用例会意外借到宿主机的真实扫描器。
+    nftbin = os.path.join(repo, "lib", "nftbin.sh")
+    src = Path(nftbin).read_text(encoding="utf-8")
+    src = src.replace("/opt/pdg-bot/nftscan.py",
+                      os.path.join(repo, "no-runtime", "nftscan.py"))
+    Path(nftbin).write_text(src, encoding="utf-8")
     _set_candidates(repo, candidates)
     return repo
 
@@ -51,6 +59,12 @@ def _set_candidates(repo, paths):
     body = "".join('"%s", ' % p for p in paths)
     out = re.sub(r"^NFT_CANDIDATES = \([^)]*\)", "NFT_CANDIDATES = (%s)" % body,
                  src, count=1, flags=re.M)
+    out = re.sub(r'^MODE_FILE = ".*"$',
+                 "MODE_FILE = %r" % os.path.join(repo, "state", "firewall-mode"),
+                 out, count=1, flags=re.M)
+    out = re.sub(r'^PROFILE_FILE = ".*"$',
+                 "PROFILE_FILE = %r" % os.path.join(repo, "state", "profile.env"),
+                 out, count=1, flags=re.M)
     assert out != src, "nftscan.py 里没有可替换的 NFT_CANDIDATES 常量"
     with open(os.path.join(repo, "deploy", "bot", "nftscan.py"), "w", encoding="utf-8") as fh:
         fh.write(out)
@@ -84,13 +98,27 @@ table inet filter {
   chain input {
     type filter hook input priority 0; policy accept;
     ct state established,related accept
-    tcp dport 9443 accept
+    tcp dport 10443 accept
   }
   chain forward {
     type filter hook forward priority 0; policy accept;
   }
 }
 table inet pdg {
+  comment "owner=privdns-gateway;schema=1;component=firewall;mode=managed"
+  set pdg_tls_tcp_ports {
+    type inet_service
+    elements = { 443 }
+  }
+  set pdg_http_tcp_ports {
+    type inet_service
+    elements = { 80 }
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    ip saddr 172.22.0.0/16 tcp dport @pdg_tls_tcp_ports redirect to :7893
+    ip saddr 172.22.0.0/16 tcp dport @pdg_http_tcp_ports redirect to :7893
+  }
   chain input {
     type filter hook input priority 0; policy drop;
     ip saddr 172.22.0.0/16 tcp dport { 53, 80, 443, 853 } accept
@@ -117,6 +145,20 @@ table inet wg {
   }
 }
 table inet pdg {
+  comment "owner=privdns-gateway;schema=1;component=firewall;mode=managed"
+  set pdg_tls_tcp_ports {
+    type inet_service
+    elements = { 443 }
+  }
+  set pdg_http_tcp_ports {
+    type inet_service
+    elements = { 80 }
+  }
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    ip saddr 172.22.0.0/16 tcp dport @pdg_tls_tcp_ports redirect to :7893
+    ip saddr 172.22.0.0/16 tcp dport @pdg_http_tcp_ports redirect to :7893
+  }
   chain input {
     type filter hook input priority 0; policy drop;
     ip saddr 172.22.0.0/16 tcp dport { 53, 80, 443 } accept
@@ -125,6 +167,20 @@ table inet pdg {
 """
 
 LIVE_FOREIGN = """table inet pdg {
+	comment "owner=privdns-gateway;schema=1;component=firewall;mode=managed"
+	set pdg_tls_tcp_ports {
+		type inet_service
+		elements = { 443 }
+	}
+	set pdg_http_tcp_ports {
+		type inet_service
+		elements = { 80 }
+	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		ip saddr 172.22.0.0/16 tcp dport @pdg_tls_tcp_ports redirect to :7893
+		ip saddr 172.22.0.0/16 tcp dport @pdg_http_tcp_ports redirect to :7893
+	}
 	chain input {
 		type filter hook input priority filter; policy drop;
 	}
@@ -189,7 +245,7 @@ def main():
                  "\t\ttype filter hook input priority filter; policy drop;",
                  "    type filter hook input priority -150; policy accept;",
                  "    type filter hook input priority mangle + 10; policy accept;"):
-        txt = ("table inet other {\n  chain c {\n%s\n    tcp dport 9443 accept\n  }\n}\n"
+        txt = ("table inet other {\n  chain c {\n%s\n    tcp dport 10443 accept\n  }\n}\n"
                % decl)
         assert len(nftscan.scan_text(txt, "")) == 1, (decl, nftscan.scan_text(txt, ""))
     ok("各种真实写法的 input 链声明(数字/具名/负数/表达式优先级)一个不漏")
@@ -217,7 +273,7 @@ table inet filter {
 
     # 骨架里只要有一条放行, 就是真冲突(它会被 PDG 的 policy drop 架空)
     withrule = STOCK.replace("type filter hook input priority filter;",
-                             "type filter hook input priority filter;\n\t\ttcp dport 9443 accept")
+                             "type filter hook input priority filter;\n\t\ttcp dport 10443 accept")
     f = nftscan.scan_text(withrule, "")
     assert len(f) == 1 and "1 条规则" in f[0], f
     ok("骨架里加一条放行 → 判为冲突, 并说明是几条规则")
@@ -303,7 +359,9 @@ table inet filter {
             fh.write("#!/bin/sh\necho 'Error: Could not process rule: Operation not permitted' >&2\nexit 1\n")
         os.chmod(nft, 0o755)
         env_path = tmp + os.pathsep + os.environ["PATH"]
-        old = os.environ["PATH"]; os.environ["PATH"] = env_path
+        old = os.environ["PATH"]
+        old_candidates = nftscan.NFT_CANDIDATES
+        os.environ["PATH"] = env_path
         try:
             txt, readable = nftscan.live_ruleset()
             assert readable is False, "nft 非 0 退出必须判为读不到"
@@ -312,11 +370,13 @@ table inet filter {
             # (b) nft 根本不存在
             os.environ["PATH"] = tmp                     # 目录里只有上面那个 nft
             os.remove(nft)
+            nftscan.NFT_CANDIDATES = ()                  # 隔离宿主机真实 /usr/sbin/nft
             txt, readable = nftscan.live_ruleset()
             assert readable is False, "nft 不存在必须判为读不到"
             ok("nft 不存在 → readable=False")
 
             # (c) 正常返回 → readable=True, 内容原样带回
+            nftscan.NFT_CANDIDATES = old_candidates
             os.environ["PATH"] = env_path                 # 桩里要用 cat, 把系统 PATH 接回来
             with open(nft, "w") as fh:
                 fh.write("#!/bin/sh\ncat <<'E'\n" + LIVE_FOREIGN + "E\n")
@@ -326,6 +386,7 @@ table inet filter {
             ok("nft 正常 → readable=True 且内容带回")
         finally:
             os.environ["PATH"] = old
+            nftscan.NFT_CANDIDATES = old_candidates
 
     # ── 6. CLI 退出码: 0=有冲突 1=确认干净 2=无法确认 ──
     with tempfile.TemporaryDirectory() as tmp:
@@ -340,7 +401,8 @@ table inet filter {
                 fh.write(nft_script)
             os.chmod(nft, 0o755)
             env = dict(os.environ, PATH=bindir)
-            return subprocess.run([sys.executable, str(NFTSCAN), conf],
+            return subprocess.run([sys.executable, str(NFTSCAN),
+                                   "--mode", "managed", conf],
                                   capture_output=True, text=True, env=env)
 
         NFT_OK = "#!/bin/sh\nexit 0\n"                       # 读得到, 内存里没规则
@@ -411,9 +473,11 @@ table inet filter {
     with tempfile.TemporaryDirectory() as tmp:
         conf = os.path.join(tmp, "nftables.conf")
         bindir = os.path.join(tmp, "bin"); os.makedirs(bindir)
-        with open(os.path.join(bindir, "nft"), "w") as fh:
+        nft = os.path.join(bindir, "nft")
+        with open(nft, "w") as fh:
             fh.write("#!/bin/sh\nexit 0\n")
-        os.chmod(os.path.join(bindir, "nft"), 0o755)
+        os.chmod(nft, 0o755)
+        repo = _shim_repo(tmp, (nft,))
         fnsh = os.path.join(tmp, "fn.sh")
         body = pdg_src.split("_pdg_nft_foreign_input_chains(){", 1)[1].split("\n}\n", 1)[0]
         with open(fnsh, "w") as fh:
@@ -425,7 +489,7 @@ table inet filter {
                                 ". '%s'; _pdg_nft_foreign_input_chains '%s'" % (fnsh, conf)],
                                capture_output=True, text=True,
                                env=dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"],
-                                        REPO_DIR=str(ROOT)))
+                                        REPO_DIR=repo))
             assert r.returncode == want, (want, r.returncode, r.stdout, r.stderr)
         ok("pdg.sh 前置门与 nftscan CLI 结论一致(有冲突/干净)")
 
@@ -560,18 +624,14 @@ table inet filter {
             with open(log, encoding="utf-8") as fh:
                 return fh.read()
 
-        # 12a. uninstall.sh 的防火墙段(真实代码行, 只是 _UN_HERE 指到影子仓库)
-        un_lines = (ROOT / "uninstall.sh").read_text(encoding="utf-8").split("\n")
-        bi = next(i for i, ln in enumerate(un_lines) if "删本项目独立表 inet pdg" in ln)
-        bj = next(i for i in range(bi, len(un_lines)) if un_lines[i] == "fi")
-        block = "\n".join(un_lines[bi:bj + 1])
-        assert "command -v nft >/dev/null" not in block, "uninstall 又退回只看 PATH 了: %s" % block
-        open(log, "w").close()
-        r = subprocess.run(["bash", "-c", '_UN_HERE=%r\n%s' % (repo, block)],
-                           capture_output=True, text=True, env=env)
-        assert r.returncode == 0, (r.returncode, r.stderr)
-        assert "delete table inet pdg" in nft_calls(), (nft_calls(), r.stderr)
-        ok("uninstall: PATH 上没有 nft 也照样删掉内核里的 inet pdg 表")
+        # 12a. uninstall 仍从共用判据定位 nft，但只有 scanner 证明运行态表 owned 才删除。
+        # 动态 ownership/remove 行为由 firewall ownership 回归覆盖；这里守住 PATH 合同。
+        un_text = (ROOT / "uninstall.sh").read_text(encoding="utf-8")
+        assert "pdg_nft_bin" in un_text
+        assert "--table-status=live" in un_text
+        assert '"$_UN_NFT" delete table inet pdg' in un_text
+        assert "command -v nft >/dev/null" not in un_text
+        ok("uninstall: 共用 nft 路径判据 + 运行态 ownership 门均存在")
 
         # 12b/12c. certbot 钩子: 拷一份把绝对路径指到沙箱(不给生产代码加接缝)
         conf = os.path.join(tmp, "nftables.conf")

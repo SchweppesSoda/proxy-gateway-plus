@@ -1,0 +1,49 @@
+name: Build patched MosDNS
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/build-mosdns-patched.yml"
+      - "lib/versions.sh"
+      - "patches/mosdns/**"
+      - "tools/build-mosdns-patched.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pinned Go toolchain
+        env:
+          GO_TARBALL_SHA256: 5b7899591c2dd6e9da1809fde4a2fad842c45d3f6b9deb235ba82216e31e34a6
+        run: |
+          set -euo pipefail
+          curl -fsSLO https://go.dev/dl/go1.24.9.linux-amd64.tar.gz
+          printf '%s  %s\n' "$GO_TARBALL_SHA256" go1.24.9.linux-amd64.tar.gz | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/go-toolchain"
+          tar -xzf go1.24.9.linux-amd64.tar.gz -C "$RUNNER_TEMP/go-toolchain"
+          echo "$RUNNER_TEMP/go-toolchain/go/bin" >> "$GITHUB_PATH"
+
+      - name: Build twice and verify reproducibility
+        run: |
+          set -euo pipefail
+          bash tools/build-mosdns-patched.sh --arch "${{ matrix.arch }}" --out "$RUNNER_TEMP/first"
+          bash tools/build-mosdns-patched.sh --arch "${{ matrix.arch }}" --out "$RUNNER_TEMP/second"
+          diff -ru "$RUNNER_TEMP/first" "$RUNNER_TEMP/second"
+
+      - name: Upload release-candidate interface
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosdns-${{ matrix.arch }}-release-candidate
+          path: ${{ runner.temp }}/first/*
+          if-no-files-found: error
+          retention-days: 14

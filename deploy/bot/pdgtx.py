@@ -106,6 +106,8 @@ _STATIC = {
     "model":          ("/etc/sing-box/config.json", 0o600, True, ("json_model",)),
     "mihomo_cfg":     ("/etc/mihomo/config.yaml", 0o600, True, ("mihomo_check",)),
     "mosdns_conf":    ("/etc/mosdns/config.yaml", 0o644, False, ("mosdns_probe",)),
+    "ruleset_direct": ("/etc/mosdns/rules/ruleset_direct.txt", 0o644, False,
+                       ("mosdns_lines",)),
     "rs_meta":        ("/opt/pdg-bot/rulesets.json", 0o644, False, ("json_any",)),
     "profile_env":    ("/etc/privdns-gateway/profile.env", 0o600, False, ("kv_env",)),
     "nftables_conf":  ("/etc/nftables.conf", 0o644, False, ("nft_check",)),
@@ -123,7 +125,7 @@ _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
 # 目标 → 该目标牵动哪个服务(决定基线范围、观察范围)
 _TARGET_SVC = {
     "model": "mihomo", "mihomo_cfg": "mihomo", "rs_meta": "mihomo",
-    "mosdns_conf": "mosdns", "mitm_hijack": "mosdns",
+    "mosdns_conf": "mosdns", "mitm_hijack": "mosdns", "ruleset_direct": "mosdns",
     "cert_fullchain": "mosdns", "cert_privkey": "mosdns",
     "mitm_json": "pdg-mitm",
 }
@@ -660,7 +662,10 @@ def _v_mosdns_probe(path, data, ctx):
                     if os.path.isfile(src):
                         os.symlink(src, os.path.join(probe_rules, leaf))
             for name, t in sorted(getattr(ctx, "targets", {}).items() if ctx else []):
-                if not (name.startswith("mosdns_rule:") or name == "mitm_hijack"):
+                if not (
+                    name.startswith("mosdns_rule:")
+                    or name in ("mitm_hijack", "ruleset_direct")
+                ):
                     continue
                 leaf = os.path.basename(t["path"])
                 dst = os.path.join(probe_rules, leaf)
@@ -879,6 +884,7 @@ class Tx:
         self._read_sha = {}        # read_for_update 记下的"候选所依据的源内容" sha
         self.derivers = []         # (target, fn)
         self.actions = []
+        self.service_guards = {}
         self.warnings = []
         self.meta = {
             "schema_version": SCHEMA_VERSION, "runner_sha256": _runner_sha(),
@@ -997,6 +1003,19 @@ class Tx:
             self.actions.append(action)
         return self
 
+    def guard_service(self, unit, expect):
+        """在全局事务锁内复核服务前置状态。
+
+        这不是服务动作：调用方仍须按需显式声明 restart/start。guard 只解决调用方在
+        apply 之前查询服务留下的 TOCTOU，保证动生产文件前仍处于所要求的精确状态。
+        """
+        if unit not in _SERVICE_UNITS or expect not in ("active", "inactive"):
+            raise TxError("服务 guard 不合法: %s/%s" % (unit, expect))
+        self.service_guards[unit] = {"expect": expect}
+        self.meta["service_guards"] = dict(self.service_guards)
+        self._save_meta()
+        return self
+
     def warn(self, msg):
         self.warnings.append(redact(msg))
         return self
@@ -1098,7 +1117,8 @@ class Tx:
             raise TxRefused("服务动作冲突: %s" % "; ".join(bad_actions))
         services = sorted({s for s in (target_service(t) for t in self.targets) if s} |
                           {a.split(":", 1)[1] for a in self.actions
-                           if a.split(":", 1)[0] in ("restart", "start", "stop")})
+                           if a.split(":", 1)[0] in ("restart", "start", "stop")} |
+                          set(self.service_guards))
         self.meta["services"] = services
         self.meta["targets"] = sorted(self.targets)
         exp = expected_states(self.actions)
@@ -1107,7 +1127,19 @@ class Tx:
         # 判据换成"操作后是否达到期望终态"(见 _observe)。只放宽这些 unit 的 active 检查。
         relax = tuple(u for u, w in exp.items() if any(
             a in self.actions for a in ("start:" + u, "stop:" + u)))
-        # 2) 基线
+        # 2) 服务前置 guard + 基线。guard 必须在全局事务锁内复核，不能只靠调用方在
+        # apply 之前跑一次 systemctl（那会在两个进程之间留下明显 TOCTOU）。
+        for unit, guard in sorted(self.service_guards.items()):
+            cur, ok = _svc_prop_ex(unit, "ActiveState")
+            if not ok or not cur.strip():
+                self.meta["error_class"] = "PRECONDITION_FAILED"
+                raise TxRefused("PRECONDITION_FAILED: 查不到 %s 的 ActiveState，服务 guard 无法证明"
+                                % unit)
+            cur = cur.strip()
+            if cur != guard["expect"]:
+                self.meta["error_class"] = "PRECONDITION_FAILED"
+                raise TxRefused("PRECONDITION_FAILED: %s 当前是 %s，服务 guard 要求 %s"
+                                % (unit, cur, guard["expect"]))
         base = health_snapshot(services, relax_units=relax)
         if relax:      # 放宽的那几个 unit 操作前什么样, 仍要留档(审计要看得见)
             self.meta["baseline_relaxed"] = {"svc:" + u: _svc_active(u) for u in relax}
@@ -1257,8 +1289,14 @@ class Tx:
                 _fsync_dir(os.path.dirname(t["path"]))
             return
         st = self._before["files"].get(name, {})
-        atomic_write(t["path"], t["data"], st.get("mode", t["mode"]),
-                     st.get("uid"), st.get("gid"))
+        if name in ("cert_fullchain", "cert_privkey"):
+            # Production copies are managed ordinary files, not Certbot's
+            # /live symlinks.  Repair legacy ownership/modes on every deploy
+            # so Web TLS validation cannot inherit an unsafe old uid/gid.
+            atomic_write(t["path"], t["data"], t["mode"], 0, 0)
+        else:
+            atomic_write(t["path"], t["data"], st.get("mode", t["mode"]),
+                         st.get("uid"), st.get("gid"))
         t["applied_sha"] = _sha(t["data"])
 
     def _do_actions(self):
@@ -1793,6 +1831,61 @@ def _cli_service(a):
     return 0
 
 
+def _cli_guard(a):
+    d = os.path.join(TX_ROOT, a.tx)
+    m = load_meta(d)
+    if not m or m.get("state") != PREPARING:
+        print("事务不存在或不在 PREPARING: %s" % a.tx, file=sys.stderr); return 2
+    if a.unit not in _SERVICE_UNITS or a.expect not in ("active", "inactive"):
+        print("服务 guard 不合法: %s/%s" % (a.unit, a.expect), file=sys.stderr); return 2
+    m.setdefault("staged_service_guards", {})[a.unit] = {"expect": a.expect}
+    atomic_write(os.path.join(d, "meta.json"),
+                 json.dumps(m, ensure_ascii=False, indent=1).encode(), 0o600)
+    return 0
+
+
+def _cli_rebuild_watches(meta):
+    """把不同小版本写下的 watch metadata 还原为 Tx.watch() 的内存形态。
+
+    `watched` 是 Python API 当前写出的 dict；早期 CLI 实验版可能留下
+    `staged_watches`（dict 或 entry list）。路径永远重新走逻辑目标白名单解析，不信任
+    metadata 中的任意路径。缺少这两个字段的旧事务兼容为空 watch 集。
+    """
+    rebuilt = {}
+    groups = []
+    if meta.get("watched"):
+        groups.append(meta["watched"])
+    if meta.get("staged_watches"):
+        groups.append(meta["staged_watches"])
+    for raw in groups:
+        if isinstance(raw, dict):
+            entries = [(name, rec) for name, rec in raw.items()]
+        elif isinstance(raw, list):
+            entries = []
+            for rec in raw:
+                if not isinstance(rec, dict):
+                    raise TxError("watch metadata list entry 不是 dict")
+                entries.append((rec.get("target") or rec.get("name"), rec))
+        else:
+            raise TxError("watch metadata 不是 dict/list")
+        for name, rec in entries:
+            if not isinstance(name, str) or not isinstance(rec, dict):
+                raise TxError("watch metadata entry 不完整")
+            path, _mode, _secret, _validators = resolve_target(name)
+            sha = rec.get("sha256")
+            absent = bool(rec.get("absent", sha is None))
+            optional = bool(rec.get("optional", False))
+            if sha is not None and not re.fullmatch(r"[0-9a-f]{64}", str(sha)):
+                raise TxError("watch metadata sha256 不合法: %s" % name)
+            if absent and sha is not None:
+                raise TxError("watch metadata 自相矛盾(absent 但有 sha): %s" % name)
+            if absent and not optional:
+                raise TxError("必需 watch 不应记录为 absent: %s" % name)
+            rebuilt[name] = {
+                "path": path, "sha256": sha, "absent": absent, "optional": optional}
+    return rebuilt
+
+
 def _cli_apply(a):
     d = os.path.join(TX_ROOT, a.tx)
     m = load_meta(d)
@@ -1814,6 +1907,14 @@ def _cli_apply(a):
     tx.state, tx.meta = PREPARING, m
     tx.derivers, tx.warnings = [], list(m.get("warnings", []))
     tx.actions = list(m.get("staged_actions", []))
+    tx.service_guards = dict(
+        m.get("staged_service_guards", m.get("service_guards", {})) or {})
+    tx._read_sha = {}
+    try:
+        tx.watches = _cli_rebuild_watches(m)
+    except TxError as e:
+        print("ERROR: %s" % redact(str(e)), file=sys.stderr)
+        return 2
     tx.targets = {}
     for s in m.get("staged", []):
         path, mode, secret, validators = resolve_target(s["target"])
@@ -1912,6 +2013,9 @@ def main(argv=None):
     p.set_defaults(fn=_cli_read)
     p = sub.add_parser("service"); p.add_argument("--tx", required=True)
     p.add_argument("--action", required=True); p.set_defaults(fn=_cli_service)
+    p = sub.add_parser("guard"); p.add_argument("--tx", required=True)
+    p.add_argument("--unit", required=True); p.add_argument("--expect", required=True)
+    p.set_defaults(fn=_cli_guard)
     p = sub.add_parser("apply"); p.add_argument("--tx", required=True)
     p.add_argument("--allow-runner-drift", action="store_true"); p.set_defaults(fn=_cli_apply)
     p = sub.add_parser("list"); p.add_argument("--limit", type=int, default=20)

@@ -4,7 +4,7 @@
 #
 # 上一轮只做到"文本保留": 把用户的表原样留在 /etc/nftables.conf 里。但那不等于规则还有效 ——
 # PDG 自己的 `table inet pdg` 带 `hook input priority 0; policy drop`, 而 nftables 里**同一
-# hook 上的多个 base chain 都会执行**, 任何一条判 drop 包就没了。于是用户 chain 里对 9443 /
+# hook 上的多个 base chain 都会执行**, 任何一条判 drop 包就没了。于是用户 chain 里对 10443 /
 # WireGuard 的 accept 形同虚设: 配置看着还在, 端口实际已经不通, 而迁移还报"成功"。
 #
 # 保守方案: 除 pdg 外还存在挂 `hook input` 的 base chain(**配置文件或当前运行 ruleset 任一**)
@@ -86,7 +86,7 @@ table inet myfilter {
         type filter hook input priority 0; policy drop;
         iif "lo" accept
         ct state established,related accept
-        tcp dport { 9443, 9444 } accept
+        tcp dport { 10443, 10444 } accept
         udp dport 51820 accept
     }
 }
@@ -242,7 +242,7 @@ cat >> /etc/nftables.conf <<'NFT'
 table inet lateradd {
     chain input {
         type filter hook input priority 0; policy accept;
-        tcp dport 9443 accept
+        tcp dport 10443 accept
     }
 }
 NFT

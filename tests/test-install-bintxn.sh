@@ -55,6 +55,15 @@ c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 systemctl(){ echo "systemctl $*" >> "$SB/../calls.log"; return "${SYSTEMCTL_RC:-0}"; }
 nft(){ echo "nft $*" >> "$SB/../calls.log"
        [[ "${1:-}" == list ]] && return "${NFT_LIST_RC:-0}"; return "${NFT_RC:-0}"; }
+python3(){
+  case "$*" in
+    *--table-status=live*) return "${NFT_LIST_RC:-0}";;
+    *--nft-path*)
+      [[ "${NFT_RC:-0}" == 0 ]] && echo /usr/bin/true || echo /usr/bin/false
+      return 0;;
+  esac
+  return 0
+}
 cp(){
   [[ -n "${CP_FAIL:-}" ]] && return 1
   if [[ -n "${CP_PARTIAL:-}" ]]; then printf 'PARTIAL' > "${@: -1}"; return 0; fi
@@ -225,6 +234,7 @@ rollback; echo rb_rc=\$?")
 # 7c. nft 表存在但删除失败 → 计入 failed
 mk_sandbox; seed_units
 out=$(sh_run "NFT_RC=1 NFT_LIST_RC=0" "$RB_STATE
+NFT_RUNTIME_TOUCHED=1; _NFTSCAN=mock-nftscan
 rollback; echo rb_rc=\$?")
 { grep -q '未能恢复' <<<"$out" && grep -q 'rb_rc=1' <<<"$out"; } \
   && ok "7c: nft 表存在但删除失败 → 计入未恢复项" || bad "7c: out=$out"

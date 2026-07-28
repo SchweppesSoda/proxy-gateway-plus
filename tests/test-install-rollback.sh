@@ -4,7 +4,7 @@
 #
 # 现场: `MIHOMO_INSTALLED: unbound variable` —— rollback 里 set +e 只关了 errexit,
 # nounset 仍然生效, 读到未赋值的 MIHOMO_INSTALLED 直接中断, 于是它后面的
-# nftables.conf / systemd-resolved / resolv.conf 三项系统级还原全部没跑, 而且
+# systemd-resolved / resolv.conf 等系统级还原全部没跑, 而且
 # 原始安装错误被这个二次错误盖掉。
 #
 # 覆盖:
@@ -39,7 +39,7 @@ xfn(){
     }' "$ROOT/install.sh"
 }
 : > "$WORK/fn.sh"
-for _f in _sha _stash_bin _rollback_bins _commit_bins rollback on_exit; do
+for _f in _sha _stash_bin _rollback_bins _commit_bins _commit_dirs rollback on_exit; do
   xfn "$_f" >> "$WORK/fn.sh"
 done
 grep -q '^rollback(){' "$WORK/fn.sh" && grep -q '^on_exit(){' "$WORK/fn.sh" \
@@ -49,14 +49,15 @@ grep -qE 'apt-get|curl -fsSL' "$WORK/fn.sh" && { echo "抽取越界: 含安装�
 
 # 只重定向绝对路径字面量到沙箱根
 sed -i -e 's#/etc/#$SB/etc/#g' -e 's#/usr/local/bin/#$SB/usr/local/bin/#g' \
+       -e 's#/usr/local/libexec/#$SB/usr/local/libexec/#g' \
        -e 's#/opt/#$SB/opt/#g' "$WORK/fn.sh"
 
 mk_sandbox(){   # 造一个"安装到一半"的现场
   SB="$WORK/root"; rm -rf "$SB"
   mkdir -p "$SB/etc/systemd/system" "$SB/etc/systemd/journald.conf.d" "$SB/usr/local/bin" \
-           "$SB/opt/pdg-bot" "$SB/etc/mosdns" "$SB/etc/privdns-gateway"
+           "$SB/usr/local/libexec" "$SB/opt/pdg-bot" "$SB/etc/mosdns" \
+           "$SB/etc/privdns-gateway"
   printf 'PDG-NEW\n'  > "$SB/etc/nftables.conf"
-  printf 'ORIG-NFT\n' > "$SB/etc/nftables.conf.pdg-orig"
   printf 'PDG-NEW\n'  > "$SB/etc/resolv.conf"
   printf 'ORIG-RESOLV\n' > "$SB/etc/resolv.conf.pdg-orig"
   for b in mosdns sing-box mihomo pdg pdg-set-token; do printf '%s\n' "$b" > "$SB/usr/local/bin/$b"; done
@@ -89,8 +90,13 @@ mk_sandbox
 out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0')
 grep -q 'unbound variable' <<<"$out" && bad "A: rollback 仍报 unbound variable" || ok "A: set -u 下 MIHOMO_INSTALLED 未赋值也不报 unbound variable"
 grep -qE '已回滚到安装前状态|回滚已尽力执行完' <<<"$out" && ok "A: rollback 跑到了末尾(没有中途夭折)" || bad "A: 未跑到末尾 out=$out"
-[[ "$(cat "$SB/etc/nftables.conf")" == "ORIG-NFT" ]] && ok "A: nftables.conf 已从 .pdg-orig 还原" || bad "A: nftables.conf 未还原"
+[[ "$(cat "$SB/etc/nftables.conf")" == "PDG-NEW" ]] \
+  && ok "A: 未登记本次 owned 变更时不做整文件覆盖" \
+  || bad "A: nftables.conf 被旧整文件备份覆盖"
 [[ "$(cat "$SB/etc/resolv.conf")" == "ORIG-RESOLV" ]] && ok "A: resolv.conf 已从 .pdg-orig 还原" || bad "A: resolv.conf 未还原"
+[[ -d "$SB/etc/mosdns" && -d "$SB/opt/pdg-bot" ]] \
+  && ok "A: DIR_TXN 为空时不猜测删除任何目录" \
+  || bad "A: DIR_TXN 为空却删除了安装前目录"
 
 # ── B. sing-box 本次新装 → 删掉本次装的 ─────────────────────────────────────
 mk_sandbox
@@ -106,7 +112,9 @@ grep -q 'unbound variable' <<<"$out" && bad "B: unbound variable" || {
 mk_sandbox
 out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0')
 [[ -e "$SB/usr/local/bin/mihomo" ]] && ok "C: mihomo 装前已存在且未重装 → 不被删除" || bad "C: 误删了装前已存在的 mihomo"
-[[ "$(cat "$SB/etc/nftables.conf")" == "ORIG-NFT" ]] && ok "C: rollback 完整执行" || bad "C: rollback 未完整执行"
+[[ "$(cat "$SB/etc/nftables.conf")" == "PDG-NEW" ]] \
+  && ok "C: rollback 不用装前整文件覆盖当前 nftables.conf" \
+  || bad "C: rollback 覆盖了当前 nftables.conf"
 
 # ── D. mihomo 本次新装 → 只删本次新增的 ─────────────────────────────────────
 mk_sandbox
@@ -228,6 +236,65 @@ for v in $(grep -oE '\$\{?[A-Z_][A-Z0-9_]*' "$WORK/trapbody.sh" | tr -d '${' | s
 done
 [[ -z "$miss" ]] && ok "G: trap/rollback 路径无未初始化且无默认值的变量(set -u 安全)" \
   || bad "G: 这些变量既未在 trap 前初始化, 引用处也没有 :- 兜底 →$miss"
+
+# ── L. QUIC 精确清理失败: 禁用启动，但保留完整 provenance/recovery 工具 ─────
+mk_sandbox
+printf 'MARK=0x504447\nMASK=0xffffffff\nTABLE=7895\nPRIORITY=17895\n' \
+  >"$SB/etc/privdns-gateway/quic-routing.state"
+printf 'PDG_QUIC_MODE=tproxy\n' >"$SB/etc/privdns-gateway/profile.env"
+printf 'parser\n' >"$SB/opt/pdg-bot/pdgprofile.py"
+printf 'converter\n' >"$SB/opt/pdg-bot/sb2mihomo.py"
+printf '[Unit]\n' >"$SB/etc/systemd/system/pdg-quic-routing.service"
+cat >"$SB/usr/local/libexec/pdg-quic-routing.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$SB/usr/local/libexec/pdg-quic-routing.sh"
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; RESOLVED_DISABLED=0; QUIC_ROUTING_TOUCHED=1; NFT_CONFIG_CHANGED=0; NFT_RUNTIME_TOUCHED=0')
+lout="$out"
+grep -q 'systemctl disable --now pdg-quic-routing.service' "$WORK/calls.log" \
+  && ok "L: cleanup 不确定时 route unit 仍 stop+disable" \
+  || bad "L: route unit 未被禁用"
+for kept in \
+  "$SB/etc/privdns-gateway/quic-routing.state" \
+  "$SB/etc/privdns-gateway/profile.env" \
+  "$SB/usr/local/libexec/pdg-quic-routing.sh" \
+  "$SB/etc/systemd/system/pdg-quic-routing.service" \
+  "$SB/opt/pdg-bot/pdgprofile.py" \
+  "$SB/opt/pdg-bot/sb2mihomo.py"; do
+  [[ -e "$kept" ]] || bad "L: recovery 文件被删: $kept"
+done
+
+# ── L2. 仓库目录与证书 hook 都走精确事务 ───────────────────────────────────
+mk_sandbox
+mkdir -p "$SB/opt/privdns-gateway"
+printf 'NEW-REPO\n' > "$SB/opt/privdns-gateway/HEAD"
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; RESOLVED_DISABLED=0' \
+  'DIR_TXN=("$SB/opt/privdns-gateway|0|")')
+[[ ! -e "$SB/opt/privdns-gateway" ]] \
+  && ok "L2: 装前不存在的 /opt 仓库副本在失败后删除" \
+  || bad "L2: 新建 /opt 仓库副本残留"
+
+mk_sandbox
+mkdir -p "$SB/etc/letsencrypt/renewal-hooks/deploy"
+printf 'OLD-HOOK\n' > "$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh"
+old_hook_sha=$(sha256sum "$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh" | cut -d' ' -f1)
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; RESOLVED_DISABLED=0' \
+  "_stash_bin \"\$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh\" || exit 9
+printf 'NEW-HOOK\n' > \"\$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh\"")
+[[ "$(sha256sum "$SB/etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh" | cut -d' ' -f1)" == "$old_hook_sha" ]] \
+  && ok "L2: 既有 99-pdg-cert.sh 在失败后精确还原" \
+  || bad "L2: 证书 deploy hook 未还原"
+
+grep -q '/var/lib/privdns-gateway' "$ROOT/install.sh" \
+  && ok "L2: pdgtx 状态目录已纳入 DIR_TXN" || bad "L2: pdgtx 状态目录未入账"
+grep -q 'mktemp -d /opt/.privdns-gateway.bootstrap' "$ROOT/install.sh" \
+  && ok "L2: curl 自举先在 /opt 临时目录 clone/checkout" || bad "L2: 自举仍可能直接污染目标"
+grep -q 'set -o noclobber' "$ROOT/install.sh" \
+  && ok "L2: 首装 marker 拒绝覆盖预存对象" || bad "L2: marker 创建非排他"
+ok "L: QUIC cleanup 失败时 state/profile/helper/unit/parser bundle 均保留"
+grep -q '精确清理/证明 QUIC policy routing' <<<"$lout" \
+  && ok "L: 不完整回滚明确报告" || bad "L: cleanup 失败未报告"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

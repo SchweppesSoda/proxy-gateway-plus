@@ -16,6 +16,15 @@ def block_after(text: str, marker: str, window: int = 900) -> str:
     return text[start:start + window]
 
 
+def shell_function(text: str, name: str) -> str:
+    marker = f"{name}(){{"
+    start = text.find(marker)
+    assert start >= 0, f"missing shell function: {name}"
+    end = text.find("\n}\n", start)
+    assert end >= 0, f"unterminated shell function: {name}"
+    return text[start:end + 3]
+
+
 send_plain = block_after(bot, "def send_plain")
 assert "p.pop(\"parse_mode\", None)" in send_plain, (
     "send_plain should retry without HTML parse_mode when Telegram rejects unescaped user/error text"
@@ -24,9 +33,9 @@ assert send_plain.count("post(\"sendMessage\", p)") >= 2, (
     "send_plain should attempt HTML first, then plain text fallback"
 )
 
-pdg_pos = report.find('"inet", "pdg", "input"')
+pdg_pos = report.find('"nft", "list", "table", "inet", "pdg"')
 filter_pos = report.find('"inet", "filter", "input"')
-assert pdg_pos >= 0, "pdg report should read the current firewall chain inet pdg/input"
+assert pdg_pos >= 0, "pdg report should read the complete current firewall table inet pdg"
 assert filter_pos >= 0, "pdg report should keep fallback compatibility with old inet filter/input installs"
 assert pdg_pos < filter_pos, "pdg report should prefer inet pdg before falling back to inet filter"
 
@@ -54,16 +63,15 @@ assert "临时观测/控制面板" in install_doc and "临时观测/控制面板
     "install and production docs should document the temporary panel boundary"
 )
 
-rollback = block_after(pdg, "cmd_rollback()", window=6200)   # harden + core-aware + 跨内核 + --dir/--git + 用快照自带内核校验旧配置后更大(实测约 5.7k)
+rollback = shell_function(pdg, "cmd_rollback")
 assert '[[ "$idx" =~ ^[0-9]+$ ]]' in rollback, "rollback index should reject non-numeric input"
 assert 'idx >= ${#snaps[@]}' in rollback, "rollback index should reject out-of-range input"
 
 # P2-1: cmd_update 装好新脚本后, 必须用"新脚本"跑迁移(否则 v1.2.x 新迁移要等下次命令才生效)
-# window 放宽: 必需文件安装改成"任一失败即回滚"的 if 链后, 装 pdg.sh 与调 __migrate 之间
-# 还隔着失败分支 + iOS/健康服务/certbot 钩子等可选文件安装(约 1300 字符); 断言语义不变 ——
-# __migrate 仍必须出现在"装好新 pdg.sh 之后"。
-cmd_update = block_after(pdg, "install -m755 \"$REPO_DIR\"/deploy/bot/pdg.sh", window=1600)
-assert "bash /usr/local/bin/pdg __migrate" in cmd_update, (
+# 安装清单会随平台/Web 组件增长，不用固定字符窗口；直接验证新脚本安装点与迁移点的顺序。
+new_pdg_pos = pdg.find('install -m755 "$REPO_DIR"/deploy/bot/pdg.sh')
+new_migrate_pos = pdg.find("bash /usr/local/bin/pdg __migrate", new_pdg_pos)
+assert new_pdg_pos >= 0 and new_migrate_pos > new_pdg_pos, (
     "cmd_update must re-invoke the freshly-installed script for migrations, not call old in-memory funcs"
 )
 assert "__migrate)" in pdg and "run_all_migrations" in pdg, "hidden __migrate subcommand + run_all_migrations must exist"
@@ -109,8 +117,11 @@ assert '_sb_sanitize_panel /etc/sing-box/config.json' not in rollback, (
 )
 assert 'tar tzf "$f" > "$members"' in rollback, "rollback must validate and retain the original archive member list"
 assert "快照含越界路径" in rollback, "rollback must reject archive members outside the managed etc/opt roots"
-assert '_pdg_apply_snapshot_tree "$tree" "$members" /' in rollback, (
-    "rollback must apply the validated temporary tree using the original archive member list"
+assert "awk '$0 !~ /^etc[/]nftables[.]conf$/'" in rollback, (
+    "rollback must exclude nftables.conf from the normal tree copy before its atomic install"
+)
+assert '_pdg_apply_snapshot_tree "$tree" "$apply_members" /' in rollback, (
+    "rollback must apply the validated temporary tree using the filtered member list"
 )
 
 # P2-3: mosdns cache 与 journald 修复相互独立(各自成函数, migrate_lowmem 里 mosdns 失败不 return 全函数)

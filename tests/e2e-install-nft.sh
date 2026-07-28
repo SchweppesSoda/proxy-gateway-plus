@@ -16,7 +16,7 @@ E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 source "$(dirname "${BASH_SOURCE[0]}")/e2e-lib.sh"
 e2e_enter "$@"
 
-e2e_stub_system
+e2e_stub_system fresh
 
 # 打桩外部世界(apt/certbot/下载), 与 e2e-install.sh 同口径 —— 本用例要验的是防火墙合并,
 # 不该被沙箱里的包管理器网络状况左右。
@@ -29,6 +29,19 @@ cat > /usr/local/bin/dpkg <<'S'
 exit 0
 S
 chmod 755 /usr/local/bin/dpkg
+cat > /usr/local/bin/curl <<'S'
+#!/bin/sh
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+[ -n "$out" ] || exit 1
+case "$out" in
+  */geosite.dat)
+    printf '\012\021\012\002CN\022\013\010\002\022\007test.io\012\036\012\017GEOLOCATION-!CN\022\013\010\002\022\007test.io\012\024\012\005APPLE\022\013\010\002\022\007test.io\012\022\012\003GFW\022\013\010\002\022\007test.io' > "$out";;
+  *) printf 'stub' > "$out";;
+esac
+exit 0
+S
+chmod 755 /usr/local/bin/curl
 . "$E2E_ROOT/lib/versions.sh"
 if ! command -v mosdns >/dev/null 2>&1; then
   printf '#!/bin/sh\ncase "$1" in version) echo "v%s";; start) sleep 3600;; esac\nexit 0\n' \
@@ -67,6 +80,8 @@ reset_box(){
          /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
          /etc/systemd/system/mosdns.service /etc/nftables.conf.pdg-orig
   rm -rf /tmp/e2e-svc; mkdir -p /tmp/e2e-svc
+  printf 0 > /tmp/e2e-svc/mosdns.ac
+  printf 0 > /tmp/e2e-svc/mihomo.ac
 }
 
 # ══ 1. 只有 NAT / forward / VPN 表(不挂 input hook)→ 逐字节保留并安全合并 ═══
@@ -116,7 +131,7 @@ table inet myfilter {
         type filter hook input priority 0; policy drop;
         iif "lo" accept
         ct state established,related accept
-        tcp dport { 9443, 9444 } accept
+        tcp dport { 10443, 10444 } accept
         udp dport 51820 accept
     }
 }
@@ -197,7 +212,7 @@ seed_conflict(){ cat > /etc/nftables.conf <<'NFT'
 table inet myfilter {
     chain input {
         type filter hook input priority 0; policy drop;
-        tcp dport { 9443 } accept
+        tcp dport { 10443 } accept
     }
 }
 NFT

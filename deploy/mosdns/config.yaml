@@ -27,7 +27,9 @@ plugins:
     args: { files: ["/etc/mosdns/rules/unlock.txt"] }
   - tag: geosite_cn
     type: domain_set
-    args: { files: ["/etc/mosdns/rules/geosite_cn.txt","/etc/mosdns/rules/geosite_apple.txt","/etc/mosdns/rules/custom_direct.txt"] }
+    # custom_direct = 显式单域名手机直连；ruleset_direct = target=direct 规则集的事务派生聚合。
+    # 两者都让手机取得真实地址，不进入 VPS/Mihomo。
+    args: { files: ["/etc/mosdns/rules/geosite_cn.txt","/etc/mosdns/rules/geosite_apple.txt","/etc/mosdns/rules/custom_direct.txt","/etc/mosdns/rules/ruleset_direct.txt"] }
   - tag: npn_clients
     type: ip_set
     args: { ips: ["__INTERNAL_CIDR__"] }
@@ -38,6 +40,11 @@ plugins:
   - tag: hijack_set
     type: domain_set
     args: { files: ["/etc/mosdns/rules/__HIJACK_SET_FILE__","/etc/mosdns/rules/custom_hijack.txt"] }
+  # 显式单域名出口规则比 geosite_cn/宽泛 direct 规则集更具体，必须先强制劫持；否则一个
+  # ruleset_direct 的宽后缀会吞掉“该后缀内某域名 → 代理出口”的显式覆盖。
+  - tag: explicit_hijack
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/custom_hijack.txt"] }
   # MITM 接管域名集(Feature B / iOS): 这些域名强制劫持到网关(即使是 Apple/国内直连域名),
   # 好让 mihomo 把它们路由到 MITM 服务终止 TLS。平时空文件 = 无接管(休眠); bot 启用插件时填。
   - tag: force_hijack
@@ -84,6 +91,9 @@ plugins:
       - exec: jump has_resp
       # MITM 接管域名: 强制劫持(在 CN 判断之前, 即使 Apple/国内域名也劫持; goto 不返回)
       - matches: qname $force_hijack
+        exec: goto force_hijack_seq
+      # 显式单域名代理覆盖优先于 CN/规则集手机直连，进入同一 fake-IP/SNI 劫持序列。
+      - matches: qname $explicit_hijack
         exec: goto force_hijack_seq
       - matches: qname $geosite_cn
         exec: $ecs_china

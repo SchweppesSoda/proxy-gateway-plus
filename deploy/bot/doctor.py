@@ -2,7 +2,7 @@
 """PrivDNS Gateway 自检 —— 只读, 一条命令跑全部检查。
   pdg doctor          人类可读
   pdg doctor --json   JSON 输出
-  pdg doctor --deep   追加慢速端到端检查(DoT 握手 / :81 探测 / DNS 解析 / clash_api)
+  pdg doctor --deep   追加慢速端到端检查(DoT 两次握手/会话恢复 / :81 探测 / DNS 解析 / clash_api)
 退出码: 有 fail → 1, 否则 0。"""
 import sys, json
 sys.path.insert(0, "/opt/pdg-bot")
