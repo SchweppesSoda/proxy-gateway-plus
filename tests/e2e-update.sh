@@ -122,18 +122,19 @@ git -C "$REPO" checkout -q v9.9.8                     # 退回旧版, 好再更�
 rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
 for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
 install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
-# 让 doctor 报一条 fail(内核服务不在) —— 用有状态 systemd 桩把 mihomo 置为 inactive
-e2e_svc_fail mihomo
+# 让 doctor 报一条 fail：restart 返回成功，但 Mihomo 随即崩回 inactive。
+# 瞬时 e2e_svc_fail 会被 updater 的正常 restart 治愈，不能作为观察期故障注入。
+e2e_svc_crash mihomo
 before=$(sha256sum /opt/pdg-bot/checks.py | cut -d' ' -f1)
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && ! grep -q '✅ 已更新' <<<"$out"; } \
   && ok "doctor 有 fail → 返回非0 且不显示'已更新'" || bad "rc=$rc 却报了成功"
-grep -qE '自检发现|回滚' <<<"$out" && ok "明确说明是自检失败并回滚" || bad "没说回滚原因: $(tail -3 <<<"$out")"
+grep -q '自检发现' <<<"$out" && ok "明确说明是自检失败并回滚" || bad "没说回滚原因: $(tail -3 <<<"$out")"
 [[ "$(sha256sum /opt/pdg-bot/checks.py | cut -d' ' -f1)" == "$before" ]] \
   && ok "回滚把部署文件真的换回了更新前那份(按 sha 比对)" || bad "回滚后文件不是更新前的"
 grep -q 'NEWVERSION-MARKER' /opt/pdg-bot/checks.py \
   && bad "回滚后仍残留新版标记(说明没换回去)" || ok "回滚后无新版残留"
-rm -f /tmp/e2e-svc/mihomo.ac
+e2e_svc_heal mihomo
 
 # ── 3. --dry-run 只看不动 ════════════════════════════════════════════════════
 echo; echo "── 3. --dry-run ──"

@@ -219,7 +219,7 @@ build_nopy_path(){
   ! PATH="$NOPY_BIN" command -v python3 >/dev/null 2>&1     # 真的找不到才算造成功
 }
 run_install_nopy(){   # 用"没有 python3"的 PATH 跑装机
-  env -i PATH="$NOPY_BIN" HOME=/root \
+  env -i PATH="$NOPY_BIN" HOME=/root PDG_IP_BIN=/tmp/e2e-pdg-ip \
       PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
       PDG_MOSDNS_ARTIFACT=/tmp/e2e-mosdns-pdg-nft \
       PDG_MOSDNS_ARTIFACT_SHA256="$E2E_MOSDNS_SHA" \

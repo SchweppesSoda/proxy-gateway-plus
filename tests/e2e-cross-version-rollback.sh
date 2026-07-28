@@ -32,16 +32,42 @@ e2e_enter "$@"
 # 只跑首尾是拿"中间那版大概一样"当假设: 这三个 tag 之间 cmd_update / cmd_rollback 的实现
 # 各有改动, 中间版本恰好走了另一条分支的话就永远测不到。三个版本各一遍, 用例本身不长。
 OLD_TAGS="${PDG_XVER_TAGS:-v1.5.10 v1.5.11 v1.5.12}"
-AVAIL=""
+CASE_LABELS=()
+CASE_SOURCE_REFS=()
+MISSING=""
+official_peeled_ref(){
+  case "$1" in
+    v1.5.10) printf '%s\n' 0ab482171833b71ac57fedce6eedadcf89e040d2 ;;
+    v1.5.11) printf '%s\n' aa06e319d699e2896e1544d340ff3ff7a5a9c1cf ;;
+    v1.5.12) printf '%s\n' 0031aa3a6e0355a878d4be3d4b3d6a133128b82c ;;
+    *) return 1 ;;
+  esac
+}
 for _t in $OLD_TAGS; do
-  git -C "$E2E_ROOT" rev-parse "$_t" >/dev/null 2>&1 && AVAIL="$AVAIL $_t"
+  _source_ref=""
+  if git -C "$E2E_ROOT" rev-parse --verify --quiet "$_t^{commit}" >/dev/null; then
+    _source_ref="$_t"
+  else
+    _source_ref="$(official_peeled_ref "$_t" 2>/dev/null || true)"
+    [[ -n "$_source_ref" ]] \
+      && git -C "$E2E_ROOT" cat-file -e "$_source_ref^{commit}" 2>/dev/null \
+      || _source_ref=""
+  fi
+  if [[ -n "$_source_ref" ]]; then
+    CASE_LABELS+=("$_t")
+    CASE_SOURCE_REFS+=("$_source_ref")
+  else
+    MISSING="${MISSING:+$MISSING }$_t"
+  fi
 done
-[[ -n "${AVAIL// /}" ]] || e2e_skip "本地没有任何受影响旧 tag($OLD_TAGS; 浅克隆?), 跨版本用例跳过"
+[[ -z "$MISSING" ]] \
+  || e2e_skip "缺少请求的旧版本源码 ref($MISSING; tag 与固定官方 commit 均不可达), 跨版本用例跳过"
 
 # 每个受影响旧版跑一遍完整现场(装机 → 该版本 update → 迁移成功 → 注入 doctor 失败 → 该版本回滚)
 # 函数体不缩进: 内部有 heredoc, 缩进会把结束定界符一起缩进而破坏它。
 run_case_for_tag(){
 OLD_TAG="$1"
+OLD_SOURCE_REF="$2"
 echo; echo "══════════ 更新器版本: $OLD_TAG ══════════"
 e2e_stub_system
 e2e_seed_install
@@ -55,7 +81,7 @@ mkdir -p /var/lib/privdns-gateway
 # ── 造出"仍在跑 v1.5.12 + sing-box"的机器 ───────────────────────────────────
 printf 'singbox\n' > /etc/privdns-gateway/backend
 # unit 用 v1.5.12 的 pdg_unit_singbox 真的生成(既是真实形态, 也让归属判定认得出是本项目装的)
-( eval "$(git -C "$E2E_ROOT" show "$OLD_TAG:lib/units.sh")"; pdg_unit_singbox ) \
+( eval "$(git -C "$E2E_ROOT" show "$OLD_SOURCE_REF:lib/units.sh")"; pdg_unit_singbox ) \
   > /etc/systemd/system/sing-box.service
 chmod 644 /etc/systemd/system/sing-box.service
 SB_UNIT_SHA="$(sha256sum /etc/systemd/system/sing-box.service | cut -d' ' -f1)"
@@ -76,7 +102,7 @@ git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
 git -C "$REPO" config commit.gpgsign false
 # 第一个提交 = v1.5.12 的全部代码(更新器就来自它)
 rm -rf "${REPO:?}"/* 2>/dev/null || true
-git -C "$E2E_ROOT" archive "$OLD_TAG" | tar -x -C "$REPO"
+git -C "$E2E_ROOT" archive "$OLD_SOURCE_REF" | tar -x -C "$REPO"
 git -C "$REPO" add -A >/dev/null 2>&1
 git -C "$REPO" commit -qm "$OLD_TAG" >/dev/null 2>&1
 git -C "$REPO" tag "$OLD_TAG"
@@ -150,6 +176,8 @@ grep -q 'ExecStart=/usr/local/bin/sing-box' /etc/systemd/system/sing-box.service
 
 }
 
-for _tag in $AVAIL; do run_case_for_tag "$_tag"; done
+for _i in "${!CASE_LABELS[@]}"; do
+  run_case_for_tag "${CASE_LABELS[$_i]}" "${CASE_SOURCE_REFS[$_i]}"
+done
 
 e2e_summary

@@ -7,9 +7,23 @@
 #   C. 部分恢复失败(git ref 不存在)→ 不谎报"完全回滚", 打印"未完全回滚"并返回 1。
 #   D. 静态: cmd_update 快照失败即中止; 用 --dir "$snap_dir" --git "$pre_sha"(非 cmd_rollback 0);
 #      快照 cand 覆盖已装脚本 + 全部 unit; 越界守卫放行 usr/local/bin。
-# 沙箱化: 覆写 _pdg_apply_snapshot_tree 落到沙箱(不碰真 /), 打桩 systemctl/nft/内核 check。
+# 沙箱化: 覆写 apply、定向绝对写路径，打桩 systemctl/nft/内核 check；不碰真 /。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
+
+# cmd_rollback intentionally contains real absolute-path cleanup for managed
+# assets. Refuse privileged or already-deployed hosts before extracting it;
+# this unit test never needs either environment.
+if (( EUID == 0 )); then
+  echo "[FAIL] test-update-rollback.sh refuses to run as root" >&2
+  exit 1
+fi
+if [[ -e /usr/local/libexec/pdg-quic-routing.sh \
+   || -e /etc/privdns-gateway || -e /opt/pdg-bot || -e /opt/pdg-web ]]; then
+  echo "[FAIL] test-update-rollback.sh refuses to run on a deployed PDG host" >&2
+  exit 1
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
@@ -33,14 +47,21 @@ REPO="$WORK/repo"; mkdir -p "$REPO"
   && echo v1 > f && git add f && git commit -qm c1 && echo v2 > f && git add f && git commit -qm c2 )
 GOOD_REF=$(git -C "$REPO" rev-parse HEAD~1)   # 第一提交
 HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
-# cmd_rollback 的真实 nft 定位助手会从 REPO_DIR 读取同源判据；给假仓库补齐该只读依赖。
-mkdir -p "$REPO/lib"
-cp "$ROOT/lib/nftbin.sh" "$REPO/lib/nftbin.sh"
+# ruleset_direct 重建助手会从 REPO_DIR 读取可信 Bot 实现；给假仓库补齐该只读依赖。
+mkdir -p "$REPO/deploy/bot"
+cp "$ROOT/deploy/bot/pdg-bot.py" "$REPO/deploy/bot/pdg-bot.py"
 
 # ── 抽取 cmd_rollback + 打桩 ──────────────────────────────────────────────────
-for fn in _pdg_nft_bin cmd_rollback; do
+for fn in _pdg_snapshot_rederive_ruleset_direct cmd_rollback; do
   sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
-done | sed 's#> /etc/privdns-gateway/backend#> "$SB/etc/privdns-gateway/backend"#' \
+done | sed \
+  -e 's#> /etc/privdns-gateway/backend#> "$SB/etc/privdns-gateway/backend"#' \
+  -e 's# /etc/nftables\.conf# "$SB/etc/nftables.conf"#g' \
+  -e 's# /etc/mihomo/config\.yaml# "$SB/etc/mihomo/config.yaml"#g' \
+  -e 's# /etc/sing-box/config\.json# "$SB/etc/sing-box/config.json"#g' \
+  -e 's#install -d -m700 /etc/mihomo#install -d -m700 "$SB/etc/mihomo"#' \
+  -e 's#rm -f -- "/$mp"#rm -f -- "$SB/$mp"#' \
+  -e 's#rmdir /opt/pdg-web/static /opt/pdg-web#rmdir "$SB/opt/pdg-web/static" "$SB/opt/pdg-web"#' \
   > "$WORK/rollback.sh"
 # 快照里不含 etc/sing-box/config.json 与 etc/nftables.conf → 内核/nft 校验分支被跳过,
 # 无需真 sing-box/mihomo/nft 二进制(也就不必打桩带连字符的函数名)。
@@ -56,6 +77,8 @@ _pdg_core_svc(){ echo sing-box; }
 _pdg_mktemp_dir(){ mktemp -d; }
 _sb_panel_managed_on(){ return 1; }
 _core_kernel_activate(){ return 0; }
+_pdg_nft_bin(){ return 1; }
+_pdg_snapshot_abort(){ echo "unexpected rollback abort" >&2; return 1; }
 # cmd_rollback 会用到的 units.sh / 归属助手: 沙箱里没有真 /etc, 一并打桩(与 systemctl/nft 同理)
 pdg_write_unit(){ return 0; }
 pdg_unit_mihomo(){ echo "[Unit]"; }
