@@ -10,6 +10,10 @@ The import was produced with `git archive` from a reviewed local Git object for
 that fixed, pinned upstream commit. No working tree was restored or used as an
 import source, and no `.git` directory was copied.
 
+The fixed commit is also connected as a history-only merge parent. This keeps
+the imported tree and the repository's original first-parent history intact
+while giving future upstream reviews a real Git ancestry base.
+
 The previous tracked architecture is preserved byte-for-byte under
 `legacy/current-architecture/`.
 
