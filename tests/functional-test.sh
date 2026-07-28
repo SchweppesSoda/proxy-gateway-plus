@@ -5,13 +5,15 @@
 #
 # 做法(全本地、可在 CI / 干净机跑, 仅需 python3 + 官方 mihomo):
 #   1) 起 3 个本地 mock SOCKS5 当"出口", 各自记录收到的目标域名;
-#   2) 用 redir 入口(开 sniffer + override-destination, 与生产同款)起 mihomo,
+#   2) 用显式 named TCP redir listener(开 sniffer + override-destination)起 mihomo,
 #      按域名规则分到出口 A/B、其余走 MATCH 兜底;
 #   3) 按不同 SNI 发 TLS ClientHello 到入口, 断言每个 SNI 被嗅探并路由到正确出口。
 #
-# 生产上 80/443/5228-5230 由 nft REDIRECT 进这个 redir 端口(见 deploy/firewall/nftables-mihomo.conf);
-# 测试里直接连该端口即可 —— sniffer 的 override-destination 会用嗅到的 SNI 顶掉原目的地,
-# 正是生产中"手机连过来 → 嗅 SNI → 按域名选出口"那条路。
+# 生产 TCP 80/443/5228-5230 由 nft REDIRECT 进 redir :7893；QUIC UDP/443 则由独立
+# TPROXY :7895 路径及其数据面测试覆盖(见 deploy/firewall/nftables-mihomo.conf)。
+# 本测试只发送 TCP TLS ClientHello；显式 named redir 只启动 TCP，避免 top-level
+# redir-port 额外启动 UDP listener。sniffer 的 override-destination 会用嗅到的 SNI
+# 顶掉原目的地，验证 TCP REDIRECT 后的分流路径。
 #
 # 退出码 0 = 通过; 非 0 = 失败(并打印 mihomo 输出便于排查)。
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,12 +75,19 @@ python3 "$HERE/mock_socks.py" 11080 "$LOGA" & PIDS+=($!)
 python3 "$HERE/mock_socks.py" 11081 "$LOGB" & PIDS+=($!)
 python3 "$HERE/mock_socks.py" 11082 "$LOGD" & PIDS+=($!)
 
-# ── 3. 写 mihomo 测试配置: redir 入口 + sniffer 覆盖目的地, 按域名分流, 其余走 MATCH ──
-# (JSON 即合法 YAML —— 与生产渲染出的 /etc/mihomo/config.yaml 同一形态)
+# ── 3. 写 mihomo 测试配置: 显式 named TCP redir listener + SNI 覆盖, 按域名分流 ──
+# (JSON 即合法 YAML；测试与生产使用同一 JSON/YAML 配置格式)
 cat > "$WORK/cfg.yaml" <<'JSON'
 {
   "log-level": "warning",
-  "redir-port": 18443,
+  "listeners": [
+    {
+      "name": "test-redir",
+      "type": "redir",
+      "listen": "127.0.0.1",
+      "port": 18443
+    }
+  ],
   "sniffer": {
     "enable": true,
     "override-destination": true,
