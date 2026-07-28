@@ -37,13 +37,14 @@ e2e_reset_box(){
   # 真内核(几十 MB), 每个脚本重下一遍既慢又会在没网时把用例整条 skip 掉(假绿)。
   rm -f /usr/local/bin/sing-box \
         /usr/local/bin/pdg /usr/local/bin/pdg-set-token \
+        /usr/local/bin/pdg-webctl \
         /usr/local/bin/proxy-gateway-open-cert-http.sh \
         /usr/local/bin/proxy-gateway-restore-firewall.sh \
         /usr/local/libexec/pdg-quic-routing.sh 2>/dev/null || true
-  rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-mitm,pdg-quic-routing,mosdns,mihomo,sing-box,pdg-rules-update,pdg-health}.service \
+  rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-mitm,pdg-quic-routing,pdg-web,mosdns,mihomo,sing-box,pdg-rules-update,pdg-health}.service \
         /etc/systemd/system/{pdg-rules-update,pdg-health}.timer \
         /etc/systemd/journald.conf.d/50-pdg.conf 2>/dev/null || true
-  rm -rf /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /opt/pdg-bot \
+  rm -rf /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /opt/pdg-bot /opt/pdg-web \
          /opt/privdns-gateway /var/lib/privdns-gateway 2>/dev/null || true
   rm -f /etc/nftables.conf.pdg-orig /etc/resolv.conf.pdg-orig 2>/dev/null || true
   rm -rf /tmp/e2e-svc /tmp/e2e-nft-ruleset /tmp/e2e-calls.log /tmp/e2e-inject \

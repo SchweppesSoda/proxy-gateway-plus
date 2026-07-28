@@ -31,7 +31,7 @@ echo "qq.com" > "$WORK/rules/geosite_cn.txt"
 echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"
 # (mitm_hijack.txt 故意不建: 迁移应自动补)
 
-# ── 渲染当前 config → 完整版(v1.5), 端口换高位、去 DoT、rules 指向 $WORK/rules ──
+# ── 渲染当前 config，端口换高位、去 DoT、rules 指向 $WORK/rules ───────────
 render_full(){
   sed -e "s/__SERVER_IP__/10.9.9.9/g" -e "s#__INTERNAL_CIDR__#127.0.0.0/8#g" -e "s#__CERT_DIR__#$WORK#g" \
       -e "s#__MOSDNS_CACHE__#8192#g" -e "s#__HIJACK_SET_FILE__#geosite_geolocation-!cn.txt#g" \
@@ -40,16 +40,73 @@ render_full(){
 }
 render_full > "$WORK/full.yaml"
 
-# ── 造 v1.4.x fixture: 从完整版剥掉 force_hijack domain_set / force_hijack_seq / 优先级规则 ──
-python3 - "$WORK/full.yaml" "$WORK/v14.yaml" <<'PY'
-import sys, re
-s = open(sys.argv[1]).read()
-s = re.sub(r'  - tag: force_hijack\n    type: domain_set\n    args:[^\n]*\n', '', s)
-s = re.sub(r'  - tag: force_hijack_seq\n(?:.*\n)*?      - matches: qtype 1\n        exec: black_hole [0-9.]+\n', '', s)
-s = re.sub(r'      # MITM 接管域名[^\n]*\n      - matches: qname \$force_hijack\n        exec: goto force_hijack_seq\n', '', s)
-open(sys.argv[2], 'w').write(s)
+# 本单测只验证 MITM force 迁移。explicit_hijack 是更晚加入、由 migrate_custom_hijack
+# 独立负责的功能；legacy 当时两者都不存在。先从当前完整版精确移除 explicit plugin/rule，
+# 得到“当前 canonical 的 MITM 投影”，再从该投影剥掉 force 三件套构造真实 legacy fixture。
+# 迁移结果应逐结构恢复到投影中的 canonical 顺序，而不是把 unrelated explicit 功能算作
+# migrate_mosdns_mitm 的职责。
+python3 - "$WORK/full.yaml" "$WORK/expected.yaml" "$WORK/v14.yaml" <<'PY'
+import re
+import sys
+
+source, expected, legacy = sys.argv[1:]
+s = open(source, encoding="utf-8").read()
+
+def remove_once(text, pattern, label):
+    result, count = re.subn(pattern, "", text, count=1, flags=re.MULTILINE)
+    assert count == 1, "%s 结构不唯一或缺失" % label
+    return result
+
+# Later explicit-hijack feature: outside this migration's contract.
+s = remove_once(
+    s,
+    r"^  - tag: explicit_hijack\n"
+    r"    type: domain_set\n"
+    r"    args: \{ files: \[[^\n]*custom_hijack\.txt[^\n]*\] \}\n",
+    "explicit_hijack plugin",
+)
+s = remove_once(
+    s,
+    r"^      - matches: qname \$explicit_hijack\n"
+    r"        exec: goto force_hijack_seq\n",
+    "explicit_hijack rule",
+)
+open(expected, "w", encoding="utf-8").write(s)
+
+# v1.4.x had none of the MITM force mechanism.
+s = remove_once(
+    s,
+    r"^  - tag: force_hijack\n"
+    r"    type: domain_set\n"
+    r"    args:[^\n]*\n",
+    "force_hijack plugin",
+)
+s = remove_once(
+    s,
+    r"^  - tag: force_hijack_seq\n"
+    r"(?:.*\n)*?"
+    r"^      - matches: qtype 1\n"
+    r"        exec: black_hole [0-9.]+\n",
+    "force_hijack_seq",
+)
+s = remove_once(
+    s,
+    r"^      # MITM 接管域名[^\n]*\n"
+    r"      - matches: qname \$force_hijack\n"
+    r"        exec: goto force_hijack_seq\n",
+    "force_hijack rule",
+)
+active = "\n".join(line.split("#", 1)[0] for line in s.splitlines())
+assert "force_hijack" not in active, "legacy fixture 仍含 force 机制"
+assert "explicit_hijack" not in active, "legacy fixture 仍含 explicit 关联"
+open(legacy, "w", encoding="utf-8").write(s)
 PY
-grep -q 'force_hijack' "$WORK/v14.yaml" && bad "v1.4.x fixture 构造失败(仍含 force_hijack)" || ok "构造 v1.4.x fixture(无 force_hijack)"
+if grep -Eq '^[[:space:]]*(- tag: force_hijack(_seq)?|- matches: qname \$(force|explicit)_hijack|exec: goto force_hijack_seq)' \
+    "$WORK/v14.yaml"; then
+  bad "v1.4.x fixture 构造失败(仍含 force/explicit 机制)"
+else
+  ok "构造 v1.4.x fixture(无 force/explicit 机制)"
+fi
 
 start_mosdns(){   # 起 mosdns 加载 $1, 成功返回0
   "$MD" start -c "$1" -d "$WORK" > "$WORK/mos.out" 2>&1 & PIDS+=($!)
@@ -84,9 +141,15 @@ s = open(sys.argv[1]).read()
 b = s[s.index('- tag: internal_sequence'):s.index('- tag: main_sequence')]
 assert b.index('qname $force_hijack') < b.index('qname $geosite_cn'), '顺序不对'
 PY
-# 迁移后与完整版结构一致(忽略注释)
-diff <(grep -vE '^\s*#' "$WORK/mig.yaml") <(grep -vE '^\s*#' "$WORK/full.yaml") >/dev/null \
-  && ok "迁移结果与当前完整版结构一致(byte 对齐, 忽略注释)" || bad "迁移结果与完整版不一致"
+# 与当前 canonical 的 MITM 投影结构一致(忽略注释)。这也阻断 force 规则被插到 CN
+# 判断之后等“内容齐全但优先级错误”的假绿。
+if diff <(grep -vE '^\s*#' "$WORK/mig.yaml") <(grep -vE '^\s*#' "$WORK/expected.yaml") >/dev/null; then
+  ok "迁移结果与当前 canonical MITM 顺序一致(byte 对齐, 忽略注释)"
+else
+  bad "迁移结果与当前 canonical MITM 投影不一致"
+  diff -u <(grep -vE '^\s*#' "$WORK/expected.yaml") \
+    <(grep -vE '^\s*#' "$WORK/mig.yaml") | head -40
+fi
 # 真起 mosdns 加载迁移后配置
 if [[ -n "${MD:-}" ]] && command -v dig >/dev/null; then
   start_mosdns "$WORK/mig.yaml" && ok "迁移后 mosdns 真实加载通过(force_hijack 生效)" \

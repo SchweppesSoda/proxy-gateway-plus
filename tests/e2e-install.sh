@@ -118,9 +118,10 @@ run_install_interactive(){
 reset_box(){
   # /opt/privdns-gateway 也要清: 留着它, 后面的安装会走"已有 .git 就不复制"的分支,
   # 复制路径压根测不到(mosdns/mihomo 桩留在 /usr/local/bin, 那是本用例自己造的外部世界)
-  rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot \
+  rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot /opt/pdg-web \
          /opt/privdns-gateway \
-         /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
+         /usr/local/bin/pdg /usr/local/bin/pdg-set-token /usr/local/bin/pdg-webctl \
+         /etc/systemd/system/pdg-*.service \
          /etc/systemd/system/mosdns.service /etc/systemd/system/sing-box.service
   rm -rf /tmp/e2e-svc; mkdir -p /tmp/e2e-svc
   printf 0 > /tmp/e2e-svc/mosdns.ac

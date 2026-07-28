@@ -154,6 +154,16 @@ grep -qE '^apt-get install .*\biproute2\b' "$E2E_ROOT/install.sh" \
   && ok "install.sh 的依赖列表显式包含 iproute2" || bad "4b: 依赖列表没有 iproute2"
 cat > /usr/local/bin/ss <<'S'
 #!/bin/sh
+if [ "${1:-}" = "-H" ]; then
+cat <<'E'
+LISTEN 0 4096   0.0.0.0:53    0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:853   0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:7893  0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:8445  0.0.0.0:*
+LISTEN 0 4096   0.0.0.0:81    0.0.0.0:*
+E
+exit 0
+fi
 cat <<'E'
 tcp   LISTEN 0 4096   0.0.0.0:53    0.0.0.0:*
 tcp   LISTEN 0 4096   0.0.0.0:853   0.0.0.0:*

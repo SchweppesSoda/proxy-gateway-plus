@@ -93,8 +93,9 @@ run_install(){   # $1=额外 env
       bash "$E2E_INSTALL_ROOT/install.sh" 2>&1
 }
 reset_box(){
-  rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot \
-         /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
+  rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot /opt/pdg-web \
+         /usr/local/bin/pdg /usr/local/bin/pdg-set-token /usr/local/bin/pdg-webctl \
+         /etc/systemd/system/pdg-*.service \
          /usr/local/libexec/pdg-quic-routing.sh \
          /etc/systemd/system/mosdns.service /etc/systemd/system/mihomo.service \
          /etc/nftables.conf.pdg-orig

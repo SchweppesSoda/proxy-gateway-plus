@@ -16,6 +16,25 @@ e2e_enter "$@"
 command -v git >/dev/null 2>&1 || e2e_skip "无 git"
 e2e_stub_system
 e2e_seed_install
+# 这是带 ready Bot 凭据的已安装老机器：pdg update 只会刷新既有 unit，
+# 不会为从未安装 Bot 的机器凭空创建它。保留旧 sing-box 依赖，顺带让
+# migrate_deploy_units 覆盖真实的 legacy → mihomo unit 更新路径。
+cat > /etc/systemd/system/pdg-bot.service <<'BOTU'
+[Unit]
+Description=PrivDNS Gateway Telegram bot
+After=network-online.target sing-box.service mosdns.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/privdns-gateway/bot.env
+Environment=PDG_CERT=/etc/mosdns/certs/fullchain.pem
+ExecStart=/usr/bin/python3 /opt/pdg-bot/bot.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+BOTU
+chmod 644 /etc/systemd/system/pdg-bot.service
 e2e_seed_mosdns all
 e2e_seed_singbox_model
 e2e_seed_nft singbox
