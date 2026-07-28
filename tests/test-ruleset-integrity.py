@@ -178,7 +178,7 @@ def main():
     # ── 5. YAML provider 放行 ──
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp)
-        bot._build_source = lambda url, path: (12, False)
+        bot._build_source = lambda url, path, *, phone_direct=False: (12, False)
         okr, msg = bot.add_ruleset("https://example.com/rules.yaml", "hk")
         if not okr:
             bad(f"YAML provider 被拒: {msg}")
@@ -225,7 +225,7 @@ def main():
     # ── 8. 正常规则集(有 rule-provider)不受影响 ──
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp)
-        bot._build_source = lambda url, path: (34, False)
+        bot._build_source = lambda url, path, *, phone_direct=False: (34, False)
         okr, msg = bot.add_ruleset("https://example.com/cn.list", "hk")
         if not okr:
             bad(f"正常 .list 规则集被误拒: {msg}")
