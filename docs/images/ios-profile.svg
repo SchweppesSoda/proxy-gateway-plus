@@ -1,0 +1,15 @@
+<svg viewBox="0 0 220 372" width="300" height="507" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="iOS 安装描述文件示意">
+<title>iOS 描述文件</title>
+<rect x="0" y="0" width="220" height="372" rx="14" fill="#eef0f3"/>
+<rect x="0" y="0" width="220" height="44" rx="14" fill="#f7f8fa"/><rect x="0" y="30" width="220" height="14" fill="#f7f8fa"/>
+<text x="14" y="28" fill="#007aff" font-family="sans-serif" font-size="12">取消</text>
+<text x="110" y="28" fill="#000000" font-family="sans-serif" font-size="12.5" font-weight="500" text-anchor="middle">安装描述文件</text>
+<text x="206" y="28" fill="#007aff" font-family="sans-serif" font-size="12" font-weight="500" text-anchor="end">安装</text>
+<line x1="0" y1="44" x2="220" y2="44" stroke="#d9dbe0"/>
+<rect x="12" y="58" width="196" height="74" rx="10" fill="#ffffff"/>
+<text x="22" y="80" fill="#000000" font-family="sans-serif" font-size="13" font-weight="500">PrivDNS Gateway DoT</text>
+<text x="22" y="100" fill="#34a853" font-family="sans-serif" font-size="10.5">已签名 · Let's Encrypt</text>
+<text x="22" y="120" fill="#6b7077" font-family="sans-serif" font-size="10.5">包含: DNS 设置(DoT)</text>
+<rect x="12" y="146" width="196" height="40" rx="10" fill="#ffffff"/>
+<text x="22" y="170" fill="#6b7077" font-family="sans-serif" font-size="10.5">描述: 私密 DNS,仅设一条 DoT</text>
+</svg>

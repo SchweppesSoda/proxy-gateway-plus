@@ -1,0 +1,7 @@
+[Unit]
+Description=PrivDNS Gateway 健康自检 (异常时 Telegram 通知)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/pdg-bot/healthcheck.py

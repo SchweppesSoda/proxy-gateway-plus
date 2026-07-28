@@ -1,0 +1,44 @@
+{
+  "log": { "level": "warn", "timestamp": true },
+  "experimental": {
+    "clash_api": { "external_controller": "127.0.0.1:9090" },
+    "cache_file": { "enabled": true, "path": "/etc/sing-box/cache.db" }
+  },
+  "inbounds": [
+    {
+      "type": "direct", "tag": "in-https",
+      "listen": "0.0.0.0", "listen_port": 443,
+      "sniff": true, "sniff_override_destination": true, "sniff_timeout": "300ms"
+    },
+    {
+      "type": "direct", "tag": "in-http", "network": "tcp",
+      "listen": "0.0.0.0", "listen_port": 80,
+      "sniff": true, "sniff_override_destination": true, "sniff_timeout": "300ms"
+    },
+    {
+      "type": "direct", "tag": "in-gms-5228", "network": "tcp",
+      "listen": "0.0.0.0", "listen_port": 5228,
+      "sniff": true, "sniff_override_destination": true, "sniff_timeout": "300ms"
+    },
+    {
+      "type": "direct", "tag": "in-gms-5229", "network": "tcp",
+      "listen": "0.0.0.0", "listen_port": 5229,
+      "sniff": true, "sniff_override_destination": true, "sniff_timeout": "300ms"
+    },
+    {
+      "type": "direct", "tag": "in-gms-5230", "network": "tcp",
+      "listen": "0.0.0.0", "listen_port": 5230,
+      "sniff": true, "sniff_override_destination": true, "sniff_timeout": "300ms"
+    },
+    { "type": "mixed", "tag": "tg-proxy", "listen": "0.0.0.0", "listen_port": 8445 }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "jp" }
+  ],
+  "route": {
+    "rules": [
+      { "ip_cidr": ["__SERVER_IP__/32", "127.0.0.0/8"], "action": "reject" }
+    ],
+    "final": "jp"
+  }
+}

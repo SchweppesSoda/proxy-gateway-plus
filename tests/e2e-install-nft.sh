@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# 端到端: **全新安装**不得覆盖用户已有的 nftables 配置。
+#
+# install.sh 原先直接 `render 模板 > /etc/nftables.conf`: 机器上预先存在的 VPN/NAT/转发表
+# 连同自定义 input 链一起消失, 而安装照样返回成功 —— 用户装完才发现 WireGuard 不通,
+# 且 doctor 是在**装完之后**才报 input 链冲突, 那时原文件已经没了。
+#
+# 现在两条纪律(与迁移共用 nftscan.py / nftmerge.py, 不另立判据):
+#   · 存在其它挂 hook input 的 base chain → **装之前**中止, 点名冲突位置, 一个字节都不动;
+#   · 只有 NAT/forward/VPN 这类不冲突的表 → 逐字节保留, 只把 table inet pdg 合并进去。
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# shellcheck source=tests/e2e-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/e2e-lib.sh"
+e2e_enter "$@"
+
+e2e_stub_system
+
+# 打桩外部世界(apt/certbot/下载), 与 e2e-install.sh 同口径 —— 本用例要验的是防火墙合并,
+# 不该被沙箱里的包管理器网络状况左右。
+for c in apt-get certbot vnstat; do
+  printf '#!/bin/sh\nexit 0\n' > "/usr/local/bin/$c"; chmod 755 "/usr/local/bin/$c"
+done
+cat > /usr/local/bin/dpkg <<'S'
+#!/bin/sh
+[ "$1" = "--print-architecture" ] && { echo amd64; exit 0; }
+exit 0
+S
+chmod 755 /usr/local/bin/dpkg
+. "$E2E_ROOT/lib/versions.sh"
+if ! command -v mosdns >/dev/null 2>&1; then
+  printf '#!/bin/sh\ncase "$1" in version) echo "v%s";; start) sleep 3600;; esac\nexit 0\n' \
+    "$MOSDNS_VER" > /usr/local/bin/mosdns; chmod 755 /usr/local/bin/mosdns
+fi
+if ! command -v mihomo >/dev/null 2>&1; then
+  printf '#!/bin/sh\ncase "$1" in -v|version) echo "Mihomo Meta %s linux amd64";; -t) exit 0;; esac\nexit 0\n' \
+    "$MIHOMO_VER" > /usr/local/bin/mihomo; chmod 755 /usr/local/bin/mihomo
+fi
+
+# 带**真状态**的 nft 桩: `nft -f` 装载, `nft list ruleset` 回显当前已加载规则
+NFT_STATE=/tmp/e2e-nft-ruleset
+cat > /usr/local/bin/nft <<'S'
+#!/bin/sh
+STATE=/tmp/e2e-nft-ruleset
+case "$1" in
+  -c) exit 0 ;;
+  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
+  list) cat "$STATE" 2>/dev/null; exit 0 ;;
+  delete) exit 0 ;;
+esac
+exit 0
+S
+chmod 755 /usr/local/bin/nft
+
+run_install(){   # $1=额外 env
+  # shellcheck disable=SC2086
+  env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
+      PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaaBBbbCCccDDddEEeeFFffGGgg \
+      PDG_ALLOWED=1 PDG_PLATFORM=android $1 \
+      bash "$E2E_ROOT/install.sh" 2>&1
+}
+reset_box(){
+  rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot \
+         /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
+         /etc/systemd/system/mosdns.service /etc/nftables.conf.pdg-orig
+  rm -rf /tmp/e2e-svc; mkdir -p /tmp/e2e-svc
+}
+
+# ══ 1. 只有 NAT / forward / VPN 表(不挂 input hook)→ 逐字节保留并安全合并 ═══
+echo "── 1. 已有自定义 NAT/forward 表 ──"
+reset_box
+cat > /etc/nftables.conf <<'NFT'
+#!/usr/sbin/nft -f
+table ip mynat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 10.66.0.0/24 oifname "eth0" masquerade   # WireGuard 出网
+    }
+}
+
+table inet myfwd {
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        iifname "wg0" oifname "eth0" accept
+    }
+}
+NFT
+nft -f /etc/nftables.conf
+CUSTOM_BEFORE="$(cat /etc/nftables.conf)"
+out=$(run_install ""); rc=$?
+[[ "$rc" == 0 ]] && ok "无冲突的自定义表 → 安装照常成功" || bad "1: 安装失败 rc=$rc: $(tail -6 <<<"$out")"
+for probe in 'table ip mynat' 'masquerade' 'table inet myfwd' 'wg0'; do
+  grep -qF "$probe" /etc/nftables.conf && ok "自定义规则保留: $probe" || bad "1b: 丢了 $probe"
+done
+# 用户区(pdg 管理区之前的部分)必须逐字节一致
+CUSTOM_AFTER="$(awk '/PrivDNS Gateway 管理区|table inet pdg/{exit} {print}' /etc/nftables.conf)"
+[[ "$(printf '%s\n' "$CUSTOM_AFTER" | sed '/^$/d')" == "$(printf '%s\n' "$CUSTOM_BEFORE" | sed '/^$/d')" ]] \
+  && ok "用户区逐字节保留(只多了 pdg 管理区)" \
+  || { bad "1c: 用户区被改写"; diff <(printf '%s\n' "$CUSTOM_BEFORE") <(printf '%s\n' "$CUSTOM_AFTER") | head -8; }
+grep -q 'table inet pdg' /etc/nftables.conf && ok "pdg 管理区已合并进来" || bad "1d: pdg 表没进去"
+[[ "$(grep -c '^table inet pdg {' /etc/nftables.conf)" == 1 ]] \
+  && ok "pdg 表只有一份" || bad "1e: pdg 表重复"
+grep -qF 'table ip mynat' "$NFT_STATE" \
+  && ok "运行中的 ruleset 里也还有用户的表(真的加载了合并结果)" || bad "1f: 运行规则丢了用户表"
+
+# ══ 2. 存在其它 input base chain → 安装前中止, 现场一个字节都不动 ═══════════
+echo; echo "── 2. 已有自定义 input base chain ──"
+reset_box
+cat > /etc/nftables.conf <<'NFT'
+#!/usr/sbin/nft -f
+table inet myfilter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        tcp dport { 9443, 9444 } accept
+        udp dport 51820 accept
+    }
+}
+NFT
+nft -f /etc/nftables.conf
+CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
+out=$(run_install ""); rc=$?
+[[ "$rc" != 0 ]] && ok "冲突现场 → 安装中止(返回非 0)" || bad "2: 竟然装成功了: $(tail -4 <<<"$out")"
+grep -qE 'input|中止安装' <<<"$out" && ok "说明了原因(input 链冲突)" || bad "2b: 没说清原因: $(tail -4 <<<"$out")"
+grep -q 'myfilter' <<<"$out" && ok "点名了冲突的表(myfilter)" || bad "2c: 没点名冲突表"
+[[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]] \
+  && ok "中止后 /etc/nftables.conf 逐字节未变" || bad "2d: 原文件被改写"
+[[ "$(sha256sum "$NFT_STATE" | cut -d' ' -f1)" == "$RULESET_SHA" ]] \
+  && ok "中止后运行中的 ruleset 未变" || bad "2e: 运行规则被改了"
+# 中止必须发生在"动任何东西之前": 二进制/服务/配置目录都不该出现
+for p in /usr/local/bin/pdg /opt/pdg-bot/bot.py /etc/mosdns/config.yaml /etc/privdns-gateway/profile.env; do
+  [[ -e "$p" ]] && bad "2f: 中止前已经动了 $p" || ok "未创建 $(basename "$p")(中止发生在动手之前)"
+done
+
+# ══ 3. 冲突解除后可以正常安装 ══════════════════════════════════════════════
+echo; echo "── 3. 解除冲突后重装 ──"
+python3 - <<'PY'
+txt = open("/etc/nftables.conf", encoding="utf-8").read()
+open("/etc/nftables.conf", "w", encoding="utf-8").write(
+    txt.replace("hook input", "hook forward"))     # 把冲突链改挂到 forward
+PY
+nft -f /etc/nftables.conf
+out=$(run_install ""); rc=$?
+[[ "$rc" == 0 ]] && ok "冲突解除后安装成功" || bad "3: rc=$rc: $(tail -6 <<<"$out")"
+grep -q 'table inet myfilter' /etc/nftables.conf && ok "用户的表仍在" || bad "3b: 用户表丢了"
+
+# ══ 4. 扫描器跑不起来时, 绝不能静默继续 ═══════════════════════════════════
+# 极简 Debian 12 没有 python3 → `python3 nftscan.py` 直接 127。旧写法的 case 只认 0 和 2,
+# 127 静默落空, 于是"有冲突的机器照样装下去", 这道门等于不存在。
+echo; echo "── 4. 扫描器退出码 ──"
+
+REAL_PY="$(readlink -f "$(command -v python3)")"
+cp -f "$REAL_PY" /usr/local/bin/py3-real 2>/dev/null || cp "$REAL_PY" /usr/local/bin/py3-real
+: > /tmp/notexec; chmod 644 /tmp/notexec
+
+put_py_stub(){   # 写一个 python3 桩(先删: 上一步可能留下指向真解释器的符号链接, 直接写会写穿)
+  rm -f /usr/local/bin/python3
+  cat > /usr/local/bin/python3
+  chmod 755 /usr/local/bin/python3
+}
+restore_py(){ rm -f /usr/local/bin/python3; ln -sf /usr/local/bin/py3-real /usr/local/bin/python3; }
+# 真实模拟"机器上没有 python3": 造一个 PATH 目录, 把系统各 bin 目录里的命令**除 python3**
+# 全部软链进来, 然后只用它当 PATH。比 bind mount 可靠(bind 到符号链接上 `command -v` 仍能
+# 找到), 也比"放个 exit 127 的桩"忠实 —— 后者是"python3 存在但坏了", 不是"没装"。
+NOPY_BIN=/tmp/nopy-bin
+build_nopy_path(){
+  rm -rf "$NOPY_BIN"; mkdir -p "$NOPY_BIN"
+  local d f b
+  for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*; do
+      b="$(basename "$f")"
+      case "$b" in python3*) continue;; esac
+      [[ -e "$NOPY_BIN/$b" ]] || ln -sf "$f" "$NOPY_BIN/$b" 2>/dev/null || true
+    done
+  done
+  ! PATH="$NOPY_BIN" command -v python3 >/dev/null 2>&1     # 真的找不到才算造成功
+}
+run_install_nopy(){   # 用"没有 python3"的 PATH 跑装机
+  env -i PATH="$NOPY_BIN" HOME=/root \
+      PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
+      PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaaBBbbCCccDDddEEeeFFffGGgg \
+      PDG_ALLOWED=1 PDG_PLATFORM=android \
+      bash "$E2E_ROOT/install.sh" 2>&1
+}
+
+reset_all(){ reset_box; rm -rf /opt/privdns-gateway; }
+
+seed_conflict(){ cat > /etc/nftables.conf <<'NFT'
+#!/usr/sbin/nft -f
+table inet myfilter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        tcp dport { 9443 } accept
+    }
+}
+NFT
+nft -f /etc/nftables.conf; }
+seed_clean(){ cat > /etc/nftables.conf <<'NFT'
+#!/usr/sbin/nft -f
+table ip mynat {
+    chain postrouting { type nat hook postrouting priority srcnat; policy accept; }
+}
+NFT
+nft -f /etc/nftables.conf; }
+
+untouched(){   # 中止后: 防火墙文件、运行规则、PDG 路径都不许被动过
+  local tag="$1" bad_paths=() p
+  [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]] \
+    || bad_paths+=("/etc/nftables.conf 被改写")
+  [[ "$(sha256sum "$NFT_STATE" | cut -d' ' -f1)" == "$RULESET_SHA" ]] \
+    || bad_paths+=("运行 ruleset 被改")
+  for p in /usr/local/bin/pdg /opt/pdg-bot/bot.py /etc/mosdns/config.yaml \
+           /etc/privdns-gateway/profile.env /etc/systemd/system/pdg-bot.service; do
+    [[ -e "$p" ]] && bad_paths+=("创建了 $p")
+  done
+  if [[ ${#bad_paths[@]} -eq 0 ]]; then ok "$tag: 中止后 nft 文件/运行规则/PDG 路径均未改变"
+  else bad "$tag: ${bad_paths[*]}"; fi
+}
+
+# ── 4a. 机器上真没有 python3 + 冲突链 → 装上前置依赖后识别并中止 ──
+reset_all; seed_conflict
+CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
+# apt 桩: 被要求装 python3 时把真解释器放进那个 PATH 目录(等价于 apt 真的装好了)
+cat > /usr/local/bin/apt-get <<'S'
+#!/bin/sh
+for a in "$@"; do
+  case "$a" in
+    python3|python3-minimal) ln -sf /usr/local/bin/py3-real /tmp/nopy-bin/python3 ;;
+  esac
+done
+exit 0
+S
+chmod 755 /usr/local/bin/apt-get
+ln -sf /usr/local/bin/apt-get "$NOPY_BIN/apt-get" 2>/dev/null || true
+if build_nopy_path; then
+  ln -sf /usr/local/bin/apt-get "$NOPY_BIN/apt-get"
+  out=$(run_install_nopy); rc=$?
+  [[ "$rc" != 0 ]] && ok "无 python3 + 冲突链 → 安装中止(不再因 127 静默继续)" \
+    || bad "4a: 竟然装成功了: $(tail -4 <<<"$out")"
+  grep -q '安全检查前置依赖' <<<"$out" \
+    && ok "明确区分了「安全检查前置依赖」与正式依赖安装" || bad "4a2: $(head -8 <<<"$out")"
+  grep -q 'myfilter' <<<"$out" \
+    && ok "装好 python3 后确实识别出冲突表并点名" || bad "4a3: 没识别冲突: $(tail -6 <<<"$out")"
+  untouched "4a"
+else
+  echo "[SKIP] 造不出「没有 python3」的 PATH, 跳过该用例"
+fi
+
+# ── 4b. 真没有 python3 + 干净配置 → 装上前置依赖后照常继续 ──
+reset_all; seed_clean
+if build_nopy_path; then
+  ln -sf /usr/local/bin/apt-get "$NOPY_BIN/apt-get"
+  out=$(run_install_nopy); rc=$?
+  [[ "$rc" == 0 ]] && ok "无 python3 + 干净配置 → 装上前置依赖后安装继续并成功" \
+    || bad "4b: rc=$rc: $(tail -6 <<<"$out")"
+  grep -q '安全检查前置依赖' <<<"$out" && ok "干净路径同样先补前置依赖再检查" || bad "4b2: 没提前置依赖"
+  [[ -e "$NOPY_BIN/python3" ]] && ok "前置依赖真的被装上了(apt 被调用)" || bad "4b3: 没装 python3"
+else
+  echo "[SKIP] 同上"
+fi
+rm -rf "$NOPY_BIN"
+printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/apt-get; chmod 755 /usr/local/bin/apt-get
+
+# ── 4c. 扫描器以各种异常码退出 → 一律中止(检查没跑成 ≠ 检查通过) ──
+for code in 126 127 3 137; do
+  reset_all; seed_clean
+  CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+  RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
+  put_py_stub <<S
+#!/bin/sh
+# 只拦"扫描"这一次调用(第二个参数是配置路径); --nft-path 是另一个用途, 放行给真解释器,
+# 否则连"nft 在哪"都被注入的故障顶掉, 测的就不是同一件事了
+case "\$1 \$2" in
+  */nftscan.py\ --nft-path) ;;
+  */nftscan.py*) echo "注入的扫描器故障(code $code)" >&2; exit $code ;;
+esac
+exec /usr/local/bin/py3-real "\$@"
+S
+  out=$(run_install ""); rc=$?
+  restore_py
+  [[ "$rc" != 0 ]] && ok "扫描器退出 $code → 安装中止" || bad "4c: 退出 $code 却继续装了: $(tail -3 <<<"$out")"
+  grep -q "退出码 $code" <<<"$out" && ok "退出 $code: 报出了具体退出码" || bad "4c2($code): $(tail -3 <<<"$out")"
+  grep -q '注入的扫描器故障' <<<"$out" \
+    && ok "退出 $code: 带出了扫描器自己的 stderr(没被吞掉)" || bad "4c3($code): stderr 被吞了"
+  untouched "退出 $code"
+done
+
+# ── 4d. 0/1/2 三种既有语义仍然正确 ──
+for code in 0 1 2; do
+  reset_all; seed_clean
+  CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+  RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
+  put_py_stub <<S
+#!/bin/sh
+case "\$1 \$2" in
+  */nftscan.py\ --nft-path) ;;                 # 放行: 这是问"nft 在哪", 不是扫描
+  */nftscan.py*) echo "注入: 模拟退出 $code"; exit $code ;;
+esac
+exec /usr/local/bin/py3-real "\$@"
+S
+  out=$(run_install ""); rc=$?
+  restore_py
+  case "$code" in
+    0) { [[ "$rc" != 0 ]] && grep -q '不兼容的 nftables input 链' <<<"$out"; } \
+         && ok "退出 0(有冲突)→ 中止并说明是 input 链冲突" || bad "4d(0): rc=$rc: $(tail -3 <<<"$out")"
+       untouched "退出 0" ;;
+    1) [[ "$rc" == 0 ]] && ok "退出 1(确认干净)→ 继续并装完" || bad "4d(1): rc=$rc: $(tail -4 <<<"$out")" ;;
+    2) # nft 可用却读不到运行规则 → 不能盲目往下写规则
+       { [[ "$rc" != 0 ]] && grep -q '无法确认现有 nftables 规则' <<<"$out"; } \
+         && ok "退出 2 且 nft 可用 → 中止并说明读不到运行规则" || bad "4d(2): rc=$rc: $(tail -3 <<<"$out")"
+       untouched "退出 2" ;;
+  esac
+done
+
+# ── 4d2. nft 在 sbin 但 PATH 里没有 + 读不到运行规则 → 必须中止(不能当成"nft 没装") ──
+# 真实现场: `su`(不带 -)/cron/某些容器的 root PATH 里没有 sbin。旧写法用 `command -v nft`
+# 判"在不在", 于是这台机器被当成裸机, 一整套现网 input 链就这么放过去了。
+reset_all; seed_clean
+CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
+mkdir -p /usr/local/sbin
+cp /usr/local/bin/nft /usr/local/sbin/nft            # nft 挪到 sbin(PATH 里没有它)
+cat > /usr/local/sbin/nft <<'S'
+#!/bin/sh
+# 装着 nftables, 但读不到运行 ruleset(权限/内核异常的真实形态)
+case "$1 $2" in
+  "list ruleset") echo "Error: Could not process rule: Operation not permitted" >&2; exit 1 ;;
+esac
+exec /usr/local/bin/nft-real "$@"
+S
+chmod 755 /usr/local/sbin/nft
+mv /usr/local/bin/nft /usr/local/bin/nft-real
+out=$(env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/root \
+      PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
+      PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaa PDG_ALLOWED=1 PDG_PLATFORM=android \
+      bash "$E2E_ROOT/install.sh" 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -q '无法确认现有 nftables 规则' <<<"$out"; } \
+  && ok "nft 只在 sbin(PATH 里没有)且读不到运行规则 → 中止, 不再误判成「没装 nftables」" \
+  || bad "4d2: rc=$rc: $(tail -4 <<<"$out")"
+grep -qE 'nft 在 /\S*/nft' <<<"$out" \
+  && ok "报出了实际找到 nft 的位置(不是含糊地说「nft 不可用」)" \
+  || bad "4d2b: 没报出 nft 路径: $(tail -4 <<<"$out")"
+untouched "4d2"
+mv /usr/local/bin/nft-real /usr/local/bin/nft; rm -f /usr/local/sbin/nft
+
+# ── 4e. 扫描器文件缺失 → 同样中止(不是"没检查出问题") ──
+reset_all; seed_clean
+rm -rf /tmp/repo-noscan && cp -a "$E2E_ROOT" /tmp/repo-noscan
+rm -f /tmp/repo-noscan/deploy/bot/nftscan.py
+out=$(env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
+      PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaa PDG_ALLOWED=1 PDG_PLATFORM=android \
+      bash /tmp/repo-noscan/install.sh 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -q '缺少防火墙冲突扫描器' <<<"$out"; } \
+  && ok "扫描器文件缺失 → 中止并说明仓库不完整" || bad "4e: rc=$rc: $(tail -3 <<<"$out")"
+rm -rf /tmp/repo-noscan
+rm -f /usr/local/bin/py3-real /tmp/notexec; rm -rf "$NOPY_BIN"
+
+rm -f "$NFT_STATE"
+e2e_summary

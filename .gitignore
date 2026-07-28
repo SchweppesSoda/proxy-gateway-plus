@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# pdg 运行期数据 (对应 /var/lib/pdg, /var/log/pdg)
+/var/
+*.log
+
+# 生成的配置产物 (本地试编译时)
+/out/
+*.generated.lua
+*.generated.json
+
+# 机密: 真实 IP / 密码 / 证书不要进版本库
+config/pdg.local.conf
+*.pem
+*.key
+tls/

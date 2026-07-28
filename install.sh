@@ -1,2991 +1,834 @@
 #!/usr/bin/env bash
-#
-# install.sh - High-performance transparent proxy + Smart DNS (DoT) one-click installer
-# Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12/13, CentOS 7/8/9 Stream,
-#           Rocky Linux 8/9, AlmaLinux 8/9, RHEL 8/9, Fedora 39+
-#
-
+# ─────────────────────────────────────────────────────────────────────────────
+# PrivDNS Gateway 一键安装 (Debian 12+ / Ubuntu 22+, 需 root)
+#   sudo ./install.sh
+# 非交互/自动化: 预置 PDG_* 环境变量 + PDG_NONINTERACTIVE=1 (见 docs/INSTALL.md)。
+#   PDG_SERVER_IP PDG_SSH_PORT PDG_INTERNAL_CIDR PDG_BOT_TOKEN PDG_ALLOWED PDG_DOT_DOMAIN
+#   PDG_SKIP_CERT=1  跳过 certbot, 生成自签占位证书 (之后用 bot 补正式证书)
+# 做什么: 装 mosdns + mihomo + 管理 bot + 防火墙 + DoT 证书。
+#   自动识别公网IP / 内网卡段; DNS(域名 A 记录) 那步留给你自己做; 落地出口装好后用 bot 加。
+# 也支持 curl|bash 直接跑: curl -fsSL <raw>/install.sh | sudo bash  (脚本会自动拉取仓库)
+# ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-# =============================================================================
-# Configurable defaults
-# =============================================================================
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_OWNER="SchweppesSoda"
-REPO_NAME="proxy-gateway-plus"
-REPO_BRANCH="${PROXY_GATEWAY_BRANCH:-main}"
-REPO_ARCHIVE_URL="${PROXY_GATEWAY_ARCHIVE_URL:-https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz}"
-BASE_DIR="/opt/proxy-gateway"
-CONF_DIR="${BASE_DIR}/etc"
-LOG_DIR="${BASE_DIR}/log"
-SRC_DIR="${BASE_DIR}/src"
-WWW_DIR="${BASE_DIR}/www"
-IOS_PROFILE_PORT=8111
-GFWLIST_URL="https://github.com/gfwlist/gfwlist/raw/master/gfwlist.txt"
-CHINALIST_URL="https://github.com/felixonmars/dnsmasq-china-list/raw/master/accelerated-domains.china.conf"
-DEFAULT_OVERSEAS_DNS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
-DEFAULT_PUBLIC_OVERSEAS_DNS=("1.1.1.1" "8.8.8.8")
-BOOTSTRAP_SYSTEM_DNS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
-DEFAULT_DNS_CACHE_SIZE=200000
-DEFAULT_CLIENT_CIDR="172.22.0.0/16"
-DEFAULT_FIREWALL_MODE="additive"
-DEFAULT_REVERSE_PROXY_MODE="local"
-DEFAULT_SOCKS5_PORT=1080
-DEFAULT_SOCKS5_USER="pgw"
-DEFAULT_WG_PORT=51820
-DEFAULT_WG_SERVER_ADDR="10.66.0.1/24"
-DEFAULT_WG_CLIENT_ADDR="10.66.0.2/32"
-REQUIRED_REPO_FILES=(
-    "dnsdist.conf.template"
-    "sniproxy.conf"
-    "update-rules.sh"
-    "renew-hook.sh"
-    "quic-proxy.go"
-    "china-dns-race-proxy.go"
-)
+REPO_URL="https://github.com/misaka-cpu/privdns-gateway.git"
+CERT_DIR="/etc/mosdns/certs"
+NONINT="${PDG_NONINTERACTIVE:-}"
+# 二进制版本(MOSDNS_VER/MIHOMO_VER)+ 钉死 SHA256 来自 lib/versions.sh, 自举进仓库后 source(见下)
 
-# =============================================================================
-# Colors
-# =============================================================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+c_g(){ echo -e "\033[1;32m[*]\033[0m $*"; }
+c_y(){ echo -e "\033[1;33m[!]\033[0m $*"; }
+die(){ echo -e "\033[1;31m[x]\033[0m $*" >&2; exit 1; }
 
-info()  { echo -e "${BLUE}[INFO]${NC} $*"; }
-ok()    { echo -e "${GREEN}[OK]${NC}   $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()   { echo -e "${RED}[ERR]${NC}  $*" >&2; }
+# 交互读取一行到指定变量, 撞 EOF / 无可用终端时回落到默认值 —— 绝不触发 errexit。
+# 用法: ask <变量名> <提示语> [默认值]
+# 为什么每次新开 /dev/tty: 自举把 fd 0 绑成某一个 /dev/tty 打开描述(见下方 exec ... < /dev/tty),
+# 长时间抓包(detect-internal-range.sh ~90s)后该描述在某些云主机/终端上会进入异常态, 后续 read
+# 立即返回 EOF。旧写法 `read ... VAR` 的非零返回会被 set -e 判成致命错误 → 整场安装回滚, 且不留
+# 任何错误行(见 issue: "内网卡来源段 CIDR [...]: [!] 安装失败")。这里每次都新开 /dev/tty 取一个
+# 干净的终端描述, 并把 EOF/无终端当"用默认值"处理, 让一次 read 失手不再拖垮整场安装。
+ask(){
+  local __var="$1" __prompt="$2" __def="${3:-}" __ans=""
+  # 探针与重跑处同款: 把重定向挂在普通命令上, 打不开只让该命令返回非零(不会让 shell 退出);
+  # 能打开才 read, 且 read 的 EOF 用 `|| __ans=""` 吃掉 —— 两条路都回落到默认值, 均不触发 errexit。
+  if { true < /dev/tty; } 2>/dev/null; then
+    read -rp "$__prompt" __ans < /dev/tty || __ans=""
+  fi
+  printf -v "$__var" '%s' "${__ans:-$__def}"
+}
 
-has_required_repo_files() {
-    local file
-    for file in "${REQUIRED_REPO_FILES[@]}"; do
-        [[ -f "${SCRIPT_DIR}/${file}" ]] || return 1
-    done
+pdg_checkout_latest_tag(){
+  local dir="$1" tag cur target
+  git -C "$dir" fetch -q --tags origin main
+  if [[ "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+    git -C "$dir" fetch -q --unshallow --tags origin main
+  fi
+  tag=$(git -C "$dir" tag -l 'v*' --sort=-v:refname | head -1)
+  [[ -n "$tag" ]] || die "仓库没有发布 tag(v*), 中止安装。"
+  cur=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
+  target=$(git -C "$dir" rev-parse "$tag^{commit}" 2>/dev/null || true)
+  if [[ "$cur" != "$target" ]]; then
+    git -C "$dir" checkout -q "$tag"
+  fi
+  echo "$tag"
+}
+
+[[ $EUID -eq 0 ]] || die "请用 root 运行: sudo ./install.sh  (或 curl ... | sudo bash)"
+command -v apt-get >/dev/null || die "目前仅支持 Debian/Ubuntu (apt)"
+case "$(dpkg --print-architecture)" in
+  amd64) MARCH=amd64 ;; arm64) MARCH=arm64 ;; *) die "不支持的架构: $(dpkg --print-architecture)";;
+esac
+
+# ── 自举: 若通过 curl|bash 直接运行(不在仓库内), 自动 clone 后从文件重跑 ──
+# (从文件重跑能让 read 交互正常: curl|bash 时 stdin 是脚本本身, 故把 stdin 接回 /dev/tty)
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /nonexistent)"
+if [[ ! -f "$SRC/deploy/mosdns/config.yaml" ]]; then
+  c_g "未在仓库目录内运行 → 自动拉取 privdns-gateway…"
+  command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
+  DEST=/opt/privdns-gateway
+  if [[ ! -d "$DEST/.git" ]]; then
+    rm -rf "$DEST"; git clone -q "$REPO_URL" "$DEST"
+  fi
+  TAG=$(pdg_checkout_latest_tag "$DEST")
+  c_g "使用最新发布 $TAG"
+  # 有可用控制终端就把 stdin 接回它(交互), 否则直接重跑(靠 PDG_* 环境变量非交互)
+  export PDG_TAG_BOOTSTRAPPED=1
+  if { true < /dev/tty; } 2>/dev/null; then exec bash "$DEST/install.sh" "$@" < /dev/tty
+  else exec bash "$DEST/install.sh" "$@"; fi
+fi
+REPO_DIR="$SRC"
+if [[ -d "$REPO_DIR/.git" && "${PDG_TAG_BOOTSTRAPPED:-}" != "1" ]]; then
+  command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
+  TAG=$(pdg_checkout_latest_tag "$REPO_DIR")
+  export PDG_TAG_BOOTSTRAPPED=1
+  c_g "使用最新发布 $TAG"
+  if { true < /dev/tty; } 2>/dev/null; then exec bash "$REPO_DIR/install.sh" "$@" < /dev/tty
+  else exec bash "$REPO_DIR/install.sh" "$@"; fi
+fi
+
+# ── 版本 + 钉死 SHA256(供应链校验)──
+# shellcheck source=lib/versions.sh
+source "$REPO_DIR/lib/versions.sh"
+# shellcheck source=lib/units.sh
+source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 pdg 迁移共用, 免漂移)
+# shellcheck source=lib/mosdns.sh
+source "$REPO_DIR/lib/mosdns.sh" # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
+# shellcheck source=lib/cidr.sh
+source "$REPO_DIR/lib/cidr.sh"   # 内网卡段校验 + 抓包/手输并行(与 pdg detect-cidr 共用)
+
+# ── 事务性安装: 失败自动回滚(只撤本次新装的, 不误伤既有可用部署)──
+INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
+# 安装状态: 全部在注册 EXIT trap 前初始化 —— rollback 在 set -u 下读到未赋值的变量会
+# 二次崩溃, 把最初的安装错误盖掉, 还会漏掉它后面的 nftables/resolved/resolv.conf 还原。
+PRIOR_INSTALL=0; MOSDNS_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0
+# 二进制安装事务台账: 每项 "目标路径|装前是否存在(0/1)|备份路径|装前SHA"。
+# 只要"即将改动目标"就先记一笔 —— *_INSTALLED 表示的是"装成功了吗", 不能拿来表示
+# "这次碰过目标没有": install 写了一半才失败时它还是 0, 回滚就会漏掉那个半成品。
+BIN_TXN=()
+# 目录事务台账: 每项 "目录|装前是否存在(0/1)|装前内容备份路径"。
+# 回滚只该撤销**本次**造成的改动: 本次新建的目录才删, 装前就存在的要按备份还原 ——
+# 直接 rm -rf 那几个目录会把装前就在那儿的东西(可能是别人的)一并抹掉。
+DIR_TXN=()
+[[ -f /opt/pdg-bot/bot.py || -x /usr/local/bin/pdg ]] && PRIOR_INSTALL=1
+
+# ── 第三方路径冲突: 在改动任何东西之前中止 ──────────────────────────────────
+# 本项目把 /etc/sing-box/config.json 当数据模型, 而手工装的 sing-box 也常用这个路径。
+# 若机器上已有一份**证明不了归属**的 sing-box(unit / 二进制 / 配置), 继续装就会覆盖别人的
+# 配置且不可逆 —— 直接中止, 把处置权交回用户。
+# shellcheck source=lib/singbox.sh
+source "$REPO_DIR/lib/singbox.sh"
+if [[ "$PRIOR_INSTALL" == 0 ]]; then
+  _sb_conflict=()
+  [[ -e /etc/systemd/system/sing-box.service ]] && _sb_conflict+=("/etc/systemd/system/sing-box.service")
+  [[ -e /usr/local/bin/sing-box ]] && _sb_conflict+=("/usr/local/bin/sing-box")
+  [[ -e /etc/sing-box/config.json ]] && _sb_conflict+=("/etc/sing-box/config.json")
+  if [[ ${#_sb_conflict[@]} -gt 0 ]] && ! pdg_singbox_is_ours; then
+    die "检测到已存在的 sing-box, 且无法确认是本项目安装的 → 中止安装(未改动任何文件)。
+  冲突路径: ${_sb_conflict[*]}
+  本项目会把 /etc/sing-box/config.json 用作数据模型, 继续装会覆盖上面这些内容, 且不可逆。
+  请先确认它们的归属: 确实不再需要就自行备份并移除, 再重跑本脚本;
+  若那是你自己在跑的 sing-box, 请换一台机器部署本项目。"
+  fi
+fi
+
+# 已有部署: install.sh 会重写配置, 半途失败难以无损还原 → 默认拒绝, 引导走 pdg update(带快照+回滚)。
+# 确需原机覆盖重装的显式 PDG_FORCE_REINSTALL=1; 此时先打快照, 失败用 pdg rollback 恢复。
+if [[ "$PRIOR_INSTALL" == 1 ]]; then
+  if [[ -z "${PDG_FORCE_REINSTALL:-}" ]]; then
+    die "检测到已有 PrivDNS Gateway 部署。
+  升级请用:  sudo pdg update   (带快照 + 校验门 + 失败自动回滚, 不动出口/分流/证书)
+  确要原机覆盖重装(会重写配置): sudo PDG_FORCE_REINSTALL=1 ./install.sh"
+  fi
+  FORCED_REINSTALL=1
+  # 覆盖重装会重写既有部署的配置, 没有快照就等于不可恢复 → 快照拿不到就在动任何文件之前中止。
+  command -v pdg >/dev/null 2>&1 \
+    || die "PDG_FORCE_REINSTALL: 找不到 pdg 命令, 无法在覆盖前留快照 → 中止。"
+  c_y "PDG_FORCE_REINSTALL: 在已有部署上覆盖重装 → 先留一份快照…"
+  pdg snapshot >/dev/null 2>&1 \
+    || die "覆盖重装前快照失败 → 中止(拒绝在无法恢复配置的前提下覆盖已有部署)。"
+fi
+
+# ── 防火墙冲突: 同样在改动任何东西之前中止 ──────────────────────────────────
+# 本项目的 table inet pdg 带 `hook input priority 0; policy drop`, 而 nftables 里同一 hook
+# 上的多个 base chain **都会执行** —— 任一条判 drop 包就没了。机器上已有别的 input base chain
+# 时装上去, 用户那些放行(自定义端口/VPN)会被架空: 配置看着还在, 端口实际不通。
+# 判据与迁移共用 deploy/bot/nftscan.py, 不另写一套。
+# **安全检查前置依赖**: 扫描器是 python3 写的。极简 Debian 12 默认没有 python3, 那时
+# `python3 …` 直接 127 —— 旧写法的 case 只认 0 和 2, 127 静默落空, 于是"有冲突的机器照样
+# 装下去", 这道门等于不存在。所以先把 python3 装上(只装它, 与后面那批正式依赖分开: 这是
+# 为了**能做检查**, 不是开始部署), 装不上就中止 —— 检查做不了就不能往下走。
+_NFTSCAN="$REPO_DIR/deploy/bot/nftscan.py"
+[[ -f "$_NFTSCAN" ]] || die "缺少防火墙冲突扫描器 $_NFTSCAN → 中止安装(未改动任何文件)。
+  仓库不完整? 请重新 clone 后再装。"
+if ! command -v python3 >/dev/null 2>&1; then
+  c_y "[*] 安全检查前置依赖: 本机没有 python3, 先装上它才能做防火墙冲突检查…"
+  apt-get update -qq >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-minimal >/dev/null 2>&1 \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null 2>&1 || true
+  command -v python3 >/dev/null 2>&1 \
+    || die "装不上 python3 → 无法检查现有 nftables 是否与本项目冲突, 中止安装(未改动配置)。
+  本项目本来就依赖 python3(bot / 自检 / 渲染都用它)。请先手工装好:
+    sudo apt-get update && sudo apt-get install -y python3
+  再重跑本脚本。"
+fi
+
+# 退出码本身就是结论(0=有冲突 1=干净 2=读不到), 非零是正常返回 —— 赋值必须自己接住,
+# 否则 set -e 会在"现场干净"时把安装直接杀掉。stderr 单独留一份: 出了别的错(解释器炸了 /
+# 脚本语法坏了)要能看见原因, 不能只丢一句"检查失败"。
+_nft_rc=0
+_nft_err="$(mktemp)" || die "无法创建临时文件"
+_nft_conflict="$(python3 "$_NFTSCAN" /etc/nftables.conf 2>"$_nft_err")" || _nft_rc=$?
+_nft_stderr="$(head -c 2000 "$_nft_err" 2>/dev/null)"; rm -f "$_nft_err"
+case "$_nft_rc" in
+  0) die "检测到与本项目不兼容的 nftables input 链 → 中止安装(未改动任何文件)。
+$(printf '%s\n' "$_nft_conflict" | sed 's/^/    /')
+  本项目的 table inet pdg 是 policy drop, 而同一 hook 上每条 base chain 都会执行 ——
+  上面这些表里的放行会被架空(端口看着开着、实际不通), 比直接报错更难查。
+  请把需要的放行并入 table inet pdg 的 input chain(或把那些链改挂到非 input hook), 再重跑。" ;;
+  1) : ;;   # 确认无冲突 → 继续
+  2) # 读不到运行中的 ruleset。机器上压根没有 nft = 还没装 nftables, 没有现网规则可冲突,
+     # 照常继续(本脚本随后会装 nftables); nft 在却读不到 = 权限/内核异常, 不能盲目往下写规则。
+     #
+     # "在不在"必须与扫描器用**同一份**判据: `command -v nft` 只看 PATH, 而 nft 装在
+     # /usr/sbin —— `su`(不带 -)、cron、某些容器的 root PATH 里没有 sbin, 于是明明装着
+     # nftables 却被判成"没装", 一整套现网 input 链就这么被当成裸机放过去了。
+     _nft_bin="$(python3 "$_NFTSCAN" --nft-path 2>/dev/null || true)"
+     if [[ -n "$_nft_bin" && -x "$_nft_bin" ]]; then
+       die "无法确认现有 nftables 规则(nft 在 $_nft_bin, 但 list ruleset 读不到)
+  → 中止安装(未改动任何文件)。
+$(printf '%s\n' "$_nft_conflict" | sed 's/^/    /')
+  请用 root 重跑; 若 nftables 本身不可用(内核缺 nf_tables 模块等), 请先修好它再装。"
+     fi
+     c_y "[*] 本机还没有 nftables(扫描器也找不到 nft)→ 仅依据 /etc/nftables.conf 判定, 继续安装。" ;;
+  *) # 127=找不到解释器 / 126=不可执行 / 1xx=被信号杀 / 其它=扫描器自己出错。
+     # 一律中止: "检查没跑成"和"检查通过"是两回事, 后者才有资格继续装。
+     die "防火墙冲突检查没能跑起来(退出码 $_nft_rc)→ 中止安装(未改动任何文件)。
+$( [[ -n "$_nft_stderr" ]] && printf '  扫描器输出:\n%s\n' "$(printf '%s\n' "$_nft_stderr" | sed 's/^/    /')" )
+  常见原因: python3 不可用或版本过旧(127/126)、$_NFTSCAN 损坏、被 OOM/信号杀掉。
+  先确认 \`python3 $_NFTSCAN /etc/nftables.conf; echo \$?\` 能跑出 0/1/2, 再重跑本脚本。" ;;
+esac
+
+_sha(){ sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# 覆盖既有内核/解析器二进制前先留一份原件。别人装的 mosdns/sing-box/mihomo(哪怕版本
+# 不同)不算"本次新增", 回滚时应当还原原件而不是删掉。
+#
+# 返回非 0 = 备份不可靠, 调用方**必须中止**, 绝不能继续覆盖 —— 备份失败还照装, 等于
+# 在没有退路的前提下改别人的二进制。目标本来就不存在时返回 0(没什么可留)。
+_stash_bin(){
+  local p="$1" bak="$1.pdg-preinstall" tmp sha
+  if [[ ! -e "$p" ]]; then
+    BIN_TXN+=("$p|0||")               # 仍要记账: 回滚时要删掉本次可能留下的半成品
     return 0
-}
-
-download_repo_archive() {
-    local output="$1"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fL --connect-timeout 15 --retry 2 -o "$output" "$REPO_ARCHIVE_URL"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -O "$output" "$REPO_ARCHIVE_URL"
+  fi
+  sha="$(_sha "$p")"
+  [[ -n "$sha" ]] || { c_y "读不到 $p 的校验和 → 中止(无法保证可回退)。"; return 1; }
+  if [[ -e "$bak" ]]; then
+    # 残留备份分两种: 与当前文件**内容一致** = 上次装成功后没清掉的, 清掉继续即可(常见, 安全);
+    # 内容不同 = 来源不明, 既不能拿当前文件盖掉它, 也不能拿它顶替当前文件 → 交人工。
+    if [[ "$(_sha "$bak")" == "$sha" ]]; then
+      rm -f "$bak" 2>/dev/null || { c_y "清理残留备份 $bak 失败 → 中止。"; return 1; }
     else
-        err "curl or wget is required to download ${REPO_ARCHIVE_URL}"
-        return 1
+      c_y "发现上次遗留的备份: $bak(内容与当前 $p 不同, 来源不明)"
+      c_y "  拒绝覆盖。请先人工确认(确是旧版就 mv 回 $p, 无用则删除), 再重跑。"
+      return 1
     fi
+  fi
+  # 先写同目录临时文件, 校验通过再原子 mv 落位: 半截拷贝不会被当成完整原件
+  tmp="$(mktemp "$(dirname "$p")/.pdg-stash.XXXXXX" 2>/dev/null)" \
+    || { c_y "无法在 $(dirname "$p") 创建临时文件 → 中止。"; return 1; }
+  if ! cp -a "$p" "$tmp" 2>/dev/null || [[ "$(_sha "$tmp")" != "$sha" ]]; then
+    rm -f "$tmp" 2>/dev/null
+    c_y "备份 $p 失败(拷贝不完整) → 中止, 不在无法回退的前提下覆盖二进制。"; return 1
+  fi
+  if ! mv -f "$tmp" "$bak" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null; c_y "备份落位失败 → 中止。"; return 1
+  fi
+  BIN_TXN+=("$p|1|$bak|$sha")
+  return 0
 }
 
-bootstrap_full_repo_if_needed() {
-    has_required_repo_files && return 0
-
-    if [[ "${PROXY_GATEWAY_BOOTSTRAPPED:-}" == "1" ]]; then
-        err "Required repository files are still missing under ${SCRIPT_DIR}"
-        exit 1
+# 回滚二进制: 按事务台账逐条独立处理, 失败计入调用方的 failed(动态作用域)。
+# 台账在"即将改动目标"之前就记好, 所以 install 写了一半才失败也能被恢复 ——
+# 用 *_INSTALLED(装成功了吗)判断"这次碰过目标没有"会漏掉正是这种情况。
+_rollback_bins(){
+  local entry p pre bak sha
+  for entry in ${BIN_TXN[@]+"${BIN_TXN[@]}"}; do
+    IFS='|' read -r p pre bak sha <<<"$entry"
+    if [[ "$pre" == 1 ]]; then
+      if [[ -z "$bak" || ! -e "$bak" ]]; then failed+=("还原 $p(备份丢失)"); continue; fi
+      if ! mv -f "$bak" "$p" 2>/dev/null;   then failed+=("还原 $p(mv 失败)");  continue; fi
+      # 只看"文件在"不够: 必须确认还原出来的确实等于备份下来的那一份
+      if [[ -n "$sha" && "$(_sha "$p")" != "$sha" ]]; then failed+=("还原 $p(校验和不符)"); continue; fi
+    else
+      rm -f "$p" 2>/dev/null || failed+=("移除 $p")
     fi
-    if [[ "${PROXY_GATEWAY_NO_BOOTSTRAP:-}" == "1" ]]; then
-        err "Required repository files are missing under ${SCRIPT_DIR}"
-        exit 1
-    fi
-    if ! command -v tar >/dev/null 2>&1; then
-        err "tar is required to extract ${REPO_ARCHIVE_URL}"
-        exit 1
-    fi
-
-    local workdir archive extracted_dir
-    workdir="$(mktemp -d "${TMPDIR:-/tmp}/${REPO_NAME}.XXXXXX")"
-    archive="${workdir}/${REPO_NAME}.tar.gz"
-
-    info "Current directory does not contain the full repository."
-    info "Downloading ${REPO_ARCHIVE_URL}"
-    download_repo_archive "$archive"
-    tar -xzf "$archive" -C "$workdir"
-
-    extracted_dir="$(find "$workdir" -mindepth 1 -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n 1 || true)"
-    if [[ -z "$extracted_dir" || ! -f "${extracted_dir}/install.sh" ]]; then
-        err "Failed to locate extracted ${REPO_NAME} repository under ${workdir}"
-        exit 1
-    fi
-
-    chmod +x "${extracted_dir}/install.sh" "${extracted_dir}/update-rules.sh" "${extracted_dir}/renew-hook.sh" 2>/dev/null || true
-    export PROXY_GATEWAY_BOOTSTRAPPED=1
-    info "Switching to ${extracted_dir}/install.sh"
-    exec "${extracted_dir}/install.sh" "$@"
+  done
 }
 
-tty_read() {
-    local __var="$1"
-    local prompt="$2"
-    local default="${3:-}"
-    local value=""
+# 安装确认成功后清理备份(原件不再需要)。
+_commit_bins(){
+  local entry p pre bak sha
+  for entry in ${BIN_TXN[@]+"${BIN_TXN[@]}"}; do
+    IFS='|' read -r p pre bak sha <<<"$entry"
+    [[ -n "$bak" ]] && rm -f "$bak" 2>/dev/null
+  done
+  return 0
+}
 
-    if [[ -r /dev/tty ]]; then
-        if [[ -n "$default" ]]; then
-            printf "%s [%s]: " "$prompt" "$default" > /dev/tty
+rollback(){
+  # set +e 只关 errexit, nounset 仍然生效 → 下面一律用 ${VAR:-0} 兜底, 不整体关 nounset。
+  set +e
+  local failed=()                       # 未能恢复的项; 单项失败不中断后续恢复
+  [[ "${ROLLBACK_DONE:-0}" == 1 ]] && return; ROLLBACK_DONE=1
+  if [[ "${FORCED_REINSTALL:-0}" == 1 ]]; then
+    c_y "覆盖重装中途失败 —— 既有部署的配置可能已被改写。"
+    # 配置交给 pdg rollback(有安装前快照), 但**本次事务动过的二进制必须自己还原**:
+    # 旧版本的快照未必含内核二进制, 指望 pdg rollback 收拾它们并不可靠。
+    _rollback_bins
+    if [[ ${#failed[@]} -eq 0 ]]; then
+      c_y "  本次覆盖的二进制已还原(无备份残留)。"
+    else
+      c_y "  以下二进制未能还原, 请手工检查: ${failed[*]}"
+    fi
+    c_y "  恢复配置:  sudo pdg rollback   (用安装前那份快照), 再  sudo pdg doctor  复查。"
+    [[ ${#failed[@]} -eq 0 ]] || return 1
+    return 0
+  fi
+  c_y "安装失败 → 回滚本次全新安装的改动…"
+  # 各步骤相互独立: 单项失败只记账, 不挡住后面的恢复; 但也绝不因此谎报"已回滚"。
+  local units="pdg-bot.service pdg-probe81.service mosdns.service sing-box.service mihomo.service
+               pdg-mitm.service pdg-rules-update.service pdg-health.service
+               pdg-rules-update.timer pdg-health.timer"
+  for u in $units; do
+    [[ -e "/etc/systemd/system/$u" ]] || continue        # 本次没创建过的 unit 不算失败
+    systemctl disable --now "$u" >/dev/null 2>&1 || failed+=("停用 $u")
+  done
+  for u in $units; do
+    [[ -e "/etc/systemd/system/$u" ]] || continue
+    rm -f "/etc/systemd/system/$u" || failed+=("删除 unit $u")
+  done
+  for d in /etc/systemd/journald.conf.d/50-pdg.conf /etc/systemd/system/journald.conf.d/50-pdg.conf; do
+    [[ -e "$d" ]] || continue                            # 正确 + 历史错路径都删
+    rm -f "$d" || failed+=("删除 $d")
+  done
+  systemctl daemon-reload 2>/dev/null || failed+=("daemon-reload")
+  systemctl restart systemd-journald 2>/dev/null || true   # CanReload=no: 必须 restart 才松开封顶
+  if nft list table inet pdg >/dev/null 2>&1; then         # 表不存在不算失败
+    nft delete table inet pdg 2>/dev/null || failed+=("删除 nft 表 inet pdg")
+  fi
+  # 按目录事务台账还原: 本次新建的删掉; 装前就存在的按备份原样还原 —— 无差别 rm -rf 会把
+  # 装前就在那儿的东西(可能是第三方 sing-box 的配置)一并抹掉, 那不是"回滚"而是破坏。
+  # 台账可能还没建(极早期失败) —— 在 set -u 下必须先安全取用, 直接 ${#DIR_TXN[@]} 会 unbound,
+  # 那会让回滚自己崩掉并盖住最初的安装错误(正是本项目专门防的那类事故)。
+  local dirtxn=(); dirtxn=(${DIR_TXN[@]+"${DIR_TXN[@]}"})
+  if [[ ${#dirtxn[@]} -gt 0 ]]; then
+    local entry d pre bak
+    for entry in "${dirtxn[@]}"; do
+      IFS='|' read -r d pre bak <<<"$entry"
+      if [[ "$pre" == 1 ]]; then
+        rm -rf "$d" 2>/dev/null
+        if [[ -n "$bak" && -d "$bak" ]]; then
+          mkdir -p "$d" && cp -a "$bak/." "$d/" 2>/dev/null || failed+=("还原 $d")
+          rm -rf "$bak"
         else
-            printf "%s: " "$prompt" > /dev/tty
+          failed+=("还原 $d(备份丢失)")
         fi
-        IFS= read -r value < /dev/tty || value=""
-    elif [[ -t 0 ]]; then
-        if [[ -n "$default" ]]; then
-            printf "%s [%s]: " "$prompt" "$default"
-        else
-            printf "%s: " "$prompt"
-        fi
-        IFS= read -r value || value=""
-    fi
-
-    if [[ -z "$value" ]]; then
-        value="$default"
-    fi
-    printf -v "$__var" '%s' "$value"
-}
-
-tty_yes_no() {
-    local __var="$1"
-    local prompt="$2"
-    local default="${3:-Y}"
-    local answer=""
-    local suffix="[Y/n]"
-    [[ "$default" =~ ^[Nn]$ ]] && suffix="[y/N]"
-
-    while true; do
-        tty_read answer "${prompt} ${suffix}" ""
-        if [[ -z "$answer" ]]; then
-            answer="$default"
-        fi
-        case "$answer" in
-            y|Y|yes|YES) printf -v "$__var" '%s' "y"; return 0 ;;
-            n|N|no|NO) printf -v "$__var" '%s' "n"; return 0 ;;
-            *) warn "无效输入，请输入 y 或 n。" ;;
-        esac
+      else
+        [[ -e "$d" ]] && { rm -rf "$d" || failed+=("删除 $d"); }
+      fi
     done
-}
-
-pause_return() {
-    local _
-    if [[ -r /dev/tty || -t 0 ]]; then
-        tty_read _ "按 Enter 返回" ""
-    fi
-}
-
-random_secret() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 18 | tr -d '=+/[:space:]' | cut -c1-24
+  else                                    # 台账还没建起来就失败了(极早期): 退回旧行为
+    for d in /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway; do
+      [[ -e "$d" ]] || continue
+      rm -rf "$d" || failed+=("删除 $d")
+    done
+  fi
+  rm -f /usr/local/bin/{pdg,pdg-set-token,proxy-gateway-open-cert-http.sh,proxy-gateway-restore-firewall.sh} \
+    || failed+=("删除本次安装的管理脚本")
+  _rollback_bins        # 按事务台账还原/清除二进制(装前存在的还原原件, 不存在的删半成品)
+  # 还原系统级改动(仅全新安装才到这里)。逐项独立判定: 任一项失败都不许挡住后面的还原。
+  if [[ -e /etc/nftables.conf.pdg-orig ]]; then
+    if cp -a /etc/nftables.conf.pdg-orig /etc/nftables.conf 2>/dev/null; then
+      nft -f /etc/nftables.conf 2>/dev/null || failed+=("nftables 重载")
+      rm -f /etc/nftables.conf.pdg-orig
     else
-        tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24
+      failed+=("nftables.conf 还原")
     fi
-}
-
-resolv_conf_lacks_external_nameserver() {
-    local ns has_nameserver=0 has_external=0
-
-    [[ -r /etc/resolv.conf ]] || return 0
-    while read -r _ ns _; do
-        [[ -z "${ns:-}" ]] && continue
-        has_nameserver=1
-        case "$ns" in
-            127.*|0.0.0.0|::1) ;;
-            *) has_external=1 ;;
-        esac
-    done < <(awk '$1 == "nameserver" {print $0}' /etc/resolv.conf)
-
-    [[ "$has_nameserver" -eq 0 || "$has_external" -eq 0 ]]
-}
-
-write_static_resolv_conf() {
-    local reason="${1:-system DNS bootstrap}"
-    local backup="/etc/resolv.conf.proxy-gateway.bak"
-    local resolver
-
-    if [[ ! -e "$backup" && ! -L "$backup" ]]; then
-        if [[ -L /etc/resolv.conf ]]; then
-            readlink /etc/resolv.conf > "${backup}.symlink" 2>/dev/null || true
-        elif [[ -e /etc/resolv.conf ]]; then
-            cp -a /etc/resolv.conf "$backup" 2>/dev/null || true
-        fi
-    fi
-
-    if [[ -L /etc/resolv.conf ]]; then
-        rm -f /etc/resolv.conf
-    fi
-
-    {
-        echo "# Written by proxy-gateway installer: ${reason}"
-        for resolver in "${BOOTSTRAP_SYSTEM_DNS[@]}"; do
-            echo "nameserver ${resolver}"
-        done
-        echo "options timeout:2 attempts:2"
-    } > /etc/resolv.conf
-}
-
-ensure_system_dns_ready() {
-    local probe_host="${1:-deb.debian.org}"
-    local reason="${2:-package installation}"
-
-    getent hosts "$probe_host" >/dev/null 2>&1 && return 0
-
-    if resolv_conf_lacks_external_nameserver; then
-        warn "System DNS cannot resolve ${probe_host}; /etc/resolv.conf has no external resolver."
-        write_static_resolv_conf "$reason"
-    fi
-
-    if ! getent hosts "$probe_host" >/dev/null 2>&1; then
-        err "DNS resolution failed for ${probe_host}. Fix /etc/resolv.conf or system DNS, then rerun this installer."
-        exit 1
-    fi
-
-    ok "System DNS is available via /etc/resolv.conf"
-}
-
-ensure_resolver_survives_dns_owner_stop() {
-    local owner="${1:-local DNS service}"
-
-    if resolv_conf_lacks_external_nameserver; then
-        warn "/etc/resolv.conf depends on ${owner}; switching system resolver before stopping it."
-        write_static_resolv_conf "before stopping ${owner}"
-    fi
-}
-
-render_overseas_dns_servers() {
-    local input="${1:-}"
-    local pool="${2:-overseas}"
-    local prefix="${3:-overseas}"
-    local dns_list=()
-    local item order=1 name
-
-    if [[ -z "$input" ]]; then
-        dns_list=("${DEFAULT_OVERSEAS_DNS[@]}")
+  fi
+  if [[ "${RESOLVED_DISABLED:-0}" == 1 ]]; then
+    systemctl enable --now systemd-resolved 2>/dev/null || failed+=("systemd-resolved 恢复")
+  fi
+  if [[ -e /etc/resolv.conf.pdg-orig ]]; then
+    # 同装机那侧: bind-mount 的 resolv.conf 删不掉也 mv 不上去, 但内容能原地写回。
+    # 退化路径丢的是"原来是个符号链接"这一属性, 内容(上游 DNS)是对的 —— 比整条还原失败强。
+    if rm -f /etc/resolv.conf 2>/dev/null && mv /etc/resolv.conf.pdg-orig /etc/resolv.conf 2>/dev/null; then
+      :
+    elif cat /etc/resolv.conf.pdg-orig > /etc/resolv.conf 2>/dev/null; then
+      rm -f /etc/resolv.conf.pdg-orig 2>/dev/null
     else
-        input="${input//,/ }"
-        read -r -a dns_list <<< "$input"
+      failed+=("resolv.conf 还原")
     fi
-
-    for item in "${dns_list[@]}"; do
-        [[ -z "$item" ]] && continue
-        if [[ ! "$item" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-            warn "跳过无效的海外 DNS 地址: $item"
-            continue
-        fi
-        name="${prefix}${order}"
-        printf 'newServer({address="%s:53", pool="%s", name="%s", order=%d, useClientSubnet=true})\n' "$item" "$pool" "$name" "$order"
-        order=$((order + 1))
-    done
-}
-
-render_sniproxy_dns_nameservers() {
-    local input="${1:-}"
-    local dns_list=()
-    local item
-
-    if [[ -z "$input" ]]; then
-        dns_list=("${DEFAULT_OVERSEAS_DNS[@]}")
-    else
-        input="${input//,/ }"
-        read -r -a dns_list <<< "$input"
-    fi
-
-    for item in "${dns_list[@]}"; do
-        [[ -z "$item" ]] && continue
-        if [[ ! "$item" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-            warn "跳过无效的 sniproxy DNS 地址: $item"
-            continue
-        fi
-        printf '    nameserver %s\n' "$item"
-    done
-}
-
-configure_overseas_dns() {
-    local legacy="${OVERSEAS_DNS:-}"
-    local private_selected="${PRIVATE_OVERSEAS_DNS:-$legacy}"
-    local public_selected="${PUBLIC_OVERSEAS_DNS:-}"
-    local sniproxy_selected="${SNIPROXY_DNS:-}"
-
-    if [[ -z "$private_selected" && -t 0 ]]; then
-        echo ""
-        tty_read private_selected "私网客户端海外 DNS 上游" "1.1.1.1,8.8.8.8,9.9.9.9"
-    fi
-    if [[ -z "$public_selected" && -t 0 ]]; then
-        tty_read public_selected "公网 DoT 客户端海外 DNS 上游" "1.1.1.1,8.8.8.8"
-    fi
-    if [[ -z "$sniproxy_selected" && -t 0 ]]; then
-        tty_read sniproxy_selected "sniproxy 后端解析 DNS 上游（留空则跟随私网海外 DNS）" ""
-    fi
-
-    if [[ -z "$private_selected" ]]; then
-        private_selected="${DEFAULT_OVERSEAS_DNS[*]}"
-    fi
-    if [[ -z "$public_selected" ]]; then
-        public_selected="${DEFAULT_PUBLIC_OVERSEAS_DNS[*]}"
-    fi
-    if [[ -z "$sniproxy_selected" ]]; then
-        sniproxy_selected="$private_selected"
-    fi
-
-    OVERSEAS_DNS="$private_selected"
-    PRIVATE_OVERSEAS_DNS="$private_selected"
-    PUBLIC_OVERSEAS_DNS="$public_selected"
-    SNIPROXY_DNS="$sniproxy_selected"
-
-    mkdir -p "$CONF_DIR"
-    echo "$PRIVATE_OVERSEAS_DNS" > "${CONF_DIR}/.overseas_dns"
-    echo "$PRIVATE_OVERSEAS_DNS" > "${CONF_DIR}/.overseas_private_dns"
-    echo "$PUBLIC_OVERSEAS_DNS" > "${CONF_DIR}/.overseas_public_dns"
-    echo "$SNIPROXY_DNS" > "${CONF_DIR}/.sniproxy_dns"
-    info "私网客户端海外 DNS 上游: $PRIVATE_OVERSEAS_DNS"
-    info "公网 DoT 客户端海外 DNS 上游: $PUBLIC_OVERSEAS_DNS"
-    info "sniproxy 后端解析 DNS 上游: $SNIPROXY_DNS"
-}
-
-valid_domain() {
-    local domain="$1"
-    domain="${domain%%#*}"
-    domain="${domain%.}"
-    domain="${domain#www.}"
-    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?)+$ ]]
-}
-
-valid_ipv4() {
-    local ip="$1" o1 o2 o3 o4
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-    IFS=. read -r o1 o2 o3 o4 <<< "$ip"
-    for octet in "$o1" "$o2" "$o3" "$o4"; do
-        [[ "$octet" -ge 0 && "$octet" -le 255 ]] || return 1
-    done
-}
-
-valid_ipv4_cidr() {
-    local cidr="$1" ip prefix
-    if [[ "$cidr" == */* ]]; then
-        ip="${cidr%/*}"
-        prefix="${cidr#*/}"
-        valid_ipv4 "$ip" || return 1
-        [[ "$prefix" =~ ^[0-9]+$ && "$prefix" -ge 0 && "$prefix" -le 32 ]]
-    else
-        valid_ipv4 "$cidr"
-    fi
-}
-
-configure_dns_policy() {
-    check_root
-    local other_policy="${OTHER_POLICY:-}"
-    local cache_size="${DNS_CACHE_SIZE:-}"
-    local choice=""
-
-    mkdir -p "$CONF_DIR"
-
-    echo ""
-    echo "=================================================="
-    echo "  DNS 分流策略"
-    echo "=================================================="
-    echo "  1) 其他域名默认直连"
-    echo "  2) 其他域名默认走 VPS1 SNI/QUIC 代理"
-    echo "=================================================="
-    while true; do
-        if [[ "$other_policy" == "proxy" ]]; then
-            choice="2"
-        elif [[ "$other_policy" == "direct" ]]; then
-            choice="1"
-        else
-            tty_read choice "请输入序号 (1-2)" "1"
-        fi
-        case "$choice" in
-            1) other_policy="direct"; break ;;
-            2) other_policy="proxy"; break ;;
-            *) warn "无效输入，请重新输入 1-2 之间的数字" ;;
-        esac
-    done
-    echo "$other_policy" > "${CONF_DIR}/.other_policy"
-    if [[ -d /etc/dnsdist ]]; then
-        echo "$other_policy" > /etc/dnsdist/.other_policy
-    fi
-    OTHER_POLICY="$other_policy"
-
-    echo ""
-    echo "=================================================="
-    echo "  dnsdist 缓存大小"
-    echo "=================================================="
-    echo "  1) 50000"
-    echo "  2) 100000"
-    echo "  3) 200000"
-    echo "  4) 500000"
-    echo "  5) 自定义"
-    echo "=================================================="
-    while true; do
-        if [[ -n "$cache_size" ]]; then
-            choice="custom"
-        else
-            tty_read choice "请输入序号 (1-5)" "3"
-        fi
-        case "$choice" in
-            1) cache_size=50000; break ;;
-            2) cache_size=100000; break ;;
-            3) cache_size=$DEFAULT_DNS_CACHE_SIZE; break ;;
-            4) cache_size=500000; break ;;
-            5|custom)
-                tty_read cache_size "请输入 dnsdist cache 条目数" "${cache_size:-$DEFAULT_DNS_CACHE_SIZE}"
-                if [[ "$cache_size" =~ ^[0-9]+$ && "$cache_size" -gt 0 ]]; then
-                    break
-                fi
-                warn "无效输入，请输入正整数"
-                cache_size=""
-                ;;
-            *) warn "无效输入，请重新输入 1-5 之间的数字" ;;
-        esac
-    done
-    echo "$cache_size" > "${CONF_DIR}/.cache_size"
-    if [[ -d /etc/dnsdist ]]; then
-        echo "$cache_size" > /etc/dnsdist/.cache_size
-    fi
-    DNS_CACHE_SIZE="$cache_size"
-
-    touch "${CONF_DIR}/gfwlist-extra-local.txt" \
-        "${CONF_DIR}/proxy-extra-local.txt" \
-        "${CONF_DIR}/direct-extra-local.txt" \
-        "${CONF_DIR}/custom-proxy-lists.txt" \
-        "${CONF_DIR}/custom-direct-lists.txt"
-    if [[ -d /etc/dnsdist ]]; then
-        touch /etc/dnsdist/gfwlist-extra-local.txt \
-            /etc/dnsdist/proxy-extra-local.txt \
-            /etc/dnsdist/direct-extra-local.txt \
-            /etc/dnsdist/custom-proxy-lists.txt \
-            /etc/dnsdist/custom-direct-lists.txt
-    fi
-    ok "DNS 分流策略已保存（其他域名: ${OTHER_POLICY}, cache: ${DNS_CACHE_SIZE}）"
-}
-
-append_line_if_missing() {
-    local file="$1"
-    local value="$2"
-    mkdir -p "$(dirname "$file")"
-    touch "$file"
-    if ! grep -Fxq "$value" "$file"; then
-        printf '%s\n' "$value" >> "$file"
-    fi
-}
-
-configure_custom_lists_menu() {
-    check_root
-    local choice="" value="" file=""
-    local policy_dir="$CONF_DIR"
-    [[ -d /etc/dnsdist ]] && policy_dir="/etc/dnsdist"
-    mkdir -p "$policy_dir"
-
-    while true; do
-        echo ""
-        echo "=================================================="
-        echo "  自定义分流列表"
-        echo "=================================================="
-        echo "  格式: 本地域名每行一个，如 example.com；远程列表每行一个 URL。"
-        echo "  远程列表支持裸域名、Adblock ||domain^、http(s) URL、dnsmasq server=/domain/ 或 address=/domain/。"
-        echo "  不支持 Clash/Surge 的 DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR 或正则。"
-        echo "=================================================="
-        echo "  1) 添加走代理的远程 list URL"
-        echo "  2) 添加直连的远程 list URL"
-        echo "  3) 添加本地代理域名"
-        echo "  4) 添加本地直连域名"
-        echo "  5) 查看当前列表"
-        echo "  6) 清空当前自定义列表"
-        echo "  0) 返回主菜单"
-        echo "=================================================="
-        tty_read choice "请输入序号 (0-6)" ""
-        case "$choice" in
-            1)
-                tty_read value "远程 proxy list URL" ""
-                [[ -z "$value" ]] && warn "URL 不能为空" && continue
-                append_line_if_missing "${policy_dir}/custom-proxy-lists.txt" "$value"
-                ok "已添加 proxy list: $value"
-                ;;
-            2)
-                tty_read value "远程 direct list URL" ""
-                [[ -z "$value" ]] && warn "URL 不能为空" && continue
-                append_line_if_missing "${policy_dir}/custom-direct-lists.txt" "$value"
-                ok "已添加 direct list: $value"
-                ;;
-            3)
-                tty_read value "代理域名" ""
-                valid_domain "$value" || { warn "无效域名: $value"; continue; }
-                append_line_if_missing "${policy_dir}/proxy-extra-local.txt" "$value"
-                ok "已添加代理域名: $value"
-                ;;
-            4)
-                tty_read value "直连域名" ""
-                valid_domain "$value" || { warn "无效域名: $value"; continue; }
-                append_line_if_missing "${policy_dir}/direct-extra-local.txt" "$value"
-                ok "已添加直连域名: $value"
-                ;;
-            5)
-                for file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
-                    echo ""
-                    echo "== ${policy_dir}/${file} =="
-                    if [[ -s "${policy_dir}/${file}" ]]; then
-                        sed -n '1,120p' "${policy_dir}/${file}"
-                    else
-                        echo "(empty)"
-                    fi
-                done
-                pause_return
-                ;;
-            6)
-                clear_custom_policy_lists "$policy_dir"
-                ;;
-            0) return 0 ;;
-            *) warn "无效输入，请重新输入 0-6 之间的数字" ;;
-        esac
-    done
-}
-
-clear_custom_policy_lists() {
-    local policy_dir="${1:-$CONF_DIR}"
-    local confirm="" file
-
-    warn "这会清空本地追加的代理/直连域名和远程列表 URL，不会删除下载的 GFWList/ChinaList 源规则。"
-    tty_yes_no confirm "确认清空当前自定义列表？" "N"
-    [[ "$confirm" == "y" ]] || { info "已取消清空"; return 0; }
-
-    mkdir -p "$policy_dir"
-    for file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
-        : > "${policy_dir}/${file}"
-        if [[ "$policy_dir" != "$CONF_DIR" ]]; then
-            mkdir -p "$CONF_DIR"
-            : > "${CONF_DIR}/${file}"
-        fi
-    done
-    ok "已清空自定义分流列表"
-    warn "运行“立即更新 DNS 规则”或 $0 --update-rules 后才会从 dnsdist 运行配置中移除旧规则。"
-}
-
-clear_dns_policy_settings() {
-    local dir file
-    for dir in "$CONF_DIR" /etc/dnsdist; do
-        [[ -d "$dir" ]] || continue
-        for file in .overseas_dns .overseas_private_dns .overseas_public_dns .sniproxy_dns .other_policy .cache_size; do
-            rm -f "${dir}/${file}"
-        done
-    done
-    unset OVERSEAS_DNS PRIVATE_OVERSEAS_DNS PUBLIC_OVERSEAS_DNS SNIPROXY_DNS OTHER_POLICY DNS_CACHE_SIZE
-    ok "已恢复 DNS 上游、分流默认策略和缓存大小为默认值"
-    warn "运行“立即更新 DNS 规则”或 $0 --update-rules 后才会应用到 dnsdist 运行配置。"
-}
-
-clear_settings_menu() {
-    check_root
-    local choice="" confirm="" file policy_dir="$CONF_DIR"
-    [[ -d /etc/dnsdist ]] && policy_dir="/etc/dnsdist"
-
-    while true; do
-        echo ""
-        echo "=================================================="
-        echo "  清空 DNS 设置"
-        echo "=================================================="
-        echo "  1) 清空自定义分流列表"
-        echo "  2) 恢复 DNS 上游/默认分流/缓存设置"
-        echo "  3) 执行以上两项"
-        echo "  0) 返回主菜单"
-        echo "=================================================="
-        tty_read choice "请输入序号 (0-3)" ""
-        case "$choice" in
-            1)
-                clear_custom_policy_lists "$policy_dir"
-                pause_return
-                ;;
-            2)
-                warn "这会删除已保存的 DNS 上游、其他域名默认策略和 cache size，之后使用脚本默认值。"
-                tty_yes_no confirm "确认恢复默认 DNS 设置？" "N"
-                [[ "$confirm" == "y" ]] && clear_dns_policy_settings || info "已取消恢复默认设置"
-                pause_return
-                ;;
-            3)
-                warn "这会清空自定义列表，并恢复 DNS 上游、默认分流和 cache size。"
-                tty_yes_no confirm "确认清空以上 DNS 设置？" "N"
-                if [[ "$confirm" == "y" ]]; then
-                    mkdir -p "$policy_dir"
-                    for file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
-                        : > "${policy_dir}/${file}"
-                        if [[ "$policy_dir" != "$CONF_DIR" ]]; then
-                            mkdir -p "$CONF_DIR"
-                            : > "${CONF_DIR}/${file}"
-                        fi
-                    done
-                    clear_dns_policy_settings
-                    ok "已清空自定义列表并恢复 DNS 设置默认值"
-                else
-                    info "已取消清空"
-                fi
-                pause_return
-                ;;
-            0) return 0 ;;
-            *) warn "无效输入，请重新输入 0-3 之间的数字" ;;
-        esac
-    done
-}
-
-# =============================================================================
-# Command-line dispatch
-# =============================================================================
-usage() {
-    cat <<EOF
-Usage: $0 [OPTION]
-
-Options:
-  (none)           Full interactive installation
-  --status         Show service status
-  --update-rules   Update GFWList/ChinaList and reload dnsdist
-  --renew-cert     Force renew certificates and reload services
-  --clear-settings Clear local DNS policy/list settings
-  --vps1-forward   Configure VPS1 to forward SNI/QUIC traffic to a VPS2 backend
-  --vps2-backend   Install VPS2 SNI/QUIC backend services
-  --uninstall      Remove all installed components
-  -ios          Regenerate iOS DoT profile and QR code
-  -h, --help       Show this help
-
-Environment variables (for non-interactive use):
-  DOMAIN         Pre-configured domain to verify and use for DoT/certificates
-  OVERSEAS_DNS   Backward-compatible alias for PRIVATE_OVERSEAS_DNS
-  PRIVATE_OVERSEAS_DNS  Overseas upstream DNS for 172.22.0.0/16 DoT clients
-  PUBLIC_OVERSEAS_DNS   Overseas upstream DNS for non-private DoT clients
-  SNIPROXY_DNS   Resolver upstream DNS for TCP sniproxy backends
-  FIREWALL_MODE  additive (default), managed-exclusive, or disabled
-  SSH_PORTS      Comma/space separated SSH ports to preserve in firewall rules
-  REVERSE_PROXY_MODE local (default) or forward
-  REVERSE_PROXY_BACKEND_IP  VPS2 backend IP for VPS1 forward mode
-  REVERSE_PROXY_CLIENT_CIDR Allowed client CIDR for VPS1 reverse proxy ports
-  REVERSE_PROXY_BACKEND_ALLOWED_CIDR  VPS1 IP/CIDR allowed on VPS2 backend
-  EMAIL          Email for Let's Encrypt
-EOF
-}
-
-# =============================================================================
-# Basic checks
-# =============================================================================
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "This script must be run as root (use sudo)"
-        exit 1
-    fi
-}
-
-detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS=$ID
-        VER=$VERSION_ID
-    else
-        err "Cannot detect OS. /etc/os-release not found."
-        exit 1
-    fi
-
-    case "$OS" in
-        ubuntu|debian)
-            PKG_MGR="apt-get"
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            if command -v dnf >/dev/null 2>&1; then
-                PKG_MGR="dnf"
-            else
-                PKG_MGR="yum"
-            fi
-            ;;
-        *)
-            err "Unsupported OS: $OS"
-            exit 1
-            ;;
-    esac
-
-    info "Detected OS: $OS $VER (package manager: $PKG_MGR)"
-}
-
-get_public_ip() {
-    PUBLIC_IP=$(curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null || \
-                curl -4 -s --max-time 10 https://ifconfig.me 2>/dev/null || \
-                curl -4 -s --max-time 10 https://icanhazip.com 2>/dev/null || echo "")
-    if [[ -z "$PUBLIC_IP" ]]; then
-        PUBLIC_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[\d.]+' || echo "")
-    fi
-    if [[ -z "$PUBLIC_IP" ]]; then
-        err "Failed to detect public IPv4 address. Please set PUBLIC_IP manually."
-        exit 1
-    fi
-    info "Public IP detected: $PUBLIC_IP"
-}
-
-check_port_53() {
-    info "Checking port 53 availability..."
-    local pid
-    pid=$(ss -lnptu 2>/dev/null | grep ':53 ' | head -n1 | grep -oP 'pid=\K[0-9]+' || true)
-
-    if [[ -n "$pid" ]]; then
-        local proc
-        proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
-        warn "Port 53 is already in use by: $proc (PID: $pid)"
-
-        tty_read confirm "Stop and disable '$proc' to free port 53? [Y/n]" ""
-        if [[ "$confirm" =~ ^[Nn]$ ]]; then
-            err "Port 53 must be free for dnsdist to start. Aborting."
-            exit 1
-        fi
-
-        stop_port53_owner "$pid" "$proc"
-        sleep 1
-
-        # Double check
-        pid=$(ss -lnptu 2>/dev/null | grep ':53 ' | head -n1 | grep -oP 'pid=\K[0-9]+' || true)
-        if [[ -n "$pid" ]]; then
-            err "Failed to free port 53. Please manually stop the service using it."
-            exit 1
-        fi
-        ok "Port 53 is now free"
-    else
-        ok "Port 53 is available"
-    fi
-}
-
-systemd_unit_for_pid() {
-    local pid="${1:-}"
-    [[ -z "$pid" || ! -r "/proc/$pid/cgroup" ]] && return 0
-    grep -aoE '[^/]+\.service' "/proc/$pid/cgroup" | head -n1 || true
-}
-
-stop_port53_owner() {
-    local pid="${1:-}"
-    local proc="${2:-unknown}"
-    local unit
-    unit=$(systemd_unit_for_pid "$pid")
-
-    ensure_resolver_survives_dns_owner_stop "$proc"
-
-    if [[ -n "$unit" ]]; then
-        info "Stopping systemd unit owning port 53: $unit"
-        systemctl stop "$unit" 2>/dev/null || true
-        systemctl disable "$unit" 2>/dev/null || true
-    fi
-
-    case "$proc" in
-        systemd-resolve|systemd-resolved)
-            info "Stopping systemd-resolved service to release DNS stub port 53"
-            systemctl stop systemd-resolved.service 2>/dev/null || true
-            systemctl disable systemd-resolved.service 2>/dev/null || true
-            ;;
-        dnsmasq)
-            systemctl stop dnsmasq.service 2>/dev/null || true
-            systemctl disable dnsmasq.service 2>/dev/null || true
-            ;;
-        named)
-            systemctl stop named.service bind9.service 2>/dev/null || true
-            systemctl disable named.service bind9.service 2>/dev/null || true
-            ;;
-    esac
-
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-    fi
-}
-
-# =============================================================================
-# Dependencies
-# =============================================================================
-install_deps() {
-    info "Installing system dependencies..."
-
-    case "$PKG_MGR" in
-        apt-get)
-            export DEBIAN_FRONTEND=noninteractive
-            local dns_probe_host="deb.debian.org"
-            [[ "$OS" == "ubuntu" ]] && dns_probe_host="archive.ubuntu.com"
-            ensure_system_dns_ready "$dns_probe_host" "apt dependency installation"
-            apt-get update -qq
-            local pcre_dev_pkg="libpcre3-dev"
-            if [[ "$(apt-cache policy "$pcre_dev_pkg" | awk '/Candidate:/ {print $2; exit}')" == "(none)" ]]; then
-                pcre_dev_pkg="libpcre2-dev"
-            fi
-            apt-get install -y -qq \
-                build-essential git wget curl ca-certificates \
-                libev-dev "$pcre_dev_pkg" libudns-dev libssl-dev \
-                autoconf automake libtool pkg-config \
-                dnsdist certbot python3-certbot-dns-cloudflare \
-                python3 python3-pip jq libcap2-bin \
-                nftables qrencode
-            ;;
-        dnf|yum)
-            $PKG_MGR install -y -q \
-                gcc gcc-c++ make git wget curl ca-certificates \
-                libev-devel pcre-devel openssl-devel \
-                autoconf automake libtool pkgconfig \
-                dnsdist certbot python3-certbot-dns-cloudflare \
-                python3 python3-pip jq libcap-ng-utils \
-                nftables qrencode || true
-            ;;
-    esac
-
-    # Ensure Go is installed (for quic-proxy compilation)
-    if ! command -v go >/dev/null 2>&1; then
-        info "Installing Go compiler..."
-        GO_VER="1.22.4"
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64) GO_ARCH="amd64" ;;
-            aarch64|arm64) GO_ARCH="arm64" ;;
-            *) GO_ARCH="amd64" ;;
-        esac
-        wget -q "https://go.dev/dl/go${GO_VER}.linux-${GO_ARCH}.tar.gz" -O /tmp/go.tar.gz
-        rm -rf /usr/local/go
-        tar -C /usr/local -xzf /tmp/go.tar.gz
-        rm -f /tmp/go.tar.gz
-        export PATH=$PATH:/usr/local/go/bin
-        echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
-    fi
-
-    ok "Go version: $(go version)"
-
-    # Ensure Python requests for cloudns API fallback
-    pip3 install requests -q 2>/dev/null || true
-
-    # Fix certbot compatibility on newer Python versions (e.g. 3.12+)
-    if command -v certbot >/dev/null 2>&1; then
-        if ! certbot --version >/dev/null 2>&1; then
-            warn "Certbot has compatibility issues with the current Python version. Attempting to fix..."
-            pip3 install --upgrade --break-system-packages certbot josepy cryptography 2>/dev/null || \
-                pip3 install --upgrade certbot josepy cryptography 2>/dev/null || true
-        fi
-    fi
-
-    # Verify critical binaries
-    for bin in dnsdist certbot; do
-        if ! command -v "$bin" >/dev/null 2>&1; then
-            err "Required package '$bin' was not installed successfully."
-            err "Please check your package manager output above."
-            exit 1
-        fi
-    done
-}
-
-# =============================================================================
-# Domain configuration
-# =============================================================================
-generate_domain() {
-    if [[ -n "${DOMAIN:-}" ]]; then
-        valid_domain "$DOMAIN" || { err "无效域名: $DOMAIN"; exit 1; }
-        info "使用预设域名: $DOMAIN"
-        DOMAIN_PRECONFIGURED=1
-        mkdir -p "$CONF_DIR"
-        echo "$DOMAIN" > "${CONF_DIR}/.domain"
-        return
-    fi
-
-    local saved_domain=""
-    local selected_domain=""
-    saved_domain=$(cat "${CONF_DIR}/.domain" 2>/dev/null || true)
-
-    if [[ ! -r /dev/tty && ! -t 0 ]]; then
-        err "未提供 DOMAIN，且当前不是交互终端。请设置 DOMAIN=your.domain 后重试。"
-        exit 1
-    fi
-
-    echo ""
-    echo "=================================================="
-    echo "  域名设置"
-    echo "=================================================="
-    echo "  请输入你准备用于 DoT 和证书的域名。"
-    echo "  可使用任意 DNS 服务商，只要该域名的 A 记录指向本机公网 IP。"
-    echo "  本机公网 IP: ${PUBLIC_IP}"
-    echo "=================================================="
-
-    while true; do
-        tty_read selected_domain "请输入域名" "$saved_domain"
-        if valid_domain "$selected_domain"; then
-            DOMAIN="${selected_domain%.}"
-            break
-        fi
-        warn "无效域名，请输入类似 dot.example.com 的完整域名"
-    done
-
-    mkdir -p "$CONF_DIR"
-    echo "$DOMAIN" > "${CONF_DIR}/.domain"
-    info "已保存域名: $DOMAIN"
-}
-
-verify_domain_dns() {
-    if [[ "${DOMAIN_PRECONFIGURED:-0}" == "1" ]]; then
-        info "预设域名仍会进行 DNS 解析验证: $DOMAIN"
-        mkdir -p "$CONF_DIR"
-        echo "$DOMAIN" > "${CONF_DIR}/.domain"
-    fi
-
-    info "域名解析检查"
-    info "=================================================="
-    info "域名: $DOMAIN"
-    info "目标 A 记录值: $PUBLIC_IP"
-    info "=================================================="
-    info "请在你的 DNS 服务商里确认 ${DOMAIN} 的 A 记录已经指向 ${PUBLIC_IP}。"
-    info "Cloudflare、阿里云、腾讯云、Namecheap、ClouDNS 或其他 DNS 服务都可以使用。"
-
-    local confirm=""
-    tty_read confirm "设置好解析后按 Enter 开始验证（输入 skip 可跳过）" ""
-    if [[ "$confirm" == "skip" ]]; then
-        warn "跳过域名解析验证，请确保 A 记录已正确配置"
-    else
-        info "等待 DNS 解析生效（最多 120 秒，每 5 秒检查一次）..."
-        local waited=0 resolved=""
-        while [[ $waited -lt 120 ]]; do
-            resolved=$(dig +short A "$DOMAIN" @1.1.1.1 +time=2 +tries=1 2>/dev/null | tr '\n' ' ' || true)
-            if printf '%s\n' "$resolved" | tr ' ' '\n' | grep -Fxq "$PUBLIC_IP"; then
-                ok "DNS 解析验证通过: $DOMAIN -> $PUBLIC_IP"
-                touch "${CONF_DIR}/.domain_verified"
-                break
-            fi
-            sleep 5
-            waited=$((waited + 5))
-            echo "[*] 已等待 ${waited}/120 秒，当前解析结果: ${resolved:-无记录}"
-        done
-        if [[ $waited -ge 120 ]]; then
-            warn "DNS 解析未在 120 秒内生效，将继续安装。如后续证书申请失败，请检查 DNS 配置。"
-        fi
-    fi
-
-    mkdir -p "$CONF_DIR"
-    echo "$DOMAIN" > "${CONF_DIR}/.domain"
-}
-
-# =============================================================================
-# Let's Encrypt Certificate
-# =============================================================================
-cert_covers_domain() {
-    local cert_path="$1"
-    local domain="$2"
-
-    [[ -f "$cert_path" ]] || return 1
-    command -v openssl >/dev/null 2>&1 || return 1
-    openssl x509 -in "$cert_path" -noout -checkhost "$domain" >/dev/null 2>&1 || return 1
-    openssl x509 -in "$cert_path" -noout -checkend 604800 >/dev/null 2>&1 || return 1
-}
-
-find_existing_cert_for_domain() {
-    local domain="$1"
-    local cert_dir
-
-    for cert_dir in "/etc/letsencrypt/live/${domain}" /etc/letsencrypt/live/*; do
-        [[ -d "$cert_dir" ]] || continue
-        [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]] || continue
-        if cert_covers_domain "${cert_dir}/fullchain.pem" "$domain"; then
-            printf '%s\n' "$cert_dir"
-            return 0
-        fi
-    done
+  fi
+  if [[ ${#failed[@]} -eq 0 ]]; then
+    c_y "已回滚到安装前状态。修正问题后可重跑 install.sh。"
+  else
+    c_y "回滚已尽力执行完, 但以下项未能恢复, 请手工检查: ${failed[*]}"
     return 1
+  fi
 }
-
-copy_cert_to_dnsdist() {
-    local cert_live_dir="$1"
-    local cert_basename
-
-    info "Copying certificates to /etc/dnsdist/certs/ ..."
-    mkdir -p /etc/dnsdist/certs "$CONF_DIR"
-    cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
-    cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
-    chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/ 2>/dev/null || true
-    chmod 640 /etc/dnsdist/certs/*.pem
-    cert_basename="$(basename "$cert_live_dir")"
-    echo "$cert_basename" > "${CONF_DIR}/.cert_basename"
-    ok "Certificates copied to /etc/dnsdist/certs/ from ${cert_live_dir}"
+# 不在此处 exit: 让 shell 保持触发退出的原始状态码, 回滚的失败不改写最初的安装错误。
+on_exit(){
+  local rc="$1"
+  if [[ "${INSTALL_OK:-0}" == 1 || "$rc" == 0 ]]; then
+    _commit_bins                      # 装成了, 原件备份不再需要
+    return 0
+  fi
+  rollback || true                    # 回滚自身的成败已在上面打印, 不改写最初的安装退出码
+  return 0
 }
+trap 'on_exit $?' EXIT
 
-deploy_cert_renewal_hook() {
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cp "${SCRIPT_DIR}/renew-hook.sh" /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
-    chmod +x /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
-    ok "证书已就绪，自动续期 Hook 已部署"
-}
+# ── 1. 依赖 ──
+c_g "安装依赖…"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+# zstd: 读 mihomo .mrs 规则集的头部(判 domain/ipcidr), 没它大文件就只能让用户手填类型
+# iproute2: install.sh 用 ss 探 SSH 端口, pdg status/report/doctor 也靠它看监听 —— 极简
+# Debian 12 默认不带, 缺了它"监听端口"整块是空的, 而装机不会报任何错。
+apt-get install -y -qq curl tar unzip zstd nftables iproute2 python3 openssl certbot dnsutils tcpdump jq ca-certificates vnstat >/dev/null
+systemctl enable --now vnstat >/dev/null 2>&1 || true   # 网卡流量统计(轻量, ~3MB)
 
-install_cert() {
-    local certbot_cmd existing_cert_dir cert_live_dir
-    install_certbot_firewall_hooks
+# ── 2. mosdns ──
+# 按**钉死版本**判定, 不是"装了就算数": 机器上原有的 mosdns(第三方装的/早年老版)会让
+# `command -v mosdns` 成立而整段跳过 —— 既不升到钉死版, 也跳过 SHA256 供应链校验,
+# 安装日志上连"下载 mosdns"这行都不会出现(现场就这么发现的)。
+if ! pdg_mosdns_is_version "$MOSDNS_VER"; then
+  c_g "下载 mosdns $MOSDNS_VER ($MARCH)…"
+  t=$(mktemp -d)
+  curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-${MARCH}.zip" -o "$t/m.zip"
+  pdg_verify_sha256 "$t/m.zip" "${PDG_SHA256[mosdns-$MARCH]:-}" "mosdns $MOSDNS_VER ($MARCH)" \
+    || { rm -rf "$t"; die "mosdns 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
+  _stash_bin /usr/local/bin/mosdns || die "备份既有 mosdns 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
+  (cd "$t" && unzip -q m.zip && install -m755 mosdns /usr/local/bin/mosdns)
+  # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;
+  # 回滚已改看 BIN_TXN 事务台账(它才代表"这次碰过目标没有")。
+  MOSDNS_INSTALLED=1
+  rm -rf "$t"
+fi
 
-    if existing_cert_dir="$(find_existing_cert_for_domain "$DOMAIN")"; then
-        ok "发现本机已有覆盖 ${DOMAIN} 的有效证书，跳过重新申请: ${existing_cert_dir}"
-        copy_cert_to_dnsdist "$existing_cert_dir"
-        deploy_cert_renewal_hook
-        return
-    fi
+# ── 3. 内核: mihomo(clash.meta)—— 唯一流量内核 ──
+# 历史上支持 sing-box(1.12.x)/mihomo 二选一; 但 sing-box 1.13 移除了本网关依赖的
+# sniff_override_destination、被钉死在死胡同, 故 v1.6.0 起彻底移除 sing-box 运行时,
+# mihomo 成唯一内核。旧的 sing-box 机器 `pdg update` 时由 migrate_drop_singbox 自动迁移。
+CORE=mihomo
+CORE_SVC=mihomo
+if ! pdg_mihomo_is_version "$MIHOMO_VER"; then
+  c_g "下载 mihomo $MIHOMO_VER ($MARCH)…"
+  t=$(mktemp -d)
+  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${MARCH}-${MIHOMO_VER}.gz" -o "$t/mihomo.gz"
+  pdg_verify_sha256 "$t/mihomo.gz" "${PDG_SHA256[mihomo-$MARCH]:-}" "mihomo $MIHOMO_VER ($MARCH)" \
+    || { rm -rf "$t"; die "mihomo 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
+  gunzip -c "$t/mihomo.gz" > "$t/mihomo"
+  _stash_bin /usr/local/bin/mihomo || die "备份既有 mihomo 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
+  install -m755 "$t/mihomo" /usr/local/bin/mihomo
+  # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;
+  # 回滚已改看 BIN_TXN 事务台账(它才代表"这次碰过目标没有")。
+  MIHOMO_INSTALLED=1
+  rm -rf "$t"
+fi
 
-    # Normal issuance (first time) - no force-renewal to avoid rate limits
-    certbot_cmd=(certbot certonly --standalone -d "$DOMAIN" \
-        --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
-        --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
-        --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
-    info "未找到可复用的本机证书，申请 Let's Encrypt 证书 for $DOMAIN..."
+# ── 4. 收集参数 (env 预置优先; PDG_NONINTERACTIVE=1 则不交互) ──
+echo
+SERVER_IP="${PDG_SERVER_IP:-}"
+if [[ -z "$SERVER_IP" ]]; then
+  DET_IP=$(curl -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+  if [[ -n "$NONINT" ]]; then SERVER_IP="$DET_IP"; else ask SERVER_IP "本机公网 IP [${DET_IP}]: " "$DET_IP"; fi
+fi
+[[ -n "$SERVER_IP" ]] || die "公网 IP 不能为空"
 
-    run_certbot() {
-        open_cert_http_port
-        trap restore_reverse_proxy_firewall RETURN
-        if "${certbot_cmd[@]}"; then
-            return 0
-        fi
-        # Check for known Python compatibility error
-        if "${certbot_cmd[@]}" 2>&1 | grep -q "AttributeError" || \
-           certbot --version 2>&1 | grep -q "AttributeError"; then
-            warn "Certbot compatibility error detected. Attempting to fix Python dependencies..."
-            pip3 install --upgrade --break-system-packages certbot josepy cryptography 2>/dev/null || \
-                pip3 install --upgrade certbot josepy cryptography 2>/dev/null || true
-            info "Retrying certificate request..."
-            "${certbot_cmd[@]}"
-        else
-            return 1
-        fi
-    }
+SSH_PORT="${PDG_SSH_PORT:-}"
+if [[ -z "$SSH_PORT" ]]; then
+  DET_SSH=$(ss -lntpH 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}'); DET_SSH="${DET_SSH:-22}"
+  if [[ -n "$NONINT" ]]; then SSH_PORT="$DET_SSH"; else ask SSH_PORT "SSH 端口 [${DET_SSH}]: " "$DET_SSH"; fi
+fi
 
-    if ! run_certbot; then
-        err "证书申请失败。请检查:"
-        err "  1. 域名 $DOMAIN 是否正确解析到本机 ($PUBLIC_IP)"
-        err "  2. 端口 80 是否被占用"
-        err "  3. 防火墙是否放行 80"
-        err "  4. 是否触发了 Let's Encrypt 速率限制 (同一域名 7 天内限 5 次)"
-        exit 1
-    fi
-
-    cert_live_dir="$(find_existing_cert_for_domain "$DOMAIN" || true)"
-    if [[ -z "$cert_live_dir" ]]; then
-        cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
-    fi
-    if [[ ! -d "$cert_live_dir" ]]; then
-        err "证书申请成功但未找到 live 目录: $cert_live_dir"
-        exit 1
-    fi
-    copy_cert_to_dnsdist "$cert_live_dir"
-    deploy_cert_renewal_hook
-}
-
-# =============================================================================
-# sniproxy (TCP)
-# =============================================================================
-install_sniproxy() {
-    if ! command -v sniproxy >/dev/null 2>&1; then
-        info "Compiling sniproxy (TCP SNI proxy)..."
-        mkdir -p "$SRC_DIR"
-        cd "$SRC_DIR"
-
-        if [[ ! -d sniproxy ]]; then
-            git clone --depth=1 https://github.com/dlundquist/sniproxy.git
-        fi
-        cd sniproxy
-
-        DEBEMAIL="root@localhost" DEBFULLNAME="root" ./autogen.sh >/dev/null
-        ./configure --prefix=/usr/local --sysconfdir=/etc --enable-dns >/dev/null
-        make -j$(nproc) >/dev/null
-        make install >/dev/null
+INTERNAL_CIDR="${PDG_INTERNAL_CIDR:-}"
+if [[ -z "$INTERNAL_CIDR" ]]; then
+  if [[ -n "$NONINT" ]]; then
+    INTERNAL_CIDR="172.16.0.0/12"
+  else
+    echo; c_y "识别【内网卡来源段】(抓包 ~90s; 期间可随时直接手输网段, 谁先给出结果就用谁)"
+    # 抓包与手输并行: 知道网段的人不必干等 90 秒, 抓到了也不用再确认一遍。
+    INTERNAL_CIDR="$(pdg_detect_cidr_race 90 "$SERVER_IP" || true)"
+    if [[ -n "$INTERNAL_CIDR" ]]; then
+      c_g "内网卡来源段: $INTERNAL_CIDR"
     else
-        info "sniproxy already installed"
+      c_y "没抓到(手机没走内网卡? 云安全组挡了 80/ICMP?)。"
+      c_y "先手填一个即可; 装完再从容跑 \`sudo pdg detect-cidr\` 重新识别并一键应用。"
     fi
-
-    if [[ -f "${SCRIPT_DIR}/sniproxy.conf" ]]; then
-        local sniproxy_nameservers
-        sniproxy_nameservers=$(render_sniproxy_dns_nameservers "$SNIPROXY_DNS")
-        python3 - "${SCRIPT_DIR}/sniproxy.conf" "$sniproxy_nameservers" /etc/sniproxy.conf <<'PYEOF'
-import sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    content = f.read()
-content = content.replace("__SNIPROXY_NAMESERVERS__", sys.argv[2])
-with open(sys.argv[3], "w", encoding="utf-8") as f:
-    f.write(content)
-PYEOF
-    else
-        err "sniproxy.conf not found in ${SCRIPT_DIR}"
-        exit 1
-    fi
-
-    # systemd service
-    cat > /etc/systemd/system/sniproxy.service <<'EOF'
-[Unit]
-Description=sniproxy (TCP SNI transparent proxy)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/sbin/sniproxy -c /etc/sniproxy.conf -f
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=5
-User=root
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable sniproxy
-    ok "sniproxy installed"
-}
-
-# =============================================================================
-# quic-proxy (UDP / QUIC SNI proxy)
-# =============================================================================
-install_quic_proxy() {
-    if [[ ! -x "${BASE_DIR}/bin/quic-proxy" ]]; then
-        info "Compiling quic-proxy (UDP/QUIC SNI proxy)..."
-        mkdir -p "${BASE_DIR}/bin"
-        mkdir -p "${SRC_DIR}"
-        cp "${SCRIPT_DIR}/quic-proxy.go" "${SRC_DIR}/quic-proxy.go"
-        cd "${SRC_DIR}"
-
-        export PATH=$PATH:/usr/local/go/bin
-        go build -ldflags="-s -w" -o "${BASE_DIR}/bin/quic-proxy" quic-proxy.go
-    else
-        info "quic-proxy already compiled"
-    fi
-
-    # systemd service
-    cat > /etc/systemd/system/quic-proxy.service <<'EOF'
-[Unit]
-Description=quic-proxy (UDP/QUIC SNI transparent proxy)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/opt/proxy-gateway/bin/quic-proxy -l 0.0.0.0:443
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=5
-User=root
-LimitNOFILE=65535
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable quic-proxy
-    ok "quic-proxy installed"
-}
-
-# =============================================================================
-# VPS1 -> VPS2 SNI/QUIC reverse proxy forwarding
-# =============================================================================
-install_reverse_proxy_deps() {
-    detect_os
-    info "Installing SNI/QUIC reverse proxy dependencies..."
-    case "$PKG_MGR" in
-        apt-get)
-            export DEBIAN_FRONTEND=noninteractive
-            local dns_probe_host="deb.debian.org"
-            [[ "$OS" == "ubuntu" ]] && dns_probe_host="archive.ubuntu.com"
-            ensure_system_dns_ready "$dns_probe_host" "reverse proxy dependency installation"
-            apt-get update -qq
-            local pcre_dev_pkg="libpcre3-dev"
-            if [[ "$(apt-cache policy "$pcre_dev_pkg" | awk '/Candidate:/ {print $2; exit}')" == "(none)" ]]; then
-                pcre_dev_pkg="libpcre2-dev"
-            fi
-            apt-get install -y -qq \
-                build-essential git wget curl ca-certificates \
-                libev-dev "$pcre_dev_pkg" libudns-dev libssl-dev \
-                autoconf automake libtool pkg-config \
-                python3 nftables
-            ;;
-        dnf|yum)
-            $PKG_MGR install -y -q \
-                gcc gcc-c++ make git wget curl ca-certificates \
-                libev-devel pcre-devel openssl-devel \
-                autoconf automake libtool pkgconfig \
-                python3 nftables || true
-            ;;
-    esac
-
-    if ! command -v go >/dev/null 2>&1; then
-        info "Installing Go compiler..."
-        local go_ver="1.22.4" arch go_arch
-        arch=$(uname -m)
-        case "$arch" in
-            x86_64) go_arch="amd64" ;;
-            aarch64|arm64) go_arch="arm64" ;;
-            *) go_arch="amd64" ;;
-        esac
-        wget -q "https://go.dev/dl/go${go_ver}.linux-${go_arch}.tar.gz" -O /tmp/go.tar.gz
-        rm -rf /usr/local/go
-        tar -C /usr/local -xzf /tmp/go.tar.gz
-        rm -f /tmp/go.tar.gz
-        export PATH=$PATH:/usr/local/go/bin
-        echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
-    fi
-}
-
-stop_local_reverse_proxy_services() {
-    info "Stopping local sniproxy/quic-proxy services for forward mode..."
-    systemctl stop sniproxy quic-proxy 2>/dev/null || true
-    systemctl disable sniproxy quic-proxy 2>/dev/null || true
-}
-
-configure_vps1_forward_backend() {
-    check_root
-    local backend_ip="${REVERSE_PROXY_BACKEND_IP:-}" client_cidr="${REVERSE_PROXY_CLIENT_CIDR:-}" firewall_mode="${FIREWALL_MODE:-}"
-
-    if [[ ! -f /etc/dnsdist/dnsdist.conf || ! -x /usr/local/bin/update-dnsdist-rules.sh ]]; then
-        warn "当前机器还没有检测到 VPS1 核心 DNS 网关安装结果。"
-        warn "此项只启用 VPS1 -> VPS2 的 80/443/TCP 和 443/UDP 转发，不会安装 dnsdist 或申请 DoT 证书。"
-        warn "新 VPS1 请先执行菜单 1：安装/更新 VPS1 核心 DNS 网关。"
-        if [[ -r /dev/tty || -t 0 ]]; then
-            local continue_answer=""
-            tty_yes_no continue_answer "仍然继续只配置转发？" "N"
-            [[ "$continue_answer" == "y" ]] || return 0
-        fi
-    fi
-
-    if [[ -z "$backend_ip" ]]; then
-        backend_ip="$(get_reverse_proxy_backend_ip)"
-    fi
-    while true; do
-        tty_read backend_ip "VPS2 SNI/QUIC 后端 IP（公网或内网均可）" "$backend_ip"
-        valid_ipv4 "$backend_ip" && break
-        warn "无效 IPv4 地址: $backend_ip"
+    # 取不到/填错都再给机会 —— 等满 90 秒后因一个空回车就回滚整场安装, 那是白等。
+    _cidr_try=0
+    while ! pdg_cidr_valid "$INTERNAL_CIDR"; do
+      [[ -n "$INTERNAL_CIDR" ]] && c_y "「$INTERNAL_CIDR」不是合法网段(形如 172.22.0.0/16)。"
+      _cidr_try=$((_cidr_try + 1))
+      if [[ "$_cidr_try" -gt 3 ]]; then
+        die "未取得内网卡来源段 (形如 172.22.0.0/16; 非交互/无终端请用 PDG_INTERNAL_CIDR)"
+      fi
+      # 无终端时再问也白问(ask 会立刻回空), 直接给出可操作的出路, 不空转三次
+      if ! { true < /dev/tty; } 2>/dev/null; then
+        die "无可用终端且未取得内网卡来源段 (请用 PDG_INTERNAL_CIDR=172.22.0.0/16 重跑)"
+      fi
+      ask INTERNAL_CIDR "内网卡来源段 CIDR (如 172.22.0.0/16): " ""
     done
+  fi
+fi
 
-    if [[ -z "$client_cidr" ]]; then
-        client_cidr="$(get_reverse_proxy_client_cidr)"
-    fi
-    while true; do
-        tty_read client_cidr "允许访问 VPS1 反代入口的客户端 CIDR" "$client_cidr"
-        valid_ipv4_cidr "$client_cidr" && break
-        warn "无效 IPv4/CIDR: $client_cidr"
-    done
+# 手机平台: ios | android。一台网关服务一个内网卡手机号, 故平台是每台装机的固定属性。
+# 决定客户端下发方式(iOS 描述文件 / 安卓私密DNS)+ 是否提供 iOS 专属功能(如 MITM 插件, 安卓需 root 故不提供)。
+PLATFORM="${PDG_PLATFORM:-}"
+# 覆盖重装(PDG_FORCE_REINSTALL)未显式传 PDG_PLATFORM 时: 优先沿用已有平台标记 —— 不能默认把 iOS 改成 Android。
+if [[ -z "$PLATFORM" ]]; then
+  # 全新装时该文件尚不存在, cat 返 1 —— 在 set -e 下"赋值里命令替换失败"是致命错误, 会当场
+  # 中止并回滚(屏幕上只剩"安装失败", 真原因被埋掉; 正是交互全新装偏偏挂在这里的根因)。故 || true。
+  _ep="$(cat /etc/privdns-gateway/platform 2>/dev/null || true)"
+  [[ "$_ep" == ios || "$_ep" == android ]] && { PLATFORM="$_ep"; c_g "沿用已有平台标记: $PLATFORM"; }
+fi
+if [[ -z "$PLATFORM" ]]; then
+  if [[ -n "$NONINT" ]]; then PLATFORM="android"
+  else
+    echo; c_y "你的手机平台?(决定客户端下发 + iOS 专属功能;一台网关对一个手机)"
+    _p=""; ask _p "平台 [1=iOS / 2=Android, 默认 2]: " ""
+    case "$_p" in 1 | ios | iOS | IOS) PLATFORM=ios;; *) PLATFORM=android;; esac
+  fi
+fi
+[[ "$PLATFORM" == ios || "$PLATFORM" == android ]] || die "PDG_PLATFORM 只能是 ios 或 android"
 
-    firewall_mode="${firewall_mode:-$(get_firewall_mode)}"
-    while true; do
-        tty_read firewall_mode "防火墙模式 additive / managed-exclusive / disabled" "$firewall_mode"
-        case "$firewall_mode" in
-            additive|managed-exclusive|disabled) break ;;
-            *) warn "无效防火墙模式，请输入 additive、managed-exclusive 或 disabled" ;;
-        esac
-    done
+BOT_TOKEN="${PDG_BOT_TOKEN:-}"; ALLOWED_IDS="${PDG_ALLOWED:-}"; DOT_DOMAIN="${PDG_DOT_DOMAIN:-}"
+if [[ -z "$NONINT" ]]; then
+  echo
+  if [[ -z "$BOT_TOKEN" ]]; then
+    c_y "提示: 出口(落地节点)和分流规则都在 Telegram bot 里设置。不填 token 也能装完,"
+    c_y "      但要等之后 sudo pdg-set-token 设好 token、给 bot 发 /start 才能配代理。"
+    ask BOT_TOKEN "Telegram bot token (可留空): " ""
+  fi
+  if [[ -n "$BOT_TOKEN" && -z "$ALLOWED_IDS" ]]; then ask ALLOWED_IDS "你的 Telegram user id (只允许它管理): " ""; fi
+  [[ -n "$DOT_DOMAIN" ]] || ask DOT_DOMAIN "DoT 域名 (如 dot.example.com): " ""
+fi
+[[ -n "$DOT_DOMAIN" ]] || die "DoT 域名不能为空 (非交互请用 PDG_DOT_DOMAIN)"
+# token / user id 可留空 → 装完先不启 bot, 之后 sudo pdg-set-token 补
 
-    mkdir -p "$CONF_DIR"
-    echo "forward" > "${CONF_DIR}/.reverse_proxy_mode"
-    echo "$backend_ip" > "${CONF_DIR}/.reverse_proxy_backend_ip"
-    echo "$client_cidr" > "${CONF_DIR}/.reverse_proxy_client_cidr"
-    echo "$firewall_mode" > "${CONF_DIR}/.firewall_mode"
-
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
-    sysctl -w net.netfilter.nf_conntrack_udp_timeout=30 >/dev/null 2>&1 || true
-    sysctl -w net.netfilter.nf_conntrack_udp_timeout_stream=300 >/dev/null 2>&1 || true
-
-    stop_local_reverse_proxy_services
-    setup_firewall
-
-    ok "VPS1 转发模式已启用: ${client_cidr} -> ${backend_ip} (TCP 80/443, UDP 443)"
-    warn "VPS2 必须运行 sniproxy 和 quic-proxy，并且只允许 VPS1 来源访问反代端口。"
-}
-
-setup_vps2_backend_firewall() {
-    local allow_cidr="$1"
-    local mode ssh_ports ssh_ports_nft ssh_ports_csv
-
-    mode="$(get_firewall_mode)"
-    ssh_ports="$(get_ssh_ports)"
-    ssh_ports_nft="$(ports_to_nft_set "$ssh_ports")"
-    ssh_ports_csv="$(ports_to_csv "$ssh_ports")"
-
-    if [[ "$mode" == "disabled" ]]; then
-        warn "防火墙模式为 disabled，未修改规则。需要允许 ${allow_cidr} 访问 TCP 80/443 和 UDP 443。"
-    elif [[ "$mode" == "managed-exclusive" ]]; then
-        if command -v nft >/dev/null 2>&1; then
-            cat > /etc/nftables.conf <<EOF
-#!/usr/sbin/nft -f
-flush ruleset
-
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        ct state established,related accept
-        tcp dport ${ssh_ports_nft} accept
-        ip saddr ${allow_cidr} tcp dport { 80, 443 } accept
-        ip saddr ${allow_cidr} udp dport 443 accept
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
-    }
-    chain forward {
-        type filter hook forward priority 0; policy accept;
-    }
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-EOF
-            chmod +x /etc/nftables.conf
-            nft -f /etc/nftables.conf 2>/dev/null || true
-            systemctl enable nftables 2>/dev/null || true
-        else
-            iptables -F INPUT
-            iptables -P INPUT DROP
-            iptables -A INPUT -i lo -j ACCEPT
-            iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-            iptables -A INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
-            iptables -A INPUT -s "$allow_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
-            iptables -A INPUT -s "$allow_cidr" -p udp --dport 443 -j ACCEPT
-            iptables -A INPUT -p icmp -j ACCEPT
-            iptables -P FORWARD ACCEPT
-            iptables -P OUTPUT ACCEPT
-            command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
-        fi
-    elif command -v nft >/dev/null 2>&1; then
-        nft add table inet proxy_gateway_filter 2>/dev/null || true
-        nft add chain inet proxy_gateway_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null || true
-        nft flush chain inet proxy_gateway_filter input 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input ct state established,related accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input tcp dport ${ssh_ports_nft} accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input ip saddr "$allow_cidr" tcp dport { 80, 443 } accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input tcp dport { 80, 443 } drop 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input ip saddr "$allow_cidr" udp dport 443 accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input udp dport 443 drop 2>/dev/null || true
+# ── 5. 目录 + 静态文件 ──
+c_g "铺设文件…"
+# 记目录事务: 在**动这些目录之前**记下"装前存在吗", 存在的先备份一份内容。
+# 回滚据此只撤本次的改动: 本次新建的删掉, 装前就有的按备份还原(不再无差别 rm -rf)。
+_dir_txn_record(){
+  local d bak
+  for d in "$@"; do
+    if [[ -e "$d" ]]; then
+      bak="$(mktemp -d)" || { c_y "无法为 $d 备份 → 中止(拒绝在无法回退的前提下改动它)"; return 1; }
+      cp -a "$d/." "$bak/" 2>/dev/null || { rm -rf "$bak"; c_y "备份 $d 失败 → 中止"; return 1; }
+      DIR_TXN+=("$d|1|$bak")
     else
-        ensure_iptables_jump "" INPUT PROXY_GATEWAY_INPUT
-        iptables -A PROXY_GATEWAY_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -s "$allow_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports 80,443 -j DROP
-        iptables -A PROXY_GATEWAY_INPUT -s "$allow_cidr" -p udp --dport 443 -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -p udp --dport 443 -j DROP
-        iptables -A PROXY_GATEWAY_INPUT -j RETURN
-        command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
+      DIR_TXN+=("$d|0|")
     fi
-    ok "VPS2 SNI/QUIC backend firewall configured (mode: ${mode}, allowed: ${allow_cidr}, SSH ports: ${ssh_ports})"
+  done
 }
+_dir_txn_record /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway \
+  || die "目录备份失败, 未改动任何文件。"
+install -d /etc/mosdns/rules /etc/sing-box/rs /opt/pdg-bot "$CERT_DIR" /etc/letsencrypt/renewal-hooks/deploy /etc/systemd/journald.conf.d
+install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py            /opt/pdg-bot/bot.py
+install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py      /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/checks.py           /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/nftscan.py          /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py            /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/nftmerge.py         /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/doctor.py           /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
+# iOS 专属组件(MITM 模块 / :81 探测 / 描述文件模板)只在 iOS 平台安装; Android 不装。
+if [[ "$PLATFORM" == ios ]]; then
+  install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/
+  install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/
+  install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/
+  install -m755 "$REPO_DIR"/deploy/ios/probe81.py           /opt/pdg-bot/
+  install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
+fi
+install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh     /usr/local/bin/
+install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh   /usr/local/bin/
+install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh       /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
+install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh                     /usr/local/bin/pdg-set-token
+install -m755 "$REPO_DIR"/deploy/bot/pdg.sh                               /usr/local/bin/pdg
+# 把仓库放到 /opt/privdns-gateway 供 `pdg update` / `pdg uninstall` 用。
+# 复制失败**必须中止**: 旧写法 `|| true` 吞掉错误, 装完机器上没有仓库副本, 之后 pdg update
+# 和 pdg uninstall 都无从谈起, 而装机全程一句提示都没有。
+if [[ "$REPO_DIR" != "/opt/privdns-gateway" ]]; then
+  if [[ ! -d /opt/privdns-gateway/.git ]]; then
+    rm -rf /opt/privdns-gateway
+    cp -a "$REPO_DIR" /opt/privdns-gateway || die "复制仓库到 /opt/privdns-gateway 失败(磁盘满/权限?)"
+    [[ -d /opt/privdns-gateway/.git ]] || die "复制后的 /opt/privdns-gateway 里没有 .git —— 更新/卸载会用不了"
+  fi
+fi
+# 属主统一收归 root: 用户常见做法是普通账号 git clone 后 sudo ./install.sh, 复制过去的副本
+# 于是归那个普通用户所有。之后 root 跑 pdg update, git 会以 "dubious ownership" 拒绝一切操作
+# (连 describe/tag 都读不到), 表现成"更新检查不出新版"这种莫名其妙的样子。
+chown -R root:root /opt/privdns-gateway 2>/dev/null || true
+git config --system --get-all safe.directory 2>/dev/null | grep -qx '/opt/privdns-gateway' \
+  || git config --system --add safe.directory /opt/privdns-gateway 2>/dev/null || true
+: > /etc/mosdns/rules/custom_direct.txt
+: > /etc/mosdns/rules/custom_hijack.txt   # bot 指到出口的域名(必须被 mosdns 劫持才会进代理)
+: > /etc/mosdns/rules/unlock.txt          # WDA 解锁域名集(空=休眠; bot『🔓 解锁走 WDA』填充)
+: > /etc/mosdns/rules/mitm_hijack.txt     # MITM 接管域名集(空=休眠; iOS 启用 MITM 插件时填充)
 
-install_vps2_sni_quic_backend() {
-    check_root
-    local allow_cidr="${REVERSE_PROXY_BACKEND_ALLOWED_CIDR:-}" firewall_mode="${FIREWALL_MODE:-}"
+# 内存模式(克制版): PDG_LOWMEM=auto(默认)|1|0; MemTotal ≤ 1300MiB 判低内存。持久化到 profile.env。
+# 只调确认安全的项: mosdns cache(8192/2048)+ journald 上限(50M/20M)。不动 sysctl/swap/MemoryMax。
+case "${PDG_LOWMEM:-auto}" in
+  1) LOWMEM=1;; 0) LOWMEM=0;;
+  *) _cur=""; [[ -f /etc/privdns-gateway/profile.env ]] && _cur=$(sed -n 's/^PDG_LOWMEM=//p' /etc/privdns-gateway/profile.env | tail -1)
+     if [[ "$_cur" == 0 || "$_cur" == 1 ]]; then LOWMEM="$_cur"   # 已固定的模式沿用(强制重装不覆盖用户选择)
+     else _mt=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)
+          if [[ -n "$_mt" && "$_mt" -le 1331200 ]]; then LOWMEM=1; else LOWMEM=0; fi; fi;;
+esac
+if [[ "$LOWMEM" == 1 ]]; then MOSDNS_CACHE=2048; JOURNALD_MAXUSE=20M; else MOSDNS_CACHE=8192; JOURNALD_MAXUSE=50M; fi
 
-    install_reverse_proxy_deps
-    if [[ -z "$SNIPROXY_DNS" && -t 0 ]]; then
-        tty_read SNIPROXY_DNS "VPS2 sniproxy 后端解析 DNS（留空使用默认海外 DNS）" ""
-    fi
-    [[ -z "${SNIPROXY_DNS:-}" ]] && SNIPROXY_DNS="${DEFAULT_OVERSEAS_DNS[*]}"
+# 劫持模式: all(默认, 非CN域名全劫持进代理) | gfw(只劫持 GFWList 真被墙域名, 非墙海外域名返真实IP直连)。
+# gfw 模式修 "SSH/直连走域名被劫持到网关" 的问题; 但要求内网卡 SIM 能直达一般互联网(非墙海外可达)。持久化到 profile.env。
+case "${PDG_HIJACK_MODE:-}" in
+  gfw) HIJACK_MODE=gfw;; all) HIJACK_MODE=all;;
+  *) _hm=""; [[ -f /etc/privdns-gateway/profile.env ]] && _hm=$(sed -n 's/^PDG_HIJACK_MODE=//p' /etc/privdns-gateway/profile.env | tail -1)
+     [[ "$_hm" == gfw || "$_hm" == all ]] && HIJACK_MODE="$_hm" || HIJACK_MODE=all;;
+esac
+[[ "$HIJACK_MODE" == gfw ]] && HIJACK_SET_FILE="geosite_gfw.txt" || HIJACK_SET_FILE="geosite_geolocation-!cn.txt"
 
-    if [[ -z "$allow_cidr" && -t 0 ]]; then
-        tty_read allow_cidr "允许访问 VPS2 反代端口的 VPS1 IP/CIDR" ""
-    fi
-    [[ -z "$allow_cidr" ]] && { err "VPS1 IP/CIDR 不能为空"; return 1; }
-    valid_ipv4_cidr "$allow_cidr" || { err "无效 VPS1 IP/CIDR: $allow_cidr"; return 1; }
+install -d -m700 /etc/privdns-gateway
+# 写本次管理的三个键; 在已有安装上覆盖重装时(与上面读回 PDG_LOWMEM/PDG_HIJACK_MODE 的意图一致),
+# 保留 profile.env 里其余键 —— 尤其 PDG_TFO(bot 持久化的 TFO 意图)与未知/自定义键, 不被重装清掉。
+#
+# 走临时文件 + 原子替换, 且每一步的失败都要看见。旧写法是
+#     { printf …; [[ -f old ]] && grep -v … old; } > new && mv new old
+# 新装时 `[[ -f old ]]` 为假 → 整个 group 返回 1 → `&& mv` 不执行(而 && 列表里的失败又不触发
+# set -e), 于是机器上只剩一个 profile.env.new: PDG_HIJACK_MODE 根本没落盘, 下一次 pdg restart
+# 读不到就按默认 all 把 mosdns 形态改回去 —— 装机时选的 gfw 悄悄没了。
+_prof_tmp="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || die "创建 profile.env 临时文件失败"
+{
+  printf 'PDG_LOWMEM=%s\nPDG_HIJACK_MODE=%s\nPDG_PLATFORM=%s\n' "$LOWMEM" "$HIJACK_MODE" "$PLATFORM"
+  if [[ -f /etc/privdns-gateway/profile.env ]]; then
+    # grep -v 在"旧文件只有受管键"时没有输出 → 返回 1, 不能让它把整段判成失败
+    grep -vE '^[[:space:]]*(PDG_LOWMEM|PDG_HIJACK_MODE|PDG_PLATFORM)=' \
+      /etc/privdns-gateway/profile.env || true
+  fi
+} > "$_prof_tmp" || { rm -f "$_prof_tmp"; die "写 profile.env 失败(磁盘满/只读?)"; }
+chmod 600 "$_prof_tmp"
+mv -f "$_prof_tmp" /etc/privdns-gateway/profile.env \
+  || { rm -f "$_prof_tmp"; die "落盘 profile.env 失败"; }
+rm -f /etc/privdns-gateway/profile.env.new          # 清掉历史版本留下的半成品
+grep -q "^PDG_HIJACK_MODE=$HIJACK_MODE$" /etc/privdns-gateway/profile.env \
+  || die "profile.env 未写入预期的 PDG_HIJACK_MODE"
+printf '%s\n' "$PLATFORM" > /etc/privdns-gateway/platform
 
-    firewall_mode="${firewall_mode:-$(get_firewall_mode)}"
-    mkdir -p "$CONF_DIR"
-    echo "$allow_cidr" > "${CONF_DIR}/.reverse_proxy_backend_allowed_cidr"
-    echo "$firewall_mode" > "${CONF_DIR}/.firewall_mode"
+render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
+              -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
+              -e "s|__MOSDNS_CACHE__|$MOSDNS_CACHE|g" -e "s|__JOURNALD_MAXUSE__|$JOURNALD_MAXUSE|g" \
+              -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" "$1"; }
 
-    install_sniproxy
-    install_quic_proxy
-    systemctl restart sniproxy || { err "sniproxy failed to start"; journalctl -u sniproxy --no-pager -n 20; return 1; }
-    systemctl restart quic-proxy || { err "quic-proxy failed to start"; journalctl -u quic-proxy --no-pager -n 20; return 1; }
-    setup_vps2_backend_firewall "$allow_cidr"
+render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
+# 模板自带 gfw 那道劫持门; all 模式要去掉它 —— all 的语义是"不是国内就劫持"(排除式),
+# 留着门会退化成"只劫持 geosite 策展分类里的域名"。
+_mosdns_hijack_shape "$HIJACK_MODE" /etc/mosdns/config.yaml "$HIJACK_SET_FILE" >/dev/null \
+  || die "mosdns 劫持形态渲染失败"
+render "$REPO_DIR/deploy/singbox/config.json.tmpl"    > /etc/sing-box/config.json   # 始终是 bot 的数据模型(mihomo 模式下也由它渲染)
+# iOS: 模板含 GMS(in-gms-5228/5229/5230)入站, iOS 走 APNs 不需要 → 删掉, 让 canonical model 从一开始就无 GMS。
+if [[ "$PLATFORM" == ios ]]; then
+  python3 - /etc/sing-box/config.json <<'PY'
+import json, sys
+f = sys.argv[1]; c = json.load(open(f))
+c["inbounds"] = [i for i in c.get("inbounds", []) if i.get("tag") not in ("in-gms-5228", "in-gms-5229", "in-gms-5230")]
+json.dump(c, open(f, "w"), ensure_ascii=False, indent=2)
+PY
+fi
+chmod 700 /etc/sing-box; chmod 600 /etc/sing-box/config.json   # config 含出口密码/uuid
+# /etc/sing-box 是本项目的**数据模型**目录(即便 v1.6 起已不装 sing-box 运行时)。落一份归属
+# 标记, 卸载 --purge 才知道该删它 —— 里面是出口密码/UUID/节点地址, 留在盘上等于凭据没清。
+# 标记落在 /etc/privdns-gateway 下, 已在目录事务台账里(装机失败回滚会连它一起还原)。
+pdg_sbmodel_mark_owned || die "写数据模型归属标记失败(磁盘满/只读?)"
+[[ -e /etc/nftables.conf.pdg-orig ]] || cp -a /etc/nftables.conf /etc/nftables.conf.pdg-orig 2>/dev/null || true  # 供 uninstall 还原
+# 内核后端: 标记(恒 mihomo)+ 防火墙(mihomo REDIRECT 入站变体)+ 初始渲染 mihomo 配置
+printf '%s\n' "$CORE" > /etc/privdns-gateway/backend
+# 防火墙: **合并**而不是整文件覆盖 —— 用户的 VPN/NAT/转发/开放端口原样保留(与迁移同一实现)。
+# iOS 的 GMS 剥离在**渲染出来的块上**做, 不在合并结果上做: 后者会拿正则去扫用户自己的规则行。
+_nft_block="$(mktemp)"; _nft_merged="$(mktemp)"
+render "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$_nft_block"
+if [[ "$PLATFORM" == ios ]]; then
+  sed -E -i 's#(tcp dport [{] 53, 80, 81, 443, 853), 5228-5230, 8445 [}] accept#\1, 8445 } accept#' "$_nft_block"
+  sed -E -i 's#(tcp dport [{] 80, 443), 5228-5230 [}] redirect#\1 } redirect#' "$_nft_block"
+fi
+python3 "$REPO_DIR/deploy/bot/nftmerge.py" "$_nft_block" /etc/nftables.conf "$_nft_merged" \
+  || { rm -f "$_nft_block" "$_nft_merged"
+       die "无法安全合并 /etc/nftables.conf(见上方冲突位置)→ 未改动防火墙。
+  请把本项目所需规则手工并入 table inet pdg 后重试, 或先备份并清理冲突配置。"; }
+# 用与扫描器同一份解析结果调 nft(PATH 缺 sbin 时不能因此跳过校验 —— 那等于不校验就落盘)
+_nft_exe="$(python3 "$_NFTSCAN" --nft-path 2>/dev/null || true)"
+[[ -n "$_nft_exe" && -x "$_nft_exe" ]] || _nft_exe=""     # 输出不是可执行文件就当没拿到
+if [[ -n "$_nft_exe" ]] && ! "$_nft_exe" -c -f "$_nft_merged" >/dev/null 2>&1; then
+  rm -f "$_nft_block" "$_nft_merged"; die "合并后的 nftables 配置校验(nft -c)未过 → 未改动防火墙。"
+fi
+cp -f "$_nft_merged" /etc/nftables.conf || { rm -f "$_nft_block" "$_nft_merged"; die "写入 /etc/nftables.conf 失败"; }
+rm -f "$_nft_block" "$_nft_merged"
+install -d -m700 /etc/mihomo
+python3 - <<PY
+import json, os, sys
+sys.path.insert(0, "$REPO_DIR/deploy/bot")
+import sb2mihomo
+model = json.load(open("/etc/sing-box/config.json"))   # config.json 仍是核无关的数据模型
+cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893)
+with open("/etc/mihomo/config.yaml", "w") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)   # JSON 即合法 YAML
+os.chmod("/etc/mihomo/config.yaml", 0o600)
+PY
+render "$REPO_DIR/deploy/bot/pdg-bot.service"         > /etc/systemd/system/pdg-bot.service
+chmod 644 /etc/systemd/system/pdg-bot.service        # 不再含 token (token 在 bot.env)
 
-    ok "VPS2 SNI/QUIC 后端已安装，只允许 ${allow_cidr} 访问 TCP 80/443 和 UDP 443"
-}
+# token / 允许 id 写入受限的 bot.env (目录 700 / 文件 600), 不进 unit 也不进版本库
+install -d -m700 /etc/privdns-gateway
+( umask 077; printf 'PDG_BOT_TOKEN=%s\nPDG_BOT_ALLOWED=%s\n' "$BOT_TOKEN" "$ALLOWED_IDS" > /etc/privdns-gateway/bot.env )
+chmod 600 /etc/privdns-gateway/bot.env
+install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.service /etc/systemd/system/
+install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.timer   /etc/systemd/system/
+install -m644 "$REPO_DIR"/deploy/bot/pdg-health.service       /etc/systemd/system/
+install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer         /etc/systemd/system/
+# pdg-probe81(:81 探测)是 iOS 专属, 仅 iOS 装 unit; Android 不装、不起、不开 81。
+[[ "$PLATFORM" == ios ]] && install -m644 "$REPO_DIR"/deploy/ios/pdg-probe81.service /etc/systemd/system/
+render "$REPO_DIR/deploy/firewall/journald-50-pdg.conf" > /etc/systemd/journald.conf.d/50-pdg.conf; chmod 644 /etc/systemd/journald.conf.d/50-pdg.conf
 
-# =============================================================================
-# China DNS race proxy (UDP DNS upstream racing for ChinaList)
-# =============================================================================
-install_china_dns_race_proxy() {
-    info "Compiling china-dns-race-proxy..."
-    mkdir -p "${BASE_DIR}/bin"
-    mkdir -p "${SRC_DIR}"
-    cp "${SCRIPT_DIR}/china-dns-race-proxy.go" "${SRC_DIR}/china-dns-race-proxy.go"
-    cd "${SRC_DIR}"
-
-    export PATH=$PATH:/usr/local/go/bin
-    go build -ldflags="-s -w" -o "${BASE_DIR}/bin/china-dns-race-proxy" china-dns-race-proxy.go
-
-    cat > /etc/systemd/system/china-dns-race-proxy.service <<'EOF'
+cat > /etc/systemd/system/mosdns.service <<'EOF'
 [Unit]
-Description=China DNS race proxy
-After=network.target
-Before=dnsdist.service
-
+Description=mosdns
+After=network-online.target
+Wants=network-online.target
 [Service]
-Type=simple
-ExecStart=/opt/proxy-gateway/bin/china-dns-race-proxy -l 127.0.0.1:5301
+ExecStart=/usr/local/bin/mosdns start -d /etc/mosdns
 Restart=on-failure
 RestartSec=3
-User=root
-LimitNOFILE=65535
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    systemctl enable china-dns-race-proxy
-    ok "china-dns-race-proxy installed"
-}
-
-# =============================================================================
-# dnsdist (DoT + Smart DNS)
-# =============================================================================
-install_dnsdist() {
-    info "Configuring dnsdist..."
-
-    mkdir -p /etc/dnsdist
-    cp "${SCRIPT_DIR}/dnsdist.conf.template" /etc/dnsdist/dnsdist.conf.template
-    cp "${SCRIPT_DIR}/update-rules.sh" /usr/local/bin/update-dnsdist-rules.sh
-    chmod +x /usr/local/bin/update-dnsdist-rules.sh
-
-    # Save domain and IP for template generation
-    echo "$DOMAIN" > /etc/dnsdist/.domain
-    echo "$PUBLIC_IP" > /etc/dnsdist/.public_ip
-    echo "$PRIVATE_OVERSEAS_DNS" > /etc/dnsdist/.overseas_dns
-    echo "$PRIVATE_OVERSEAS_DNS" > /etc/dnsdist/.overseas_private_dns
-    echo "$PUBLIC_OVERSEAS_DNS" > /etc/dnsdist/.overseas_public_dns
-    echo "$SNIPROXY_DNS" > /etc/dnsdist/.sniproxy_dns
-    echo "${OTHER_POLICY:-direct}" > /etc/dnsdist/.other_policy
-    echo "${DNS_CACHE_SIZE:-$DEFAULT_DNS_CACHE_SIZE}" > /etc/dnsdist/.cache_size
-    touch /etc/dnsdist/gfwlist-extra-local.txt \
-        /etc/dnsdist/proxy-extra-local.txt \
-        /etc/dnsdist/direct-extra-local.txt \
-        /etc/dnsdist/custom-proxy-lists.txt \
-        /etc/dnsdist/custom-direct-lists.txt
-    local policy_file
-    for policy_file in gfwlist-extra-local.txt proxy-extra-local.txt direct-extra-local.txt custom-proxy-lists.txt custom-direct-lists.txt; do
-        if [[ -s "${CONF_DIR}/${policy_file}" && ! -s "/etc/dnsdist/${policy_file}" ]]; then
-            cp "${CONF_DIR}/${policy_file}" "/etc/dnsdist/${policy_file}"
-        fi
-    done
-    local overseas_private_servers overseas_public_servers
-    overseas_private_servers=$(render_overseas_dns_servers "$PRIVATE_OVERSEAS_DNS" "overseas_private" "overseas_private")
-    overseas_public_servers=$(render_overseas_dns_servers "$PUBLIC_OVERSEAS_DNS" "overseas_public" "overseas_public")
-
-    # Determine actual certificate directory name
-    local cert_basename="${DOMAIN}"
-    if [[ -f "${CONF_DIR}/.cert_basename" ]]; then
-        cert_basename=$(cat "${CONF_DIR}/.cert_basename")
-    fi
-
-    # Generate initial config (empty rules, will be populated by update-rules.sh)
-    python3 - /etc/dnsdist/dnsdist.conf.template "${PUBLIC_IP}" "${cert_basename}" "$overseas_private_servers" "$overseas_public_servers" "${OTHER_POLICY:-direct}" "${DNS_CACHE_SIZE:-$DEFAULT_DNS_CACHE_SIZE}" /etc/dnsdist/dnsdist.conf <<'PYEOF'
-import sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    content = f.read()
-content = content.replace("__GFWLIST_RULES__", "-- (rules will be loaded by update-rules.sh)")
-content = content.replace("__CHINALIST_RULES__", "-- (rules will be loaded by update-rules.sh)")
-content = content.replace("__PROXY_EXTRA_RULES__", "-- (rules will be loaded by update-rules.sh)")
-content = content.replace("__DIRECT_EXTRA_RULES__", "-- (rules will be loaded by update-rules.sh)")
-content = content.replace("__SERVER_IP__", sys.argv[2])
-content = content.replace("__DOMAIN__", sys.argv[3])
-content = content.replace("__OVERSEAS_PRIVATE_DNS_SERVERS__", sys.argv[4])
-content = content.replace("__OVERSEAS_PUBLIC_DNS_SERVERS__", sys.argv[5])
-content = content.replace("__OTHER_POLICY__", sys.argv[6])
-content = content.replace("__DNS_CACHE_SIZE__", sys.argv[7])
-with open(sys.argv[8], "w", encoding="utf-8") as f:
-    f.write(content)
-PYEOF
-
-    # systemd override for dnsdist (ensure it reads our config + supports reload)
-    mkdir -p /etc/systemd/system/dnsdist.service.d
-    cat > /etc/systemd/system/dnsdist.service.d/override.conf <<'EOF'
-[Service]
-ExecStart=
-ExecStart=/usr/bin/dnsdist --supervised -C /etc/dnsdist/dnsdist.conf
-ExecReload=/bin/kill -HUP $MAINPID
-LimitNOFILE=65535
-EOF
-
-    systemctl daemon-reload
-    systemctl enable dnsdist
-    ok "dnsdist configured"
-}
-
-# =============================================================================
-# Rules initialization
-# =============================================================================
-init_rules() {
-    info "Initializing GFWList and ChinaList..."
-    /usr/local/bin/update-dnsdist-rules.sh || warn "Rule update failed, will retry later"
-}
-
-# =============================================================================
-# iOS DoT profile
-# =============================================================================
-generate_ios_profile() {
-    info "Generating iOS DoT configuration profile..."
-
-    mkdir -p "$WWW_DIR"
-    local profile_path="${WWW_DIR}/ios-dot.mobileconfig"
-    local profile_url="http://${DOMAIN}:${IOS_PROFILE_PORT}/ios-dot.mobileconfig"
-
-    cat > "$profile_path" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>PayloadContent</key>
-    <array>
-        <dict>
-            <key>DNSSettings</key>
-            <dict>
-                <key>DNSProtocol</key>
-                <string>TLS</string>
-                <key>ServerName</key>
-                <string>${DOMAIN}</string>
-                <key>ServerAddresses</key>
-                <array>
-                    <string>${PUBLIC_IP}</string>
-                </array>
-            </dict>
-            <key>OnDemandRules</key>
-            <array>
-                <dict>
-                    <key>Action</key>
-                    <string>Connect</string>
-                    <key>InterfaceTypeMatch</key>
-                    <string>Cellular</string>
-                </dict>
-                <dict>
-                    <key>Action</key>
-                    <string>Disconnect</string>
-                    <key>InterfaceTypeMatch</key>
-                    <string>WiFi</string>
-                </dict>
-                <dict>
-                    <key>Action</key>
-                    <string>Disconnect</string>
-                </dict>
-            </array>
-            <key>PayloadDescription</key>
-            <string>Use ${DOMAIN} DNS over TLS only on cellular networks.</string>
-            <key>PayloadDisplayName</key>
-            <string>Proxy Gateway Cellular DoT</string>
-            <key>PayloadIdentifier</key>
-            <string>com.proxy-gateway.${DOMAIN}.dnssettings</string>
-            <key>PayloadType</key>
-            <string>com.apple.dnsSettings.managed</string>
-            <key>PayloadUUID</key>
-            <string>$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')</string>
-            <key>PayloadVersion</key>
-            <integer>1</integer>
-        </dict>
-    </array>
-    <key>PayloadDescription</key>
-    <string>Installs a DNS over TLS profile for cellular networks only.</string>
-    <key>PayloadDisplayName</key>
-    <string>Proxy Gateway Cellular DoT</string>
-    <key>PayloadIdentifier</key>
-    <string>com.proxy-gateway.${DOMAIN}</string>
-    <key>PayloadOrganization</key>
-    <string>Proxy Gateway</string>
-    <key>PayloadRemovalDisallowed</key>
-    <false/>
-    <key>PayloadType</key>
-    <string>Configuration</string>
-    <key>PayloadUUID</key>
-    <string>$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')</string>
-    <key>PayloadVersion</key>
-    <integer>1</integer>
-</dict>
-</plist>
-EOF
-
-    cat > "${WWW_DIR}/index.html" <<EOF
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Proxy Gateway iOS DoT</title>
-</head>
-<body>
-  <h1>Proxy Gateway iOS DoT</h1>
-  <p><a href="/ios-dot.mobileconfig">下载 iOS 蜂窝网络 DoT 描述文件</a></p>
-</body>
-</html>
-EOF
-
-    cat > /etc/systemd/system/proxy-gateway-ios-profile.service <<EOF
-[Unit]
-Description=Proxy Gateway iOS profile static server
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=${WWW_DIR}
-ExecStart=/usr/bin/python3 -m http.server ${IOS_PROFILE_PORT} --bind 0.0.0.0
-Restart=on-failure
-RestartSec=5
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now proxy-gateway-ios-profile.service
-
-    echo "$profile_url" > "${WWW_DIR}/ios-profile-url.txt"
-    if command -v qrencode >/dev/null 2>&1; then
-        qrencode -t ANSIUTF8 "$profile_url" | tee "${WWW_DIR}/ios-dot.qr.txt"
-    else
-        warn "qrencode is not installed; QR code skipped. Profile URL: $profile_url"
-    fi
-
-    ok "iOS profile ready: $profile_url"
-}
-
-# =============================================================================
-# System tuning
-# =============================================================================
-system_tuning() {
-    info "Applying kernel and system tuning..."
-
-    modprobe nf_conntrack >/dev/null 2>&1 || true
-    mkdir -p /etc/modules-load.d
-    echo nf_conntrack > /etc/modules-load.d/proxy-gateway-net.conf
-
-    cat > /etc/sysctl.d/99-proxy-gateway.conf <<'EOF'
-# Proxy Gateway Optimizations
-fs.file-max=10240000
-fs.nr_open=2097152
-net.core.default_qdisc=fq
-net.core.netdev_max_backlog=65536
-net.core.somaxconn=10240000
-net.ipv4.conf.all.rp_filter=2
-net.ipv4.conf.default.rp_filter=2
-net.ipv4.ip_default_ttl=128
-net.ipv4.ip_forward=1
-net.ipv4.ip_local_port_range=10240 65535
-net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_dsack=1
-net.ipv4.tcp_ecn=1
-net.ipv4.tcp_fastopen=1027
-net.ipv4.tcp_fastopen_blackhole_timeout_sec=0
-net.ipv4.tcp_fin_timeout=2
-net.ipv4.tcp_keepalive_intvl=5
-net.ipv4.tcp_keepalive_probes=2
-net.ipv4.tcp_keepalive_time=120
-net.ipv4.tcp_max_orphans=10240
-net.ipv4.tcp_max_syn_backlog=65536
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_no_metrics_save=1
-net.ipv4.tcp_retries1=2
-net.ipv4.tcp_retries2=2
-net.ipv4.tcp_rfc1337=1
-net.ipv4.tcp_rmem=8192 65536 134217728
-net.ipv4.tcp_moderate_rcvbuf=1
-net.ipv4.tcp_sack=1
-net.ipv4.tcp_syn_retries=2
-net.ipv4.tcp_synack_retries=2
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_wmem=8192 131072 134217728
-net.netfilter.nf_conntrack_generic_timeout=10
-net.netfilter.nf_conntrack_icmp_timeout=2
-net.netfilter.nf_conntrack_max=10240000
-net.netfilter.nf_conntrack_tcp_max_retrans=2
-net.netfilter.nf_conntrack_tcp_timeout_close=2
-net.netfilter.nf_conntrack_tcp_timeout_close_wait=2
-net.netfilter.nf_conntrack_tcp_timeout_established=30
-net.netfilter.nf_conntrack_tcp_timeout_fin_wait=2
-net.netfilter.nf_conntrack_tcp_timeout_last_ack=2
-net.netfilter.nf_conntrack_tcp_timeout_max_retrans=2
-net.netfilter.nf_conntrack_tcp_timeout_syn_recv=2
-net.netfilter.nf_conntrack_tcp_timeout_syn_sent=2
-net.netfilter.nf_conntrack_tcp_timeout_time_wait=2
-net.netfilter.nf_conntrack_tcp_timeout_unacknowledged=2
-net.netfilter.nf_conntrack_udp_timeout=2
-net.netfilter.nf_conntrack_udp_timeout_stream=30
-vm.swappiness=0
-EOF
-
-    local mem_pages
-    mem_pages=$(awk '/MemTotal/ { printf "%d", ($2 * 1024) / 4096 }' /proc/meminfo 2>/dev/null || echo "")
-    if [[ -n "$mem_pages" && "$mem_pages" -gt 0 ]]; then
-        {
-            echo "net.ipv4.tcp_mem=$((mem_pages / 100 * 12)) $((mem_pages / 100 * 50)) $((mem_pages / 100 * 70))"
-        } >> /etc/sysctl.d/99-proxy-gateway.conf
-    fi
-
-    sysctl --system >/dev/null
-
-    # PAM limits (avoid duplicate entries)
-    if ! grep -q "proxy-gateway-limits" /etc/security/limits.conf 2>/dev/null; then
-        cat >> /etc/security/limits.conf <<'EOF'
-# proxy-gateway-limits
-* soft nofile 1048576
-* hard nofile 1048576
-root soft nofile 1048576
-root hard nofile 1048576
-EOF
-    fi
-
-    mkdir -p /etc/systemd/system
-    cat > /etc/systemd/system/disable-transparent-huge-pages.service <<'EOF'
-[Unit]
-Description=Disable Transparent Huge Pages (THP)
-DefaultDependencies=no
-After=sysinit.target local-fs.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'test -w /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/enabled || true'
-ExecStart=/bin/sh -c 'test -w /sys/kernel/mm/transparent_hugepage/defrag && echo never > /sys/kernel/mm/transparent_hugepage/defrag || true'
-
-[Install]
-WantedBy=basic.target
-EOF
-
-    mkdir -p /etc/systemd/journald.conf.d
-    cat > /etc/systemd/journald.conf.d/99-proxy-gateway.conf <<'EOF'
-[Journal]
-SystemMaxUse=384M
-SystemMaxFileSize=128M
-ForwardToSyslog=no
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now disable-transparent-huge-pages.service 2>/dev/null || true
-    systemctl restart systemd-journald 2>/dev/null || true
-
-    ok "System tuning applied"
-}
-
-# =============================================================================
-# Firewall (additive by default; managed-exclusive is opt-in)
-# =============================================================================
-normalize_port_list() {
-    local raw="$*"
-    local port seen="" out=""
-
-    raw="${raw//,/ }"
-    for port in $raw; do
-        [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] || continue
-        if [[ " ${seen} " == *" ${port} "* ]]; then
-            continue
-        fi
-        seen="${seen} ${port}"
-        out="${out} ${port}"
-    done
-    echo "${out# }"
-}
-
-detect_ssh_ports() {
-    local ports="" config file
-
-    if command -v sshd >/dev/null 2>&1; then
-        ports+=" $(sshd -T 2>/dev/null | awk 'tolower($1) == "port" {print $2}')"
-    fi
-
-    for config in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
-        [[ -f "$config" ]] || continue
-        ports+=" $(awk 'tolower($1) == "port" && $1 !~ /^#/ {print $2}' "$config" 2>/dev/null || true)"
-    done
-
-    if command -v ss >/dev/null 2>&1; then
-        ports+=" $(ss -ltnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]}')"
-    fi
-
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        ports+=" $(printf '%s\n' "$SSH_CONNECTION" | awk '{print $4}')"
-    fi
-    if [[ -n "${SSH_CLIENT:-}" ]]; then
-        ports+=" $(printf '%s\n' "$SSH_CLIENT" | awk '{print $3}')"
-    fi
-
-    normalize_port_list "$ports"
-}
-
-get_ssh_ports() {
-    local ports=""
-
-    ports="$(normalize_port_list "${SSH_PORTS:-}")"
-    if [[ -z "$ports" && -f "${CONF_DIR}/.ssh_ports" ]]; then
-        ports="$(normalize_port_list "$(cat "${CONF_DIR}/.ssh_ports" 2>/dev/null || true)")"
-    fi
-    if [[ -z "$ports" ]]; then
-        ports="$(detect_ssh_ports)"
-    fi
-    if [[ -z "$ports" ]]; then
-        ports="22"
-        warn "未检测到实际 SSH 监听端口，默认保留 TCP/22；如使用自定义端口，请设置 SSH_PORTS 后重跑。" >&2
-    fi
-
-    mkdir -p "$CONF_DIR"
-    echo "$ports" > "${CONF_DIR}/.ssh_ports"
-    echo "$ports"
-}
-
-ports_to_csv() {
-    normalize_port_list "$*" | tr ' ' ','
-}
-
-ports_to_nft_set() {
-    local csv
-    csv="$(ports_to_csv "$*")"
-    csv="${csv//,/,\ }"
-    echo "{ ${csv:-22} }"
-}
-
-get_firewall_mode() {
-    local mode="${FIREWALL_MODE:-}"
-    if [[ -z "$mode" && -f "${CONF_DIR}/.firewall_mode" ]]; then
-        mode="$(cat "${CONF_DIR}/.firewall_mode" 2>/dev/null || true)"
-    fi
-    mode="${mode:-$DEFAULT_FIREWALL_MODE}"
-    case "$mode" in
-        additive|managed-exclusive|disabled) ;;
-        *)
-            warn "无效防火墙模式 '$mode'，使用 additive" >&2
-            mode="additive"
-            ;;
-    esac
-    mkdir -p "$CONF_DIR"
-    echo "$mode" > "${CONF_DIR}/.firewall_mode"
-    echo "$mode"
-}
-
-get_reverse_proxy_mode() {
-    local mode="${REVERSE_PROXY_MODE:-}"
-    if [[ -z "$mode" && -f "${CONF_DIR}/.reverse_proxy_mode" ]]; then
-        mode="$(cat "${CONF_DIR}/.reverse_proxy_mode" 2>/dev/null || true)"
-    fi
-    mode="${mode:-$DEFAULT_REVERSE_PROXY_MODE}"
-    [[ "$mode" == "forward" ]] || mode="local"
-    echo "$mode"
-}
-
-get_reverse_proxy_client_cidr() {
-    local cidr="${REVERSE_PROXY_CLIENT_CIDR:-}"
-    if [[ -z "$cidr" && -f "${CONF_DIR}/.reverse_proxy_client_cidr" ]]; then
-        cidr="$(cat "${CONF_DIR}/.reverse_proxy_client_cidr" 2>/dev/null || true)"
-    fi
-    echo "${cidr:-$DEFAULT_CLIENT_CIDR}"
-}
-
-get_reverse_proxy_backend_ip() {
-    local backend="${REVERSE_PROXY_BACKEND_IP:-}"
-    if [[ -z "$backend" && -f "${CONF_DIR}/.reverse_proxy_backend_ip" ]]; then
-        backend="$(cat "${CONF_DIR}/.reverse_proxy_backend_ip" 2>/dev/null || true)"
-    fi
-    echo "$backend"
-}
-
-apply_additive_firewall_nft() {
-    local ssh_ports_nft="$1" client_cidr="$2" reverse_mode="$3" backend_ip="$4" socks_port="$5" socks_cidr="$6" wg_port="$7"
-
-    nft add table inet proxy_gateway_filter 2>/dev/null || true
-    nft add chain inet proxy_gateway_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null || true
-    nft flush chain inet proxy_gateway_filter input 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input ct state established,related accept 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input tcp dport ${ssh_ports_nft} accept 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input tcp dport { 53, 853, 8111 } accept 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input udp dport 53 accept 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input ip saddr "$client_cidr" tcp dport { 80, 443 } accept 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input tcp dport { 80, 443 } drop 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input ip saddr "$client_cidr" udp dport 443 accept 2>/dev/null || true
-    nft add rule inet proxy_gateway_filter input udp dport 443 drop 2>/dev/null || true
-    if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
-        nft add rule inet proxy_gateway_filter input ip saddr "$socks_cidr" tcp dport "$socks_port" accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input tcp dport "$socks_port" drop 2>/dev/null || true
-    fi
-    if [[ "$wg_port" =~ ^[0-9]+$ ]]; then
-        nft add rule inet proxy_gateway_filter input udp dport "$wg_port" accept 2>/dev/null || true
-    fi
-
-    nft add table ip proxy_gateway_nat 2>/dev/null || true
-    nft add chain ip proxy_gateway_nat prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' 2>/dev/null || true
-    nft add chain ip proxy_gateway_nat postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' 2>/dev/null || true
-    nft add chain inet proxy_gateway_filter forward '{ type filter hook forward priority -100; policy accept; }' 2>/dev/null || true
-    nft flush chain ip proxy_gateway_nat prerouting 2>/dev/null || true
-    nft flush chain ip proxy_gateway_nat postrouting 2>/dev/null || true
-    nft flush chain inet proxy_gateway_filter forward 2>/dev/null || true
-
-    if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
-        nft add rule ip proxy_gateway_nat prerouting ip saddr "$client_cidr" tcp dport { 80, 443 } dnat to "$backend_ip" 2>/dev/null || true
-        nft add rule ip proxy_gateway_nat prerouting ip saddr "$client_cidr" udp dport 443 dnat to "$backend_ip" 2>/dev/null || true
-        nft add rule ip proxy_gateway_nat postrouting ip daddr "$backend_ip" tcp dport { 80, 443 } masquerade 2>/dev/null || true
-        nft add rule ip proxy_gateway_nat postrouting ip daddr "$backend_ip" udp dport 443 masquerade 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter forward ip daddr "$backend_ip" tcp dport { 80, 443 } accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter forward ip daddr "$backend_ip" udp dport 443 accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter forward ip saddr "$backend_ip" ct state established,related accept 2>/dev/null || true
-    fi
-}
-
-ensure_iptables_jump() {
-    local table="$1" parent="$2" child="$3"
-    iptables ${table:+-t "$table"} -N "$child" 2>/dev/null || true
-    iptables ${table:+-t "$table"} -C "$parent" -j "$child" 2>/dev/null || \
-        iptables ${table:+-t "$table"} -I "$parent" 1 -j "$child"
-    iptables ${table:+-t "$table"} -F "$child"
-}
-
-apply_additive_firewall_iptables() {
-    local ssh_ports_csv="$1" client_cidr="$2" reverse_mode="$3" backend_ip="$4" socks_port="$5" socks_cidr="$6" wg_port="$7"
-
-    ensure_iptables_jump "" INPUT PROXY_GATEWAY_INPUT
-    iptables -A PROXY_GATEWAY_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
-    iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports 53,853,8111 -j ACCEPT
-    iptables -A PROXY_GATEWAY_INPUT -p udp --dport 53 -j ACCEPT
-    iptables -A PROXY_GATEWAY_INPUT -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
-    iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports 80,443 -j DROP
-    iptables -A PROXY_GATEWAY_INPUT -s "$client_cidr" -p udp --dport 443 -j ACCEPT
-    iptables -A PROXY_GATEWAY_INPUT -p udp --dport 443 -j DROP
-    if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
-        iptables -A PROXY_GATEWAY_INPUT -s "$socks_cidr" -p tcp --dport "$socks_port" -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -p tcp --dport "$socks_port" -j DROP
-    fi
-    if [[ "$wg_port" =~ ^[0-9]+$ ]]; then
-        iptables -A PROXY_GATEWAY_INPUT -p udp --dport "$wg_port" -j ACCEPT
-    fi
-    iptables -A PROXY_GATEWAY_INPUT -j RETURN
-
-    ensure_iptables_jump nat PREROUTING PROXY_GATEWAY_PREROUTING
-    ensure_iptables_jump nat POSTROUTING PROXY_GATEWAY_POSTROUTING
-    ensure_iptables_jump "" FORWARD PROXY_GATEWAY_FORWARD
-    iptables -A PROXY_GATEWAY_FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-
-    if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
-        iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j DNAT --to-destination "$backend_ip"
-        iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p udp --dport 443 -j DNAT --to-destination "$backend_ip"
-        iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p tcp -m multiport --dports 80,443 -j MASQUERADE
-        iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p udp --dport 443 -j MASQUERADE
-        iptables -A PROXY_GATEWAY_FORWARD -d "$backend_ip" -p tcp -m multiport --dports 80,443 -j ACCEPT
-        iptables -A PROXY_GATEWAY_FORWARD -d "$backend_ip" -p udp --dport 443 -j ACCEPT
-    fi
-    iptables -A PROXY_GATEWAY_FORWARD -j RETURN
-
-    command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
-}
-
-setup_managed_exclusive_firewall() {
-    local ssh_ports_nft="$1" ssh_ports_csv="$2" client_cidr="$3" reverse_mode="$4" backend_ip="$5" socks_port="$6" socks_cidr="$7" wg_port="$8"
-    local socks_nft_rule="" wg_nft_rule="" nft_nat_block=""
-
-    if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
-        socks_nft_rule="        ip saddr ${socks_cidr} tcp dport ${socks_port} accept"
-    fi
-    if [[ "$wg_port" =~ ^[0-9]+$ ]]; then
-        wg_nft_rule="        udp dport ${wg_port} accept"
-    fi
-    if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
-        nft_nat_block="
-table ip proxy_gateway_nat {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-        ip saddr ${client_cidr} tcp dport { 80, 443 } dnat to ${backend_ip}
-        ip saddr ${client_cidr} udp dport 443 dnat to ${backend_ip}
-    }
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ip daddr ${backend_ip} tcp dport { 80, 443 } masquerade
-        ip daddr ${backend_ip} udp dport 443 masquerade
-    }
-}"
-    fi
-
-    if command -v nft >/dev/null 2>&1; then
-        cat > /etc/nftables.conf <<EOF
-#!/usr/sbin/nft -f
-flush ruleset
-
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        ct state established,related accept
-        tcp dport ${ssh_ports_nft} accept
-        tcp dport { 53, 853, 8111 } accept
-        udp dport 53 accept
-        ip saddr ${client_cidr} tcp dport { 80, 443 } accept
-        ip saddr ${client_cidr} udp dport 443 accept
-${socks_nft_rule}
-${wg_nft_rule}
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
-    }
-    chain forward {
-        type filter hook forward priority 0; policy accept;
-    }
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-${nft_nat_block}
-EOF
-        chmod +x /etc/nftables.conf
-        nft -f /etc/nftables.conf 2>/dev/null || true
-        systemctl enable nftables 2>/dev/null || true
-    else
-        iptables -F INPUT
-        iptables -P INPUT DROP
-        iptables -A INPUT -i lo -j ACCEPT
-        iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        iptables -A INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
-        iptables -A INPUT -p tcp -m multiport --dports 53,853,8111 -j ACCEPT
-        iptables -A INPUT -p udp --dport 53 -j ACCEPT
-        iptables -A INPUT -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j ACCEPT
-        iptables -A INPUT -s "$client_cidr" -p udp --dport 443 -j ACCEPT
-        if [[ "$socks_port" =~ ^[0-9]+$ && -n "$socks_cidr" ]]; then
-            iptables -A INPUT -s "$socks_cidr" -p tcp --dport "$socks_port" -j ACCEPT
-        fi
-        if [[ "$wg_port" =~ ^[0-9]+$ ]]; then
-            iptables -A INPUT -p udp --dport "$wg_port" -j ACCEPT
-        fi
-        iptables -A INPUT -p icmp -j ACCEPT
-        iptables -P FORWARD ACCEPT
-        iptables -P OUTPUT ACCEPT
-
-        if [[ "$reverse_mode" == "forward" && -n "$backend_ip" ]]; then
-            ensure_iptables_jump nat PREROUTING PROXY_GATEWAY_PREROUTING
-            ensure_iptables_jump nat POSTROUTING PROXY_GATEWAY_POSTROUTING
-            iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p tcp -m multiport --dports 80,443 -j DNAT --to-destination "$backend_ip"
-            iptables -t nat -A PROXY_GATEWAY_PREROUTING -s "$client_cidr" -p udp --dport 443 -j DNAT --to-destination "$backend_ip"
-            iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p tcp -m multiport --dports 80,443 -j MASQUERADE
-            iptables -t nat -A PROXY_GATEWAY_POSTROUTING -d "$backend_ip" -p udp --dport 443 -j MASQUERADE
-        fi
-        command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
-    fi
-}
-
-setup_firewall() {
-    info "Configuring firewall..."
-    local mode ssh_ports ssh_ports_nft ssh_ports_csv client_cidr reverse_mode backend_ip socks_port="" socks_cidr="" wg_port=""
-
-    mode="$(get_firewall_mode)"
-    ssh_ports="$(get_ssh_ports)"
-    ssh_ports_nft="$(ports_to_nft_set "$ssh_ports")"
-    ssh_ports_csv="$(ports_to_csv "$ssh_ports")"
-    client_cidr="$(get_reverse_proxy_client_cidr)"
-    reverse_mode="$(get_reverse_proxy_mode)"
-    backend_ip="$(get_reverse_proxy_backend_ip)"
-    socks_port=$(cat "${CONF_DIR}/.socks5_port" 2>/dev/null || true)
-    socks_cidr=$(cat "${CONF_DIR}/.socks5_client_cidr" 2>/dev/null || true)
-    wg_port=$(cat "${CONF_DIR}/.wg_port" 2>/dev/null || true)
-
-    case "$mode" in
-        disabled)
-            warn "防火墙模式为 disabled，未修改规则。需要放行 SSH(${ssh_ports})、DNS/DoT、${client_cidr} 到 80/443/TCP 和 443/UDP。"
-            ;;
-        managed-exclusive)
-            setup_managed_exclusive_firewall "$ssh_ports_nft" "$ssh_ports_csv" "$client_cidr" "$reverse_mode" "$backend_ip" "$socks_port" "$socks_cidr" "$wg_port"
-            ;;
-        additive)
-            if command -v nft >/dev/null 2>&1; then
-                apply_additive_firewall_nft "$ssh_ports_nft" "$client_cidr" "$reverse_mode" "$backend_ip" "$socks_port" "$socks_cidr" "$wg_port"
-            else
-                apply_additive_firewall_iptables "$ssh_ports_csv" "$client_cidr" "$reverse_mode" "$backend_ip" "$socks_port" "$socks_cidr" "$wg_port"
-            fi
-            ;;
-    esac
-
-    ok "Firewall configured (mode: ${mode}, SSH ports: ${ssh_ports}, reverse proxy whitelist: ${client_cidr})"
-}
-
-setup_socks_only_firewall() {
-    local socks_port="$1"
-    local allow_cidr="$2"
-    local mode ssh_ports ssh_ports_nft ssh_ports_csv
-    info "Configuring SOCKS5-only firewall..."
-
-    mode="$(get_firewall_mode)"
-    ssh_ports="$(get_ssh_ports)"
-    ssh_ports_nft="$(ports_to_nft_set "$ssh_ports")"
-    ssh_ports_csv="$(ports_to_csv "$ssh_ports")"
-
-    if [[ "$mode" == "disabled" ]]; then
-        warn "防火墙模式为 disabled，未修改规则。需要允许 ${allow_cidr} 访问 TCP/${socks_port}。"
-    elif [[ "$mode" == "managed-exclusive" ]]; then
-        if command -v nft >/dev/null 2>&1; then
-            cat > /etc/nftables.conf <<EOF
-#!/usr/sbin/nft -f
-flush ruleset
-
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        ct state established,related accept
-        tcp dport ${ssh_ports_nft} accept
-        ip saddr ${allow_cidr} tcp dport ${socks_port} accept
-        ip protocol icmp accept
-        ip6 nexthdr icmpv6 accept
-    }
-    chain forward {
-        type filter hook forward priority 0; policy accept;
-    }
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-EOF
-            chmod +x /etc/nftables.conf
-            nft -f /etc/nftables.conf 2>/dev/null || true
-            systemctl enable nftables 2>/dev/null || true
-        else
-            iptables -F INPUT
-            iptables -P INPUT DROP
-            iptables -A INPUT -i lo -j ACCEPT
-            iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-            iptables -A INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
-            iptables -A INPUT -s "$allow_cidr" -p tcp --dport "$socks_port" -j ACCEPT
-            iptables -A INPUT -p icmp -j ACCEPT
-            iptables -P FORWARD ACCEPT
-            iptables -P OUTPUT ACCEPT
-            command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
-        fi
-    elif command -v nft >/dev/null 2>&1; then
-        nft add table inet proxy_gateway_filter 2>/dev/null || true
-        nft add chain inet proxy_gateway_filter input '{ type filter hook input priority -100; policy accept; }' 2>/dev/null || true
-        nft flush chain inet proxy_gateway_filter input 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input ct state established,related accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input tcp dport ${ssh_ports_nft} accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input ip saddr "$allow_cidr" tcp dport "$socks_port" accept 2>/dev/null || true
-        nft add rule inet proxy_gateway_filter input tcp dport "$socks_port" drop 2>/dev/null || true
-    else
-        ensure_iptables_jump "" INPUT PROXY_GATEWAY_INPUT
-        iptables -A PROXY_GATEWAY_INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -p tcp -m multiport --dports "$ssh_ports_csv" -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -s "$allow_cidr" -p tcp --dport "$socks_port" -j ACCEPT
-        iptables -A PROXY_GATEWAY_INPUT -p tcp --dport "$socks_port" -j DROP
-        iptables -A PROXY_GATEWAY_INPUT -j RETURN
-        command -v iptables-save >/dev/null 2>&1 && iptables-save > /etc/iptables.rules 2>/dev/null || true
-    fi
-    ok "SOCKS5-only firewall configured (mode: ${mode}, SSH ports: ${ssh_ports})"
-}
-
-open_cert_http_port() {
-    info "Temporarily opening TCP/80 for Let's Encrypt HTTP-01..."
-
-    if command -v nft >/dev/null 2>&1 && nft list chain inet proxy_gateway_filter input >/dev/null 2>&1; then
-        nft insert rule inet proxy_gateway_filter input tcp dport 80 accept comment "proxy-gateway-cert-http" 2>/dev/null || true
-    elif command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then
-        nft insert rule inet filter input tcp dport 80 accept 2>/dev/null || true
-    elif command -v iptables >/dev/null 2>&1; then
-        if iptables -L PROXY_GATEWAY_INPUT >/dev/null 2>&1; then
-            iptables -I PROXY_GATEWAY_INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
-        else
-            iptables -I INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
-        fi
-    fi
-}
-
-restore_reverse_proxy_firewall() {
-    info "Restoring reverse proxy firewall whitelist..."
-    setup_firewall >/dev/null 2>&1 || true
-}
-
-install_certbot_firewall_hooks() {
-    mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
-
-    cat > /usr/local/bin/proxy-gateway-open-cert-http.sh <<'EOF'
-#!/bin/bash
-set -e
-if command -v nft >/dev/null 2>&1 && nft list chain inet proxy_gateway_filter input >/dev/null 2>&1; then
-    nft insert rule inet proxy_gateway_filter input tcp dport 80 accept comment "proxy-gateway-cert-http" 2>/dev/null || true
-elif command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then
-    nft insert rule inet filter input tcp dport 80 accept 2>/dev/null || true
-elif command -v iptables >/dev/null 2>&1; then
-    if iptables -L PROXY_GATEWAY_INPUT >/dev/null 2>&1; then
-        iptables -I PROXY_GATEWAY_INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
-    else
-        iptables -I INPUT 1 -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null || true
-    fi
+pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
+
+# pdg-mitm: MITM 插件服务(Feature B, 仅 iOS)。按 /etc/privdns-gateway/mitm.json 加载启用的插件。
+if [[ "$PLATFORM" == ios ]]; then
+  pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
 fi
-EOF
-    cat > /usr/local/bin/proxy-gateway-restore-firewall.sh <<'EOF'
-#!/bin/bash
-set -e
-if command -v nft >/dev/null 2>&1 && nft list chain inet proxy_gateway_filter input >/dev/null 2>&1; then
-    for handle in $(nft -a list chain inet proxy_gateway_filter input | awk '/proxy-gateway-cert-http/ {print $NF}'); do
-        nft delete rule inet proxy_gateway_filter input handle "$handle" 2>/dev/null || true
-    done
-elif command -v nft >/dev/null 2>&1 && [[ -f /etc/nftables.conf ]]; then
-    nft -f /etc/nftables.conf 2>/dev/null || true
-elif command -v iptables >/dev/null 2>&1; then
-    while iptables -D PROXY_GATEWAY_INPUT -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D INPUT -p tcp --dport 80 -m comment --comment proxy-gateway-cert-http -j ACCEPT 2>/dev/null; do :; done
+
+# ── 6. DoT 证书 ──
+if [[ -n "${PDG_SKIP_CERT:-}" ]]; then
+  c_y "PDG_SKIP_CERT: 跳过 certbot, 生成自签占位证书 (生产请用 bot『🌐 DoT 自定义域名』补正式证书)"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$CERT_DIR/privkey.pem" \
+    -out "$CERT_DIR/fullchain.pem" -days 3650 -subj "/CN=$DOT_DOMAIN" >/dev/null 2>&1
+  chmod 644 "$CERT_DIR/fullchain.pem"; chmod 600 "$CERT_DIR/privkey.pem"
+  echo "$DOT_DOMAIN" > /opt/pdg-bot/dot-domain
+else
+  echo
+  c_y "现在签 DoT 证书。请先确认: $DOT_DOMAIN 的 A 记录已指向 $SERVER_IP"
+  c_y "(Cloudflare 等用『灰云 / DNS only』, 不要开代理; 等生效后再继续)"
+  # 交互暂停确认 A 记录: 撞 EOF/无终端不该触发 errexit → 直接继续(等同回车); Ctrl-C 仍能中止。
+  if [[ -z "$NONINT" ]] && { true < /dev/tty; } 2>/dev/null; then
+    read -rp "A 记录已指好? 回车继续签发 / Ctrl-C 退出去配 DNS: " _ < /dev/tty || true
+  fi
+  certbot certonly --standalone -d "$DOT_DOMAIN" --non-interactive --agree-tos \
+    --register-unsafely-without-email --keep-until-expiring \
+    --pre-hook  /usr/local/bin/proxy-gateway-open-cert-http.sh \
+    --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh \
+    || die "证书签发失败: 检查 A 记录是否已生效、80 口是否能从公网到达"
+  echo "$DOT_DOMAIN" > /opt/pdg-bot/dot-domain
+  install -m644 "/etc/letsencrypt/live/$DOT_DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
+  install -m600 "/etc/letsencrypt/live/$DOT_DOMAIN/privkey.pem"   "$CERT_DIR/privkey.pem"
 fi
+
+# ── 7. geosite 规则库 (此时 DNS 仍可用) ──
+c_g "下载并解析 geosite 规则库…"
+bash /opt/pdg-bot/update-rules.sh || c_y "geosite 下载失败, 装好后可在 bot『更新规则库』重试"
+
+# ── 8. 启动 ──
+c_g "启动服务…"
+# 释放 53 口: systemd-resolved 的 stub 占 127.0.0.53:53, 会和 mosdns 0.0.0.0:53 冲突
+# 先备份原 resolv.conf(含符号链接), 供 uninstall 恢复
+[[ -e /etc/resolv.conf.pdg-orig ]] || cp -a /etc/resolv.conf /etc/resolv.conf.pdg-orig 2>/dev/null || true
+# LXC/Docker 之类的环境把 /etc/resolv.conf **bind-mount** 进来: 删不掉(EBUSY), 但能原地写。
+# 直接 `rm -f` 会被 set -e 判成致命错误, 整场安装在这里中止并转入回滚 —— 而回滚打印的是
+# "安装失败", 真原因(删不掉 resolv.conf)反倒看不见。删不掉就原地覆盖内容即可。
+# 连写都写不进去(只读挂载)也不该中止: 那只影响**网关自己**解析用哪个上游, 转发链路照常。
+_write_resolv(){
+  rm -f /etc/resolv.conf 2>/dev/null || true    # 常见是指向 resolved stub 的符号链接, 删掉才落得下实文件
+  printf '%s\n' "$@" > /etc/resolv.conf 2>/dev/null \
+    || c_y "写不了 /etc/resolv.conf(只读挂载?), 本机自身 DNS 维持原样; 转发不受影响。"
+}
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+  systemctl disable --now systemd-resolved 2>/dev/null && RESOLVED_DISABLED=1 || true
+fi
+_write_resolv "nameserver 1.1.1.1"
+systemctl daemon-reload
+systemctl restart systemd-journald
+systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
+# pdg-probe81 / pdg-mitm 仅 iOS: Android 不启 :81 探测、不起 MITM 服务。
+[[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
+                             systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
+systemctl enable --now pdg-rules-update.timer >/dev/null 2>&1 || true
+systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true
+if [[ -n "$BOT_TOKEN" && -n "$ALLOWED_IDS" ]]; then
+  systemctl enable --now pdg-bot >/dev/null 2>&1 || true
+else
+  systemctl enable pdg-bot >/dev/null 2>&1 || true   # 开机自启; 现在没 token 暂不启动, 用 pdg-set-token 设置后启用
+fi
+_write_resolv "nameserver 127.0.0.1" "nameserver 1.1.1.1"
+
+# ── 9. 防火墙 ──
+c_g "应用防火墙…"
+systemctl enable nftables >/dev/null 2>&1 || true
+nft -f /etc/nftables.conf
+
+# ── 提交点前: 确认核心服务"持续"起来了 ──
+# systemd 默认 Type=simple, `systemctl start` 返 0 只代表 exec 成功, 进程可能随即崩溃。
+# 单看一次 active 有竞态(起来又崩) → 要求连续 3 次保持 active 才算稳(flapping 的 failed/activating 会打断)。
+c_g "校验核心服务(需连续保持 active, 防起来又崩)…"
+# 按平台的必需服务: pdg-probe81 仅 iOS(Android 不装/不起, 不纳入门槛, 否则 Android 装机误判失败回滚)。
+PLAT_SVCS=(mosdns "$CORE_SVC"); [[ "$PLATFORM" == ios ]] && PLAT_SVCS+=(pdg-probe81)
+svc_ok=0; streak=0
+for _ in $(seq 1 20); do
+  allact=1
+  for s in "${PLAT_SVCS[@]}"; do
+    [[ "$(systemctl is-active "$s" 2>/dev/null)" == active ]] || allact=0
+  done
+  if [[ "$allact" == 1 ]]; then streak=$((streak+1)); else streak=0; fi
+  [[ "$streak" -ge 3 ]] && { svc_ok=1; break; }
+  sleep 1
+done
+if [[ "$svc_ok" != 1 ]]; then
+  for s in "${PLAT_SVCS[@]}"; do printf '  %-12s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"; done
+  journalctl -u mosdns -u "$CORE_SVC" -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
+  die "核心服务未能持续保持运行(见上日志)。"   # → 触发回滚
+fi
+INSTALL_OK=1   # 提交点: 核心服务已确认稳定 active, 后面只是打印, 不再回滚
+
+# ── 10. 自检 ──
+echo; c_g "安装完成($PLATFORM 平台)。状态:"
+for s in mosdns "$CORE_SVC" pdg-bot "${PLAT_SVCS[@]:2}"; do printf "  %-12s %s\n" "$s" "$(systemctl is-active "$s")"; done
+if [[ -z "$BOT_TOKEN" || -z "$ALLOWED_IDS" ]]; then
+  echo; c_y "⚠️ 管理 bot 未启用(没填 token)。出口和分流规则都在 bot 里设——"
+  c_y "   现在还没法配代理。先跑:  sudo pdg-set-token  设好 token, 再给 bot 发 /start。"
+fi
+cat <<EOF
+
+下一步($PLATFORM 平台):
+  1) $( [[ "$PLATFORM" == ios ]] && echo "iOS:见第 3 步生成并安装 iOS 描述文件(DoT 域名:$DOT_DOMAIN)" || echo "手机「私密 DNS」填:  $DOT_DOMAIN" )
+  $( [[ -z "$BOT_TOKEN" || -z "$ALLOWED_IDS" ]] && echo "2) 启用管理 bot:  sudo pdg-set-token  (之后再发 /start)" || echo "2) Telegram 给你的 bot 发 /start, 然后:" )
+       • 「📤 出口管理 → 添加」粘贴 ss:// / vmess:// / trojan:// / vless:// 落地节点
+       • 「📑 分流管理」按需把域名/规则集指到出口 (默认其余国际走 jp 直出)
+  $( [[ "$PLATFORM" == ios ]] && echo "3) iOS:bot「📱 客户端 → iOS 描述文件」生成并安装(Wi-Fi/蜂窝由 :81 探测激活)" || echo "3) Android:私密 DNS 填上面的 DoT 域名即可" )
+  4) 换域名随时用 bot「🌐 DoT 自定义域名」
+
+🛠 日常管理:  sudo pdg   (状态 / 更新 / 换 token / 重启 / 日志 / 卸载)
+⚠️ SSH 端口当前按 $SSH_PORT 放行; 若你之后改 sshd Port, 记得同步改 /etc/nftables.conf 再 nft -f。
 EOF
-    chmod +x /usr/local/bin/proxy-gateway-open-cert-http.sh /usr/local/bin/proxy-gateway-restore-firewall.sh
-    cp /usr/local/bin/proxy-gateway-open-cert-http.sh /etc/letsencrypt/renewal-hooks/pre/10-proxy-gateway-open-http.sh
-    cp /usr/local/bin/proxy-gateway-restore-firewall.sh /etc/letsencrypt/renewal-hooks/post/90-proxy-gateway-restore-firewall.sh
-    chmod +x /etc/letsencrypt/renewal-hooks/pre/10-proxy-gateway-open-http.sh \
-        /etc/letsencrypt/renewal-hooks/post/90-proxy-gateway-restore-firewall.sh
-}
-
-# =============================================================================
-# Optional RethinkDNS WireGuard fallback
-# =============================================================================
-install_wireguard_fallback() {
-    check_root
-    detect_os
-    get_public_ip 2>/dev/null || true
-    local wg_port server_addr client_addr wan_if answer
-    local server_private server_public client_private client_public
-
-    tty_read wg_port "WireGuard listen UDP port" "$DEFAULT_WG_PORT"
-    [[ "$wg_port" =~ ^[0-9]+$ ]] || { err "Invalid WireGuard port: $wg_port"; return 1; }
-    tty_read server_addr "WireGuard server tunnel address" "$DEFAULT_WG_SERVER_ADDR"
-    tty_read client_addr "RethinkDNS client tunnel address" "$DEFAULT_WG_CLIENT_ADDR"
-
-    if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
-        info "Installing wireguard-tools..."
-        if [[ "$PKG_MANAGER" == "apt" ]]; then
-            apt-get update -y
-            DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard-tools iptables
-        else
-            $PKG_MANAGER install -y wireguard-tools iptables
-        fi
-    fi
-
-    mkdir -p /etc/wireguard "$CONF_DIR" "${BASE_DIR}/wireguard"
-    chmod 700 /etc/wireguard
-
-    server_private=$(wg genkey)
-    server_public=$(printf '%s' "$server_private" | wg pubkey)
-    client_private=$(wg genkey)
-    client_public=$(printf '%s' "$client_private" | wg pubkey)
-    wan_if=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-    wan_if="${wan_if:-eth0}"
-
-    cat > /etc/wireguard/pgw-rdns.conf <<EOF
-[Interface]
-Address = ${server_addr}
-ListenPort = ${wg_port}
-PrivateKey = ${server_private}
-PostUp = iptables -t nat -A POSTROUTING -s ${client_addr%/*} -o ${wan_if} -j MASQUERADE; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -s ${client_addr%/*} -o ${wan_if} -j MASQUERADE; iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT
-
-[Peer]
-PublicKey = ${client_public}
-AllowedIPs = ${client_addr}
-EOF
-    chmod 600 /etc/wireguard/pgw-rdns.conf
-
-    cat > "${BASE_DIR}/wireguard/rethinkdns-client.conf" <<EOF
-[Interface]
-PrivateKey = ${client_private}
-Address = ${client_addr}
-DNS = ${PUBLIC_IP:-}
-
-[Peer]
-PublicKey = ${server_public}
-Endpoint = ${PUBLIC_IP:-<VPS1-IP>}:${wg_port}
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-EOF
-    chmod 600 "${BASE_DIR}/wireguard/rethinkdns-client.conf"
-
-    echo "$wg_port" > "${CONF_DIR}/.wg_port"
-    setup_firewall
-    systemctl enable --now wg-quick@pgw-rdns
-
-    ok "WireGuard fallback installed"
-    echo "Client config: ${BASE_DIR}/wireguard/rethinkdns-client.conf"
-    tty_yes_no answer "Show client config now?" "Y"
-    if [[ "$answer" == "y" ]]; then
-        cat "${BASE_DIR}/wireguard/rethinkdns-client.conf"
-        pause_return
-    fi
-}
-
-# =============================================================================
-# Optional RethinkDNS SOCKS5 fallback (sing-box)
-# =============================================================================
-find_singbox_candidate() {
-    SINGBOX_BIN=""
-    SINGBOX_CONFIG=""
-    SINGBOX_SERVICE=""
-
-    local home_dir candidate_bin candidate_config unit process_line
-    for home_dir in "${HOME:-}" /root; do
-        [[ -z "$home_dir" ]] && continue
-        candidate_bin="${home_dir}/agsbx/sing-box"
-        candidate_config="${home_dir}/agsbx/sb.json"
-        if [[ -x "$candidate_bin" && -f "$candidate_config" ]]; then
-            SINGBOX_BIN="$candidate_bin"
-            SINGBOX_CONFIG="$candidate_config"
-            SINGBOX_SERVICE=""
-            return 0
-        fi
-    done
-
-    process_line=$(pgrep -af 'sing-box.*run.*-c|agsbx/.*/s|agsbx/sing-box' 2>/dev/null | head -n1 || true)
-    if [[ -n "$process_line" ]]; then
-        SINGBOX_BIN=$(awk '{for (i=2;i<=NF;i++) if ($i ~ /sing-box$/ || $i ~ /agsbx\/s$/) {print $i; exit}}' <<< "$process_line")
-        SINGBOX_CONFIG=$(sed -n 's/.*-c[ =]\([^ ]*\.json\).*/\1/p' <<< "$process_line" | head -n1)
-        [[ -n "$SINGBOX_BIN" && -n "$SINGBOX_CONFIG" ]] && return 0
-    fi
-
-    if command -v sing-box >/dev/null 2>&1; then
-        SINGBOX_BIN=$(command -v sing-box)
-        for candidate_config in /etc/sing-box/config.json /usr/local/etc/sing-box/config.json; do
-            if [[ -f "$candidate_config" ]]; then
-                SINGBOX_CONFIG="$candidate_config"
-                break
-            fi
-        done
-        unit=$(systemctl list-units --type=service --all 'sing*box*.service' --no-legend 2>/dev/null | awk '{print $1; exit}' || true)
-        SINGBOX_SERVICE="$unit"
-        [[ -n "$SINGBOX_CONFIG" ]] && return 0
-    fi
-
-    return 1
-}
-
-install_singbox_if_missing() {
-    local installer
-    if command -v sing-box >/dev/null 2>&1; then
-        SINGBOX_BIN=$(command -v sing-box)
-        return 0
-    fi
-    info "Installing sing-box from official install script..."
-    installer=$(mktemp)
-    curl -fsSL https://sing-box.app/install.sh -o "$installer"
-    sh "$installer"
-    rm -f "$installer"
-    SINGBOX_BIN=$(command -v sing-box || true)
-    [[ -n "$SINGBOX_BIN" ]] || { err "sing-box installation failed"; return 1; }
-}
-
-write_singbox_socks_config() {
-    local output_path="$1"
-    local listen_addr="$2"
-    local listen_port="$3"
-    local username="$4"
-    local password="$5"
-    local upstream_host="$6"
-    local upstream_port="$7"
-    local upstream_user="$8"
-    local upstream_pass="$9"
-
-    python3 - "$output_path" "$listen_addr" "$listen_port" "$username" "$password" "$upstream_host" "$upstream_port" "$upstream_user" "$upstream_pass" <<'PYEOF'
-import json
-import os
-import sys
-
-path, listen_addr, listen_port, username, password, upstream_host, upstream_port, upstream_user, upstream_pass = sys.argv[1:10]
-data = {}
-if os.path.exists(path):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-data.setdefault("log", {"level": "info"})
-inbounds = [x for x in data.get("inbounds", []) if x.get("tag") != "proxy-gateway-socks-in"]
-outbounds = [x for x in data.get("outbounds", []) if x.get("tag") != "proxy-gateway-socks-out"]
-
-inbounds.append({
-    "type": "socks",
-    "tag": "proxy-gateway-socks-in",
-    "listen": listen_addr,
-    "listen_port": int(listen_port),
-    "users": [{"username": username, "password": password}],
-})
-if upstream_host:
-    outbounds.append({
-        "type": "socks",
-        "tag": "proxy-gateway-socks-out",
-        "server": upstream_host,
-        "server_port": int(upstream_port or 1080),
-        "version": "5",
-        "username": upstream_user,
-        "password": upstream_pass,
-    })
-else:
-    outbounds.append({"type": "direct", "tag": "proxy-gateway-socks-out"})
-
-route = data.setdefault("route", {})
-rules = [x for x in route.get("rules", []) if x.get("outbound") != "proxy-gateway-socks-out"]
-rules.insert(0, {"inbound": ["proxy-gateway-socks-in"], "outbound": "proxy-gateway-socks-out"})
-route["rules"] = rules
-data["inbounds"] = inbounds
-data["outbounds"] = outbounds
-
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-PYEOF
-}
-
-restart_singbox_candidate() {
-    local service="$1"
-    local bin="$2"
-    local config="$3"
-    if [[ -n "$service" ]]; then
-        systemctl restart "$service"
-    else
-        warn "No systemd service detected for existing sing-box. Restart it manually if argosbx does not reload automatically:"
-        warn "  ${bin} run -c ${config}"
-    fi
-}
-
-install_socks5_fallback() {
-    check_root
-    get_public_ip 2>/dev/null || true
-    local listen_addr="0.0.0.0" listen_port username password client_cidr
-    local upstream_enabled upstream_host upstream_port upstream_user upstream_pass
-    local action="" tmp_config backup_config answer
-
-    tty_read listen_addr "SOCKS5 listen address" "0.0.0.0"
-    tty_read listen_port "SOCKS5 listen port" "$DEFAULT_SOCKS5_PORT"
-    [[ "$listen_port" =~ ^[0-9]+$ ]] || { err "Invalid SOCKS5 port: $listen_port"; return 1; }
-    tty_read username "SOCKS5 username" "$DEFAULT_SOCKS5_USER"
-    password=$(random_secret)
-    tty_read password "SOCKS5 password" "$password"
-    tty_read client_cidr "Allowed client CIDR" "$DEFAULT_CLIENT_CIDR"
-    tty_yes_no upstream_enabled "Chain this SOCKS5 inbound to a VPS2 SOCKS5 upstream?" "N"
-    if [[ "$upstream_enabled" == "y" ]]; then
-        tty_read upstream_host "VPS2 SOCKS5 host" ""
-        tty_read upstream_port "VPS2 SOCKS5 port" "$DEFAULT_SOCKS5_PORT"
-        tty_read upstream_user "VPS2 SOCKS5 username" "$DEFAULT_SOCKS5_USER"
-        tty_read upstream_pass "VPS2 SOCKS5 password" ""
-    else
-        upstream_host=""
-        upstream_port=""
-        upstream_user=""
-        upstream_pass=""
-    fi
-
-    mkdir -p "$CONF_DIR"
-    echo "$listen_port" > "${CONF_DIR}/.socks5_port"
-    echo "$client_cidr" > "${CONF_DIR}/.socks5_client_cidr"
-
-    if find_singbox_candidate; then
-        echo ""
-        echo "Detected existing sing-box:"
-        echo "  Binary: ${SINGBOX_BIN}"
-        echo "  Config: ${SINGBOX_CONFIG}"
-        echo "  Service: ${SINGBOX_SERVICE:-none detected}"
-        echo ""
-        echo "请选择 SOCKS5 安装方式："
-        echo "  1) 复用现有 sing-box，备份并追加 inbound（推荐）"
-        echo "  2) 新建独立 proxy-gateway-socks.service"
-        echo "  3) 跳过 SOCKS5"
-        while true; do
-            tty_read action "请输入序号 (1-3)" "1"
-            case "$action" in
-                1|2|3) break ;;
-                *) warn "无效输入，请重新输入 1-3 之间的数字" ;;
-            esac
-        done
-    else
-        action="2"
-    fi
-
-    case "$action" in
-        1)
-            tmp_config=$(mktemp)
-            backup_config="${SINGBOX_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-            cp "$SINGBOX_CONFIG" "$tmp_config"
-            write_singbox_socks_config "$tmp_config" "$listen_addr" "$listen_port" "$username" "$password" "$upstream_host" "$upstream_port" "$upstream_user" "$upstream_pass"
-            if "$SINGBOX_BIN" check -c "$tmp_config"; then
-                cp "$SINGBOX_CONFIG" "$backup_config"
-                cp "$tmp_config" "$SINGBOX_CONFIG"
-                restart_singbox_candidate "$SINGBOX_SERVICE" "$SINGBOX_BIN" "$SINGBOX_CONFIG"
-                ok "SOCKS5 inbound added to existing sing-box"
-                echo "Backup: $backup_config"
-            else
-                rm -f "$tmp_config"
-                err "sing-box config check failed; existing config unchanged"
-                return 1
-            fi
-            rm -f "$tmp_config"
-            ;;
-        2)
-            install_singbox_if_missing
-            mkdir -p /etc/sing-box /etc/systemd/system
-            write_singbox_socks_config /etc/sing-box/proxy-gateway-socks.json "$listen_addr" "$listen_port" "$username" "$password" "$upstream_host" "$upstream_port" "$upstream_user" "$upstream_pass"
-            "$SINGBOX_BIN" check -c /etc/sing-box/proxy-gateway-socks.json
-            cat > /etc/systemd/system/proxy-gateway-socks.service <<EOF
-[Unit]
-Description=Proxy Gateway SOCKS5 fallback
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${SINGBOX_BIN} run -c /etc/sing-box/proxy-gateway-socks.json
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            systemctl daemon-reload
-            systemctl enable --now proxy-gateway-socks
-            ok "Independent SOCKS5 service installed"
-            ;;
-        3)
-            warn "SOCKS5 setup skipped"
-            return 0
-            ;;
-    esac
-
-    setup_firewall
-    echo ""
-    echo "SOCKS5 for RethinkDNS:"
-    echo "  Host: ${PUBLIC_IP:-<VPS1-IP>}"
-    echo "  Port: ${listen_port}"
-    echo "  Username: ${username}"
-    echo "  Password: ${password}"
-    echo "  Allowed source: ${client_cidr}"
-    pause_return
-}
-
-install_vps2_socks_exit() {
-    check_root
-    get_public_ip 2>/dev/null || true
-    local listen_addr="0.0.0.0" listen_port username password allow_cidr
-
-    tty_read listen_addr "VPS2 SOCKS5 listen address" "0.0.0.0"
-    tty_read listen_port "VPS2 SOCKS5 listen port" "$DEFAULT_SOCKS5_PORT"
-    tty_read username "VPS2 SOCKS5 username" "$DEFAULT_SOCKS5_USER"
-    password=$(random_secret)
-    tty_read password "VPS2 SOCKS5 password" "$password"
-    tty_read allow_cidr "Allowed VPS1 IP/CIDR" ""
-    [[ -z "$allow_cidr" ]] && { err "Allowed VPS1 IP/CIDR is required"; return 1; }
-
-    mkdir -p "$CONF_DIR"
-    echo "$listen_port" > "${CONF_DIR}/.socks5_port"
-    echo "$allow_cidr" > "${CONF_DIR}/.socks5_client_cidr"
-    install_singbox_if_missing
-    mkdir -p /etc/sing-box
-    write_singbox_socks_config /etc/sing-box/proxy-gateway-upstream-socks.json "$listen_addr" "$listen_port" "$username" "$password" "" "" "" ""
-    "$SINGBOX_BIN" check -c /etc/sing-box/proxy-gateway-upstream-socks.json
-    cat > /etc/systemd/system/proxy-gateway-upstream-socks.service <<EOF
-[Unit]
-Description=Proxy Gateway upstream SOCKS5 exit
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${SINGBOX_BIN} run -c /etc/sing-box/proxy-gateway-upstream-socks.json
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable --now proxy-gateway-upstream-socks
-    setup_socks_only_firewall "$listen_port" "$allow_cidr"
-
-    ok "VPS2 SOCKS5 exit installed"
-    echo "VPS2 SOCKS5 address: ${PUBLIC_IP:-<VPS2-IP>}"
-    echo "VPS2 SOCKS5 port: ${listen_port}"
-    echo "VPS2 SOCKS5 username: ${username}"
-    echo "VPS2 SOCKS5 password: ${password}"
-    pause_return
-}
-
-# =============================================================================
-# Start services
-# =============================================================================
-start_services() {
-    info "Starting services..."
-    systemctl restart china-dns-race-proxy || { err "china-dns-race-proxy failed to start"; journalctl -u china-dns-race-proxy --no-pager -n 20; exit 1; }
-    systemctl restart dnsdist || { err "dnsdist failed to start"; journalctl -u dnsdist --no-pager -n 20; exit 1; }
-    if [[ "$(get_reverse_proxy_mode)" == "forward" ]]; then
-        stop_local_reverse_proxy_services
-    else
-        systemctl restart sniproxy || { err "sniproxy failed to start"; journalctl -u sniproxy --no-pager -n 20; exit 1; }
-        systemctl restart quic-proxy || { err "quic-proxy failed to start"; journalctl -u quic-proxy --no-pager -n 20; exit 1; }
-    fi
-    ok "All services started"
-}
-
-# =============================================================================
-# Cron / Systemd timers
-# =============================================================================
-setup_schedules() {
-    info "Setting up automatic updates..."
-
-    # Weekly rule update (Sunday 03:00)
-    cat > /etc/systemd/system/update-dnsdist-rules.timer <<'EOF'
-[Unit]
-Description=Weekly dnsdist rules update
-
-[Timer]
-OnCalendar=Sun *-*-* 03:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    cat > /etc/systemd/system/update-dnsdist-rules.service <<'EOF'
-[Unit]
-Description=Update dnsdist GFWList/ChinaList rules
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/update-dnsdist-rules.sh
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now update-dnsdist-rules.timer
-
-    install_certbot_firewall_hooks
-
-    # Ensure certbot timer is enabled
-    systemctl enable --now certbot.timer 2>/dev/null || true
-
-    ok "Schedules configured (rules: weekly, cert: auto)"
-}
-
-# =============================================================================
-# Status / Uninstall / Helpers
-# =============================================================================
-show_status() {
-    echo "=========================================="
-    echo "      Proxy Gateway Status"
-    echo "=========================================="
-    for svc in dnsdist sniproxy quic-proxy china-dns-race-proxy proxy-gateway-ios-profile proxy-gateway-socks proxy-gateway-upstream-socks wg-quick@pgw-rdns; do
-        status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
-        if [[ "$status" == "active" ]]; then
-            echo -e "$svc: ${GREEN}running${NC}"
-        else
-            echo -e "$svc: ${RED}$status${NC}"
-        fi
-    done
-    echo ""
-    if [[ -f "${CONF_DIR}/.domain" ]]; then
-        echo "Domain: $(cat "${CONF_DIR}/.domain")"
-    fi
-    if [[ -f "${CONF_DIR}/.other_policy" ]]; then
-        echo "Other policy: $(cat "${CONF_DIR}/.other_policy")"
-    fi
-    if [[ -f "${CONF_DIR}/.cache_size" ]]; then
-        echo "DNS cache size: $(cat "${CONF_DIR}/.cache_size")"
-    fi
-    if [[ -f "${CONF_DIR}/.firewall_mode" ]]; then
-        echo "Firewall mode: $(cat "${CONF_DIR}/.firewall_mode")"
-    fi
-    if [[ -f "${CONF_DIR}/.ssh_ports" ]]; then
-        echo "SSH ports preserved: $(cat "${CONF_DIR}/.ssh_ports")"
-    fi
-    if [[ -f "${CONF_DIR}/.reverse_proxy_mode" ]]; then
-        echo "Reverse proxy mode: $(cat "${CONF_DIR}/.reverse_proxy_mode")"
-    fi
-    if [[ -f "${CONF_DIR}/.reverse_proxy_backend_ip" ]]; then
-        echo "Reverse proxy backend: $(cat "${CONF_DIR}/.reverse_proxy_backend_ip")"
-    fi
-    if [[ -f "${CONF_DIR}/.reverse_proxy_client_cidr" ]]; then
-        echo "Reverse proxy client CIDR: $(cat "${CONF_DIR}/.reverse_proxy_client_cidr")"
-    fi
-    if [[ -f "${CONF_DIR}/.socks5_port" ]]; then
-        echo "SOCKS5 port: $(cat "${CONF_DIR}/.socks5_port")"
-    fi
-    if [[ -f "${CONF_DIR}/.wg_port" ]]; then
-        echo "WireGuard port: $(cat "${CONF_DIR}/.wg_port")"
-    fi
-    echo "Public IP: ${PUBLIC_IP:-N/A}"
-    echo "=========================================="
-}
-
-do_uninstall() {
-    warn "这会删除 proxy-gateway 服务、dnsdist 配置、可选 SOCKS5/WireGuard 单元和规则。"
-    tty_read confirm "确认卸载？[y/N]" ""
-    [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消卸载"; exit 0; }
-
-    systemctl stop dnsdist sniproxy quic-proxy china-dns-race-proxy proxy-gateway-ios-profile proxy-gateway-socks proxy-gateway-upstream-socks wg-quick@pgw-rdns 2>/dev/null || true
-    systemctl disable dnsdist sniproxy quic-proxy china-dns-race-proxy proxy-gateway-ios-profile proxy-gateway-socks proxy-gateway-upstream-socks wg-quick@pgw-rdns 2>/dev/null || true
-    rm -f /etc/systemd/system/{sniproxy,quic-proxy,china-dns-race-proxy,proxy-gateway-ios-profile,update-dnsdist-rules,proxy-gateway-socks,proxy-gateway-upstream-socks}.*
-    systemctl daemon-reload
-
-    rm -rf "$BASE_DIR" /etc/sniproxy.conf /etc/dnsdist /usr/local/bin/update-dnsdist-rules.sh /etc/sing-box/proxy-gateway-socks.json /etc/sing-box/proxy-gateway-upstream-socks.json
-    rm -f /etc/wireguard/pgw-rdns.conf
-    rm -f /usr/local/sbin/sniproxy
-    rm -f /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
-    rm -f /etc/sysctl.d/99-proxy-gateway.conf
-    rm -f /etc/profile.d/go.sh
-
-    # Optionally remove certbot certs
-    warn "SSL certificates in /etc/letsencrypt/live/ are kept. Remove manually if needed."
-
-    ok "Uninstall completed"
-}
-
-force_renew_cert() {
-    if [[ -f "${CONF_DIR}/.domain" ]]; then
-        DOMAIN=$(cat "${CONF_DIR}/.domain")
-    fi
-    if [[ -z "${DOMAIN:-}" ]]; then
-        err "No domain found. Cannot renew."
-        exit 1
-    fi
-
-    local certbot_cmd
-    certbot_cmd=(certbot certonly --standalone -d "$DOMAIN" --force-renewal \
-        --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
-        --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
-        --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
-
-    open_cert_http_port
-    trap restore_reverse_proxy_firewall RETURN
-
-    if ! "${certbot_cmd[@]}"; then
-        # Check for known Python compatibility error
-        if certbot --version 2>&1 | grep -q "AttributeError" || \
-           "${certbot_cmd[@]}" 2>&1 | grep -q "AttributeError"; then
-            warn "Certbot compatibility error detected. Attempting to fix Python dependencies..."
-            pip3 install --upgrade --break-system-packages certbot josepy cryptography 2>/dev/null || \
-                pip3 install --upgrade certbot josepy cryptography 2>/dev/null || true
-            info "Retrying certificate renewal..."
-            "${certbot_cmd[@]}" || { err "Certificate renewal failed"; exit 1; }
-        else
-            err "Certificate renewal failed"
-            exit 1
-        fi
-    fi
-
-    # Re-copy certificates to dnsdist-readable location
-    local cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
-    if [[ -d "$cert_live_dir" ]]; then
-        mkdir -p /etc/dnsdist/certs
-        cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
-        cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
-        chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
-        chmod 640 /etc/dnsdist/certs/*.pem
-    fi
-
-    if systemctl is-active --quiet dnsdist; then
-        systemctl reload dnsdist && ok "Certificate renewed and dnsdist reloaded"
-    else
-        systemctl start dnsdist && ok "Certificate renewed and dnsdist started"
-    fi
-}
-
-regenerate_ios_profile() {
-    if [[ -f "${CONF_DIR}/.domain" ]]; then
-        DOMAIN=$(cat "${CONF_DIR}/.domain")
-    elif [[ -f /etc/dnsdist/.domain ]]; then
-        DOMAIN=$(cat /etc/dnsdist/.domain)
-    fi
-
-    if [[ -f /etc/dnsdist/.public_ip ]]; then
-        PUBLIC_IP=$(cat /etc/dnsdist/.public_ip)
-    else
-        get_public_ip
-    fi
-
-    if [[ -z "${DOMAIN:-}" ]]; then
-        err "No domain found. Cannot generate iOS profile."
-        exit 1
-    fi
-
-    generate_ios_profile
-}
-
-# =============================================================================
-# Main installation flow
-# =============================================================================
-main_install() {
-    check_root
-    detect_os
-    get_public_ip
-
-    echo ""
-    echo "=========================================="
-    echo "  高性能反代系统一键部署"
-    echo "=========================================="
-    echo ""
-
-    install_deps
-    check_port_53
-    generate_domain
-    verify_domain_dns
-    install_cert
-    configure_overseas_dns
-    configure_dns_policy
-    if [[ "$(get_reverse_proxy_mode)" == "forward" ]]; then
-        stop_local_reverse_proxy_services
-    else
-        install_sniproxy
-        install_quic_proxy
-    fi
-    install_china_dns_race_proxy
-    install_dnsdist
-    init_rules
-    system_tuning
-    setup_firewall
-    generate_ios_profile
-    start_services
-    setup_schedules
-
-    echo ""
-    echo "=========================================="
-    echo "         部署完成！"
-    echo "=========================================="
-    echo ""
-    echo "DoT 地址:  tls://${DOMAIN}:853"
-    if [[ "$(get_reverse_proxy_mode)" == "forward" ]]; then
-        echo "TCP 代理:  ${PUBLIC_IP}:80, ${PUBLIC_IP}:443 -> $(get_reverse_proxy_backend_ip)"
-        echo "UDP 代理:  ${PUBLIC_IP}:443 -> $(get_reverse_proxy_backend_ip)"
-    else
-        echo "TCP 代理:  ${PUBLIC_IP}:80, ${PUBLIC_IP}:443 (sniproxy)"
-        echo "UDP 代理:  ${PUBLIC_IP}:443 (quic-proxy)"
-    fi
-    echo "DNS 查询:  ${PUBLIC_IP}:53"
-    echo "iOS 描述文件: http://${DOMAIN}:${IOS_PROFILE_PORT}/ios-dot.mobileconfig"
-    echo ""
-    echo "客户端配置示例 (Android 私人 DNS):"
-    echo "  ${DOMAIN}"
-    echo "iOS 扫码安装:"
-    if [[ -f "${WWW_DIR}/ios-dot.qr.txt" ]]; then
-        cat "${WWW_DIR}/ios-dot.qr.txt"
-    fi
-    echo ""
-    echo "管理命令:"
-    echo "  $0 --status"
-    echo "  $0 --update-rules"
-    echo "  $0 --renew-cert"
-    echo "  $0 --clear-settings"
-    echo "  $0 --vps1-forward"
-    echo "  $0 --vps2-backend"
-    echo "  $0 -ios"
-    echo "  $0 --uninstall"
-    echo "=========================================="
-}
-
-main_menu() {
-    local choice=""
-
-    while true; do
-        echo ""
-        echo "=========================================="
-        echo "  Proxy Gateway Plus"
-        echo "=========================================="
-        echo "  VPS1 主网关"
-        echo "  1) 安装/更新 VPS1 本机网关（dnsdist + 本机 sniproxy/quic-proxy）"
-        echo "  2) 配置 VPS1 DNS 分流策略"
-        echo "  3) 管理 VPS1 自定义分流列表"
-        echo "  4) 切换 VPS1 为入口转发模式（停本机 sniproxy/quic-proxy，转发到 VPS2）"
-        echo ""
-        echo "  VPS2 后端/出口"
-        echo "  5) 在 VPS2 安装 SNI/QUIC 后端（配合 4 使用）"
-        echo "  6) 在 VPS2 安装 SOCKS5 出口"
-        echo ""
-        echo "  RethinkDNS 兜底入口（装在 VPS1）"
-        echo "  7) 添加 WireGuard 兜底入口"
-        echo "  8) 添加 SOCKS5 兜底入口"
-        echo ""
-        echo "  维护"
-        echo "  9) 立即更新 DNS 规则"
-        echo " 10) 查看状态"
-        echo " 11) 续期证书"
-        echo " 12) 重新生成 iOS 描述文件"
-        echo " 13) 清空 DNS 设置"
-        echo " 14) 卸载"
-        echo "  0) 退出"
-        echo "=========================================="
-        tty_read choice "请输入序号 (0-14)" ""
-        case "$choice" in
-            1)
-                main_install
-                pause_return
-                ;;
-            2)
-                configure_dns_policy
-                pause_return
-                ;;
-            3)
-                configure_custom_lists_menu
-                ;;
-            4)
-                configure_vps1_forward_backend
-                pause_return
-                ;;
-            5)
-                install_vps2_sni_quic_backend
-                pause_return
-                ;;
-            6)
-                install_vps2_socks_exit
-                ;;
-            7)
-                install_wireguard_fallback
-                pause_return
-                ;;
-            8)
-                install_socks5_fallback
-                ;;
-            9)
-                if [[ -x /usr/local/bin/update-dnsdist-rules.sh ]]; then
-                    /usr/local/bin/update-dnsdist-rules.sh
-                else
-                    warn "update-dnsdist-rules.sh 尚未安装，请先安装核心网关。"
-                fi
-                pause_return
-                ;;
-            10)
-                get_public_ip 2>/dev/null || true
-                show_status
-                pause_return
-                ;;
-            11)
-                force_renew_cert
-                pause_return
-                ;;
-            12)
-                regenerate_ios_profile
-                pause_return
-                ;;
-            13)
-                clear_settings_menu
-                ;;
-            14)
-                do_uninstall
-                pause_return
-                ;;
-            0)
-                echo "已退出。"
-                return 0
-                ;;
-            *)
-                warn "无效输入，请重新输入 0-14 之间的数字"
-                ;;
-        esac
-    done
-}
-
-# =============================================================================
-# Entrypoint
-# =============================================================================
-case "${1:-}" in
-    --status)
-        get_public_ip 2>/dev/null || true
-        show_status
-        ;;
-    --update-rules)
-        /usr/local/bin/update-dnsdist-rules.sh
-        ;;
-    --renew-cert)
-        force_renew_cert
-        ;;
-    --clear-settings)
-        clear_settings_menu
-        ;;
-    --vps1-forward)
-        configure_vps1_forward_backend
-        ;;
-    --vps2-backend)
-        install_vps2_sni_quic_backend
-        ;;
-    --uninstall)
-        do_uninstall
-        ;;
-    -ios)
-        regenerate_ios_profile
-        ;;
-    -h|--help|help)
-        usage
-        ;;
-    "")
-        bootstrap_full_repo_if_needed "$@"
-        main_menu
-        ;;
-    *)
-        err "Unknown option: $1"
-        usage
-        exit 1
-        ;;
-esac
