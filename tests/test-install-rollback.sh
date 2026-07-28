@@ -207,7 +207,9 @@ for b in mosdns sing-box mihomo; do
       { buf[NR] = $0 }
       $0 ~ ("install -m755 .*/usr/local/bin/" b "([^-a-zA-Z0-9_.]|$)") {
         found = 0
-        for (i = NR - 3; i < NR; i++)
+        # MosDNS has a multi-line fail-closed error handler between the stash
+        # and install. Keep the guard local while allowing that reviewed block.
+        for (i = NR - 6; i < NR; i++)
           if (i > 0 && buf[i] ~ ("_stash_bin /usr/local/bin/" b "([^-a-zA-Z0-9_.]|$)")) found = 1
         if (!found) bad = 1
       }
