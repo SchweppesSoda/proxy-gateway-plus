@@ -107,17 +107,18 @@ def main():
     assert bot._profile_get("PDG_LOWMEM") == "0" and bot._profile_get("PDG_TFO") == "1"
     ok("profile.env upsert 保留其它键(PDG_LOWMEM 与 PDG_TFO 共存)")
 
-    # profile.env 的 Python 写入口只剩"纯函数 + 事务": 那个没人调的 _profile_set 已删除,
-    # 而 pdg.sh 里的同名 Bash 函数仍是生产代码(PDG_LOWMEM / PDG_PLATFORM), 不能跟着删。
+    # profile.env 的 Python 写入口只剩"纯函数 + 事务": 那个没人调的 _profile_set 已删除。
+    # pdg.sh 里的同名 Bash 函数仍由低内存路径使用；平台写入则已改走
+    # _plat_write_profile / pdgprofile retarget-platform，不能再以旧 PDG_PLATFORM 调用作 guard。
     if hasattr(bot, "_profile_set"):
         bad("Python 侧 _profile_set 还在(它没有生产调用点, 是死代码)")
     else:
         ok("Python 侧 _profile_set 已删除(生产写 profile.env 只走 _profile_text_with + 事务)")
     sh_src = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
-    if "_profile_set(){" in sh_src and "_profile_set PDG_PLATFORM" in sh_src:
-        ok("pdg.sh 里仍在用的 Bash _profile_set 原样保留")
+    if "_profile_set(){" in sh_src and "_profile_set PDG_LOWMEM" in sh_src:
+        ok("pdg.sh 的 Bash _profile_set 定义仍在，且低内存路径仍有生产调用")
     else:
-        bad("误删了 pdg.sh 的 Bash _profile_set(平台切换/低内存还在用)")
+        bad("pdg.sh 的 Bash _profile_set 定义或 PDG_LOWMEM 生产调用缺失")
 
     # ── 跨语言回归: 真跑升级 __migrate 路径的 BASH profile.env 写入(pdg.sh 的 pdg_lowmem_resolve),
     #    证明升级后 PDG_TFO 不丢、_tfo_intent 仍以持久化值为准(无需手动重开) ──
