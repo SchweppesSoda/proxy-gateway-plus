@@ -83,7 +83,9 @@ assert_near('if data == "tfo":', '"callback_data": "menu"', (
 
 callback_block = bot[bot.find('elif "callback_query" in u:'):]
 answer_pos = callback_block.find('answer_cb_async(q["id"])')
-handle_pos = callback_block.find('handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"])')
+handle_pos = callback_block.find(
+    'handle_cb(message["chat"]["id"], message["message_id"], q["data"])'
+)
 assert answer_pos >= 0 and handle_pos >= 0, "callback loop should answer and handle callback queries"
 assert answer_pos < handle_pos, "answerCallbackQuery should be sent before slow callback handling"
 
