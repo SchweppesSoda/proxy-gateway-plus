@@ -27,10 +27,12 @@ assert why == "规则集 line"
 assert "rs_9d05f092" not in why
 
 # 删除规则集的结果消息也要用显示名, 不是 rs_xxxx
-bot._rs_meta = lambda: {"rs_9d05f092": {"label": "line", "path": "/nonexistent.json"}}
+bot._rs_meta_snapshot = lambda: (
+    {"rs_9d05f092": {"label": "line", "path": "/nonexistent.json"}},
+    "0" * 64,
+)
 # 5.1: del_ruleset 现在把 model / 规则集文件 / 元数据放进同一笔事务。本用例验的是**显示名**,
 # 事务机制由 test-config-transaction*.py 覆盖 —— 这里按新契约打桩即可。
 bot.tx_apply = lambda op, **kw: (True, "")
-bot._save_rs_meta = lambda m: None
 ok, msg = bot.del_ruleset("rs_9d05f092")
 assert ok and "line" in msg and "rs_9d05f092" not in msg, msg
