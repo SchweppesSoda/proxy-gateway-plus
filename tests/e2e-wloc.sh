@@ -17,10 +17,10 @@ e2e_enter "$@"
 
 e2e_stub_system
 e2e_seed_install
-e2e_seed_mosdns all
+e2e_seed_mosdns all ios
 e2e_seed_singbox_model
 printf 'mihomo\n' > /etc/privdns-gateway/backend
-printf 'ios\n'    > /etc/privdns-gateway/platform     # WLOC 仅 iOS
+e2e_seed_platform ios                                  # WLOC 仅 iOS
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
 
 LAT=34.6937; LON=135.5023      # 大阪

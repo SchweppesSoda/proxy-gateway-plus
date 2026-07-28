@@ -127,7 +127,7 @@ out=$(bash -c "c_g(){ :; }; c_y(){ :; }; install(){ :; }; systemctl(){ echo acti
 source '$WORK/bmfn.sh'; migrate_backend_marker; cat '$BM/etc/privdns-gateway/backend'" 2>/dev/null)
 [[ "$out" == mihomo ]] && ok "backend: 已有合法标记 → 幂等不改" || bad "A3e: $out"
 
-# ── B. GMS 防火墙端口迁移: 仅 Android 补 5228-5230, iOS 跳过 ──────────────
+# ── B. GMS 端口由 canonical profile + renderer 管理，不再 sed 生成物 ───────
 # sing-box 侧的 migrate_singbox_gms 已随 sing-box 运行时一并退役, 原用例调的是一个不存在的
 # 函数(见文件头 use_fn 注释)。换成**当前仍在跑**的防火墙侧, 并钉住"它确实没了": 哪天再冒
 # 出来, 得连同它的平台跳过用例一起补回来, 而不是又静静地假绿。
@@ -137,29 +137,16 @@ else
   ok "migrate_singbox_gms 已随 sing-box 退役(不再有 model 入站迁移)"
 fi
 use_fn migrate_fw_gms
-systemctl(){ [[ "$1" == is-active ]] && echo active; return 0; }
-nft(){ return 0; }              # -c 校验与加载都当成功: 本段只验改写判据
 nf_orig='table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 8445 } accept\n}\n'
-# iOS: 原装形态也不能补 —— GMS/FCM 是 Android 的推送通道
-_pdg_platform(){ echo ios; }
 printf "$nf_orig" > "$WORK/nf"
-run_ok "migrate_fw_gms(iOS)" migrate_fw_gms "$WORK/nf"
-grep -q '5228' "$WORK/nf" && bad "iOS 不应补 GMS 防火墙端口" || ok "migrate_fw_gms: iOS 跳过(不补 5228-5230)"
-# Android: 原装形态要补上
-_pdg_platform(){ echo android; }
-printf "$nf_orig" > "$WORK/nf"
-run_ok "migrate_fw_gms(Android)" migrate_fw_gms "$WORK/nf"
-grep -qF 'tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept' "$WORK/nf" \
-  && ok "migrate_fw_gms: Android 原装端口集补上 5228-5230" || bad "Android 未补 GMS 端口: $(cat "$WORK/nf")"
 snapb="$(cat "$WORK/nf")"
-run_ok "migrate_fw_gms(幂等)" migrate_fw_gms "$WORK/nf"
-[[ "$(cat "$WORK/nf")" == "$snapb" ]] && ok "migrate_fw_gms: 已有 5228 → 幂等不再改" || bad "二跑又改了防火墙配置"
-# 自定义端口集不认: 宁可提示手动加, 也不猜着改用户的规则
-printf 'table inet pdg {\n  ip saddr 10.0.0.0/16 tcp dport { 53, 443, 10443 } accept\n}\n' > "$WORK/nfcust"
-snapb="$(cat "$WORK/nfcust")"
-run_ok "migrate_fw_gms(自定义)" migrate_fw_gms "$WORK/nfcust"
-[[ "$(cat "$WORK/nfcust")" == "$snapb" ]] && ok "migrate_fw_gms: 非原装端口集不自动改写" || bad "改写了自定义端口集"
-rm -f "$WORK"/nf.pregms.* "$WORK"/nfcust.pregms.*
+run_ok "migrate_fw_gms(兼容空操作)" migrate_fw_gms "$WORK/nf"
+[[ "$(cat "$WORK/nf")" == "$snapb" ]] \
+  && ok "migrate_fw_gms 不再 sed 改写 renderer 产物" || bad "兼容迁移改写了 nft 文件"
+_mdp="$(xt migrate_dataplane_profile)"
+grep -q '_plat_write_profile' <<<"$_mdp" && grep -q '_switchcore_nft' <<<"$_mdp" \
+  && ok "数据面迁移先同步平台 profile，再由统一事务重渲 nft" \
+  || bad "GMS 平台端口未接入 canonical profile + renderer"
 
 # ── C. migrate_ios_gms_cleanup: 删 in-gms-* + nft 移除 5228-5230 ────────────────
 use_fn migrate_ios_gms_cleanup _pdg_nft_strip_gms _pdg_nft_bin; _pdg_core_svc(){ echo mihomo; }
@@ -358,17 +345,24 @@ GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""
 _rams="$(xt run_all_migrations)"
 [[ -n "$_rams" ]] || bad "抽不到 run_all_migrations"
 ( eval "$_rams"
+  REPO_DIR="$ROOT"
+  _pdg_dataplane_mode_readonly(){ echo managed; }
+  _pdg_dataplane_nft_preflight(){ return 0; }
   for f in migrate_platform_marker migrate_backend_marker migrate_botenv migrate_firewall_to_pdg \
+           migrate_dataplane_profile \
            migrate_mosdns_concurrent migrate_mosdns_unlock migrate_fw_gms migrate_mosdns_ratelimit \
            migrate_lowmem migrate_mihomo_safepaths migrate_deploy_botfiles migrate_deploy_units \
            migrate_mosdns_hijack_shape migrate_custom_hijack migrate_mosdns_mitm \
-           migrate_pdg_mitm_service migrate_android_cleanup migrate_drop_singbox; do
+           migrate_ruleset_phone_direct migrate_pdg_mitm_service migrate_android_cleanup \
+           migrate_mosdns_patched_binary migrate_drop_singbox; do
     eval "$f(){ return 0; }"
   done
-  migrate_ios_gms_cleanup(){ return 1; }
-  run_all_migrations >/dev/null 2>&1 ) \
-  && bad "run_all_migrations 吞掉了 iOS GMS 清理的失败" \
-  || ok "run_all_migrations 把 iOS GMS 清理的失败传出(cmd_update/cmd_migrate 据此回滚/点名快照)"
+  migrate_ios_gms_cleanup(){ : > "$WORK/ios-gms-called"; return 1; }
+  run_all_migrations >/dev/null 2>&1
+  rc=$?
+  [[ "$rc" != 0 && -e "$WORK/ios-gms-called" ]] ) \
+  && ok "run_all_migrations 把 iOS GMS 清理的失败传出(cmd_update/cmd_migrate 据此回滚/点名快照)" \
+  || bad "run_all_migrations 未实际到达关键迁移或吞掉了它的失败"
 grep -q 'migrate_ios_gms_cleanup || true' "$ROOT/deploy/bot/pdg.sh" \
   && bad "pdg.sh 里还有 `migrate_ios_gms_cleanup || true`" \
   || ok "pdg.sh 里不再用 || true 吞掉这条关键迁移"

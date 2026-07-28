@@ -102,7 +102,7 @@ echo 1 > /tmp/e2e-svc/pdg-bot.ac
 
 # ══ 3. restart: iOS 服务集 ═════════════════════════════════════════════════
 echo; echo "── 3. iOS 服务集 ──"
-printf 'ios\n' > /etc/privdns-gateway/platform
+e2e_seed_platform ios
 printf '[Unit]\nDescription=probe81\n[Service]\nExecStart=/bin/true\n' > /etc/systemd/system/pdg-probe81.service
 echo 1 > /tmp/e2e-svc/pdg-probe81.ac; echo 1 > /tmp/e2e-svc/pdg-probe81.en
 out=$(pdg restart 2>&1); rc=$?
@@ -124,7 +124,7 @@ out=$(pdg restart 2>&1); rc=$?
 e2e_svc_heal pdg-mitm
 rm -f /etc/systemd/system/pdg-mitm.service /etc/systemd/system/pdg-probe81.service
 rm -f /tmp/e2e-svc/pdg-mitm.* /tmp/e2e-svc/pdg-probe81.*
-printf 'android\n' > /etc/privdns-gateway/platform
+e2e_seed_platform android
 
 # ══ 4. status: 监听端口靠 ss(iproute2) ═════════════════════════════════════
 echo; echo "── 4. status 的监听端口 ──"
@@ -147,10 +147,10 @@ out=$(pdg status 2>&1)
 for p in 53 853 7893 8445; do
   grep -qE "监听端口.*\b$p\b" <<<"$out" && ok "status 显示端口 $p" || bad "4c: 没显示 $p: $(grep 监听端口 <<<"$out")"
 done
-printf 'ios\n' > /etc/privdns-gateway/platform
+e2e_seed_platform ios
 out=$(pdg status 2>&1)
 grep -qE "监听端口.*\b81\b" <<<"$out" && ok "iOS: status 还显示 :81(probe81)" || bad "4d: iOS 没显示 81"
-printf 'android\n' > /etc/privdns-gateway/platform
+e2e_seed_platform android
 
 # ══ 5. status: 版本读不到要说"未知", 不能空 ════════════════════════════════
 echo; echo "── 5. status 的版本显示 ──"
@@ -170,6 +170,9 @@ hash_state(){
     git -C /opt/privdns-gateway rev-parse HEAD 2>/dev/null
   } | sha256sum | cut -d' ' -f1
 }
+# 故意降成 legacy/incomplete profile：若 dry-run 偷跑 migration，它一定会补键，
+# 从而被下面的零修改哈希哨兵抓到。section 7 前再逐字节恢复 canonical profile。
+cp -a /etc/privdns-gateway/profile.env /tmp/e2e-cli-canonical-profile.env
 printf 'PDG_PLATFORM=android\n' > /etc/privdns-gateway/profile.env
 # origin 指向**本地** bare 仓库: dry-run 会真的 fetch, 不该依赖外网(串行跑时前一个脚本
 # 可能已经把 /etc/resolv.conf 指到本机 mosdns, 那时解析 github.com 必然失败)。
@@ -220,6 +223,11 @@ out=$(pdg update --dry-run 2>&1); rc=$?
 mv /opt/privdns-gateway/.git-hidden /opt/privdns-gateway/.git
 git -C /opt/privdns-gateway tag -f v9.9.9 >/dev/null 2>&1
 rm -rf /tmp/e2e-empty-origin.git /tmp/e2e-cli-origin.git
+cp -a /tmp/e2e-cli-canonical-profile.env /etc/privdns-gateway/profile.env
+cmp -s /tmp/e2e-cli-canonical-profile.env /etc/privdns-gateway/profile.env \
+  && ok "dry-run 负向哨兵后已逐字节恢复 canonical profile" \
+  || bad "6i: canonical profile 恢复失败"
+rm -f /tmp/e2e-cli-canonical-profile.env
 
 # ══ 7. detect-cidr 事务化 ══════════════════════════════════════════════════
 echo; echo "── 7. detect-cidr ──"

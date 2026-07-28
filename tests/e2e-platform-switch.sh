@@ -26,10 +26,13 @@ e2e_stub_system
 e2e_seed_install
 e2e_seed_mosdns all
 e2e_seed_singbox_model
+# 用户自定义 TLS 目的端口必须跨平台保留；只有 GMS 三口随平台增删。
+sed -i 's/^PDG_HIJACK_TLS_TCP_PORTS=.*/PDG_HIJACK_TLS_TCP_PORTS=443,5228,5229,5230,10443/' \
+  /etc/privdns-gateway/profile.env
 e2e_seed_nft
 printf 'mihomo\n' > /etc/privdns-gateway/backend
 printf 'android\n' > /etc/privdns-gateway/platform
-printf 'PDG_PLATFORM=android\n' > /etc/privdns-gateway/profile.env
+# e2e_seed_mosdns 已写入完整 Android profile；平台切换必须在该真实契约上执行。
 # 真实装好的机器上这三个 unit 一定在(切平台的校验门会逐个查它们是否稳定运行)
 # unit 取真实形态: 幂等迁移按 unit 内容判断要不要补 SAFE_PATHS, 占位 unit 会让它每次重跑
 # shellcheck source=lib/units.sh
@@ -57,9 +60,52 @@ S
 chmod 755 /usr/local/bin/nft
 nft -f /etc/nftables.conf
 
-gms_in_nft(){ grep -qE 'tcp dport [{][^}]*5228' /etc/nftables.conf; }
-gms_in_ruleset(){ grep -qE 'tcp dport [{][^}]*5228' /tmp/e2e-nft-ruleset 2>/dev/null; }
+gms_in_file(){
+  local file="$1" port
+  [[ -f "$file" ]] || return 1
+  for port in 5228 5229 5230; do
+    grep -qE "elements[[:space:]]*=[[:space:]]*[{][^}]*${port}([^0-9]|$)" "$file" \
+      || return 1
+  done
+}
+gms_in_nft(){ gms_in_file /etc/nftables.conf; }
+gms_in_ruleset(){ gms_in_file /tmp/e2e-nft-ruleset; }
+custom_tls_in_file(){
+  grep -qE 'elements[[:space:]]*=[[:space:]]*[{][^}]*10443([^0-9]|$)' "$1"
+}
 mitm_out_in_core(){ grep -q 'MITM-OUT' /etc/mihomo/config.yaml 2>/dev/null; }
+assert_tls_contract(){
+  local label="$1" expected="$2" detail
+  if detail="$(python3 - "$expected" 2>&1 <<'PY'
+import json
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import checks
+import pdgprofile
+
+expected = [int(port) for port in sys.argv[1].split(",")]
+values = pdgprofile.read_values(
+    "/etc/privdns-gateway/profile.env", missing_ok=False)
+profile = pdgprofile.resolve(
+    "/etc/privdns-gateway/profile.env",
+    platform=values["PDG_PLATFORM"], environ={},
+    ssh_port=values["PDG_SSH_PORT"])
+nft = open("/etc/nftables.conf", encoding="utf-8").read()
+core = json.load(open("/etc/mihomo/config.yaml", encoding="utf-8"))
+actual = {
+    "profile": profile["tls_ports"],
+    "nft": checks._nft_set_ports(nft, "pdg_tls_tcp_ports"),
+    "mihomo": core["sniffer"]["sniff"]["TLS"]["ports"],
+}
+if any(ports != expected for ports in actual.values()):
+    raise SystemExit("expected=%r actual=%r" % (expected, actual))
+PY
+  )"; then
+    ok "$label: profile/nft/Mihomo TLS 端口完全一致"
+  else
+    bad "$label: TLS 数据面不一致: $detail"
+  fi
+}
 
 # ══ 1. Android → iOS: 组件必须真部署 ═══════════════════════════════════════
 echo "── 1. Android → iOS ──"
@@ -77,6 +123,9 @@ done
 [[ "$(systemctl is-active pdg-mitm)" == active ]] \
   && ok "pdg-mitm 已启用并运行" || bad "1f: pdg-mitm 未运行"
 gms_in_nft && bad "1g: iOS 的防火墙里仍有 GMS 5228-5230" || ok "iOS: 防火墙已无 GMS 5228-5230"
+custom_tls_in_file /etc/nftables.conf \
+  && ok "iOS: 用户自定义 TLS 端口 10443 保留" || bad "1h: 自定义 TLS 端口丢失"
+assert_tls_contract "iOS" "443,10443"
 
 # ══ 2. WLOC 开启后切回 Android: 安全休眠 + 运行时接管彻底撤掉 ═════════════
 echo; echo "── 2. WLOC 开启状态下切回 Android ──"
@@ -112,6 +161,9 @@ mitm_out_in_core && bad "2h: mihomo 配置里仍残留 MITM-OUT" || ok "mihomo �
 echo; echo "── 3. Android 的 GMS 端口 ──"
 gms_in_nft && ok "Android: 防火墙配置里有 GMS 5228-5230" || bad "3: GMS 没恢复: $(grep -n 'dport' /etc/nftables.conf | head -3)"
 gms_in_ruleset && ok "Android: 运行中的 ruleset 也有 GMS(真的应用了)" || bad "3b: 运行规则里没有 GMS"
+custom_tls_in_file /etc/nftables.conf \
+  && ok "Android: 用户自定义 TLS 端口 10443 仍保留" || bad "3b2: 自定义 TLS 端口丢失"
+assert_tls_contract "Android" "443,5228,5229,5230,10443"
 for f in /etc/systemd/system/pdg-probe81.service /opt/pdg-bot/probe81.py \
          /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/mitm_server.py; do
   [[ -e "$f" ]] && bad "3c: Android 上仍残留 $f" || ok "已移除 $(basename "$f")"
@@ -131,6 +183,7 @@ out=$(pdg platform android 2>&1); rc=$?
 # 注入: 让防火墙重建这一步失败(nft -c 判否), 现场必须整体回到 Android。
 echo; echo "── 5. 失败回滚 ──"
 NFT_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+PROFILE_SHA="$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)"
 cp /usr/local/bin/nft /usr/local/bin/nft.real
 cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
@@ -145,6 +198,8 @@ cp -f /usr/local/bin/nft.real /usr/local/bin/nft
   && ok "失败后平台标记回到 android" || bad "5b: 平台标记停在 $(cat /etc/privdns-gateway/platform)"
 grep -q '^PDG_PLATFORM=android$' /etc/privdns-gateway/profile.env \
   && ok "失败后 profile.env 也回到 android" || bad "5c: profile.env=$(grep PDG_PLATFORM /etc/privdns-gateway/profile.env)"
+[[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$PROFILE_SHA" ]] \
+  && ok "失败后完整 profile.env 逐字节恢复" || bad "5c2: profile.env before-image 被重算"
 [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA" ]] \
   && ok "失败后防火墙配置逐字节未变" || bad "5d: 防火墙被改了"
 grep -q '已恢复到原平台' <<<"$out" && ok "回滚有明确提示" || bad "5e: 没有回滚提示: $(tail -3 <<<"$out")"
@@ -167,6 +222,7 @@ out=$(pdg platform ios 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "先正常切到 iOS(准备现场)" || bad "6: 切 iOS 失败: $(tail -4 <<<"$out")"
 IOS_SHA="$(sha256sum /opt/pdg-bot/probe81.py /opt/pdg-bot/mitm_server.py \
                      /etc/systemd/system/pdg-probe81.service | sha256sum)"
+IOS_PROFILE_SHA="$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)"
 cp /usr/local/bin/nft /usr/local/bin/nft.real
 cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
@@ -182,6 +238,8 @@ cp -f /usr/local/bin/nft.real /usr/local/bin/nft
 [[ "$(sha256sum /opt/pdg-bot/probe81.py /opt/pdg-bot/mitm_server.py \
                 /etc/systemd/system/pdg-probe81.service | sha256sum)" == "$IOS_SHA" ]] \
   && ok "被清理的 iOS 组件已逐字节放回" || bad "6d: iOS 组件没恢复"
+[[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$IOS_PROFILE_SHA" ]] \
+  && ok "iOS profile before-image 已逐字节放回" || bad "6d2: iOS profile 被重算"
 [[ "$(systemctl is-active pdg-probe81)" == active ]] \
   && ok "回滚后 pdg-probe81 恢复运行" || bad "6e: probe81 没起回来"
 
@@ -205,16 +263,21 @@ out=$(pdg platform android 2>&1); rc=$?
 # 凭据配齐(ready)时, pdg-bot 起不来就必须失败并回滚
 printf 'PDG_BOT_TOKEN=123456:AAaa\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
 PLAT_BEFORE="$(cat /etc/privdns-gateway/platform)"
+PROFILE_BEFORE="$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)"
 out=$(pdg platform ios 2>&1); rc=$?
 [[ "$rc" != 0 ]] && ok "凭据 ready 但 pdg-bot 起不来 → 切换失败(非 0)" || bad "7f: 竟然成功了"
 grep -q 'pdg-bot' <<<"$out" && ok "点名了未稳定运行的 pdg-bot" || bad "7g: 没点名: $(tail -3 <<<"$out")"
 [[ "$(cat /etc/privdns-gateway/platform)" == "$PLAT_BEFORE" ]] \
   && ok "失败后平台标记已回滚" || bad "7h: 平台停在 $(cat /etc/privdns-gateway/platform)"
+[[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$PROFILE_BEFORE" ]] \
+  && ok "失败后完整 profile 已回滚" || bad "7h2: profile 未逐字节恢复"
 # 只配一半 = 配置错误, 要明确点出来
 printf 'PDG_BOT_TOKEN=123456:AAaa\n' > /etc/privdns-gateway/bot.env
 out=$(pdg platform ios 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && grep -q '只配了一项' <<<"$out"; } \
   && ok "凭据只配一半 → 明确报配置错误并回滚" || bad "7i: rc=$rc: $(tail -3 <<<"$out")"
+[[ "$(sha256sum /etc/privdns-gateway/profile.env | cut -d' ' -f1)" == "$PROFILE_BEFORE" ]] \
+  && ok "半凭据失败后完整 profile 仍未变" || bad "7i2: profile 未逐字节恢复"
 e2e_svc_heal pdg-bot
 printf 'PDG_BOT_TOKEN=123456:AAaa\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
 echo 1 > /tmp/e2e-svc/pdg-bot.ac; echo 1 > /tmp/e2e-svc/pdg-bot.en
@@ -227,7 +290,7 @@ pdg platform android >/dev/null 2>&1
 echo; echo "── 8. iOS 组件部署失败 ──"
 snapshot_state(){
   { cat /etc/privdns-gateway/platform 2>/dev/null
-    grep '^PDG_PLATFORM=' /etc/privdns-gateway/profile.env 2>/dev/null
+    sha256sum /etc/privdns-gateway/profile.env 2>/dev/null
     sha256sum /etc/nftables.conf /etc/mihomo/config.yaml 2>/dev/null
     for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
              /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \

@@ -23,6 +23,8 @@ e2e_stub_system
 e2e_seed_install
 e2e_seed_mosdns all
 e2e_seed_singbox_model
+e2e_seed_nft
+cp /etc/nftables.conf /tmp/e2e-owned-pdg.nft
 printf 'android\n' > /etc/privdns-gateway/platform
 . "$E2E_ROOT/lib/versions.sh"
 printf '#!/bin/sh\ncase "$1" in -v|version) echo "Mihomo Meta %s linux amd64";; -t) exit 0;; esac\nexit 0\n' \
@@ -68,7 +70,7 @@ WantedBy=multi-user.target
 SBU
   : > /etc/privdns-gateway/singbox.pdg-owned      # 可信归属标记: 确属本项目所装
   echo 1 > /tmp/e2e-svc/sing-box.ac; echo 1 > /tmp/e2e-svc/sing-box.en
-  rm -f /tmp/e2e-svc/mihomo.ac /tmp/e2e-svc/mihomo.en
+  echo 0 > /tmp/e2e-svc/mihomo.ac; echo 0 > /tmp/e2e-svc/mihomo.en
 }
 
 svc_state(){ printf '%s/%s|%s/%s' \
@@ -98,17 +100,8 @@ table ip mynat {
     }
 }
 
-table inet pdg
-delete table inet pdg
-
-table inet pdg {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        tcp dport { 22 } accept
-    }
-}
 NFT
+cat /tmp/e2e-owned-pdg.nft >> /etc/nftables.conf
 nft -f /etc/nftables.conf                       # 让"当前运行 ruleset"= 这份配置
 CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 RULESET_SHA="$(nft list ruleset | sha256sum | cut -d' ' -f1)"
@@ -153,18 +146,8 @@ table inet myfwd {
     }
 }
 
-table inet pdg
-delete table inet pdg
-
-table inet pdg {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        tcp dport { 22 } accept
-        ip saddr 127.0.0.0/8 tcp dport { 53, 80, 81, 443, 853, 8445 } accept
-    }
-}
 NFT
+cat /tmp/e2e-owned-pdg.nft >> /etc/nftables.conf
 nft -f /etc/nftables.conf
 CUSTOM_BEFORE="$(awk '/table inet pdg/{exit} {print}' /etc/nftables.conf)"
 CUSTOM_SHA="$(printf '%s' "$CUSTOM_BEFORE" | sha256sum | cut -d' ' -f1)"
@@ -192,19 +175,7 @@ grep -q 'tcp dport { 22 } accept' /etc/nftables.conf \
 # 旧实现把读失败静默当成没有冲突, 于是照常迁移 —— "配置保留、端口不通"换个入口又回来了。
 echo; echo "── 3. 运行 ruleset 读不到(权限不足/nft 不可用) ──"
 seed_sb
-cat > /etc/nftables.conf <<'NFT'
-#!/usr/sbin/nft -f
-table inet pdg
-delete table inet pdg
-
-table inet pdg {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        tcp dport { 22 } accept
-    }
-}
-NFT
+cp /tmp/e2e-owned-pdg.nft /etc/nftables.conf
 nft -f /etc/nftables.conf
 CONF_SHA3="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 RULESET_SHA3="$(nft list ruleset | sha256sum | cut -d' ' -f1)"
@@ -265,5 +236,5 @@ import checks
 print(checks.check_nft_input_chains())" 2>&1)
 grep -q "'ok'" <<<"$d_out" && ok "冲突链移除后 doctor 回到 ok(不恒报警)" || bad "4b: $d_out"
 
-rm -f "$NFT_STATE" /usr/local/bin/nft.real
+rm -f "$NFT_STATE" /usr/local/bin/nft.real /tmp/e2e-owned-pdg.nft
 e2e_summary

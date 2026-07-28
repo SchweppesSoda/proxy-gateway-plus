@@ -435,7 +435,14 @@ def check_gms():
                 nft = open("/etc/nftables.conf").read()
             except OSError:
                 nft = ""
-        if re.search(r"tcp dport \{[^}]*5228", nft):
+        has_legacy_gms = bool(re.search(r"tcp dport \{[^}]*5228", nft))
+        try:
+            has_profile_gms = bool(
+                {5228, 5229, 5230}
+                & set(_nft_set_ports(nft, "pdg_tls_tcp_ports")))
+        except ValueError:
+            has_profile_gms = False
+        if has_legacy_gms or has_profile_gms:
             residue.append("nft 端口集")
         if residue:
             return ("warn", "GMS 残留", "iOS 不应有 GMS 5228-5230, 检出于 " + "、".join(residue)

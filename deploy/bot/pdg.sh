@@ -272,9 +272,18 @@ _pdg_drop_singbox_files(){
   state="$(systemctl is-enabled sing-box 2>/dev/null)"
   [[ "$state" != enabled && "$state" != enabled-runtime ]]
 }
-# iOS: 从已渲染的 nft 移除 GMS 5228-5230(iOS 走 APNs, 不需要)。nft 模板对两平台通用 —— 装机/切核
-# 渲染后在 iOS 上剥掉, 免得 iOS 带上 GMS(或切核后 GMS 复活)。$1=nft 文件; 非 iOS 或文件不存在=空操作。
-_pdg_nft_strip_gms(){ :; } # compatibility seam; platform-aware profile rendering replaced fixed sed rewrites.
+# 仅用于精确识别的 pre-profile 旧防火墙单向迁移。当前 profile-owned set 不走文本
+# 剥离：_plat_write_profile 先同步 canonical TLS ports，再由统一 renderer 重建 nft。
+_pdg_nft_strip_gms(){
+  local f="$1"
+  [[ "$(_pdg_platform)" == ios && -f "$f" ]] || return 0
+  sed -E -i \
+    's#(tcp dport [{] 53, 80, 81, 443, 853), 5228-5230, 8445 [}] accept#\1, 8445 } accept#' \
+    "$f"
+  sed -E -i \
+    's#(tcp dport [{] 80, 443), 5228-5230 [}] redirect#\1 } redirect#' \
+    "$f"
+}
 
 # 串行化"会写配置/重启服务"的操作(update/rollback/snapshot), 防 bot 更新按钮与命令行并发。
 # 嵌套调用(update→snapshot)只锁一次。read-only 操作(status/doctor/report/log)不加锁。
@@ -3453,8 +3462,73 @@ _pdg_restart_restore_before(){
   return "$failed"
 }
 
+_pdg_dataplane_mode_readonly(){
+  local tool="$1" mode="" marker=""
+  # Strictly parse the managed structure and validate every present data-plane
+  # value before any migration writes a marker.  Missing keys are a legacy
+  # state and receive resolver defaults; malformed/duplicate keys are not.
+  python3 - "$tool" "$PROFILE_ENV" <<'PY' >/dev/null || return 1
+import importlib.util
+import sys
+from pathlib import Path
+tool, profile = sys.argv[1:]
+sys.path.insert(0, str(Path(tool).resolve().parent))
+spec = importlib.util.spec_from_file_location("pdgprofile_preflight", tool)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.resolve(profile, environ={})
+PY
+  marker="$(cat /etc/privdns-gateway/firewall-mode 2>/dev/null)"
+  if mode="$(_pdg_profile_get_from "$tool" PDG_FIREWALL_MODE 2>/dev/null)"; then
+    [[ "$mode" == managed || "$mode" == external ]] || return 1
+    if [[ -n "$marker" && "$marker" != "$mode" ]]; then
+      echo "firewall-mode state/profile 冲突或 marker 非法" >&2
+      return 1
+    fi
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  if [[ "$marker" == managed || "$marker" == external ]]; then
+    printf '%s\n' "$marker"
+  elif [[ -n "$marker" ]]; then
+    echo "firewall-mode marker 非法" >&2
+    return 1
+  elif grep -q 'mode=external' /etc/nftables.conf 2>/dev/null; then
+    printf 'external\n'
+  elif grep -q 'mode=managed' /etc/nftables.conf 2>/dev/null \
+    || grep -qE 'table inet (pdg|filter)' /etc/nftables.conf 2>/dev/null; then
+    printf 'managed\n'
+  else
+    echo "无法从可信现场证据确定 firewall mode，拒绝默认 managed" >&2
+    return 1
+  fi
+}
+
+_pdg_dataplane_nft_preflight(){
+  local mode="$1" scan_out scan_rc
+  [[ -f "$REPO_DIR/deploy/bot/nftscan.py" ]] \
+    || { echo "checked-out nftables 扫描器不存在" >&2; return 1; }
+  scan_out="$(python3 "$REPO_DIR/deploy/bot/nftscan.py" \
+    --mode "$mode" /etc/nftables.conf 2>&1)"; scan_rc=$?
+  case "$scan_rc" in
+    0)
+      echo "检测到自定义 input base chain，与 PDG 的 policy drop 不兼容 → 迁移前置检查中止:"
+      printf '%s\n' "$scan_out" | sed 's/^/    /'
+      return 1;;
+    1) return 0;;
+    2)
+      echo "无法确认 input 链冲突 → 迁移前置检查中止:"
+      printf '%s\n' "$scan_out" | sed 's/^/    /'
+      return 1;;
+    *)
+      echo "nftables 迁移前置扫描器异常退出 $scan_rc:"
+      printf '%s\n' "$scan_out" | sed 's/^/    /'
+      return 1;;
+  esac
+}
+
 migrate_dataplane_profile(){
-  local tool mode="" marker="" cidr="" sshp="" line key value
+  local tool mode="" marker="" cidr="" sshp="" key value
   # An update may be running with an old /opt runtime bundle.  Migration must
   # consume one coherent checked-out bundle, never import old bot/sb2mihomo
   # before copying the new files.
@@ -3462,24 +3536,12 @@ migrate_dataplane_profile(){
   [[ -f "$tool" && -f "$REPO_DIR/deploy/bot/pdg-bot.py" \
      && -f "$REPO_DIR/deploy/bot/sb2mihomo.py" ]] \
     || { echo "checked-out data-plane bundle 不完整"; return 1; }
-  install -d -m700 /etc/privdns-gateway || return 1
 
-  # Canonicalize pre-profile releases from explicit deployed evidence only.
-  if ! mode="$(_pdg_profile_get PDG_FIREWALL_MODE 2>/dev/null)"; then
-    marker="$(cat /etc/privdns-gateway/firewall-mode 2>/dev/null)"
-    if [[ "$marker" == managed || "$marker" == external ]]; then mode="$marker"
-    elif grep -q 'mode=external' /etc/nftables.conf 2>/dev/null; then mode=external
-    elif grep -q 'mode=managed' /etc/nftables.conf 2>/dev/null \
-      || grep -qE 'table inet (pdg|filter)' /etc/nftables.conf 2>/dev/null; then
-      mode=managed
-      c_y "  老版本无 firewall mode，按其带 input 防火墙的现场证据迁移为 managed。"
-    else
-      echo "无法从可信现场证据确定 firewall mode，拒绝默认 managed" >&2
-      return 1
-    fi
-    _profile_set PDG_FIREWALL_MODE "$mode" || return 1
-  fi
-  [[ "$mode" == managed || "$mode" == external ]] || return 1
+  mode="$(_pdg_dataplane_mode_readonly "$tool")" || return 1
+  _pdg_dataplane_nft_preflight "$mode" || return 1
+
+  install -d -m700 /etc/privdns-gateway || return 1
+  _profile_set PDG_FIREWALL_MODE "$mode" || return 1
   if [[ -e /etc/privdns-gateway/firewall-mode ]]; then
     marker="$(cat /etc/privdns-gateway/firewall-mode 2>/dev/null)"
     [[ "$marker" == "$mode" ]] || {
@@ -3504,7 +3566,7 @@ migrate_dataplane_profile(){
     sshp="${sshp:-22}"
     _profile_set PDG_SSH_PORT "$sshp" || return 1
   fi
-  _profile_set PDG_PLATFORM "$(_pdg_platform)" || return 1
+  _plat_write_profile "$(_pdg_platform)" || return 1
 
   # Resolve the whole group before writing any one of it. Invalid/duplicate
   # existing keys abort; missing keys receive this fork's explicit defaults.
@@ -3551,10 +3613,18 @@ migrate_dataplane_profile(){
 }
 
 run_all_migrations(){
-  local rc=0
+  local rc=0 tool preflight_mode
+  # Hard gate before even platform/backend marker migrations: a conflict,
+  # unreadable live ruleset, or corrupt managed profile must be zero-write.
+  tool="$REPO_DIR/deploy/bot/pdgprofile.py"
+  [[ -f "$tool" ]] || return 1
+  preflight_mode="$(_pdg_dataplane_mode_readonly "$tool")" || return 1
+  _pdg_dataplane_nft_preflight "$preflight_mode" || return 1
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
-  migrate_dataplane_profile || rc=1
+  # 数据面前置迁移负责在任何写入前完成 mode-aware nft 冲突扫描；失败后继续跑
+  # best-effort 迁移会破坏其“冲突现场零改动”保证，因此这里立即返回。
+  migrate_dataplane_profile || return 1
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
@@ -3944,7 +4014,19 @@ migrate_drop_singbox(){
 # profile.env 的 PDG_PLATFORM 与 platform 文件必须同步 —— 后者丢了(备份恢复/手工清理)时
 # _pdg_platform 会回退去读 profile.env, 两处不一致就会在下一次迁移里把平台判反。
 _plat_write_profile(){
-  _profile_set PDG_PLATFORM "$1"
+  local target="$1" tool tmp
+  [[ "$target" == ios || "$target" == android ]] || return 1
+  tool="$REPO_DIR/deploy/bot/pdgprofile.py"
+  [[ -f "$tool" ]] || tool="$(_pdg_profile_tool)" || return 1
+  mkdir -p "$(dirname "$PROFILE_ENV")" 2>/dev/null || true
+  tmp="$(mktemp "${PROFILE_ENV}.XXXXXX" 2>/dev/null)" || return 1
+  if ! python3 "$tool" --profile "$PROFILE_ENV" \
+      retarget-platform "$target" >"$tmp"; then
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  mv -f "$tmp" "$PROFILE_ENV" 2>/dev/null \
+    || { rm -f "$tmp" 2>/dev/null; return 1; }
 }
 
 # 部署 iOS 专属组件(幂等)。probe81 / 描述文件模板 / MITM 模块 —— 缺一样 doctor 就会报
@@ -4041,7 +4123,12 @@ cmd_platform(){
   for f in /etc/privdns-gateway/platform /etc/privdns-gateway/profile.env \
            /etc/privdns-gateway/mitm.json /etc/nftables.conf /etc/mihomo/config.yaml \
            /etc/mosdns/rules/mitm_hijack.txt; do
-    [[ -e "$f" ]] && cp -a "$f" "$wd/$(basename "$f")" 2>/dev/null
+    if [[ ( -e "$f" || -L "$f" ) ]] \
+       && ! cp -a "$f" "$wd/$(basename "$f")" 2>/dev/null; then
+      echo "❌ 无法备份 $f → 中止切换(未改动任何东西)"
+      rm -rf "$wd"
+      return 1
+    fi
   done
   # 2b) 平台专属文件也要能原样回去: 装上去的要删掉, 清掉的要放回来。
   # 只还原配置不管这些文件的话, 一次失败的 Android→iOS 会在盘上留下 probe81/描述文件模板/
@@ -4056,11 +4143,20 @@ cmd_platform(){
     /etc/systemd/system/pdg-probe81.service
     /etc/systemd/system/pdg-mitm.service
   )
-  mkdir -p "$wd/plat"
+  if ! mkdir -p "$wd/plat"; then
+    echo "❌ 无法创建平台专属文件备份目录 → 中止切换(未改动任何东西)"
+    rm -rf "$wd"
+    return 1
+  fi
   local _pf _key
   for _pf in "${_PLAT_FILES[@]}"; do
     _key="${_pf//\//_}"
-    [[ -e "$_pf" ]] && cp -a "$_pf" "$wd/plat/$_key" 2>/dev/null
+    if [[ ( -e "$_pf" || -L "$_pf" ) ]] \
+       && ! cp -a "$_pf" "$wd/plat/$_key" 2>/dev/null; then
+      echo "❌ 无法备份平台专属文件 $_pf → 中止切换(未改动任何东西)"
+      rm -rf "$wd"
+      return 1
+    fi
   done
   # 服务的启用/运行状态同样记下来(回滚后不能留下一个"unit 已删但还标着 enabled"的现场)
   # 只取第一行并在空值时兜底: systemctl 这些子命令是"既打印状态又用退出码表态", 拿
@@ -4075,7 +4171,12 @@ cmd_platform(){
     local g
     for g in platform profile.env mitm.json nftables.conf config.yaml mitm_hijack.txt; do
       case "$g" in
-        platform|profile.env|mitm.json) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" "/etc/privdns-gateway/$g";;
+        platform|profile.env|mitm.json)
+          if [[ -e "$wd/$g" ]]; then
+            cp -a "$wd/$g" "/etc/privdns-gateway/$g"
+          else
+            rm -f "/etc/privdns-gateway/$g"
+          fi;;
         nftables.conf) if [[ -e "$wd/$g" ]]; then
           local pnx; pnx="$(_pdg_nft_bin)"
           # shellcheck source=lib/nfttxn.sh
@@ -4083,15 +4184,21 @@ cmd_platform(){
             && pdg_nft_atomic_install "$wd/$g" /etc/nftables.conf "$pnx" \
             && "$pnx" -f /etc/nftables.conf >/dev/null 2>&1 || true
         fi;;
-        config.yaml)   [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mihomo/config.yaml;;
-        mitm_hijack.txt) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mosdns/rules/mitm_hijack.txt;;
+        config.yaml)
+          if [[ -e "$wd/$g" ]]; then cp -a "$wd/$g" /etc/mihomo/config.yaml
+          else rm -f /etc/mihomo/config.yaml
+          fi;;
+        mitm_hijack.txt)
+          if [[ -e "$wd/$g" ]]; then cp -a "$wd/$g" /etc/mosdns/rules/mitm_hijack.txt
+          else rm -f /etc/mosdns/rules/mitm_hijack.txt
+          fi;;
       esac
     done
     # 平台专属文件: 有备份的放回去, 本来不存在的删掉(这次新装的)
     local pf key
     for pf in "${_PLAT_FILES[@]}"; do
       key="${pf//\//_}"
-      if [[ -e "$wd/plat/$key" ]]; then
+      if [[ -e "$wd/plat/$key" || -L "$wd/plat/$key" ]]; then
         install -d "$(dirname "$pf")" 2>/dev/null || true
         cp -a "$wd/plat/$key" "$pf" 2>/dev/null || true
       else
@@ -4114,7 +4221,6 @@ cmd_platform(){
         systemctl disable --now "$svc" >/dev/null 2>&1 || true
       fi
     done <<< "$_pstate"
-    _plat_write_profile "$cur" >/dev/null 2>&1 || true
     [[ -x /usr/local/libexec/pdg-quic-routing.sh ]] \
       && /usr/local/libexec/pdg-quic-routing.sh apply >/dev/null 2>&1 \
       && /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1 || true

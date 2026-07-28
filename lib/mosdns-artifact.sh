@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # MosDNS 修补产物获取、候选校验与安装证明。调用前须 source lib/versions.sh。
+# shellcheck disable=SC2034
+# 上述候选输出变量由 source 本库的 install.sh / pdg.sh 在函数返回后读取。
 
 PDG_MOSDNS_ATTESTATION="${PDG_MOSDNS_ATTESTATION:-/etc/privdns-gateway/mosdns-build.env}"
 

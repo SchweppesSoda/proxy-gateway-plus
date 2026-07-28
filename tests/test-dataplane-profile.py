@@ -146,6 +146,47 @@ def main():
             raises(pdgprofile.canonical_hostname, bad_host)
         assert pdgprofile.canonical_hostname("dot.example.com") == "dot.example.com"
 
+    # Platform retargeting is one strict, side-effect-free profile transform.
+    # It canonicalizes leading whitespace, preserves custom data/comments, and
+    # only removes/adds Android's three GMS TLS ports.
+    with tempfile.TemporaryDirectory() as raw:
+        td = Path(raw)
+        p = td / "platform-profile.env"
+        p.write_text(
+            "# keep this comment\n"
+            "PDG_UNKNOWN=unchanged\n"
+            "  PDG_PLATFORM=android\n"
+            "  PDG_HIJACK_TLS_TCP_PORTS=10443,443,5228,5229,5230\n",
+            encoding="utf-8")
+        ios = pdgprofile.retarget_platform_text(p, "ios")
+        assert ios.count("PDG_PLATFORM=") == 1
+        assert ios.count("PDG_HIJACK_TLS_TCP_PORTS=") == 1
+        assert "PDG_PLATFORM=ios\n" in ios
+        assert "PDG_HIJACK_TLS_TCP_PORTS=443,10443\n" in ios
+        assert "# keep this comment\nPDG_UNKNOWN=unchanged\n" in ios
+        p.write_text(ios, encoding="utf-8")
+        android = pdgprofile.retarget_platform_text(p, "android")
+        assert "PDG_PLATFORM=android\n" in android
+        assert (
+            "PDG_HIJACK_TLS_TCP_PORTS=443,5228,5229,5230,10443\n"
+            in android)
+
+        p.write_text("PDG_PLATFORM=android\n", encoding="utf-8")
+        assert (
+            "PDG_HIJACK_TLS_TCP_PORTS=443\n"
+            in pdgprofile.retarget_platform_text(p, "ios"))
+        for invalid in (
+            "PDG_PLATFORM=android\nPDG_PLATFORM=ios\n"
+            "PDG_HIJACK_TLS_TCP_PORTS=443\n",
+            "PDG_PLATFORM=android\nPDG_HIJACK_TLS_TCP_PORTS=\n",
+            "PDG_PLATFORM=android\nPDG_HIJACK_TLS_TCP_PORTS=not-a-port\n",
+            "PDG_PLATFORM=android\nPDG_HIJACK_TLS_TCP_PORTS=5228,5229,5230\n",
+        ):
+            p.write_text(invalid, encoding="utf-8")
+            before = p.read_bytes()
+            raises(pdgprofile.retarget_platform_text, p, "ios")
+            assert p.read_bytes() == before
+
     with tempfile.TemporaryDirectory() as raw:
         td = Path(raw)
         cfg, nft_path, _mihomo = materialize(td, profile_text())

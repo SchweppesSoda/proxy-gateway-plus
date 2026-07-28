@@ -112,6 +112,56 @@ def read_values(path=PROFILE_FILE, *, missing_ok=True):
     return found
 
 
+def retarget_platform_text(path, target):
+    """Return a strict profile candidate for an Android/iOS transition.
+
+    Only the canonical platform and Android-only GMS TLS ports change.  Unknown
+    keys, comments and every other managed value retain their original order.
+    """
+    target = _choice(target, ("android", "ios"), "PDG_PLATFORM")
+    values = read_values(path)
+    if "PDG_HIJACK_TLS_TCP_PORTS" in values:
+        ports = sb2mihomo.parse_port_list(
+            values["PDG_HIJACK_TLS_TCP_PORTS"],
+            name="PDG_HIJACK_TLS_TCP_PORTS")
+    else:
+        ports = list(DEFAULT_TLS_PORTS[target])
+    gms = {5228, 5229, 5230}
+    if target == "ios":
+        ports = [port for port in ports if port not in gms]
+    else:
+        ports = sorted(set(ports) | gms)
+    if not ports:
+        raise ProfileError(
+            "切换到 iOS 后 TLS 端口集合为空；请先保留至少一个非 GMS 目的端口")
+
+    updates = {
+        "PDG_PLATFORM": target,
+        "PDG_HIJACK_TLS_TCP_PORTS": ",".join(map(str, ports)),
+    }
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as error:
+        raise ProfileError("无法读取 profile: %s" % path) from error
+    seen = set()
+    output = []
+    for line in lines:
+        stripped = line.lstrip()
+        key = stripped.split("=", 1)[0] if "=" in stripped else ""
+        if key in updates:
+            if key not in seen:
+                output.append("%s=%s" % (key, updates[key]))
+                seen.add(key)
+        else:
+            output.append(line)
+    for key in ("PDG_PLATFORM", "PDG_HIJACK_TLS_TCP_PORTS"):
+        if key not in seen:
+            output.append("%s=%s" % (key, updates[key]))
+    return "\n".join(output) + "\n"
+
+
 def _choice(value, choices, name):
     if not isinstance(value, str) or value not in choices:
         raise ProfileError("%s 只能是 %s" % (name, " 或 ".join(choices)))
@@ -399,6 +449,8 @@ def main(argv=None):
     ipv4.add_argument("value")
     hostname = sub.add_parser("canonical-hostname")
     hostname.add_argument("value")
+    platform = sub.add_parser("retarget-platform")
+    platform.add_argument("target", choices=("android", "ios"))
     nft = sub.add_parser("render-nft")
     nft.add_argument("--template", required=True)
     nft.add_argument("--internal-cidr", required=True)
@@ -413,6 +465,9 @@ def main(argv=None):
             return 0
         if args.command == "canonical-hostname":
             print(canonical_hostname(args.value))
+            return 0
+        if args.command == "retarget-platform":
+            print(retarget_platform_text(args.profile, args.target), end="")
             return 0
         occupied = live_tcp_listener_ports() if args.listener_preflight else ()
         config = resolve(

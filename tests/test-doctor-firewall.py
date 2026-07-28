@@ -23,6 +23,9 @@ spec = importlib.util.spec_from_file_location("pdg_checks", ROOT / "deploy/bot/c
 checks = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(checks)
+# Dynamic cases below exercise the managed-firewall contract.  Never inherit a
+# developer/VPS host's persisted external mode.
+checks._firewall_mode = lambda: "managed"
 
 checks._run = lambda cmd: (0, "chain input {\n tcp dport { 22 } accept\n"
                               " tcp dport { 5228-5230 } accept\n}", "")
@@ -152,6 +155,14 @@ try:
 
     # nft 端口集残留 5228-5230 → warn 指出 nft
     r = ios_case('{"inbounds": []}', "chain prerouting {\n ip saddr 172.22.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n}")
+    assert r is not None and r[0] == "warn" and "nft" in r[2], r
+
+    # 当前 profile-owned schema 把目的端口放在 pdg_tls_tcp_ports set。
+    r = ios_case('{"inbounds": []}',
+                 "set pdg_tls_tcp_ports {\n"
+                 " type inet_service\n"
+                 " elements = { 443, 5228, 5229, 5230 }\n"
+                 "}\n")
     assert r is not None and r[0] == "warn" and "nft" in r[2], r
 finally:
     checks._platform = _orig_platform

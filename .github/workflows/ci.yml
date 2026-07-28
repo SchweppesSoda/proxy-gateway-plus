@@ -196,6 +196,9 @@ jobs:
       - name: "原生 Web 安装生命周期回归"
         run: bash tests/test-web-install.sh
 
+      - name: "Web setup 晚期失败恢复与 enable 回滚"
+        run: bash tests/test-webctl-failure.sh
+
       - name: "规则集手机直连完整生命周期回归"
         run: python3 tests/test-ruleset-phone-direct.py
 
@@ -264,6 +267,15 @@ jobs:
 
       - name: "Phase3: install 回滚与 QUIC routing 恢复资产保留"
         run: bash tests/test-install-rollback.sh
+
+      - name: "Phase3: Android DoT 双连接与 TLS session 恢复探针"
+        run: python3 tests/test-dot-session-probe.py
+
+      - name: "Phase3: patched MosDNS 产物供应链契约"
+        run: bash tests/test-mosdns-patched-artifact.sh
+
+      - name: "Phase3: MosDNS binary + attestation 热替换事务"
+        run: bash tests/test-mosdns-swap.sh
 
       - name: "Phase3: 首装 geosite 离线事务与 live updater 硬门"
         run: bash tests/test-update-rules-bootstrap.sh

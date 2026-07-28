@@ -128,7 +128,7 @@ INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
 NFT_CONFIG_CHANGED=0; NFT_RUNTIME_TOUCHED=0
 QUIC_ROUTING_TOUCHED=0
 PRESERVE_QUIC_RECOVERY=0
-WEB_WAS_ENABLED=0; WEB_WAS_ACTIVE=0; WEB_RUNTIME_TOUCHED=0
+WEB_WAS_ENABLED=0; WEB_WAS_ACTIVE=0
 # 安装状态: 全部在注册 EXIT trap 前初始化 —— rollback 在 set -u 下读到未赋值的变量会
 # 二次崩溃, 把最初的安装错误盖掉, 还会漏掉它后面的 nftables/resolved/resolv.conf 还原。
 PRIOR_INSTALL=0; MOSDNS_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0
@@ -1144,7 +1144,6 @@ if [[ "$WEB_WAS_ENABLED" == 1 || "$WEB_WAS_ACTIVE" == 1 ]]; then
     || die "pdg-web 新版本配置/TLS 校验失败；拒绝重启并回滚覆盖重装。"
 fi
 if [[ "$WEB_WAS_ACTIVE" == 1 ]]; then
-  WEB_RUNTIME_TOUCHED=1
   systemctl restart pdg-web >/dev/null 2>&1 \
     && _web_service_stable \
     || die "pdg-web 原为 active，但新版本未能稳定重启；回滚覆盖重装。"

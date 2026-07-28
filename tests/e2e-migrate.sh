@@ -21,6 +21,39 @@ e2e_seed_install
 seed_old_box(){   # $1=平台标记(留空=老机器原样, 无标记)
   rm -f /etc/privdns-gateway/platform /etc/privdns-gateway/platform.guessed /etc/privdns-gateway/backend
   e2e_seed_mosdns all
+  # 回到 pre-profile / pre-schema 版本：仅保留当时已有的两个 profile 键，
+  # 并制造 nftscan.py 明确认得出的精确 markerless stock PDG 形态。新版迁移
+  # 必须从这些已部署证据补齐 firewall mode、CIDR、SSH 与 QUIC 数据面契约。
+  /usr/local/libexec/pdg-quic-routing.sh remove >/dev/null 2>&1 || true
+  rm -f /etc/privdns-gateway/firewall-mode /etc/privdns-gateway/quic-routing.state
+  rm -f /usr/local/libexec/pdg-quic-routing.sh \
+        /etc/systemd/system/pdg-quic-routing.service
+  printf 'PDG_LOWMEM=0\nPDG_HIJACK_MODE=all\n' > /etc/privdns-gateway/profile.env
+  echo 0 > /tmp/e2e-svc/pdg-quic-routing.ac
+  echo 0 > /tmp/e2e-svc/pdg-quic-routing.en
+  cat > /etc/nftables.conf <<'NFT'
+#!/usr/sbin/nft -f
+table inet pdg
+delete table inet pdg
+
+table inet pdg {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip saddr 127.0.0.0/8 tcp dport { 80, 443, 5228-5230 } redirect to :7893
+    }
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        tcp dport { 22 } accept
+        ip saddr 127.0.0.0/8 tcp dport { 53, 81, 853, 7893, 8445 } accept
+        ip saddr 127.0.0.0/8 udp dport 53 accept
+        ip saddr 127.0.0.0/8 udp dport 443 reject
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+    }
+}
+NFT
   # 退回"老形态": 去掉 hijack_set 插件(那时还没有这机制)
   python3 - /etc/mosdns/config.yaml <<'PY'
 import re, sys
@@ -43,6 +76,31 @@ PY
                    {"domain_suffix":["ip.skk.moe","example.test"],"outbound":"jp"}],
           "final":"direct"}}
 J
+  # 当时由 PDG 安装且仍在运行的 sing-box runtime。可信归属标记与历史
+  # unit 形态让迁移真正覆盖 stop/disable/read-back/remove 生命周期。
+  cat > /usr/local/bin/sing-box <<'SB'
+#!/bin/sh
+exit 0
+SB
+  chmod 755 /usr/local/bin/sing-box
+  cat > /etc/systemd/system/sing-box.service <<'SBU'
+[Unit]
+Description=sing-box
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target
+SBU
+  : > /etc/privdns-gateway/singbox.pdg-owned
+  echo 1 > /tmp/e2e-svc/sing-box.ac
+  echo 1 > /tmp/e2e-svc/sing-box.en
+  echo 0 > /tmp/e2e-svc/mihomo.ac
+  echo 0 > /tmp/e2e-svc/mihomo.en
   # v1.4.x 把 iOS 组件装给所有机器 → 它们证明不了平台
   install -m644 "$E2E_ROOT/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl" /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
   install -m755 "$E2E_ROOT/deploy/ios/probe81.py" /opt/pdg-bot/probe81.py

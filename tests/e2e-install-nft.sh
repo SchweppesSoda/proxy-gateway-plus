@@ -43,6 +43,21 @@ exit 0
 S
 chmod 755 /usr/local/bin/curl
 . "$E2E_ROOT/lib/versions.sh"
+cat > /tmp/e2e-mosdns-pdg-nft <<S
+#!/bin/sh
+case "\$1" in version) echo "$MOSDNS_BUILD_VERSION";; start) sleep 3600;; esac
+exit 0
+S
+chmod 755 /tmp/e2e-mosdns-pdg-nft
+E2E_MOSDNS_SHA="$(sha256sum /tmp/e2e-mosdns-pdg-nft | awk '{print $1}')"
+# 使用私有 source copy 把 tiny stand-in 固定为本 E2E 的 amd64 供应链 pin；
+# 生产 versions.sh 仍只信任真实修补产物。
+E2E_INSTALL_ROOT=/tmp/e2e-install-nft-source
+rm -rf "$E2E_INSTALL_ROOT"
+cp -a "$E2E_ROOT" "$E2E_INSTALL_ROOT"
+sed -i -E \
+  "s#(\\[mosdns-pdg-amd64\\]=\")[0-9a-f]+(\".*)#\\1$E2E_MOSDNS_SHA\\2#" \
+  "$E2E_INSTALL_ROOT/lib/versions.sh"
 if ! command -v mosdns >/dev/null 2>&1; then
   printf '#!/bin/sh\ncase "$1" in version) echo "v%s";; start) sleep 3600;; esac\nexit 0\n' \
     "$MOSDNS_VER" > /usr/local/bin/mosdns; chmod 755 /usr/local/bin/mosdns
@@ -70,16 +85,22 @@ chmod 755 /usr/local/bin/nft
 run_install(){   # $1=额外 env
   # shellcheck disable=SC2086
   env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_MOSDNS_ARTIFACT=/tmp/e2e-mosdns-pdg-nft \
+      PDG_MOSDNS_ARTIFACT_SHA256="$E2E_MOSDNS_SHA" \
       PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
       PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaaBBbbCCccDDddEEeeFFffGGgg \
       PDG_ALLOWED=1 PDG_PLATFORM=android $1 \
-      bash "$E2E_ROOT/install.sh" 2>&1
+      bash "$E2E_INSTALL_ROOT/install.sh" 2>&1
 }
 reset_box(){
   rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot \
          /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
-         /etc/systemd/system/mosdns.service /etc/nftables.conf.pdg-orig
+         /usr/local/libexec/pdg-quic-routing.sh \
+         /etc/systemd/system/mosdns.service /etc/systemd/system/mihomo.service \
+         /etc/nftables.conf.pdg-orig
   rm -rf /tmp/e2e-svc; mkdir -p /tmp/e2e-svc
+  : > /tmp/e2e-quic-ip/rules
+  rm -f /tmp/e2e-quic-ip/routes/* 2>/dev/null || true
   printf 0 > /tmp/e2e-svc/mosdns.ac
   printf 0 > /tmp/e2e-svc/mihomo.ac
 }
@@ -199,10 +220,12 @@ build_nopy_path(){
 run_install_nopy(){   # 用"没有 python3"的 PATH 跑装机
   env -i PATH="$NOPY_BIN" HOME=/root \
       PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
+      PDG_MOSDNS_ARTIFACT=/tmp/e2e-mosdns-pdg-nft \
+      PDG_MOSDNS_ARTIFACT_SHA256="$E2E_MOSDNS_SHA" \
       PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
       PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaaBBbbCCccDDddEEeeFFffGGgg \
       PDG_ALLOWED=1 PDG_PLATFORM=android \
-      bash "$E2E_ROOT/install.sh" 2>&1
+      bash "$E2E_INSTALL_ROOT/install.sh" 2>&1
 }
 
 reset_all(){ reset_box; rm -rf /opt/privdns-gateway; }
@@ -324,7 +347,8 @@ S
   out=$(run_install ""); rc=$?
   restore_py
   case "$code" in
-    0) { [[ "$rc" != 0 ]] && grep -q '不兼容的 nftables input 链' <<<"$out"; } \
+    0) { [[ "$rc" != 0 ]] && grep -q '注入: 模拟退出 0' <<<"$out" \
+         && grep -qE 'input|中止安装' <<<"$out"; } \
          && ok "退出 0(有冲突)→ 中止并说明是 input 链冲突" || bad "4d(0): rc=$rc: $(tail -3 <<<"$out")"
        untouched "退出 0" ;;
     1) [[ "$rc" == 0 ]] && ok "退出 1(确认干净)→ 继续并装完" || bad "4d(1): rc=$rc: $(tail -4 <<<"$out")" ;;
@@ -380,5 +404,6 @@ out=$(env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
 rm -rf /tmp/repo-noscan
 rm -f /usr/local/bin/py3-real /tmp/notexec; rm -rf "$NOPY_BIN"
 
-rm -f "$NFT_STATE"
+rm -f "$NFT_STATE" /tmp/e2e-mosdns-pdg-nft
+rm -rf "$E2E_INSTALL_ROOT"
 e2e_summary

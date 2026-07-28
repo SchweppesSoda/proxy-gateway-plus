@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 端到端沙盒骨架。用 user+mount namespace + overlayfs 把 /etc /opt /usr/local/bin 覆盖掉,
+# 端到端沙盒骨架。用 user+mount namespace + overlayfs 把 /etc /opt /usr/local 覆盖掉,
 # 于是可以在**真实绝对路径**上跑真正的 install/migrate/update/switch-core, 而宿主毫发无损
 # (所有写入落在 overlay 的 upperdir)。
 #
@@ -31,21 +31,23 @@ _e2e_git_safe(){ grep -q 'directory = \*' /etc/gitconfig 2>/dev/null || printf '
 # 把机器清回"什么都没装过"的状态。namespace 模式下 overlay 本来就干净, 这里主要给容器模式
 # (CI 里多个脚本共用一个容器)用: 二进制、unit、归属/后端标记、快照、仓库副本、服务桩一个不留。
 e2e_reset_box(){
-  systemctl disable --now pdg-bot pdg-probe81 pdg-mitm mosdns mihomo sing-box >/dev/null 2>&1 || true
+  systemctl disable --now pdg-bot pdg-probe81 pdg-mitm pdg-quic-routing mosdns mihomo sing-box >/dev/null 2>&1 || true
   # sing-box 是**必须**清掉的那个: 装机会把来源不明的 sing-box 判成第三方冲突而中止,
   # 跨版本回滚用例正好留一份在这。mihomo / mosdns 反过来要**留着** —— 它们是从网上下的
   # 真内核(几十 MB), 每个脚本重下一遍既慢又会在没网时把用例整条 skip 掉(假绿)。
   rm -f /usr/local/bin/sing-box \
         /usr/local/bin/pdg /usr/local/bin/pdg-set-token \
         /usr/local/bin/proxy-gateway-open-cert-http.sh \
-        /usr/local/bin/proxy-gateway-restore-firewall.sh 2>/dev/null || true
-  rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-mitm,mosdns,mihomo,sing-box,pdg-rules-update,pdg-health}.service \
+        /usr/local/bin/proxy-gateway-restore-firewall.sh \
+        /usr/local/libexec/pdg-quic-routing.sh 2>/dev/null || true
+  rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-mitm,pdg-quic-routing,mosdns,mihomo,sing-box,pdg-rules-update,pdg-health}.service \
         /etc/systemd/system/{pdg-rules-update,pdg-health}.timer \
         /etc/systemd/journald.conf.d/50-pdg.conf 2>/dev/null || true
   rm -rf /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /opt/pdg-bot \
          /opt/privdns-gateway /var/lib/privdns-gateway 2>/dev/null || true
   rm -f /etc/nftables.conf.pdg-orig /etc/resolv.conf.pdg-orig 2>/dev/null || true
   rm -rf /tmp/e2e-svc /tmp/e2e-nft-ruleset /tmp/e2e-calls.log /tmp/e2e-inject \
+         /tmp/e2e-quic-ip /tmp/e2e-pdg-ip \
          /tmp/e2e-origin.git /tmp/e2e-xver-origin.git /tmp/e2e-cli-origin.git \
          /tmp/e2e-empty-origin.git 2>/dev/null || true
   # 前一个脚本装的**桩命令**同样是"上一个脚本留下的状态": e2e-install 会留一个假 curl
@@ -61,7 +63,8 @@ e2e_reset_box(){
     rm -f /usr/local/bin/mosdns 2>/dev/null || true      # 小于 1MB = 桩, 不是真 mosdns
   fi
   mkdir -p /var/lib/privdns-gateway /etc/mosdns/rules /etc/sing-box /etc/mihomo \
-           /etc/privdns-gateway /etc/systemd/system /etc/systemd/journald.conf.d /tmp/e2e-svc 2>/dev/null || true
+           /etc/privdns-gateway /etc/systemd/system /etc/systemd/journald.conf.d \
+           /usr/local/libexec /tmp/e2e-svc 2>/dev/null || true
   : > /etc/nftables.conf
   # 清 bash 的命令哈希: 上面刚跑过 mihomo(能力探测)又把它删了, 不清的话后续 `command -v mihomo`
   # 仍会命中缓存里的旧路径, 于是"没有就造个桩"的分支被跳过, 装机改走下载 → 撞上假 curl → SHA 失败。
@@ -84,7 +87,7 @@ e2e_enter(){
   if [[ "${PDG_E2E_INNER:-}" == 1 ]]; then
     mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew" /etc \
       || { echo "[SKIP] overlay /etc 挂不上"; exit 0; }
-    mount -t overlay overlay -o "lowerdir=/usr/local/bin,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local/bin
+    mount -t overlay overlay -o "lowerdir=/usr/local,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local
     mount -t overlay overlay -o "lowerdir=/opt,upperdir=$E2E_OVL/ou,workdir=$E2E_OVL/ow" /opt
     mount -t tmpfs tmpfs /run 2>/dev/null || true            # pdg 的 flock 落在 /run(宿主归真 root)
     # 快照目录在 /var/lib/privdns-gateway; 宿主 /var/lib 归真 root, 不覆盖就建不了快照,
@@ -241,7 +244,59 @@ PY
 
 e2e_stub_system(){
   local shape="${1:-live}"
-  mkdir -p /tmp/e2e-svc
+  rm -rf /tmp/e2e-quic-ip
+  mkdir -p /tmp/e2e-svc /tmp/e2e-quic-ip/routes
+  : > /tmp/e2e-quic-ip/rules
+cat > /tmp/e2e-pdg-ip <<'IP'
+#!/usr/bin/env bash
+set -uo pipefail
+d=/tmp/e2e-quic-ip
+rules="$d/rules"; routes="$d/routes"
+[[ "${1:-}" == -4 ]] || exit 2
+shift
+(( $# >= 2 )) || exit 2
+kind="$1"; op="$2"; shift 2
+if [[ "$kind" == rule && "$op" == show ]]; then
+  (( $# == 0 )) || exit 2
+  cat "$rules" 2>/dev/null || true; exit 0
+fi
+if [[ "$kind" == route && "$op" == show ]]; then
+  (( $# == 2 )) && [[ "$1" == table && "$2" =~ ^[0-9]+$ ]] || exit 2
+  cat "$routes/$2" 2>/dev/null || true; exit 0
+fi
+if [[ "$kind" == rule && ( "$op" == add || "$op" == del ) ]]; then
+  (( $# == 6 )) \
+    && [[ "$1" == priority && "$2" =~ ^[0-9]+$ \
+          && "$3" == fwmark && "$4" =~ ^0x[0-9a-f]+/0x[0-9a-f]+$ \
+          && "$5" == lookup && "$6" =~ ^[0-9]+$ ]] || exit 2
+  priority="$2"; mark="$4"; table="$6"
+  line="$priority: from all fwmark $mark lookup $table"
+  if [[ "$op" == add ]]; then
+    grep -Fqx "$line" "$rules" 2>/dev/null || printf '%s\n' "$line" >>"$rules"
+  else
+    grep -Fvx "$line" "$rules" >"$rules.tmp" 2>/dev/null || true
+    mv -f "$rules.tmp" "$rules"
+  fi
+  exit 0
+fi
+if [[ "$kind" == route && ( "$op" == replace || "$op" == del ) ]]; then
+  (( $# == 6 )) \
+    && [[ "$1" == local && "$2" == 0.0.0.0/0 \
+          && "$3" == dev && "$4" == lo \
+          && "$5" == table && "$6" =~ ^[0-9]+$ ]] || exit 2
+  table="$6"
+  if [[ "$op" == replace ]]; then
+    printf 'local default dev lo\n' >"$routes/$table"
+  else
+    rm -f "$routes/$table"
+  fi
+  exit 0
+fi
+exit 2
+IP
+  chmod 755 /tmp/e2e-pdg-ip
+  export PDG_IP_BIN=/tmp/e2e-pdg-ip
+  export PDG_PROFILE_TOOL=/opt/pdg-bot/pdgprofile.py
   e2e_tx_probes || echo "[!] 事务硬门探针没起来, 相关用例会如实失败"
   # 真机上做变更时 mosdns/mihomo 本来就在跑; 沙箱的假 systemd 默认全 inactive, 会让事务的
   # 基线门(操作前组件必须是好的)正确地拒掉一切普通变更。这里把它们置为 active, 让沙箱与
@@ -253,32 +308,74 @@ e2e_stub_system(){
   fi
   # 有状态的假 systemd: 记录每个 unit 的 active/enabled。切核纪律(旧核必须真的 inactive
   # 且 disabled)只有靠状态机才验得出来 —— 无脑回 active 的桩会把 activate 判成失败。
-  cat > /usr/local/bin/systemctl <<'S'
+cat > /usr/local/bin/systemctl <<'S'
 #!/bin/sh
 D=/tmp/e2e-svc; mkdir -p "$D"
 echo "systemctl $*" >> /tmp/e2e-calls.log
+unit_key(){
+  case "$1" in *.service) printf '%s\n' "${1%.service}";; *) printf '%s\n' "$1";; esac
+}
+unit_file(){
+  case "$1" in *.service|*.timer) printf '%s\n' "$1";; *) printf '%s.service\n' "$1";; esac
+}
+unit_known(){
+  uk=$(unit_key "$1"); uf=$(unit_file "$1")
+  [ -e "/etc/systemd/system/$uf" ] \
+    || [ -e "/lib/systemd/system/$uf" ] \
+    || [ -e "/usr/lib/systemd/system/$uf" ] \
+    || [ -f "$D/${uk}.ac" ] || [ -f "$D/${uk}.en" ]
+}
+quic_action(){
+  [ "$1" = pdg-quic-routing ] || return 0
+  [ -x /usr/local/libexec/pdg-quic-routing.sh ] || return 1
+  /usr/local/libexec/pdg-quic-routing.sh "$2" >/dev/null 2>&1
+}
 verb="$1"; shift
 now=0; [ "$1" = "--now" ] && { now=1; shift; }
 case "$verb" in
   daemon-reload|reset-failed|preset|mask|unmask) exit 0;;
-  enable)  for u in "$@"; do u=${u%.service}; echo 1 > "$D/${u}.en"
+  enable)  rc=0; for u in "$@"; do
+             unit_known "$u" || { rc=1; continue; }
+             u=$(unit_key "$u"); echo 1 > "$D/${u}.en"
              # .fail 标记 = 这个 unit "起得来但立刻崩" → 起完仍是 inactive
-             if [ "$now" = 1 ]; then [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"; fi
-           done; exit 0;;
-  disable) for u in "$@"; do u=${u%.service}; echo 0 > "$D/${u}.en"; [ "$now" = 1 ] && echo 0 > "$D/${u}.ac"; done; exit 0;;
-  start|restart) for u in "$@"; do
-                   u=${u%.service}
-                   [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"
-                 done; exit 0;;
-  stop)    for u in "$@"; do u=${u%.service}; echo 0 > "$D/${u}.ac"; done; exit 0;;
+             if [ "$now" = 1 ]; then
+               if [ -f "$D/${u}.fail" ]; then echo 0 > "$D/${u}.ac"
+               elif quic_action "$u" apply; then echo 1 > "$D/${u}.ac"
+               else echo 0 > "$D/${u}.ac"; rc=1
+               fi
+             fi
+           done; exit "$rc";;
+  disable) rc=0; for u in "$@"; do
+             unit_known "$u" || { rc=1; continue; }
+             u=$(unit_key "$u"); echo 0 > "$D/${u}.en"
+             if [ "$now" = 1 ]; then
+               quic_action "$u" remove || rc=1
+               echo 0 > "$D/${u}.ac"
+             fi
+           done; exit "$rc";;
+  start|restart) rc=0; for u in "$@"; do
+                   unit_known "$u" || { rc=1; continue; }
+                   u=$(unit_key "$u")
+                   if [ -f "$D/${u}.fail" ]; then echo 0 > "$D/${u}.ac"
+                   elif quic_action "$u" apply; then echo 1 > "$D/${u}.ac"
+                   else echo 0 > "$D/${u}.ac"; rc=1
+                   fi
+                 done; exit "$rc";;
+  stop)    rc=0; for u in "$@"; do
+             unit_known "$u" || { rc=1; continue; }
+             u=$(unit_key "$u"); quic_action "$u" remove || rc=1
+             echo 0 > "$D/${u}.ac"
+           done; exit "$rc";;
   is-active)
+      while [ "${1:-}" = "--quiet" ]; do shift; done
       u="${1%.service}"; v=$(cat "$D/${u}.ac" 2>/dev/null)
-      # 没记录过的: 有 unit 文件就当它在跑(模拟装好即运行), 否则 inactive
-      [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+      # unit 文件存在不代表已启动；所有 active 状态必须由 start/enable --now 或 fixture 明示。
+      [ -z "$v" ] && v=0
       [ "$v" = 1 ] && { echo active; exit 0; }; echo inactive; exit 3;;
   is-enabled)
+      while [ "${1:-}" = "--quiet" ]; do shift; done
       u="${1%.service}"; v=$(cat "$D/${u}.en" 2>/dev/null)
-      [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+      [ -z "$v" ] && v=0
       [ "$v" = 1 ] && { echo enabled; exit 0; }; echo disabled; exit 1;;
   show)
       # show -p PROP --value UNIT。ActiveState 是"停稳"判据要看的东西(failed/activating 都不算
@@ -290,7 +387,7 @@ case "$verb" in
       u=${u%.service}
       if [ "$prop" = ActiveState ]; then
         v=$(cat "$D/${u}.ac" 2>/dev/null)
-        [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+        [ -z "$v" ] && v=0
         [ "$v" = 1 ] && echo active || echo inactive
         exit 0
       fi
@@ -303,8 +400,32 @@ case "$verb" in
         exit 0
       fi
       echo 0; exit 0;;
+  list-units)
+      for f in "$D"/*.ac; do
+        [ -e "$f" ] || continue
+        u=${f##*/}; u=${u%.ac}
+        case "$u" in *.*) uf="$u";; *) uf="$u.service";; esac
+        v=$(cat "$f" 2>/dev/null)
+        [ "$v" = 1 ] && state=active || state=inactive
+        printf '%s loaded %s running\n' "$uf" "$state"
+      done
+      exit 0;;
+  list-unit-files)
+      for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer \
+               /lib/systemd/system/*.service /lib/systemd/system/*.timer \
+               /usr/lib/systemd/system/*.service /usr/lib/systemd/system/*.timer; do
+        [ -e "$f" ] || continue
+        printf '%s disabled\n' "${f##*/}"
+      done
+      exit 0;;
+  status)
+      while [ "${1:-}" != "" ] && [ "${1#-}" != "$1" ]; do shift; done
+      unit_known "${1:-}" || exit 4
+      u=$(unit_key "$1"); v=$(cat "$D/${u}.ac" 2>/dev/null)
+      [ "$v" = 1 ] && exit 0
+      exit 3;;
 esac
-exit 0
+exit 64
 S
   cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
@@ -375,9 +496,14 @@ E2E_CIDR=127.0.0.0/8
 
 # 装好 bot 模块 + 仓库 + pdg 脚本
 e2e_seed_install(){
-  mkdir -p /opt/pdg-bot /etc/mosdns/rules /etc/privdns-gateway
+  mkdir -p /opt/pdg-bot /etc/mosdns/rules /etc/privdns-gateway \
+           /usr/local/libexec /etc/systemd/system
   cp -a "$E2E_ROOT" /opt/privdns-gateway
   install -m755 "$E2E_ROOT/deploy/bot/pdg.sh" /usr/local/bin/pdg
+  install -m755 "$E2E_ROOT/deploy/firewall/pdg-quic-routing.sh" \
+    /usr/local/libexec/pdg-quic-routing.sh
+  install -m644 "$E2E_ROOT/deploy/firewall/pdg-quic-routing.service" \
+    /etc/systemd/system/pdg-quic-routing.service
   local f; for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
   install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
   printf 'PDG_BOT_TOKEN=x\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
@@ -406,7 +532,8 @@ EOF
 
 # 渲染 mosdns 配置 + 规则文件。$1=劫持模式(all|gfw)
 e2e_seed_mosdns(){
-  local mode="${1:-all}" f
+  local mode="${1:-all}" platform="${2:-android}" tls_ports=443 f
+  [[ "$platform" == android ]] && tls_ports=443,5228,5229,5230
   for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_direct unlock mitm_hijack \
            geosite_gfw 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
   printf 'domain:baidu.com\n' > /etc/mosdns/rules/geosite_cn.txt
@@ -419,14 +546,82 @@ e2e_seed_mosdns(){
   . "$E2E_ROOT/lib/mosdns.sh"
   local setf; [[ "$mode" == gfw ]] && setf=geosite_gfw.txt || setf='geosite_geolocation-!cn.txt'
   _mosdns_hijack_shape "$mode" /etc/mosdns/config.yaml "$setf" >/dev/null
-  printf 'PDG_LOWMEM=0\nPDG_HIJACK_MODE=%s\n' "$mode" > /etc/privdns-gateway/profile.env
+  cat > /etc/privdns-gateway/profile.env <<EOF
+PDG_LOWMEM=0
+PDG_HIJACK_MODE=$mode
+PDG_FIREWALL_MODE=managed
+PDG_PLATFORM=$platform
+PDG_INTERNAL_CIDR=$E2E_CIDR
+PDG_SSH_PORT=22
+PDG_QUIC_MODE=tproxy
+PDG_HIJACK_TLS_TCP_PORTS=$tls_ports
+PDG_HIJACK_HTTP_TCP_PORTS=80
+PDG_QUIC_MARK=0x504447
+PDG_QUIC_MARK_MASK=0xffffffff
+PDG_QUIC_ROUTE_TABLE=7895
+PDG_QUIC_RULE_PRIORITY=17895
+EOF
+  printf 'managed\n' > /etc/privdns-gateway/firewall-mode
+  chmod 600 /etc/privdns-gateway/profile.env /etc/privdns-gateway/firewall-mode
+  if ! systemctl enable --now pdg-quic-routing >/dev/null 2>&1 \
+     || ! /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1; then
+    echo "[FAIL] E2E fixture 无法建立可信 QUIC routing 基线" >&2
+    exit 1
+  fi
+}
+
+# 原子同步 E2E 平台 fixture 与其 TLS 端口集合。只增删 Android GMS 三口，
+# 用户自定义端口原样保留；严格解析失败时不留下半写 profile。
+e2e_seed_platform(){
+  local target="$1" tmp
+  [[ "$target" == ios || "$target" == android ]] \
+    || { echo "[FAIL] 非法 E2E 平台: $target" >&2; exit 1; }
+  tmp="$(mktemp /etc/privdns-gateway/.profile.e2e.XXXXXX)" \
+    || { echo "[FAIL] 无法创建 E2E profile candidate" >&2; exit 1; }
+  if ! python3 "$E2E_ROOT/deploy/bot/pdgprofile.py" \
+      --profile /etc/privdns-gateway/profile.env \
+      retarget-platform "$target" >"$tmp"; then
+    rm -f "$tmp"
+    echo "[FAIL] 无法同步 E2E 平台 profile" >&2
+    exit 1
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" /etc/privdns-gateway/profile.env \
+    || { rm -f "$tmp"; echo "[FAIL] 无法安装 E2E 平台 profile" >&2; exit 1; }
+  printf '%s\n' "$target" > /etc/privdns-gateway/platform \
+    || { echo "[FAIL] 无法写 E2E 平台 marker" >&2; exit 1; }
+  chmod 600 /etc/privdns-gateway/platform
 }
 
 # 渲染真实防火墙配置(switch-core 要从中提取 SSH 端口)。$1=内核(singbox|mihomo)
 # v1.6.0: 只剩 mihomo 一套模板($1 保留但已无意义, 调用方不必改)。
 e2e_seed_nft(){
-  sed -e "s|__SSH_PORT__|22|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e "s|__SERVER_IP__|$E2E_SIP|g" \
-      "$E2E_ROOT/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
+  local platform mode cidr sshp tmp
+  platform="$(sed -n 's/^PDG_PLATFORM=//p' /etc/privdns-gateway/profile.env)"
+  mode="$(sed -n 's/^PDG_FIREWALL_MODE=//p' /etc/privdns-gateway/profile.env)"
+  cidr="$(sed -n 's/^PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env)"
+  sshp="$(sed -n 's/^PDG_SSH_PORT=//p' /etc/privdns-gateway/profile.env)"
+  tmp="$(mktemp /etc/.nftables.e2e.XXXXXX)" \
+    || { echo "[FAIL] 无法创建 E2E nft candidate" >&2; exit 1; }
+  if ! python3 "$E2E_ROOT/deploy/bot/pdgprofile.py" \
+    --profile /etc/privdns-gateway/profile.env --platform "$platform" \
+    --ssh-port "$sshp" --profile-only render-nft \
+    --template "$E2E_ROOT/deploy/firewall/nftables-mihomo.conf" \
+    --internal-cidr "$cidr" --firewall-mode "$mode" \
+    >"$tmp"; then
+    rm -f "$tmp"
+    echo "[FAIL] E2E nft renderer 拒绝当前 profile" >&2
+    exit 1
+  fi
+  if grep -qE '__[A-Z0-9_]+__' "$tmp" \
+     || ! grep -qF "owner=privdns-gateway;schema=1;component=firewall;mode=$mode" "$tmp"; then
+    rm -f "$tmp"
+    echo "[FAIL] E2E nft candidate 缺 owner/schema 或仍有占位符" >&2
+    exit 1
+  fi
+  chmod 644 "$tmp"
+  mv -f "$tmp" /etc/nftables.conf \
+    || { rm -f "$tmp"; echo "[FAIL] 无法安装 E2E nft candidate" >&2; exit 1; }
 }
 
 e2e_seed_singbox_model(){
