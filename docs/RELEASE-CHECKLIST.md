@@ -70,7 +70,7 @@ pdg update     # __migrate 里自动 sing-box → mihomo
 - [ ] **单内核入站正确**:`ss -lntup` 可见 Mihomo `:7893`;默认 `tproxy` 另见 UDP
   `:7895`;Telegram 代理启用时 `:8445` 有 Mihomo listener。原始目的端口由 nft
   REDIRECT / TPROXY 接管,不要求 Mihomo 分别监听 80/443/GMS 端口。
-- [ ] **出口/分流全保留**:bot「🚦 测出口」每个出口都返回延迟、不报「超时/不通」;**direct 出口(jp)** 也通(它在 mihomo 里映射成内建 `DIRECT`)。
+- [ ] **出口/分流全保留**:bot「🚦 测出口」每个出口都返回延迟、不报「超时/不通」;**direct 出口(JP)** 也通(它在 mihomo 里映射成内建 `DIRECT`)。
 - [ ] **有不可转换出口时**:config.json 里放一个 mihomo 不支持的出站,`pdg update` 应**中止并回滚到旧 sing-box 版**(数据无损),报出该出口名。
 
 ## ④ WLOC(仅 iOS 装机)

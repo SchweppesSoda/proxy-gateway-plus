@@ -873,6 +873,8 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
             "/api/v1/settings": self.control.settings,
             "/api/v1/traffic": self.control.traffic,
             "/api/v1/runtime": self.control.runtime,
+            "/api/v1/snapshots": self.control.snapshots,
+            "/api/v1/jobs": self.control.jobs,
         }
         if self.command == "GET" and path in get_routes:
             self._call(get_routes[path])
@@ -909,16 +911,26 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/v1/rulesets" and self.command == "POST":
             self._call_body(self.control.add_ruleset, status=201)
             return
+        if path == "/api/v1/diagnostics/exits" and self.command == "POST":
+            self._call_body(self.control.diagnose_exits)
+            return
+        if path == "/api/v1/diagnostics/domain" and self.command == "POST":
+            self._call_body(self.control.diagnose_domain)
+            return
         if path == "/api/v1/settings/tfo" and self.command == "PUT":
             self._call_body(self.control.set_tfo)
             return
 
         match = re.fullmatch(r"/api/v1/exits/([^/]+)", path)
-        if match and self.command in {"PATCH", "DELETE"}:
+        if match and self.command in {"PATCH", "PUT", "DELETE"}:
+            operation = (
+                self.control.rename_exit if self.command == "PATCH"
+                else self.control.replace_exit if self.command == "PUT"
+                else self.control.delete_exit
+            )
             self._identifier_call(
                 match.group(1), "tag",
-                self.control.rename_exit if self.command == "PATCH" else self.control.delete_exit,
-                body=self.command == "PATCH")
+                operation, body=self.command in {"PATCH", "PUT"})
             return
         match = re.fullmatch(r"/api/v1/groups/([^/]+)", path)
         if match and self.command in {"PATCH", "DELETE"}:
@@ -941,6 +953,17 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.control.patch_ruleset if self.command == "PATCH"
                 else self.control.delete_ruleset,
                 body=self.command == "PATCH")
+            return
+        match = re.fullmatch(r"/api/v1/rulesets/([^/]+)/target", path)
+        if match and self.command == "PUT":
+            self._identifier_call(
+                match.group(1), "tag", self.control.set_ruleset_target,
+                body=True)
+            return
+        match = re.fullmatch(r"/api/v1/jobs/([^/]+)", path)
+        if match and self.command == "GET":
+            self._identifier_call(
+                match.group(1), "tag", self.control.job, body=False)
             return
         match = re.fullmatch(r"/api/v1/dns/(remote|local)", path)
         if match and self.command == "PUT":

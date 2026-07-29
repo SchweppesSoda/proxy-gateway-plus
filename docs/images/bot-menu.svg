@@ -8,8 +8,8 @@
 <text x="22" y="62" fill="#7fd28a">🟢 mosdns / sing-box / pdg-bot 都在</text>
 <text x="22" y="80" fill="#c7d4e0">DoT: dot.example.com</text>
 <text x="22" y="97" fill="#c7d4e0">IP: 203.0.113.10</text>
-<text x="22" y="114" fill="#c7d4e0">出口(5): hk, tw, jp, us, auto</text>
-<text x="22" y="131" fill="#c7d4e0">故障组 auto: hk › tw › jp › us</text>
+<text x="22" y="114" fill="#c7d4e0">出口(5): hk, tw, JP, us, auto</text>
+<text x="22" y="131" fill="#c7d4e0">故障组 auto: hk › tw › JP › us</text>
 <text x="22" y="148" fill="#c7d4e0">默认出口: hk · 规则集: 3</text>
 <text x="22" y="165" fill="#c7d4e0">分流: 国内直连 / 4 条规则 / 其余→hk</text>
 </g>

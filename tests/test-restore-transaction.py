@@ -54,8 +54,34 @@ AFTER_SB["outbounds"][0]["password"] = "BACKUP-PASSWORD-2"
 AFTER_SB["route"]["rules"][0]["ip_cidr"] = ["198.51.100.7/32"]     # 备份来自另一台机器
 AFTER_SB["route"]["final"] = "new-tw"
 
-CUR_MOS = 'log: {level: info}\nips: [ "172.22.0.0/16" ]\ncert: "/etc/mosdns/certs/fullchain.pem"\n'
-BAK_MOS = 'log: {level: debug}\nips: [ "10.9.0.0/16" ]\ncert: "/etc/other/certs/fullchain.pem"\n'
+def mos_shape(level, cidr, cert):
+    return """\
+log: {level: %s}
+identity: {ips: [ "%s" ], cert: "%s"}
+plugins:
+  - tag: geosite_cn
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/ruleset_direct.txt"] }
+  - tag: explicit_hijack
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/custom_hijack.txt","/etc/mosdns/rules/ruleset_hijack.txt"] }
+  - tag: force_hijack_seq
+    type: sequence
+    args:
+      - matches: qtype 1
+        exec: black_hole 203.0.113.10
+  - tag: internal_sequence
+    type: sequence
+    args:
+      - matches: qname $explicit_hijack
+        exec: goto force_hijack_seq
+      - matches: qname $geosite_cn
+        exec: $local_upstream
+""" % (level, cidr, cert)
+
+
+CUR_MOS = mos_shape("info", "172.22.0.0/16", "/etc/mosdns/certs/fullchain.pem")
+BAK_MOS = mos_shape("debug", "10.9.0.0/16", "/etc/other/certs/fullchain.pem")
 
 
 def make_box():
@@ -70,6 +96,8 @@ def make_box():
     bot.MOSDNS_CONF = box.path("/etc/mosdns/config.yaml")
     bot.MOSDNS_DIRECT = box.path("/etc/mosdns/rules/custom_direct.txt")
     bot.MOSDNS_HIJACK = box.path("/etc/mosdns/rules/custom_hijack.txt")
+    bot.MOSDNS_RULESET_DIRECT = box.path("/etc/mosdns/rules/ruleset_direct.txt")
+    bot.MOSDNS_RULESET_HIJACK = box.path("/etc/mosdns/rules/ruleset_hijack.txt")
     bot.RS_DIR = box.path("/etc/sing-box/rs")
     bot.RS_META = box.path("/opt/pdg-bot/rulesets.json")
     bot.MIHOMO_DIR = box.path("/etc/mihomo")
@@ -84,7 +112,8 @@ def make_box():
     box.put("/opt/pdg-bot/rulesets.json", json.dumps({
         "rs_before": {"url": "https://x/before.list", "outbound": "old-hk", "format": "source",
                       "path": box.path("/etc/sing-box/rs/rs_before.json"), "count": 3}}).encode(), 0o644)
-    box.put("/etc/sing-box/rs/rs_before.json", b'{"rules":["DOMAIN,before.com"]}', 0o644)
+    box.put("/etc/sing-box/rs/rs_before.json",
+            b'{"version":1,"rules":[{"domain":["before.com"]}]}', 0o644)
     box.put("/etc/sing-box/rs/user-own.json", b'{"rules":["DOMAIN,mine.com"]}', 0o644)   # 用户自放
     box.put("/etc/mihomo/config.yaml", b"{}\n")
     box.up("mosdns"); box.up("mihomo")
@@ -114,7 +143,10 @@ def full_backup(meta=None, rs=None, with_mos=True, with_direct=True, with_hijack
         members.append(("etc/mosdns/rules/custom_hijack.txt", b"after-hijack.com\n"))
     if meta is not None:
         members.append(("opt/pdg-bot/rulesets.json", json.dumps(meta).encode()))
-    for name, data in (rs if rs is not None else [("rs_after.json", b'{"rules":["DOMAIN,after.com"]}')]):
+    for name, data in (
+        rs if rs is not None
+        else [("rs_after.json", b'{"version":1,"rules":[{"domain":["after.com"]}]}')]
+    ):
         members.append(("etc/sing-box/rs/" + name, data))
     return blob(members)
 
@@ -122,6 +154,8 @@ def full_backup(meta=None, rs=None, with_mos=True, with_direct=True, with_hijack
 def snap(box):
     keys = ["/etc/sing-box/config.json", "/etc/mosdns/config.yaml",
             "/etc/mosdns/rules/custom_direct.txt", "/etc/mosdns/rules/custom_hijack.txt",
+            "/etc/mosdns/rules/ruleset_direct.txt",
+            "/etc/mosdns/rules/ruleset_hijack.txt",
             "/opt/pdg-bot/rulesets.json", "/etc/sing-box/rs/rs_before.json",
             "/etc/sing-box/rs/rs_after.json", "/etc/sing-box/rs/user-own.json",
             "/etc/mihomo/config.yaml"]
@@ -163,7 +197,7 @@ def main():
         ok("custom_direct 按备份恢复")
     else:
         bad("custom_direct 没恢复")
-    if box.read("/etc/sing-box/rs/rs_after.json") == b'{"rules":["DOMAIN,after.com"]}':
+    if box.read("/etc/sing-box/rs/rs_after.json") == b'{"version":1,"rules":[{"domain":["after.com"]}]}':
         ok("备份里的规则集被写入")
     else:
         bad("规则集没写入")
@@ -205,6 +239,51 @@ def main():
         ok("iOS 恢复: 备份里的 GMS 入站在进候选前被净化(落盘的 model 里没有 5228)")
     else:
         bad("平台净化没生效: ok=%s tags=%s" % (okr, tags))
+    box.clean()
+
+    # ── 1c. 旧备份 direct 锚点 jp → JP，model/meta/Mihomo 在同一恢复事务中一致 ──
+    box, bot = make_box()
+    legacy = json.loads(json.dumps(AFTER_SB))
+    legacy["outbounds"][1]["tag"] = "jp"
+    legacy["outbounds"].append(
+        {"type": "urltest", "tag": "auto", "outbounds": ["new-tw", "jp"]})
+    legacy["route"]["rules"].append(
+        {"domain_suffix": ["legacy-direct.example"], "outbound": "jp"})
+    legacy["route"]["final"] = "jp"
+    legacy_meta = {
+        "rs_legacy": {
+            "url": "https://x/legacy.list",
+            "outbound": "jp",
+            "format": "source",
+            "path": "/etc/sing-box/rs/rs_legacy.json",
+            "count": 1,
+        }
+    }
+    okr, msg = bot.restore_from(blob([
+        ("etc/sing-box/config.json", json.dumps(legacy).encode()),
+        ("opt/pdg-bot/rulesets.json", json.dumps(legacy_meta).encode()),
+        ("etc/sing-box/rs/rs_legacy.json",
+         b'{"version":1,"rules":[{"domain_suffix":["legacy.example"]}]}'),
+    ]))
+    landed = json.loads(box.read("/etc/sing-box/config.json").decode())
+    landed_meta = json.loads(box.read("/opt/pdg-bot/rulesets.json").decode())
+    direct_tags = [
+        item["tag"] for item in landed["outbounds"] if item.get("type") == "direct"]
+    auto = next(item for item in landed["outbounds"] if item.get("tag") == "auto")
+    legacy_rule = next(
+        item for item in landed["route"]["rules"]
+        if item.get("domain_suffix") == ["legacy-direct.example"])
+    if (
+        okr
+        and direct_tags == ["JP"]
+        and auto["outbounds"] == ["new-tw", "JP"]
+        and legacy_rule["outbound"] == "JP"
+        and landed["route"]["final"] == "JP"
+        and landed_meta["rs_legacy"]["outbound"] == "JP"
+    ):
+        ok("旧备份恢复: direct 锚点及 model/meta 全部引用在候选阶段 jp→JP")
+    else:
+        bad("旧备份 jp→JP 不完整: ok=%s msg=%s" % (okr, msg))
     box.clean()
 
     # ── 2. 可选文件缺失 → 保持现网, 不清空 ──
@@ -456,8 +535,8 @@ def main():
     okr, msg = bot.restore_from(full_backup(
         meta={"rs_ok": {"url": "https://x/a", "outbound": "new-tw", "format": "source",
                         "path": os.path.join(bot.RS_DIR, "rs_ok.json"), "count": 1}},
-        rs=[("rs_ok.json", b'{"rules":["DOMAIN,ok.com"]}')]))
-    if okr and box.read("/etc/sing-box/rs/rs_ok.json") == b'{"rules":["DOMAIN,ok.com"]}':
+        rs=[("rs_ok.json", b'{"version":1,"rules":[{"domain":["ok.com"]}]}')]))
+    if okr and box.read("/etc/sing-box/rs/rs_ok.json") == b'{"version":1,"rules":[{"domain":["ok.com"]}]}':
         ok("合法沙箱映射路径(本机 RS_DIR)仍被接受并落盘")
     else:
         bad("收紧误伤了合法沙箱路径: %s" % msg)

@@ -193,6 +193,9 @@ jobs:
           python3 tests/test-web-security-static.py
           python3 tests/test-web-frontend-static.py
 
+      - name: "核心结构化诊断回归 (出口探测/域名路由/副作用清理)"
+        run: python3 tests/test-core-diagnostics.py
+
       - name: "原生 Web 安装生命周期回归"
         run: bash tests/test-web-install.sh
 
@@ -312,6 +315,12 @@ jobs:
 
       - name: "出口改名级联回归 (规则/故障组/final/TG 同步)"
         run: python3 tests/test-exit-rename.py
+
+      - name: "默认 direct 锚点 JP 与 WDA 动态引用回归"
+        run: python3 tests/test-direct-tag.py
+
+      - name: "默认 direct 锚点 jp→JP 锁内事务回归"
+        run: bash tests/test-direct-tag-migration.sh
 
       - name: "iOS 描述文件回归 (Wi-Fi 探测判定 + SSID 直连名单)"
         run: python3 tests/test-ios-ssid.py

@@ -165,7 +165,7 @@ def main():
     # ── 4. .mrs 是 mihomo 原生格式 → 必须放行(旧代码以"sing-box 不支持"拒掉) ──
     with tempfile.TemporaryDirectory() as tmp:
         setup(tmp)
-        bot._fetch_bytes = lambda url: b"MRSbinary"
+        bot._fetch_bytes = lambda url: b"MRS\x01\x00binary"
         # .mrs 的 behavior 判不出来, 必须显式声明(见下方真实 fixture 用例里的"未声明即拒绝")
         okr, msg = bot.add_ruleset("https://example.com/geo.mrs", "hk", behavior="domain")
         if not okr:

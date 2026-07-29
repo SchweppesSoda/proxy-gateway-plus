@@ -8,7 +8,7 @@ sing-box 出站 dict 与 route.rules 结构,这里只做"翻译成 mihomo"这一
   入站:  sing-box direct(sniff+override)  → mihomo redir-port(靠 nft REDIRECT 送入) + sniffer.override-destination
   出站:  sing-box outbounds[proxy]         → mihomo proxies[]
          sing-box outbounds[urltest]       → mihomo proxy-groups[url-test]
-         sing-box outbounds[direct] "jp"   → mihomo 内建 DIRECT
+         sing-box outbounds[direct] "JP"   → mihomo 内建 DIRECT
   路由:  route.rules[{ip_cidr,reject}]     → IP-CIDR,...,REJECT,no-resolve(反自环)
          route.rules[{domain_suffix,out}]  → DOMAIN-SUFFIX,...,<target>
          route.rules[{domain,out}]         → DOMAIN,...,<target>

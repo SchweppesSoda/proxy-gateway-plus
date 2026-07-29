@@ -99,6 +99,29 @@ for tab_id in ("overview", "exits", "rules", "dns", "runtime", "ops"):
     assert f"tab-{tab_id}" in parser.elements
     assert f"panel-{tab_id}" in parser.elements
 
+# Doctor results are rendered as a structured, live status panel rather than a
+# preformatted text dump.
+doctor_tag, doctor_attrs = parser.elements["doctor-summary"]
+assert doctor_tag == "div"
+assert doctor_attrs.get("aria-live") == "polite"
+assert "doctor-panel" in (doctor_attrs.get("class") or "")
+assert "doctor-health" in parser.elements
+load_overview = function_source("loadOverview")
+assert 'renderDoctorSummary($("#doctor-summary"), info.doctor);' in load_overview
+assert "doctorSummaryText" not in APP_SOURCE
+for selector in (
+    ".doctor-result", ".doctor-stats", ".doctor-group",
+    ".doctor-check", ".doctor-check-state",
+):
+    assert selector in STYLE_SOURCE
+
+# Canonical models now use JP; the formatter also normalizes legacy jp payloads
+# so an older backup/server response is never shown with inconsistent casing.
+format_exit_name = function_source("formatExitName")
+assert 'return value === "jp" ? "JP" : value;' in format_exit_name
+assert "formatExitName(item.tag)" in APP_SOURCE
+assert 'formatExitName(value)' in function_source("populateSelect")
+
 # Client reads and writes only the frozen API field names; no legacy aliases.
 for legacy in (
     "csrfToken", "data.expiresAt", "data?.expiresAt", "item.outbound",
@@ -123,7 +146,7 @@ for snippet in (
     'body: { domain, target }',
     'method: "PATCH", body: { target }',
     "const body = { addresses };",
-    'body: { index }',
+    'body: { snapshotId: snapshot.id, confirm: true }',
     'body: { confirm: true }',
 ):
     assert snippet in APP_SOURCE, snippet
@@ -166,18 +189,139 @@ assert '"手机直连（不经 VPS）"' in render_rulesets
 assert "规则集可选“手机直连”" in INDEX_SOURCE
 assert "内建 direct 表示流量先到 VPS" in INDEX_SOURCE
 
-# Rollback/update responses are only transient-job acceptance.  The UI must not
-# claim completion or immediately reload state while pdg-web may be restarting.
+# Existing rulesets expose an inline target selector.  Literal direct remains
+# phone-direct while a direct-type tagged outbound is labelled as VPS-local.
+assert "ruleTargetLabel(option.value)" in target_options
+assert "（VPS 本机直出）" in function_source("ruleTargetLabel")
+assert 'makeActionButton("保存出口", "target-ruleset")' in render_rulesets
+ruleset_action = function_source("handleRulesetAction")
+assert 'method: "PUT"' in ruleset_action
+assert 'body: { target }' in ruleset_action
+assert '/target`' in ruleset_action
+
+# Concrete proxy connections are replaced in a dedicated secure dialog.  The
+# selected tag is carried in UI state, never accepted from the pasted link, and
+# the sensitive textarea is cleared before confirmation/network I/O.
+replace_dialog = parser.elements["replace-exit-dialog"]
+assert replace_dialog[0] == "dialog"
+replace_link = parser.elements["replace-exit-link"]
+assert replace_link[0] == "textarea"
+assert replace_link[1].get("autocomplete") == "off"
+render_exits = function_source("renderExitList")
+assert 'makeActionButton("更新连接", "replace")' in render_exits
+replace_exit = function_source("replaceExit")
+clear_at = replace_exit.index('input.value = "";')
+confirm_at = replace_exit.index("await confirmAction(")
+request_at = replace_exit.index("await api(")
+assert clear_at < confirm_at < request_at
+assert 'method: "PUT"' in replace_exit
+assert "body = { link }" in replace_exit
+assert "body.link = \"\";" in replace_exit
+assert "body: { link, tag" not in replace_exit
+
+# Structured exit diagnostics are shown on exit cards.  A tagged direct-type
+# anchor such as JP is probeable, while the literal phone-direct pseudo target
+# is not a state exit.  Only concrete proxy protocols allow connection replace.
+assert "test-exits" in parser.elements
+test_exits = function_source("testExits")
+assert 'api("/diagnostics/exits"' in test_exits
+assert "data?.items" in test_exits
+probeable = function_source("isProbeableExit")
+assert 'item.tag !== "direct"' in probeable
+assert 'item.type !== "urltest"' in probeable
+assert 'item.type !== "direct"' not in probeable
+replaceable = function_source("isReplaceableProxy")
+assert '!["direct", "urltest"].includes(item.type)' in replaceable
+assert "isReplaceableProxy(item)" in render_exits
+diagnostic_badge = function_source("exitDiagnosticBadge")
+assert '"故障组本轮不单测"' in diagnostic_badge
+assert "isProbeableExit(item)" in diagnostic_badge
+assert "result.delayMs" in diagnostic_badge
+assert 'status === "unavailable"' in diagnostic_badge
+assert '"Mihomo API 不可用"' in diagnostic_badge
+assert "data?.available !== true" in test_exits
+assert '"Mihomo API unavailable（出口测速不可用）", "bad"' in test_exits
+assert ".latency-badge" in STYLE_SOURCE
+assert "包括 VPS 直出锚点" in INDEX_SOURCE
+
+# Domain diagnostics consume the split DNS/route evidence model.  A direct DNS
+# answer may be called measured; a gateway result must always say that only the
+# DNS entrance was measured and the concrete outbound remains a rule inference.
+assert parser.elements["route-diagnostic-result"][1].get("aria-live") == "polite"
+diagnose_domain = function_source("diagnoseDomain")
+assert 'api("/diagnostics/domain"' in diagnose_domain
+evidence = function_source("diagnosticEvidence")
+for field in ("dnsVerified", "routeConfidence"):
+    assert field in evidence
+for legacy_field in ("result?.verified", "result?.confidence"):
+    assert legacy_field not in evidence
+for label in (
+    "DNS 实测直连", "DNS 入口实测 + 出口规则推演",
+    "配置已变化", "诊断繁忙", "DNS 无应答", "规则推演", "不确定",
+):
+    assert f'"{label}"' in evidence
+assert "未进行出口连接实测" in evidence
+dns_evidence = function_source("diagnosticDnsEvidence")
+assert "result?.dnsVerified" in dns_evidence
+assert "DNS 返回真实地址" in dns_evidence
+route_confidence = function_source("diagnosticRouteConfidence")
+assert "result?.routeConfidence" in route_confidence
+assert "规则推演（未实测具体出口）" in route_confidence
+reasons = function_source("diagnosticReasonLabel")
+for reason in ("config_changed", "probe_busy", "dns_no_answer", "probe_unavailable"):
+    assert reason in reasons
+render_diagnostic = function_source("renderRouteDiagnostic")
+assert 'node("dt"' in render_diagnostic
+assert 'node("dd"' in render_diagnostic
+assert '["DNS 路径证据", diagnosticDnsEvidence(result)]' in render_diagnostic
+assert '["出口判定置信度", diagnosticRouteConfidence(result)]' in render_diagnostic
+
+# Snapshot rollback uses an exact ID selected from the server-provided list;
+# numeric indices must not return to the frontend.
+assert "rollback-index" not in parser.elements
+assert parser.elements["rollback-snapshot"][0] == "select"
+load_snapshots = function_source("loadSnapshots")
+assert 'api("/snapshots")' in load_snapshots
 rollback = function_source("rollback")
-assert '"回滚任务已启动，连接可能中断"' in rollback
-assert "已回滚" not in rollback
-assert "回滚完成" not in rollback
+assert "selectedSnapshot()" in rollback
+assert "snapshot.id" in rollback
+assert 'body: { snapshotId: snapshot.id, confirm: true }' in rollback
+assert "index" not in rollback
+assert "尚未确认完成" in rollback
+assert "回滚成功" not in rollback
 assert "loadOverview(" not in rollback
+
+# Rollback/update acceptance registers a persistent background job.  Only a
+# polled terminal state may produce a success claim; network loss stays unknown.
+assert parser.elements["maintenance-job-list"][1].get("aria-live") == "polite"
+assert "maintenance-job-health" in parser.elements
+load_jobs = function_source("loadMaintenanceJobs")
+assert 'api("/jobs")' in load_jobs
+normalize_job = function_source("normalizeMaintenanceJob")
+assert "[Tt]" in normalize_job and "[Zz]" in normalize_job
+poll_jobs = function_source("pollMaintenanceJobs")
+assert 'api(`/jobs/${encodeURIComponent(job.id)}`)' in poll_jobs
+assert "Promise.allSettled" in poll_jobs
+announce = function_source("announceMaintenanceResult")
+assert 'job.status === "succeeded"' in announce
+assert "已由后台确认成功" in announce
+assert "state.trackedMaintenanceJobs.has(job.id)" in announce
+render_jobs = function_source("renderMaintenanceJobs")
+assert "maintenancePollDisconnected" in render_jobs
+assert "不会被误判为失败" in render_jobs
+
 software_update = function_source("softwareUpdate")
 assert '"正在检查可用发布版本并启动升级…"' in software_update
-assert '"升级任务已启动，连接可能中断；请稍后重新登录核验"' in software_update
-assert "升级已提交" not in software_update
-assert "升级完成" not in software_update
+assert "registerMaintenanceJob" in software_update
+assert "尚未确认完成" in software_update
+assert "升级成功" not in software_update
+assert '"network_error"' in software_update
+
+for selector in (
+    ".diagnostic-card", ".diagnostic-details", ".job-card",
+    ".job-connection-note", ".secure-entry-dialog",
+):
+    assert selector in STYLE_SOURCE
 
 # The manifest is local and query-free as well.
 assert MANIFEST["start_url"] == "/"

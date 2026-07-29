@@ -80,7 +80,7 @@ fi
 mkrules(){ mkdir -p "$WORK/rules"
   printf 'domain:cn-site.test\n'  > "$WORK/rules/geosite_cn.txt"
   : > "$WORK/rules/geosite_apple.txt"; : > "$WORK/rules/custom_direct.txt"
-  : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/ruleset_direct.txt"
+  : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/ruleset_direct.txt"; : > "$WORK/rules/ruleset_hijack.txt"
   : > "$WORK/rules/mitm_hijack.txt"
   : > "$WORK/rules/unlock.txt"
   printf 'domain:blocked.test\n' > "$WORK/rules/geosite_gfw.txt"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import http.client
@@ -11,6 +12,7 @@ import json
 import os
 import pathlib
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -164,6 +166,12 @@ class FakeBot:
     def _rs_meta(self):
         return copy.deepcopy(self.meta)
 
+    def _rs_meta_snapshot(self):
+        raw = json.dumps(
+            self.meta, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        return copy.deepcopy(self.meta), hashlib.sha256(raw).hexdigest()
+
     def exit_tags(self, model):
         allowed = self.PROXY_TYPES + ("direct", "urltest")
         return [
@@ -212,6 +220,9 @@ class FakeBot:
             current_files = {
                 "mosdns_rule:custom_direct.txt": self._direct_text(self.direct),
                 "mosdns_rule:custom_hijack.txt": self._hijack_text(self.hijack),
+                "rs_meta": json.dumps(
+                    self.meta, ensure_ascii=False, indent=2
+                ).encode("utf-8"),
             }
             for name, expected in file_expects.items():
                 current = current_files.get(name)
@@ -414,6 +425,44 @@ class FakeBot:
             self.meta[name].pop("label", None)
         return True, "label set"
 
+    def set_ruleset_target(self, name, target):
+        self.wrapper_calls.append(("set_ruleset_target", name, target))
+        if name not in self.meta:
+            return False, "not found"
+        self.meta[name]["outbound"] = target
+        for rule in self.model["route"]["rules"]:
+            if rule.get("rule_set") == name:
+                rule["outbound"] = target
+        return True, "target set"
+
+    def probe_exit_delays(self, **_kwargs):
+        return {
+            "method": "clash",
+            "items": [
+                {
+                    "tag": "jp",
+                    "status": "ok",
+                    "delay_ms": 8,
+                    "server": f"vless://{UUID_SECRET}@secret.example",
+                },
+                {"tag": "hk", "status": "timeout"},
+            ],
+        }
+
+    @staticmethod
+    def probe_domain_route(domain):
+        return {
+            "domain": domain,
+            "path": "gateway",
+            "target": "hk",
+            "reason": "explicit_domain",
+            "dns_verified": True,
+            "route_confidence": "simulated",
+            "verified": False,
+            "confidence": "simulated",
+            "resolved_ip": PLAIN_SECRET,
+        }
+
     def del_ruleset(self, name):
         self.wrapper_calls.append(("del_ruleset", name))
         if name not in self.meta:
@@ -527,6 +576,60 @@ class FakeBot:
         return True
 
 
+class FakeJobStore:
+    JOB_ID = "20260729t010203z-a1b2c3d4e5f6"
+    SNAPSHOT_ID = "20260729-010203-a1b2c3d4"
+
+    def __init__(self):
+        self.calls = []
+        self.records = []
+
+    @contextlib.contextmanager
+    def maintenance_guard(self):
+        self.calls.append(("guard",))
+        yield
+
+    def list_snapshots(self):
+        return [{
+            "id": self.SNAPSHOT_ID,
+            "createdAt": "2026-07-29T01:02:03Z",
+            "size": 1024,
+        }]
+
+    def resolve_snapshot_id(self, snapshot_id):
+        self.calls.append(("resolve", snapshot_id))
+        if snapshot_id != self.SNAPSHOT_ID:
+            raise type("JobNotFound", (RuntimeError,), {})()
+        return snapshot_id
+
+    def snapshot_id_for_index(self, index):
+        self.calls.append(("index", index))
+        if index != 0:
+            raise type("JobNotFound", (RuntimeError,), {})()
+        return self.SNAPSHOT_ID
+
+    def start(self, kind, snapshot_id=None):
+        self.calls.append(("start", kind, snapshot_id))
+        record = {
+            "id": self.JOB_ID,
+            "kind": kind,
+            "status": "queued",
+            "createdAt": "2026-07-29T01:02:04Z",
+        }
+        if snapshot_id is not None:
+            record["snapshotId"] = snapshot_id
+        self.records = [record]
+        return copy.deepcopy(record)
+
+    def list(self):
+        return copy.deepcopy(self.records)
+
+    def get(self, job_id):
+        if job_id != self.JOB_ID or not self.records:
+            raise type("JobNotFound", (RuntimeError,), {})()
+        return copy.deepcopy(self.records[0])
+
+
 class WebAPITestCase(unittest.TestCase):
     password = "correct horse battery staple"
 
@@ -579,7 +682,9 @@ class WebAPITestCase(unittest.TestCase):
         )
         self.config = web.load_config(str(self.config_path), testing=True)
         self.fake = FakeBot()
-        self.control = pdgcontrol.PDGControl(self.fake)
+        self.jobs = FakeJobStore()
+        self.control = pdgcontrol.PDGControl(
+            self.fake, job_store=self.jobs)
         self._old_http_env = os.environ.get("PDG_WEB_TEST_ALLOW_HTTP")
         os.environ["PDG_WEB_TEST_ALLOW_HTTP"] = "1"
         self.server = web.make_server(
@@ -843,6 +948,19 @@ class WebAPITestCase(unittest.TestCase):
         )
         self.assertNotIn("private.destination.example", runtime["text"])
 
+        snapshots = self.request("GET", "/api/v1/snapshots")
+        self.assertEqual(snapshots["status"], 200)
+        self.assertEqual(set(snapshots["json"]["data"]), {"items"})
+        self.assertEqual(
+            set(snapshots["json"]["data"]["items"][0]),
+            {"id", "createdAt", "size", "legacy"},
+        )
+        self.assertFalse(snapshots["json"]["data"]["items"][0]["legacy"])
+
+        jobs = self.request("GET", "/api/v1/jobs")
+        self.assertEqual(jobs["status"], 200)
+        self.assertEqual(jobs["json"]["data"], {"items": []})
+
         manifest = self.request(
             "GET", "/manifest.webmanifest", cookie=None
         )
@@ -870,6 +988,19 @@ class WebAPITestCase(unittest.TestCase):
         )
         self.assertEqual(renamed["status"], 200, renamed["text"])
         self.assertEqual(renamed["json"]["data"]["tag"], "newer")
+        old_position = next(
+            index for index, item in enumerate(self.fake.model["outbounds"])
+            if item.get("tag") == "newer"
+        )
+        replaced = self.request(
+            "PUT", "/api/v1/exits/newer",
+            {"link": f"ss://{PLAIN_SECRET}@replacement.example:443#ignored"},
+        )
+        self.assertEqual(replaced["status"], 200, replaced["text"])
+        self.assertEqual(replaced["json"]["data"]["tag"], "newer")
+        self.assertNotIn(PLAIN_SECRET, replaced["text"])
+        self.assertEqual(
+            self.fake.model["outbounds"][old_position]["tag"], "newer")
 
         current = self.request("GET", "/api/v1/exits")["json"]["data"]["order"]
         reordered = self.request(
@@ -981,6 +1112,13 @@ class WebAPITestCase(unittest.TestCase):
             {"label": "Renamed feed"},
         )
         self.assertEqual(relabeled["status"], 200, relabeled["text"])
+        retargeted = self.request(
+            "PUT",
+            f"/api/v1/rulesets/{ruleset_name}/target",
+            {"target": "tw"},
+        )
+        self.assertEqual(retargeted["status"], 200, retargeted["text"])
+        self.assertEqual(retargeted["json"]["data"]["target"], "tw")
 
         direct_url = "https://feed.example/china-domains.txt"
         direct_ruleset = self.request(
@@ -1017,6 +1155,7 @@ class WebAPITestCase(unittest.TestCase):
         )
         self.assertEqual(tfo["status"], 200, tfo["text"])
 
+        action_results = {}
         for action, body in (
             ("restart", {}),
             ("rules-update", {}),
@@ -1028,6 +1167,7 @@ class WebAPITestCase(unittest.TestCase):
                 "POST", f"/api/v1/actions/{action}", body
             )
             self.assertEqual(result["status"], 202, result["text"])
+            action_results[action] = result["json"]["data"]
         restart_records = [
             item for item in self.fake.transactions if item["op"] == "web_restart"
         ]
@@ -1041,24 +1181,21 @@ class WebAPITestCase(unittest.TestCase):
             ["/usr/local/bin/pdg", "snapshot"],
             self.fake.sh_calls,
         )
-        rollback_argv = [
-            "systemd-run",
-            "--collect",
-            "--unit=pdg-web-rollback.service",
-            "--",
-            "/usr/local/bin/pdg",
-            "rollback",
-            "0",
-        ]
-        self.assertIn(rollback_argv, self.fake.sh_calls)
-        self.assertNotIn(
-            ["/usr/local/bin/pdg", "rollback", "0"],
-            self.fake.sh_calls,
+        self.assertEqual(
+            action_results["rollback"]["job"]["operation"], "rollback")
+        self.assertEqual(
+            action_results["software-update"]["job"]["operation"],
+            "software-update",
         )
-        self.assertLess(
-            self.fake.wrapper_calls.index(("update_check",)),
-            self.fake.wrapper_calls.index(("start_update",)),
+        self.assertIn(("index", 0), self.jobs.calls)
+        self.assertIn(
+            ("start", "rollback", FakeJobStore.SNAPSHOT_ID),
+            self.jobs.calls,
         )
+        self.assertIn(
+            ("start", "software-update", None), self.jobs.calls)
+        self.assertIn(("update_check",), self.fake.wrapper_calls)
+        self.assertNotIn(("start_update",), self.fake.wrapper_calls)
 
         deleted_group = self.request(
             "DELETE", "/api/v1/groups/fail"
@@ -1076,6 +1213,176 @@ class WebAPITestCase(unittest.TestCase):
             200,
             deleted_normal_ruleset["text"],
         )
+
+    def test_diagnostics_are_structured_and_drop_internal_fields(self):
+        self.login()
+        exits = self.request(
+            "POST", "/api/v1/diagnostics/exits", {})
+        self.assertEqual(exits["status"], 200, exits["text"])
+        self.assertEqual(
+            exits["json"]["data"],
+            {
+                "available": True,
+                "items": [
+                    {"tag": "jp", "status": "ok", "delayMs": 8},
+                    {"tag": "hk", "status": "timeout"},
+                ],
+            },
+        )
+        domain = self.request(
+            "POST", "/api/v1/diagnostics/domain",
+            {"domain": "exact.example"},
+        )
+        self.assertEqual(domain["status"], 200, domain["text"])
+        self.assertEqual(
+            domain["json"]["data"],
+            {
+                "domain": "exact.example",
+                "path": "gateway",
+                "target": "hk",
+                "reason": "explicit_domain",
+                "dnsVerified": True,
+                "routeConfidence": "simulated",
+                "verified": False,
+                "confidence": "simulated",
+            },
+        )
+        self.assertNotIn(PLAIN_SECRET, exits["text"] + domain["text"])
+        self.assertNotIn(UUID_SECRET, exits["text"] + domain["text"])
+        self.fake.probe_domain_route = lambda value: {
+            "domain": value,
+            "path": "unknown",
+            "reason": "probe_busy",
+            "dns_verified": False,
+            "route_confidence": "unknown",
+            "verified": False,
+            "confidence": "unknown",
+            "internal_error": f"ss://{PLAIN_SECRET}@secret.example",
+        }
+        busy = self.request(
+            "POST", "/api/v1/diagnostics/domain",
+            {"domain": "busy.example"},
+        )
+        self.assertEqual(busy["status"], 200, busy["text"])
+        self.assertEqual(
+            busy["json"]["data"],
+            {
+                "domain": "busy.example",
+                "path": "unknown",
+                "reason": "probe_busy",
+                "dnsVerified": False,
+                "routeConfidence": "unknown",
+                "verified": False,
+                "confidence": "unknown",
+            },
+        )
+        self.assertNotIn(PLAIN_SECRET, busy["text"])
+        self.fake.probe_domain_route = lambda value: {
+            "domain": value,
+            "path": "unknown",
+            "reason": "config_changed",
+            "dns_verified": False,
+            "route_confidence": "unknown",
+            "verified": False,
+            "confidence": "unknown",
+        }
+        changed = self.request(
+            "POST", "/api/v1/diagnostics/domain",
+            {"domain": "changed.example"},
+        )
+        self.assertEqual(changed["status"], 200, changed["text"])
+        self.assertEqual(
+            changed["json"]["data"]["reason"], "config_changed"
+        )
+        self.assertFalse(changed["json"]["data"]["dnsVerified"])
+        self.assertEqual(
+            changed["json"]["data"]["routeConfidence"], "unknown"
+        )
+        self.fake.probe_domain_route = lambda value: {
+            "domain": value,
+            "path": "gateway",
+            "reason": "dns_no_answer",
+            "dns_verified": True,
+            "route_confidence": "unknown",
+            "verified": False,
+            "confidence": "unknown",
+        }
+        inconsistent = self.request(
+            "POST", "/api/v1/diagnostics/domain",
+            {"domain": "inconsistent.example"},
+        )
+        self.assert_error(inconsistent, 500)
+
+    def test_deleting_proxy_never_remaps_literal_direct_ruleset(self):
+        self.login()
+        self.fake.meta["rs_deadbeef"]["outbound"] = "direct"
+        for rule in self.fake.model["route"]["rules"]:
+            if rule.get("rule_set") == "rs_deadbeef":
+                rule["outbound"] = "direct"
+        response = self.request("DELETE", "/api/v1/exits/hk")
+        self.assertEqual(response["status"], 200, response["text"])
+        self.assertEqual(
+            self.fake.meta["rs_deadbeef"]["outbound"], "direct")
+        route_rule = next(
+            rule for rule in self.fake.model["route"]["rules"]
+            if rule.get("rule_set") == "rs_deadbeef"
+        )
+        self.assertEqual(route_rule["outbound"], "direct")
+
+    def test_delete_exit_rejects_concurrent_ruleset_metadata_update(self):
+        self.login()
+        self.fake.meta["rs_literal_direct"] = {
+            "outbound": "direct",
+            "format": "source",
+            "path": "/etc/sing-box/rs/rs-literal-direct.json",
+            "label": "Literal direct",
+        }
+
+        def concurrent_commit(bot):
+            bot.meta["rs_deadbeef"]["label"] = "Concurrent label"
+
+        self.fake.before_file_expect_check = concurrent_commit
+        response = self.request("DELETE", "/api/v1/exits/tw")
+        self.assert_error(response, 500)
+        self.assertTrue(any(
+            item.get("tag") == "tw"
+            for item in self.fake.model["outbounds"]
+        ))
+        self.assertEqual(
+            self.fake.meta["rs_deadbeef"]["label"], "Concurrent label"
+        )
+        self.assertEqual(
+            self.fake.meta["rs_literal_direct"]["outbound"], "direct"
+        )
+        transaction = self.fake.transactions[-1]
+        self.assertEqual(
+            transaction["file_expects"],
+            {"rs_meta": transaction["file_expects"]["rs_meta"]},
+        )
+        self.assertRegex(
+            transaction["file_expects"]["rs_meta"], r"^[0-9a-f]{64}$"
+        )
+
+    def test_snapshot_id_rollback_and_persistent_job_queries(self):
+        self.login()
+        rollback = self.request(
+            "POST", "/api/v1/actions/rollback",
+            {
+                "snapshotId": FakeJobStore.SNAPSHOT_ID,
+                "confirm": True,
+            },
+        )
+        self.assertEqual(rollback["status"], 202, rollback["text"])
+        job = rollback["json"]["data"]["job"]
+        self.assertEqual(job["operation"], "rollback")
+        self.assertEqual(job["snapshotId"], FakeJobStore.SNAPSHOT_ID)
+        listing = self.request("GET", "/api/v1/jobs")
+        self.assertEqual(listing["status"], 200, listing["text"])
+        self.assertEqual(listing["json"]["data"]["items"], [job])
+        fetched = self.request(
+            "GET", f"/api/v1/jobs/{FakeJobStore.JOB_ID}")
+        self.assertEqual(fetched["status"], 200, fetched["text"])
+        self.assertEqual(fetched["json"]["data"], job)
 
     def test_schema_query_identifier_and_request_security_rejections(self):
         unauth_host = self.request(
@@ -1154,6 +1461,7 @@ class WebAPITestCase(unittest.TestCase):
         bad_schemas = [
             ("POST", "/api/v1/exits", {"link": "ss://x", "name": "x"}),
             ("PATCH", "/api/v1/exits/hk", {"tag": "x"}),
+            ("PUT", "/api/v1/exits/hk", {"link": "ss://x", "extra": True}),
             ("PUT", "/api/v1/exits/order", {"order": []}),
             ("PUT", "/api/v1/default-exit", {"tag": "hk", "extra": True}),
             ("POST", "/api/v1/groups", {"tag": "bad", "members": ["hk", "tw"]}),
@@ -1166,11 +1474,27 @@ class WebAPITestCase(unittest.TestCase):
                 {"url": "https://feed.example/list", "outbound": "hk"},
             ),
             ("PATCH", "/api/v1/rulesets/rs_deadbeef", {"target": "hk"}),
+            (
+                "PUT",
+                "/api/v1/rulesets/rs_deadbeef/target",
+                {"target": "hk", "extra": True},
+            ),
+            ("POST", "/api/v1/diagnostics/exits", {"extra": True}),
+            (
+                "POST",
+                "/api/v1/diagnostics/domain",
+                {"domain": "not a domain"},
+            ),
             ("PUT", "/api/v1/dns/remote", {"upstreams": ["udp://1.1.1.1"]}),
             ("PUT", "/api/v1/settings/tfo", {"enabled": 1}),
             ("POST", "/api/v1/actions/restart", {"confirm": True}),
             ("POST", "/api/v1/actions/rollback", {"index": -1}),
             ("POST", "/api/v1/actions/rollback", {"index": True}),
+            (
+                "POST",
+                "/api/v1/actions/rollback",
+                {"snapshotId": FakeJobStore.SNAPSHOT_ID},
+            ),
             ("POST", "/api/v1/actions/software-update", {"confirm": False}),
         ]
         for method, path, body in bad_schemas:
@@ -1185,6 +1509,8 @@ class WebAPITestCase(unittest.TestCase):
             "/api/v1/logs?lines=010",
             "/api/v1/logs?lines=10&lines=11",
             "/api/v1/logs?x=10",
+            "/api/v1/snapshots?x=1",
+            "/api/v1/jobs?x=1",
             "/api/v1/logs?lines=%31%30",
         ):
             with self.subTest(path=path):
@@ -1273,6 +1599,28 @@ class WebAPITestCase(unittest.TestCase):
         self.assertNotIn(PLAIN_SECRET, response["text"])
         self.assertNotIn("ss://", response["text"])
 
+    def test_unavailable_job_gate_blocks_synchronous_maintenance(self):
+        self.login()
+
+        class BrokenJobStore:
+            @staticmethod
+            def maintenance_guard():
+                raise RuntimeError("corrupt maintenance state")
+
+        self.control._job_store_instance = BrokenJobStore()
+        before_transactions = len(self.fake.transactions)
+        before_shell = len(self.fake.sh_calls)
+        restart = self.request(
+            "POST", "/api/v1/actions/restart", {}
+        )
+        rules = self.request(
+            "POST", "/api/v1/actions/rules-update", {}
+        )
+        self.assert_error(restart, 500)
+        self.assert_error(rules, 500)
+        self.assertEqual(len(self.fake.transactions), before_transactions)
+        self.assertEqual(len(self.fake.sh_calls), before_shell)
+
     def test_software_update_preflight_is_fail_closed_and_sanitized(self):
         self.login()
         sensitive = f"internal ss://{PLAIN_SECRET}@secret.example"
@@ -1285,7 +1633,10 @@ class WebAPITestCase(unittest.TestCase):
         ):
             with self.subTest(checked=checked):
                 self.fake.update_check_result = checked
-                before = self.fake.wrapper_calls.count(("start_update",))
+                before = len([
+                    call for call in self.jobs.calls
+                    if call[:2] == ("start", "software-update")
+                ])
                 response = self.request(
                     "POST",
                     "/api/v1/actions/software-update",
@@ -1297,7 +1648,11 @@ class WebAPITestCase(unittest.TestCase):
                     error["message"], "Operation could not be completed."
                 )
                 self.assertEqual(
-                    self.fake.wrapper_calls.count(("start_update",)), before
+                    len([
+                        call for call in self.jobs.calls
+                        if call[:2] == ("start", "software-update")
+                    ]),
+                    before,
                 )
                 self.assertNotIn(PLAIN_SECRET, response["text"])
                 self.assertNotIn("ss://", response["text"])
@@ -1323,38 +1678,24 @@ class WebAPITestCase(unittest.TestCase):
         self.assertEqual(response["status"], 202, response["text"])
         self.assertEqual(
             self.fake.wrapper_calls[before:],
-            [("update_check",), ("start_update",)],
+            [("update_check",)],
         )
         self.assertNotIn(PLAIN_SECRET, response["text"])
 
-    def test_rollback_uses_fixed_transient_unit_argv_without_direct_cli(self):
+    def test_legacy_rollback_index_resolves_to_stable_snapshot_job(self):
         self.login()
-        self.fake.sh_calls.clear()
         response = self.request(
-            "POST", "/api/v1/actions/rollback", {"index": 7}
+            "POST", "/api/v1/actions/rollback", {"index": 0}
         )
         self.assertEqual(response["status"], 202, response["text"])
         self.assertEqual(
-            response["json"]["data"],
-            {"action": "rollback", "accepted": True},
+            response["json"]["data"]["job"]["snapshotId"],
+            FakeJobStore.SNAPSHOT_ID,
         )
-        self.assertEqual(
-            self.fake.sh_calls,
-            [[
-                "systemd-run",
-                "--collect",
-                "--unit=pdg-web-rollback.service",
-                "--",
-                "/usr/local/bin/pdg",
-                "rollback",
-                "7",
-            ]],
-        )
-        self.assertFalse(
-            any(
-                call[:2] == ["/usr/local/bin/pdg", "rollback"]
-                for call in self.fake.sh_calls
-            )
+        self.assertIn(("index", 0), self.jobs.calls)
+        self.assertIn(
+            ("start", "rollback", FakeJobStore.SNAPSHOT_ID),
+            self.jobs.calls,
         )
 
     def test_security_state_limits_sessions_and_bounded_maps(self):
@@ -1440,6 +1781,265 @@ class WebAPITestCase(unittest.TestCase):
         ):
             with self.assertRaises(web.ConfigError):
                 web.load_config("/etc/privdns-gateway/web.json", testing=False)
+
+
+class PersistentJobStoreTestCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="pdg-job-test.")
+        self.root = pathlib.Path(self.temp.name)
+        self.state = self.root / "jobs"
+        self.snapshots = self.root / "backups"
+        self.snapshot_id = "20260729-010203-a1b2c3d4"
+        archive = self.snapshots / self.snapshot_id / "snap.tar.gz"
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b"snapshot")
+        self.calls = []
+        self.launch_lock_was_free = False
+        self.module = pdgcontrol.load_job_module()
+
+        def fake_run(argv, **_kwargs):
+            self.calls.append(list(argv))
+            if argv[:2] == ["systemctl", "is-active"]:
+                return FakeResult(returncode=3, stdout="inactive\n")
+            if argv and argv[0] == str(self.root / "systemd-run"):
+                with self.store._locked():
+                    self.launch_lock_was_free = True
+            return FakeResult(returncode=0)
+
+        self.store = self.module.JobStore(
+            state_dir=str(self.state),
+            snapshot_dir=str(self.snapshots),
+            cli=str(self.root / "pdg"),
+            runner=str(self.root / "pdg-web-job.py"),
+            systemd_run=str(self.root / "systemd-run"),
+            python=str(self.root / "python3"),
+            run_command=fake_run,
+            enforce_root_owner=False,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_launcher_and_runner_use_fixed_argv_and_persist_final_state(self):
+        record = self.store.start(
+            "rollback", snapshot_id=self.snapshot_id)
+        launch = self.calls[-1]
+        self.assertEqual(launch[0], str(self.root / "systemd-run"))
+        self.assertIn("--property=Type=exec", launch)
+        self.assertNotIn("/bin/sh", launch)
+        self.assertEqual(launch[-2:], ["--job-id", record["id"]])
+        self.assertTrue(self.launch_lock_was_free)
+        self.assertTrue(
+            launch[3].startswith("--unit=pdg-web-job-"))
+        self.assertEqual(self.store.run(record["id"]), 0)
+        command = self.calls[-1]
+        self.assertEqual(
+            command,
+            [
+                str(self.root / "pdg"),
+                "rollback",
+                "--dir",
+                str(self.snapshots / self.snapshot_id),
+            ],
+        )
+        final = self.store.get(record["id"])
+        self.assertEqual(final["status"], "succeeded")
+        serialized = json.dumps(final)
+        self.assertNotIn("stdout", serialized)
+        self.assertNotIn("stderr", serialized)
+
+    def test_single_active_job_and_cross_boot_interruption(self):
+        record = self.store.start("software-update")
+        with self.assertRaises(self.module.JobBusy):
+            self.store.start("software-update")
+        with self.store._locked():
+            changed = self.store._read_record(record["id"])
+            changed["bootId"] = "00000000-0000-0000-0000-000000000000"
+            self.store._write_record(changed)
+        reconciled = self.store.get(record["id"])
+        self.assertEqual(reconciled["status"], "interrupted")
+
+    def test_snapshot_resolution_follows_idle_gate_inside_start_lock(self):
+        order = []
+        original_idle = self.store._assert_idle_locked
+        original_resolve = self.store.resolve_snapshot_id
+
+        def marked_idle():
+            order.append("idle")
+            return original_idle()
+
+        def marked_resolve(snapshot_id):
+            order.append("resolve")
+            self.assertEqual(order[:2], ["idle", "resolve"])
+            return original_resolve(snapshot_id)
+
+        self.store._assert_idle_locked = marked_idle
+        self.store.resolve_snapshot_id = marked_resolve
+        self.store.start("rollback", snapshot_id=self.snapshot_id)
+        self.assertEqual(order[:2], ["idle", "resolve"])
+
+    def test_terminal_job_pruning_is_bounded_and_never_removes_active(self):
+        active = self.store.start("software-update")
+        with self.store._locked():
+            for index in range(55):
+                self.store._write_record({
+                    "id": (
+                        "20260729t010203z-"
+                        + f"{index:012x}"
+                    ),
+                    "kind": "software-update",
+                    "status": "succeeded",
+                    "createdAt": "2026-07-29T01:02:03Z",
+                    "startedAt": "2026-07-29T01:02:03Z",
+                    "finishedAt": "2026-07-29T01:02:04Z",
+                    "bootId": "unknown",
+                    "unit": (
+                        "pdg-web-job-20260729t010203z-"
+                        + f"{index:012x}"
+                        + ".service"
+                    ),
+                    "result": "completed",
+                })
+            self.store._prune_terminal_locked()
+            records = [
+                self.store._read_record(job_id)
+                for job_id in self.store._record_ids()
+            ]
+        self.assertTrue(any(
+            record["id"] == active["id"] for record in records
+        ))
+        self.assertEqual(
+            sum(record["status"] in {"succeeded", "failed", "interrupted"}
+                for record in records),
+            50,
+        )
+
+    def test_corrupted_active_record_fails_closed(self):
+        active = self.store.start("software-update")
+        path = pathlib.Path(self.store._record_path(active["id"]))
+        corrupted = json.loads(path.read_text(encoding="utf-8"))
+        corrupted["status"] = "not-a-real-status"
+        path.write_text(json.dumps(corrupted), encoding="utf-8")
+        os.chmod(path, 0o600)
+        with self.assertRaises(self.module.JobInvalid):
+            self.store._read_record(active["id"])
+        corrupted["createdAt"] = None
+        path.write_text(json.dumps(corrupted), encoding="utf-8")
+        os.chmod(path, 0o600)
+        with self.assertRaises(self.module.JobInvalid):
+            self.store._read_record(active["id"])
+        corrupted["createdAt"] = active["createdAt"]
+        corrupted["status"] = "succeeded"
+        corrupted["finishedAt"] = corrupted["createdAt"]
+        corrupted["result"] = "operation_failed"
+        path.write_text(json.dumps(corrupted), encoding="utf-8")
+        os.chmod(path, 0o600)
+        with self.assertRaises(self.module.JobInvalid):
+            self.store._read_record(active["id"])
+        launches = len([
+            call for call in self.calls
+            if call and call[0] == str(self.root / "systemd-run")
+        ])
+        with self.assertRaises(self.module.JobInvalid):
+            self.store.start("software-update")
+        self.assertEqual(
+            len([
+                call for call in self.calls
+                if call and call[0] == str(self.root / "systemd-run")
+            ]),
+            launches,
+        )
+
+    def test_record_started_timestamp_result_combinations(self):
+        job_id = "20260729t010203z-abcdef123456"
+        common = {
+            "id": job_id,
+            "kind": "software-update",
+            "createdAt": "2026-07-29T01:02:03Z",
+            "bootId": "unknown",
+            "unit": "pdg-web-job-" + job_id + ".service",
+        }
+
+        def terminal(status, result, *, started=False):
+            record = {
+                **common,
+                "status": status,
+                "finishedAt": "2026-07-29T01:02:05Z",
+                "result": result,
+            }
+            if started:
+                record["startedAt"] = "2026-07-29T01:02:04Z"
+            return record
+
+        invalid = [
+            {**common, "status": "queued", "createdAt": None},
+            {**common, "status": "running", "startedAt": None},
+            terminal("succeeded", "completed"),
+            {
+                **terminal("succeeded", "completed", started=True),
+                "finishedAt": None,
+            },
+            terminal("failed", "operation_failed"),
+            terminal("failed", "operation_timed_out"),
+            terminal("failed", "launcher_failed", started=True),
+            terminal("interrupted", "boot_changed", started=True),
+        ]
+        for record in invalid:
+            with self.subTest(record=record):
+                with self.assertRaises(self.module.JobInvalid):
+                    self.store._validate_record(record, job_id)
+
+        valid = [
+            terminal("succeeded", "completed", started=True),
+            terminal("failed", "operation_failed", started=True),
+            terminal("failed", "operation_timed_out", started=True),
+            terminal("failed", "launcher_failed"),
+            terminal("interrupted", "boot_changed"),
+            terminal("interrupted", "runner_interrupted"),
+            terminal("interrupted", "runner_interrupted", started=True),
+        ]
+        for record in valid:
+            with self.subTest(record=record):
+                self.assertEqual(
+                    self.store._validate_record(record, job_id), record
+                )
+
+    def test_snapshot_listing_ignores_untrusted_names_and_symlinks(self):
+        (self.snapshots / "../ignored").resolve()
+        bad = self.snapshots / "20260729-010204-deadbeef"
+        try:
+            bad.symlink_to(self.snapshots / self.snapshot_id, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            bad = None
+        items = self.store.list_snapshots()
+        self.assertEqual([item["id"] for item in items], [self.snapshot_id])
+
+    def test_preexisting_state_symlink_is_rejected_without_chmod_target(self):
+        target = self.root / "target"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        link = self.root / "linked-state"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlinks unavailable")
+        before = stat.S_IMODE(target.stat().st_mode)
+        with self.assertRaises(self.module.JobInvalid):
+            self.module.JobStore(
+                state_dir=str(link), snapshot_dir=str(self.snapshots),
+                enforce_root_owner=False)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), before)
+
+    @unittest.skipIf(os.name == "nt", "POSIX ownership contract")
+    def test_non_root_owned_records_and_snapshots_are_rejected(self):
+        record = self.store.start("software-update")
+        os.chmod(self.store._record_path(record["id"]), 0o660)
+        os.chmod(self.snapshots, 0o770)
+        self.store._enforce_root_owner = True
+        with self.assertRaises(self.module.JobInvalid):
+            self.store._read_record(record["id"])
+        with self.assertRaises(self.module.JobInvalid):
+            self.store.list_snapshots()
 
 
 if __name__ == "__main__":

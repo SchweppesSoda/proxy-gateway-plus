@@ -108,6 +108,8 @@ _STATIC = {
     "mosdns_conf":    ("/etc/mosdns/config.yaml", 0o644, False, ("mosdns_probe",)),
     "ruleset_direct": ("/etc/mosdns/rules/ruleset_direct.txt", 0o644, False,
                        ("mosdns_lines",)),
+    "ruleset_hijack": ("/etc/mosdns/rules/ruleset_hijack.txt", 0o644, False,
+                       ("mosdns_lines",)),
     "rs_meta":        ("/opt/pdg-bot/rulesets.json", 0o644, False, ("json_any",)),
     "profile_env":    ("/etc/privdns-gateway/profile.env", 0o600, False, ("kv_env",)),
     "nftables_conf":  ("/etc/nftables.conf", 0o644, False, ("nft_check",)),
@@ -126,6 +128,7 @@ _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
 _TARGET_SVC = {
     "model": "mihomo", "mihomo_cfg": "mihomo", "rs_meta": "mihomo",
     "mosdns_conf": "mosdns", "mitm_hijack": "mosdns", "ruleset_direct": "mosdns",
+    "ruleset_hijack": "mosdns",
     "cert_fullchain": "mosdns", "cert_privkey": "mosdns",
     "mitm_json": "pdg-mitm",
 }
@@ -527,10 +530,66 @@ def _v_mosdns_lines(path, data, ctx):
     return True, ""
 
 
+_MRS_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_MRS_BEHAVIOR_BYTES = (0, 1)  # domain / ipcidr
+
+
+def _mrs_validation_head(data, size=8):
+    """返回解压后的 MRS 头；同时严格验证 zstd 帧完整性。
+
+    MRS 的磁盘格式是 zstd(MRS + version + behavior + ...)，不能在压缩字节中搜索
+    明文 ``MRS``。安装器保证生产机有 zstd；缺少验证器时宁可拒绝候选。
+    """
+    if data[:3] == b"MRS":
+        return data[:size], ""
+    if data[:4] != _MRS_ZSTD_MAGIC:
+        return b"", "既不是 MRS 原始头，也不是 Zstandard 帧"
+    exe = shutil.which("zstd")
+    if not exe:
+        return b"", "找不到 zstd，无法严格校验压缩的 .mrs 候选"
+    fd, candidate = tempfile.mkstemp(prefix="pdgtx-mrs.")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        rc, output = _run([exe, "-tq", candidate], timeout=30)
+        if rc != 0:
+            return b"", "Zstandard 帧校验失败: " + redact(output[-200:])
+        process = subprocess.Popen(
+            [exe, "-dcq", candidate],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            head = process.stdout.read(size) if process.stdout is not None else b""
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.SubprocessError:
+                pass
+        return head, ""
+    except OSError as exc:
+        return b"", "MRS 解压校验失败(%s)" % type(exc).__name__
+    finally:
+        try:
+            os.unlink(candidate)
+        except OSError:
+            pass
+
+
 def _v_ruleset_format(path, data, ctx):
     if path.endswith(".mrs"):
-        if not data[:8].startswith(b"MRS") and b"MRS" not in data[:64]:
-            return False, ".mrs 文件头不像 mihomo 原生规则集"
+        head, error = _mrs_validation_head(data)
+        if error:
+            return False, error
+        if len(head) < 5 or head[:3] != b"MRS":
+            return False, "解压后的文件头不是 MRS"
+        if head[3] != 1:
+            return False, "不认识的 MRS 版本: %d" % head[3]
+        if head[4] not in _MRS_BEHAVIOR_BYTES:
+            return False, "不认识的 MRS behavior: %d" % head[4]
         return True, ""
     return _v_json_any(path, data, ctx)
 
@@ -664,7 +723,9 @@ def _v_mosdns_probe(path, data, ctx):
             for name, t in sorted(getattr(ctx, "targets", {}).items() if ctx else []):
                 if not (
                     name.startswith("mosdns_rule:")
-                    or name in ("mitm_hijack", "ruleset_direct")
+                    or name in (
+                        "mitm_hijack", "ruleset_direct", "ruleset_hijack"
+                    )
                 ):
                     continue
                 leaf = os.path.basename(t["path"])

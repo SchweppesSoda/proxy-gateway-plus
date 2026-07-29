@@ -44,7 +44,9 @@ plugins:
   # ruleset_direct 的宽后缀会吞掉“该后缀内某域名 → 代理出口”的显式覆盖。
   - tag: explicit_hijack
     type: domain_set
-    args: { files: ["/etc/mosdns/rules/custom_hijack.txt"] }
+    # ruleset_hijack = 非 literal-direct 的可展开 source 规则集。它必须与手工单域名劫持
+    # 一样先于 geosite_cn，才能让境内域名真正进入 VPS 后再由 Mihomo 选择出口。
+    args: { files: ["/etc/mosdns/rules/custom_hijack.txt","/etc/mosdns/rules/ruleset_hijack.txt"] }
   # MITM 接管域名集(Feature B / iOS): 这些域名强制劫持到网关(即使是 Apple/国内直连域名),
   # 好让 mihomo 把它们路由到 MITM 服务终止 TLS。平时空文件 = 无接管(休眠); bot 启用插件时填。
   - tag: force_hijack

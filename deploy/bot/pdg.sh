@@ -126,14 +126,79 @@ PY
 }
 
 _pdg_atomic_install_file(){
-  local source="$1" target="$2" mode="${3:-600}" dir tmp
+  local source="$1" target="$2" mode="${3:-600}" dir
   [[ -s "$source" ]] || return 1
   dir="$(dirname "$target")"; mkdir -p "$dir" || return 1
-  tmp="$(mktemp "$dir/.pdg-file.XXXXXX")" || return 1
-  if ! cp "$source" "$tmp" || ! cmp -s "$source" "$tmp" \
-     || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$target"; then
-    rm -f "$tmp"; return 1
-  fi
+  python3 - "$source" "$target" "$mode" <<'PY'
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+source, target, raw_mode = sys.argv[1:]
+try:
+    mode = int(raw_mode, 8)
+except ValueError:
+    raise SystemExit(1)
+if mode < 0 or mode > 0o777:
+    raise SystemExit(1)
+directory = os.path.dirname(os.path.abspath(target))
+directory_info = os.lstat(directory)
+if (
+    not stat.S_ISDIR(directory_info.st_mode)
+    or stat.S_ISLNK(directory_info.st_mode)
+):
+    raise SystemExit(1)
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+source_fd = os.open(source, flags)
+fd = -1
+temporary = ""
+try:
+    before = os.fstat(source_fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        raise SystemExit(1)
+    fd, temporary = tempfile.mkstemp(prefix=".pdg-file.", dir=directory)
+    os.fchmod(fd, mode)
+    with os.fdopen(fd, "wb", closefd=True) as out:
+        fd = -1
+        with os.fdopen(os.dup(source_fd), "rb", closefd=True) as inp:
+            shutil.copyfileobj(inp, out)
+        out.flush()
+        os.fsync(out.fileno())
+    after = os.fstat(source_fd)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise SystemExit(1)
+    os.replace(temporary, target)
+    temporary = ""
+    directory_fd = os.open(
+        directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    os.close(source_fd)
+    if fd >= 0:
+        os.close(fd)
+    if temporary:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+PY
 }
 
 # 用 before-image 的 mode/uid/gid 原子恢复目标；数据与目录均 fsync 后才算成功。
@@ -828,8 +893,8 @@ _pdg_apply_snapshot_tree(){
   )
 }
 
-# CLI 回滚绝不信任快照里的 ruleset_direct 聚合。调用当前仓库的可信 Bot 实现，
-# 从候选元数据 + 候选 source JSON 重建，并同时验证候选 MosDNS 接口。
+# CLI 回滚绝不信任快照里的 ruleset_direct/ruleset_hijack 聚合。调用当前仓库的
+# 可信 Bot 实现，从候选元数据 + 候选 source JSON 重建并验证候选 MosDNS 接口。
 _pdg_snapshot_rederive_ruleset_direct(){
   local tree="$1" source="$REPO_DIR/deploy/bot/pdg-bot.py"
   [[ -d "$tree" && -f "$source" ]] || return 1
@@ -845,7 +910,7 @@ try:
     spec.loader.exec_module(module)
     present = module._derive_ruleset_direct_tree(tree)
 except Exception as exc:
-    print("ruleset_direct 候选重建失败(%s)" % type(exc).__name__, file=sys.stderr)
+    print("规则集 DNS 聚合候选重建失败(%s)" % type(exc).__name__, file=sys.stderr)
     raise SystemExit(1)
 print("present" if present else "absent")
 PY
@@ -868,6 +933,296 @@ try:
 except Exception:
     raise SystemExit(1)
 PY
+}
+
+_pdg_ruleset_aggregate_candidates(){
+  local config="$1" direct_out="$2" hijack_out="$3"
+  local transition_out="$4" old_hijack="$5"
+  local source="$REPO_DIR/deploy/bot/pdg-bot.py"
+  [[ -f "$config" && ! -L "$config" && -f "$source" \
+     && -n "$direct_out" && -n "$hijack_out" \
+     && -n "$transition_out" && -n "$old_hijack" ]] || return 1
+  python3 - "$source" "$config" /opt/pdg-bot/rulesets.json \
+    /etc/sing-box/rs "$direct_out" "$hijack_out" "$transition_out" \
+    "$old_hijack" <<'RSAGGPY'
+import importlib.util
+import json
+import os
+import stat
+import sys
+
+(
+    source, config, meta_path, rs_dir, direct_out, hijack_out,
+    transition_out, old_hijack,
+) = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("pdg_bot_migration_derive", source)
+module = importlib.util.module_from_spec(spec)
+
+
+def read_regular(path, required, limit):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if not required:
+            return None
+        raise
+    try:
+        before = os.fstat(fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > limit
+        ):
+            raise ValueError("migration input is not a trusted regular file")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("migration input exceeds size limit")
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ValueError("migration input changed during read")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_exclusive(path, data):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short migration candidate write")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def aggregate_entries(data):
+    entries = {"full": set(), "domain": set(), "keyword": set()}
+    if data is None:
+        return entries
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("old hijack aggregate is not UTF-8") from exc
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise ValueError("old hijack aggregate line shape unknown")
+        prefix, value = line.split(":", 1)
+        if (
+            prefix not in entries
+            or not value
+            or len(value.encode("utf-8")) > 253
+            or any(ord(char) < 0x21 or ord(char) == 0x7f for char in value)
+        ):
+            raise ValueError("old hijack aggregate value is unsafe")
+        entries[prefix].add(value.lower())
+    return entries
+
+
+try:
+    spec.loader.exec_module(module)
+    config_data = read_regular(config, True, 4 * 1024 * 1024)
+    module._ruleset_direct_interface_bytes(config_data)
+    raw_meta = read_regular(meta_path, False, 4 * 1024 * 1024)
+    meta = {} if raw_meta is None else json.loads(raw_meta.decode("utf-8"))
+    if not isinstance(meta, dict):
+        raise ValueError("ruleset metadata must be an object")
+    managed = module._managed_rulesets(meta)
+    staged = {}
+    for name, leaf in sorted(managed.items()):
+        if not leaf.endswith(".json"):
+            continue
+        staged["ruleset:" + leaf] = read_regular(
+            os.path.join(rs_dir, leaf), True, 64 * 1024 * 1024
+        )
+    direct_data = module._ruleset_direct_bytes(meta, staged, {})
+    hijack_data = module._ruleset_hijack_bytes(meta, staged, {})
+    transition_entries = aggregate_entries(hijack_data)
+    old_entries = aggregate_entries(
+        read_regular(old_hijack, False, 64 * 1024 * 1024)
+    )
+    transition_lines = [
+        "# pdg-bot 迁移过渡劫持聚合（old ∪ candidate；提交完成后替换）\n"
+    ]
+    for prefix in ("full", "domain", "keyword"):
+        transition_entries[prefix].update(old_entries[prefix])
+        transition_lines.extend(
+            "%s:%s\n" % (prefix, item)
+            for item in sorted(transition_entries[prefix])
+        )
+    transition_data = "".join(transition_lines).encode("utf-8")
+    write_exclusive(direct_out, direct_data)
+    write_exclusive(hijack_out, hijack_data)
+    write_exclusive(transition_out, transition_data)
+except Exception as exc:
+    print(
+        "规则集 DNS 聚合迁移候选生成失败(%s)" % type(exc).__name__,
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+RSAGGPY
+}
+
+_pdg_restore_ruleset_migration_before(){
+  local work="$1" config="$2" direct="$3" hijack="$4"
+  local direct_pre="$5" hijack_pre="$6" failed=0
+  _pdg_atomic_restore_file "$work/config.before" "$config" 2>/dev/null \
+    && cmp -s "$work/config.before" "$config" || failed=1
+  if [[ "$direct_pre" == 1 ]]; then
+    _pdg_atomic_restore_file "$work/direct.before" "$direct" 2>/dev/null \
+      && cmp -s "$work/direct.before" "$direct" || failed=1
+  else
+    rm -f "$direct" 2>/dev/null || failed=1
+    [[ ! -e "$direct" && ! -L "$direct" ]] || failed=1
+  fi
+  if [[ "$hijack_pre" == 1 ]]; then
+    _pdg_atomic_restore_file "$work/hijack.before" "$hijack" 2>/dev/null \
+      && cmp -s "$work/hijack.before" "$hijack" || failed=1
+  else
+    rm -f "$hijack" 2>/dev/null || failed=1
+    [[ ! -e "$hijack" && ! -L "$hijack" ]] || failed=1
+  fi
+  [[ "$failed" == 0 ]]
+}
+
+_pdg_capture_ruleset_migration_before(){
+  local work="$1" config="$2" direct="$3" hijack="$4"
+  local direct_pre="$5" hijack_pre="$6"
+  cp -a "$config" "$work/config.before" 2>/dev/null \
+    && cmp -s "$config" "$work/config.before" || return 1
+  if [[ "$direct_pre" == 1 ]]; then
+    cp -a "$direct" "$work/direct.before" 2>/dev/null \
+      && cmp -s "$direct" "$work/direct.before" || return 1
+  fi
+  if [[ "$hijack_pre" == 1 ]]; then
+    cp -a "$hijack" "$work/hijack.before" 2>/dev/null \
+      && cmp -s "$hijack" "$work/hijack.before" || return 1
+  fi
+}
+
+_pdg_sync_ruleset_migration_path(){
+  local path="$1"
+  [[ -n "$path" ]] || return 1
+  python3 - "$path" <<'PY'
+import os
+import stat
+import sys
+
+root = os.path.abspath(sys.argv[1])
+st = os.lstat(root)
+if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+    raise SystemExit(1)
+if st.st_uid != 0 or st.st_gid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    raise SystemExit(1)
+for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+    for name in directories:
+        item = os.path.join(current, name)
+        info = os.lstat(item)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise SystemExit(1)
+    for name in files:
+        item = os.path.join(current, name)
+        info = os.lstat(item)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != 0
+            or info.st_gid != 0
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise SystemExit(1)
+        fd = os.open(item, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+for current, _, _ in os.walk(root, topdown=False, followlinks=False):
+    fd = os.open(current, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+PY
+}
+
+_pdg_sync_parent_dir(){
+  local path="$1"
+  python3 - "$path" <<'PY'
+import os
+import sys
+
+parent = os.path.dirname(os.path.abspath(sys.argv[1]))
+fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+_pdg_recover_ruleset_migration_journal(){
+  local journal="$1" config="$2" direct="$3" hijack="$4"
+  local direct_pre=0 hijack_pre=0
+  [[ -d "$journal" && ! -L "$journal" \
+     && -f "$journal/config.before" && ! -L "$journal/config.before" ]] \
+    || return 1
+  _pdg_sync_ruleset_migration_path "$journal" || return 1
+  if [[ -f "$journal/direct.before" && ! -L "$journal/direct.before" ]]; then
+    direct_pre=1
+  elif [[ -f "$journal/direct.absent" && ! -L "$journal/direct.absent" ]]; then
+    direct_pre=0
+  else
+    return 1
+  fi
+  if [[ -f "$journal/hijack.before" && ! -L "$journal/hijack.before" ]]; then
+    hijack_pre=1
+  elif [[ -f "$journal/hijack.absent" && ! -L "$journal/hijack.absent" ]]; then
+    hijack_pre=0
+  else
+    return 1
+  fi
+  _pdg_restore_ruleset_migration_before \
+    "$journal" "$config" "$direct" "$hijack" "$direct_pre" "$hijack_pre" \
+    || return 1
+  systemctl restart mosdns 2>/dev/null && _core_kernel_stable mosdns \
+    || return 1
+  rm -rf -- "$journal" || return 1
+  _pdg_sync_parent_dir "$journal"
 }
 
 _pdg_legacy_snapshot_mihomo_prove(){
@@ -1343,6 +1698,23 @@ _sb_sanitize_panel(){
   rm -f "$t"; return 2
 }
 
+# 快照已恢复 persistent/live nft 后，oneshot 的 active(exited) 状态不代表其
+# fwmark policy rule/table route 仍在。enable 只恢复开机状态；必须显式
+# restart 重新执行 ExecStart，再由 helper status 校验内核 tuple。
+# 返回 2 表示 profile 声明了 QUIC 数据面但 helper 缺失，便于调用方准确报告。
+_pdg_rollback_restore_quic(){
+  local helper="${1:-/usr/local/libexec/pdg-quic-routing.sh}"
+  local profile="${2:-${PROFILE_ENV:-/etc/privdns-gateway/profile.env}}"
+  if [[ -x "$helper" ]]; then
+    systemctl enable pdg-quic-routing >/dev/null 2>&1 || return 1
+    systemctl restart pdg-quic-routing >/dev/null 2>&1 || return 1
+    "$helper" status >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  grep -q '^PDG_QUIC_MODE=' "$profile" 2>/dev/null && return 2
+  return 0
+}
+
 SNAP_DIR="/var/lib/privdns-gateway/backups"
 
 # 供 cmd_update 读取"本次刚创建的快照目录"(精确回滚目标, 不靠 index 0 猜)。
@@ -1350,8 +1722,22 @@ _PDG_SNAP_CREATED=""
 cmd_snapshot(){
   need_root snapshot; _lock
   _PDG_SNAP_CREATED=""
-  local ts d; ts=$(date +%Y%m%d-%H%M%S); d="$SNAP_DIR/$ts"
-  install -d -m700 "$d"
+  local ts d="" suffix attempt
+  ts=$(date +%Y%m%d-%H%M%S)
+  install -d -m700 "$SNAP_DIR" || {
+    c_y "❌ 快照根目录不可用"; return 1; }
+  # 时间戳便于人读，随机后缀让同一秒内并发/连续创建也有稳定、不可猜错的目录 ID。
+  # mkdir 的排他创建很重要；install -d 遇到同名目录会成功，反而可能覆盖旧快照。
+  for attempt in {1..10}; do
+    suffix="$(python3 -c 'import secrets; print(secrets.token_hex(4))')" || {
+      c_y "❌ 无法生成快照 ID"; return 1; }
+    d="$SNAP_DIR/$ts-$suffix"
+    if mkdir -m700 "$d" 2>/dev/null; then
+      break
+    fi
+    d=""
+  done
+  [[ -n "$d" ]] || { c_y "❌ 无法分配唯一快照 ID"; return 1; }
   # 整机配置 + 防火墙 + bot.env(含 token)+ service + journald 封顶(含历史错路径)(相对 / 打包, 回滚 -C / 解开)
   # 含: 已安装脚本(pdg / pdg-set-token / cert hook)+ 全部 pdg unit —— 升级会改它们, 回滚要一并还原。
   # 只打包"存在的"路径 —— 历史错路径可能已被迁移清掉, 无条件列进去会让 tar 报 Cannot stat 并返 2。
@@ -1446,19 +1832,24 @@ cmd_rollback(){
     panel_sanitized=1
   fi
   local rsdirect_member="etc/mosdns/rules/ruleset_direct.txt"
-  local rsdirect_members="$tmp/members-ruleset-direct"
+  local rshijack_member="etc/mosdns/rules/ruleset_hijack.txt"
+  local rsaggregate_members="$tmp/members-ruleset-aggregates"
   if ! _pdg_snapshot_rederive_ruleset_direct "$tree" >/dev/null; then
     echo "❌ 快照的规则集手机直连候选无法可信重建, 中止"
     rm -rf "$tmp"; return 1
   fi
-  if ! awk -v p="$rsdirect_member" '$0 != p' "$members" >"$rsdirect_members"; then
+  if ! awk -v p="$rsdirect_member" -v q="$rshijack_member" \
+      '$0 != p && $0 != q' "$members" >"$rsaggregate_members"; then
     echo "❌ 无法重建回滚成员清单, 中止"; rm -rf "$tmp"; return 1
   fi
-  if [[ -f "$tree/$rsdirect_member" ]]; then
-    printf '%s\n' "$rsdirect_member" >>"$rsdirect_members" \
-      || { echo "❌ 无法登记重建后的规则集聚合, 中止"; rm -rf "$tmp"; return 1; }
-  fi
-  mv -f "$rsdirect_members" "$members" \
+  local aggregate_member
+  for aggregate_member in "$rsdirect_member" "$rshijack_member"; do
+    if [[ -f "$tree/$aggregate_member" ]]; then
+      printf '%s\n' "$aggregate_member" >>"$rsaggregate_members" \
+        || { echo "❌ 无法登记重建后的规则集聚合, 中止"; rm -rf "$tmp"; return 1; }
+    fi
+  done
+  mv -f "$rsaggregate_members" "$members" \
     || { echo "❌ 无法提交回滚成员清单, 中止"; rm -rf "$tmp"; return 1; }
   # 内核配置校验(v1.6.0 只剩 mihomo)。快照带 mihomo 配置就用 mihomo 校验(优先用快照自带的
   # mihomo 二进制 —— 拿刚升上来的新核校验旧配置可能误挡回滚)。迁移前(singbox)快照没有 mihomo
@@ -1495,6 +1886,7 @@ cmd_rollback(){
     etc/privdns-gateway/backend
     etc/privdns-gateway/mosdns-build.env
     etc/mosdns/rules/ruleset_direct.txt
+    etc/mosdns/rules/ruleset_hijack.txt
     opt/pdg-bot/pdgprofile.py
     opt/pdg-bot/sb2mihomo.py
     opt/pdg-bot/bot.py
@@ -1503,6 +1895,7 @@ cmd_rollback(){
     opt/pdg-bot/nftscan.py
     opt/pdg-bot/nftmerge.py
     opt/pdg-web/pdg-web.py
+    opt/pdg-web/pdg-web-job.py
     opt/pdg-web/pdgcontrol.py
     opt/pdg-web/pdg-web-setup.py
     opt/pdg-web/pdgwebconfig.py
@@ -1652,6 +2045,7 @@ cmd_rollback(){
   fi
   local managed_optional=(
     etc/mosdns/rules/ruleset_direct.txt
+    etc/mosdns/rules/ruleset_hijack.txt
     etc/systemd/system/pdg-quic-routing.service
     usr/local/libexec/pdg-quic-routing.sh
     etc/privdns-gateway/quic-routing.state
@@ -1660,6 +2054,7 @@ cmd_rollback(){
     etc/privdns-gateway/web.json
     usr/local/bin/pdg-webctl
     opt/pdg-web/pdg-web.py
+    opt/pdg-web/pdg-web-job.py
     opt/pdg-web/pdgcontrol.py
     opt/pdg-web/pdg-web-setup.py
     opt/pdg-web/pdgwebconfig.py
@@ -1842,13 +2237,15 @@ PY
     # sing-box 残留只清"项目自己装的"(见 _pdg_singbox_is_ours), 第三方的原样保留
     _pdg_drop_singbox_files "快照带回的"
     systemctl daemon-reload || unrestored+=("daemon-reload(清理后)")
-    if [[ -x /usr/local/libexec/pdg-quic-routing.sh ]]; then
-      systemctl enable --now pdg-quic-routing >/dev/null 2>&1 \
-        && /usr/local/libexec/pdg-quic-routing.sh status >/dev/null 2>&1 \
-        || unrestored+=("QUIC routing恢复")
-    elif grep -q '^PDG_QUIC_MODE=' "$PROFILE_ENV" 2>/dev/null; then
-      unrestored+=("QUIC routing helper缺失")
-    fi
+    local quic_restore_rc=0
+    _pdg_rollback_restore_quic \
+      /usr/local/libexec/pdg-quic-routing.sh "$PROFILE_ENV" \
+      || quic_restore_rc=$?
+    case "$quic_restore_rc" in
+      0) ;;
+      2) unrestored+=("QUIC routing helper缺失") ;;
+      *) unrestored+=("QUIC routing恢复(enable/restart/status)") ;;
+    esac
     if grep -q '^PDG_QUIC_MODE=' "$PROFILE_ENV" 2>/dev/null; then
       local dpstate=""
       dpstate="$(python3 - <<'PY'
@@ -2191,6 +2588,7 @@ cmd_update(){
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh     /usr/local/bin/pdg-set-token \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdg.sh               /usr/local/bin/pdg \
     || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web.py           /opt/pdg-web/ \
+    || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web-job.py       /opt/pdg-web/ \
     || ! install -m755 "$REPO_DIR"/deploy/web/pdgcontrol.py        /opt/pdg-web/ \
     || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web-setup.py     /opt/pdg-web/ \
     || ! install -m644 "$REPO_DIR"/deploy/web/pdgwebconfig.py      /opt/pdg-web/ \
@@ -3172,6 +3570,190 @@ PY
   return 0
 }
 
+# 把旧默认 direct-type 锚点 jp 精确迁移为 JP。与 iOS GMS 清理相同，这里已由 pdg.sh
+# 持有整机写锁，不能再调用会抢同一把 flock 的 pdgtx；因此在锁内执行候选先行的三文件
+# 小事务：canonical model + rulesets 元数据（若存在）+ 派生 Mihomo 配置。任一步失败均按
+# before-image 原子恢复并重新启动内核；自定义 direct tag 不猜测、不改写。
+migrate_default_direct_tag(){
+  local sb="${PDG_SB_MODEL:-/etc/sing-box/config.json}"
+  local mh="${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}"
+  local rs="${PDG_RS_META:-/opt/pdg-bot/rulesets.json}"
+  local statedir="${PDG_STATE_DIR:-/var/lib/privdns-gateway}"
+  local botpy="${PDG_BOT_PY:-/opt/pdg-bot/bot.py}"
+  [[ -f "$sb" && -f "$botpy" ]] || return 0
+
+  local probe
+  if ! probe="$(python3 - "$botpy" "$sb" "$rs" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("pdg_bot_direct_probe", sys.argv[1])
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parent))
+bot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bot)
+cfg = json.load(open(sys.argv[2], encoding="utf-8"))
+model_changed = bot._normalize_default_direct_tag(cfg)
+meta_changed = False
+if bot._direct_anchor_tag(cfg) == bot.DEFAULT_DIRECT_TAG and os.path.isfile(sys.argv[3]):
+    meta = json.load(open(sys.argv[3], encoding="utf-8"))
+    if not isinstance(meta, dict):
+        raise SystemExit("rulesets metadata top level is not an object")
+    meta_changed = bot._normalize_default_direct_meta(meta)
+print("migrate" if model_changed or meta_changed else "unchanged")
+PY
+  )"; then
+    c_y "  direct 锚点 jp→JP 前置检查失败，未改动任何文件"
+    return 1
+  fi
+  [[ "$probe" == migrate ]] || return 0
+
+  local wd="" rc=0 step="" core_restarted=0
+  local applied=() g target name
+  mkdir -p "$statedir" 2>/dev/null || return 1
+  wd="$(mktemp -d "$statedir/directtag.XXXXXX" 2>/dev/null)" || {
+    c_y "  direct 锚点 jp→JP: 无法创建事务目录，未改动任何文件"; return 1; }
+  chmod 700 "$wd"
+
+  # 三个事务目标只接受单链接普通文件；metadata 可以原本不存在。
+  for g in "$sb:model" "$mh:mihomo" "$rs:meta"; do
+    target="${g%%:*}"; name="${g##*:}"
+    if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+      c_y "  direct 锚点 jp→JP: $target 不是受控普通文件，未改动任何文件"
+      rm -rf "$wd"; return 1
+    fi
+    [[ -e "$target" ]] || { echo 0 >"$wd/existed-$name"; continue; }
+    [[ "$(stat -c '%h' "$target" 2>/dev/null)" == 1 ]] || {
+      c_y "  direct 锚点 jp→JP: $target 是硬链接或无法读取 stat，未改动任何文件"
+      rm -rf "$wd"; return 1; }
+    echo 1 >"$wd/existed-$name"
+    cp --preserve=mode,ownership "$target" "$wd/before-$name" 2>/dev/null \
+      && cmp -s "$target" "$wd/before-$name" || {
+        c_y "  direct 锚点 jp→JP: 保存 $name before-image 失败，未改动任何文件"
+        rm -rf "$wd"; return 1; }
+  done
+  [[ "$(cat "$wd/existed-model")" == 1 && "$(cat "$wd/existed-mihomo")" == 1 ]] || {
+    c_y "  direct 锚点 jp→JP: model 或 Mihomo 配置缺失，未改动任何文件"
+    rm -rf "$wd"; return 1; }
+
+  # 从 before-image 生成全部候选；Mihomo 必须按候选 metadata 渲染，不能偷读旧引用。
+  if ! python3 - "$botpy" "$wd/before-model" "$wd/before-meta" \
+      "$wd/candidate-model" "$wd/candidate-meta" "$wd/candidate-mihomo" \
+      "$(cat "$wd/existed-meta")" <<'PY'
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+botpy, model_in, meta_in, model_out, meta_out, mihomo_out, meta_exists = sys.argv[1:]
+sys.path.insert(0, str(Path(botpy).resolve().parent))
+spec = importlib.util.spec_from_file_location("pdg_bot_direct_migrate", botpy)
+bot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bot)
+
+cfg = json.load(open(model_in, encoding="utf-8"))
+model_changed = bot._normalize_default_direct_tag(cfg)
+if not model_changed and bot._direct_anchor_tag(cfg) != bot.DEFAULT_DIRECT_TAG:
+    raise SystemExit("candidate no longer contains a recognized default direct anchor")
+model_data = bot._model_bytes(cfg)
+staged = {"model": model_data}
+meta_changed = False
+if meta_exists == "1":
+    meta = json.load(open(meta_in, encoding="utf-8"))
+    if not isinstance(meta, dict):
+        raise SystemExit("rulesets metadata top level is not an object")
+    meta_changed = bot._normalize_default_direct_meta(meta)
+    meta_data = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
+    staged["rs_meta"] = meta_data
+    open(meta_out, "wb").write(meta_data)
+if not model_changed and not meta_changed:
+    raise SystemExit("candidate contains no legacy direct references")
+open(model_out, "wb").write(model_data)
+open(mihomo_out, "wb").write(bot._mihomo_derive(staged))
+PY
+  then
+    c_y "  direct 锚点 jp→JP: 候选生成或无损转换检查失败，未改动任何文件"
+    rm -rf "$wd"; return 1
+  fi
+  chmod 600 "$wd"/candidate-model "$wd"/candidate-mihomo
+  [[ "$(cat "$wd/existed-meta")" != 1 ]] || chmod 600 "$wd/candidate-meta"
+  if command -v mihomo >/dev/null 2>&1 \
+     && ! mihomo -t -d /etc/mihomo -f "$wd/candidate-mihomo" >/dev/null 2>&1; then
+    c_y "  direct 锚点 jp→JP: 候选 Mihomo 配置校验失败，未改动任何文件"
+    rm -rf "$wd"; return 1
+  fi
+
+  _directtag_restore(){
+    local bad=() item path before
+    for item in model meta mihomo; do
+      [[ " ${applied[*]} " == *" $item "* ]] || continue
+      case "$item" in
+        model) path="$sb";; meta) path="$rs";; mihomo) path="$mh";;
+      esac
+      before="$wd/before-$item"
+      if [[ "$(cat "$wd/existed-$item" 2>/dev/null)" == 1 ]]; then
+        _pdg_atomic_restore_file "$before" "$path" 2>/dev/null \
+          && cmp -s "$before" "$path" || bad+=("$item 未还原")
+      else
+        rm -f "$path" 2>/dev/null
+        [[ ! -e "$path" ]] || bad+=("$item 本应不存在")
+      fi
+    done
+    if [[ "$core_restarted" == 1 ]]; then
+      systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 \
+        && _core_kernel_stable "$(_pdg_core_svc)" >/dev/null 2>&1 \
+        || bad+=("Mihomo 未恢复稳定运行")
+    fi
+    if [[ ${#bad[@]} -ne 0 ]]; then
+      c_y "  ⚠️ direct 锚点迁移回滚不完整: ${bad[*]}"
+      c_y "     before-image 保留在 $wd"
+      return 1
+    fi
+    rm -rf "$wd"
+    return 0
+  }
+
+  _directtag_put(){
+    local candidate="$1" path="$2" item="$3"
+    # 候选继承目标原 mode/owner，再走同目录原子替换。
+    chmod --reference="$wd/before-$item" "$candidate" 2>/dev/null \
+      && chown --reference="$wd/before-$item" "$candidate" 2>/dev/null || return 1
+    # 原子替换可能已完成、却在目录 fsync 时返回失败；先记账，任何失败都按 before-image 回滚。
+    applied+=("$item")
+    _pdg_atomic_restore_file "$candidate" "$path" 2>/dev/null || return 1
+    cmp -s "$candidate" "$path"
+  }
+
+  step=model
+  _directtag_put "$wd/candidate-model" "$sb" model || rc=1
+  if [[ $rc == 0 && "$(cat "$wd/existed-meta")" == 1 ]]; then
+    step=metadata
+    _directtag_put "$wd/candidate-meta" "$rs" meta || rc=1
+  fi
+  if [[ $rc == 0 ]]; then
+    step="Mihomo 配置"
+    _directtag_put "$wd/candidate-mihomo" "$mh" mihomo || rc=1
+  fi
+  if [[ $rc == 0 ]]; then
+    step="Mihomo 重启"
+    core_restarted=1
+    systemctl reset-failed "$(_pdg_core_svc)" >/dev/null 2>&1 || true
+    systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 \
+      && _core_kernel_stable "$(_pdg_core_svc)" >/dev/null 2>&1 || rc=1
+  fi
+  if [[ $rc != 0 ]]; then
+    c_y "  direct 锚点 jp→JP 在「$step」失败，开始回滚"
+    _directtag_restore || return 1
+    return 1
+  fi
+
+  rm -rf "$wd"
+  c_g "  默认 direct 锚点及全部引用已迁移: jp → JP"
+  return 0
+}
+
 # issue #1: bot 把域名"指到出口"时只改了内核路由, 没让 mosdns 劫持该域名 → 手机拿到真实 IP
 # 直连, 流量根本不到网关, 那条出口规则是死的(用户现场: 加了 ip.skk.moe→jp 仍显示国内直连,
 # 手工塞进 geosite 文件并重启 mosdns 才生效)。老装补: 建用户劫持表 → 并入 hijack_set →
@@ -3228,39 +3810,79 @@ MIGPY
 # custom_hijack 单域名覆盖在 CN/宽泛 direct 规则集之前进入 fake/SNI 序列。只改本项目标准
 # 形态；自定义配置不猜。配置备份、文件创建、重启核验与失败还原在本函数内闭合。
 migrate_ruleset_phone_direct(){
-  local mc=/etc/mosdns/config.yaml agg=/etc/mosdns/rules/ruleset_direct.txt
+  local mc=/etc/mosdns/config.yaml
+  local agg=/etc/mosdns/rules/ruleset_direct.txt
+  local hijagg=/etc/mosdns/rules/ruleset_hijack.txt
+  local state_root=/var/lib/privdns-gateway/migrations
+  local journal="$state_root/ruleset-dns-v1"
+  local preparing="$state_root/.ruleset-dns-v1.preparing"
+  local work="" config_ready=0 agg_pre=0 hijagg_pre=0 mc_mode=""
   [[ -e "$mc" || -L "$mc" ]] || return 0
   [[ -f "$mc" && ! -L "$mc" ]] \
     || { c_y "  ⛔ [规则集手机直连] MosDNS 配置不是普通文件，拒绝迁移。"; return 1; }
-  # early-return 与 Bot 入口共用同一份严格判据；注释里的路径/标签不能让迁移误以为已就绪。
-  if _pdg_ruleset_direct_interface_ready_file "$mc"; then
-    _pdg_ensure_ruleset_direct_file "$agg" \
-      || { c_y "  ⛔ [规则集手机直连] 聚合目标不是可信普通文件。"; return 1; }
-    return 0
+  mc_mode="$(stat -c '%a' "$mc" 2>/dev/null)"
+  [[ "$mc_mode" =~ ^[0-7]{3,4}$ ]] \
+    || { c_y "  ⛔ [规则集手机直连] 无法读取 MosDNS 配置权限。"; return 1; }
+  install -d -o root -g root -m700 "$state_root" \
+    || { c_y "  ⛔ [规则集手机直连] 无法建立 root-only 迁移状态目录。"; return 1; }
+  if [[ -e "$journal" || -L "$journal" ]]; then
+    c_y "  [规则集手机直连] 检测到未完成提交，先按持久 before-image 恢复。"
+    _pdg_recover_ruleset_migration_journal \
+      "$journal" "$mc" "$agg" "$hijagg" \
+      || { c_y "  ⛔ [规则集手机直连] 未完成提交恢复失败，拒绝继续。"; return 1; }
   fi
-  grep -q 'tag: internal_sequence' "$mc" \
-    && grep -q 'tag: geosite_cn' "$mc" \
-    && grep -q 'tag: force_hijack_seq' "$mc" \
-    || { c_y "  [规则集手机直连] MosDNS 是自定义形态，未猜测改写；target=direct 会拒绝直到接口就绪。"; return 0; }
-  local bak agg_pre=0
-  bak="$mc.prersdirect.$(date +%s)"
+  # preparing 尚未发布为 journal 时绝不会开始改 live 文件；中断后可验证并丢弃。
+  if [[ -e "$preparing" || -L "$preparing" ]]; then
+    _pdg_sync_ruleset_migration_path "$preparing" \
+      && rm -rf -- "$preparing" \
+      && _pdg_sync_parent_dir "$preparing" \
+      || { c_y "  ⛔ [规则集手机直连] 遗留准备目录不可信，拒绝继续。"; return 1; }
+  fi
+  # 已有新版接口也不能直接返回：早期迁移可能只创建了空聚合，必须从当前 metadata/source
+  # 重新派生，才不会让现有代理规则集在 DNS 阶段被宽泛 CN 规则提前放行。
+  if _pdg_ruleset_direct_interface_ready_file "$mc"; then
+    config_ready=1
+  else
+    grep -q 'tag: internal_sequence' "$mc" \
+      && grep -q 'tag: geosite_cn' "$mc" \
+      && grep -q 'tag: force_hijack_seq' "$mc" \
+      || { c_y "  [规则集手机直连] MosDNS 是自定义形态，未猜测改写；target=direct 会拒绝直到接口就绪。"; return 0; }
+  fi
   if [[ -L "$agg" || ( -e "$agg" && ! -f "$agg" ) ]]; then
     c_y "  ⛔ [规则集手机直连] 聚合目标不是普通文件，拒绝迁移。"; return 1
   fi
+  if [[ -L "$hijagg" || ( -e "$hijagg" && ! -f "$hijagg" ) ]]; then
+    c_y "  ⛔ [规则集劫持] 聚合目标不是普通文件，拒绝迁移。"; return 1
+  fi
   [[ -f "$agg" ]] && agg_pre=1
-  cp -a "$mc" "$bak" 2>/dev/null && cmp -s "$mc" "$bak" \
-    || { c_y "  [规则集手机直连] 配置备份失败，未改动。"; rm -f "$bak"; return 0; }
-  install -d -m755 /etc/mosdns/rules 2>/dev/null || true
-  _pdg_ensure_ruleset_direct_file "$agg" \
-    || { c_y "  [规则集手机直连] 聚合文件创建失败，未改动配置。"; rm -f "$bak"; return 1; }
-  if ! python3 - "$mc" "$agg" <<'RSDIRECTPY'
+  [[ -f "$hijagg" ]] && hijagg_pre=1
+  install -d -o root -g root -m700 "$preparing" \
+    || { c_y "  [规则集手机直连] 无法创建持久迁移工作目录，未改动。"; return 1; }
+  work="$preparing"
+  if ! _pdg_capture_ruleset_migration_before \
+         "$work" "$mc" "$agg" "$hijagg" "$agg_pre" "$hijagg_pre" \
+     || ! cp -a "$work/config.before" "$work/config.candidate" 2>/dev/null \
+     || ! cmp -s "$work/config.before" "$work/config.candidate"; then
+    c_y "  [规则集手机直连] 三文件 before-image 捕获失败，未改动。"
+    rm -rf -- "$work"; return 1
+  fi
+  if [[ "$agg_pre" != 1 ]]; then
+    install -o root -g root -m600 /dev/null "$work/direct.absent" \
+      || { rm -rf -- "$work"; return 1; }
+  fi
+  if [[ "$hijagg_pre" != 1 ]]; then
+    install -o root -g root -m600 /dev/null "$work/hijack.absent" \
+      || { rm -rf -- "$work"; return 1; }
+  fi
+  if [[ "$config_ready" != 1 ]] \
+     && ! python3 - "$work/config.candidate" "$agg" "$hijagg" <<'RSDIRECTPY'
 import os
 import re
 import stat
 import sys
 import tempfile
 
-mc, agg = sys.argv[1:]
+mc, agg, hijagg = sys.argv[1:]
 s = open(mc, encoding="utf-8").read()
 
 def ensure_domain_set_file(text, tag, path):
@@ -3289,7 +3911,8 @@ if "  - tag: explicit_hijack\n" not in s:
     plugin = (
         "  - tag: explicit_hijack\n"
         "    type: domain_set\n"
-        '    args: { files: ["/etc/mosdns/rules/custom_hijack.txt"] }\n'
+        '    args: { files: ["/etc/mosdns/rules/custom_hijack.txt",'
+        '"/etc/mosdns/rules/ruleset_hijack.txt"] }\n'
     )
     s = s.replace(marker, plugin + marker, 1)
 
@@ -3297,6 +3920,7 @@ s = ensure_domain_set_file(s, "geosite_cn", agg)
 s = ensure_domain_set_file(
     s, "explicit_hijack", "/etc/mosdns/rules/custom_hijack.txt"
 )
+s = ensure_domain_set_file(s, "explicit_hijack", hijagg)
 
 marker = "      - matches: qname $geosite_cn\n"
 if s.count(marker) < 1:
@@ -3348,58 +3972,89 @@ finally:
         pass
 RSDIRECTPY
   then
-    c_y "  [规则集手机直连] 生成失败，正在原子还原配置。"
-    local generate_rb_failed=0
-    _pdg_atomic_restore_file "$bak" "$mc" 2>/dev/null \
-      && cmp -s "$bak" "$mc" || generate_rb_failed=1
-    if [[ "$agg_pre" != 1 ]]; then
-      rm -f "$agg" 2>/dev/null || generate_rb_failed=1
-    fi
-    if [[ "$generate_rb_failed" == 0 ]]; then
-      rm -f "$bak"
+    c_y "  [规则集手机直连] 配置候选生成失败，正在还原三文件 before-image。"
+    if _pdg_restore_ruleset_migration_before \
+         "$work" "$mc" "$agg" "$hijagg" "$agg_pre" "$hijagg_pre"; then
+      rm -rf -- "$work"
       c_y "  [规则集手机直连] 生成失败，磁盘配置已还原；MosDNS 运行态未重启。"
-      return 0
-    fi
-    c_y "  ⛔ [规则集手机直连] 生成失败且还原不完整；before-image 保留在 $bak"
-    return 1
-  fi
-  # 生成器只负责标准形态改写；提交前仍须调用 Bot 的同一严格接口判据。校验失败时
-  # 只恢复磁盘候选，绝不把无效配置交给 MosDNS restart。
-  if ! _pdg_ruleset_direct_interface_ready_file "$mc"; then
-    c_y "  [规则集手机直连] 生成后的严格接口校验失败，正在原子还原；未重启 MosDNS。"
-    local validate_rb_failed=0
-    _pdg_atomic_restore_file "$bak" "$mc" 2>/dev/null \
-      && cmp -s "$bak" "$mc" || validate_rb_failed=1
-    if [[ "$agg_pre" != 1 ]]; then
-      rm -f "$agg" 2>/dev/null || validate_rb_failed=1
-    fi
-    if [[ "$validate_rb_failed" == 0 ]]; then
-      rm -f "$bak"
       return 1
     fi
-    c_y "  ⛔ [规则集手机直连] 严格校验失败且还原不完整；before-image 保留在 $bak"
+    c_y "  ⛔ [规则集手机直连] 生成失败且还原不完整；before-image 保留在 $work"
+    return 1
+  fi
+
+  # 从当前 metadata + 所有受管 source JSON 纯派生两份候选。不能先落空文件再宣布
+  # 迁移成功，否则已有 proxy/direct 规则集要等到下一次 refresh 才有正确 DNS 语义。
+  if ! _pdg_ruleset_aggregate_candidates \
+         "$work/config.candidate" "$work/direct.candidate" \
+         "$work/hijack.candidate" "$work/hijack.transition" "$hijagg" \
+     || ! _pdg_ruleset_direct_interface_ready_file "$work/config.candidate"; then
+    c_y "  [规则集手机直连] 双聚合/配置候选生成失败；live 文件尚未改动。"
+    rm -rf -- "$work"
+    return 1
+  fi
+
+  # 候选与 before-image 全部持久化后，原子发布 journal；只有发布成功才允许触碰
+  # live 文件。断电后下一次 migrate 会先从该目录幂等恢复三文件。
+  if ! _pdg_sync_ruleset_migration_path "$work" \
+     || ! mv "$preparing" "$journal" \
+     || ! _pdg_sync_parent_dir "$journal"; then
+    c_y "  ⛔ [规则集手机直连] 持久恢复 journal 发布失败，拒绝提交 live 文件。"
+    return 1
+  fi
+  work="$journal"
+
+  # 过渡劫持先取 old∪candidate：出口 target 双向变化的中间窗口最多保守走网关，
+  # 不会因 direct/hijack 两文件尚未同步而误直连。config 仍最后切换。
+  if ! install -d -m755 /etc/mosdns/rules \
+     || ! _pdg_atomic_install_file "$work/hijack.transition" "$hijagg" 644 \
+     || ! _pdg_atomic_install_file "$work/direct.candidate" "$agg" 644 \
+     || ! _pdg_atomic_install_file "$work/hijack.candidate" "$hijagg" 644 \
+     || ! _pdg_atomic_install_file "$work/config.candidate" "$mc" "$mc_mode"; then
+    c_y "  [规则集手机直连] 三文件提交失败，正在按持久 journal 还原。"
+    if _pdg_restore_ruleset_migration_before \
+         "$work" "$mc" "$agg" "$hijagg" "$agg_pre" "$hijagg_pre"; then
+      rm -rf -- "$work"
+      _pdg_sync_parent_dir "$work" || true
+      return 1
+    fi
+    c_y "  ⛔ [规则集手机直连] 提交失败且还原不完整；journal 保留在 $work"
+    return 1
+  fi
+
+  # 提交后仍须调用 Bot 的同一严格接口判据。
+  if ! _pdg_ruleset_direct_interface_ready_file "$mc"; then
+    c_y "  [规则集手机直连] 严格接口校验失败，正在还原三文件 before-image；未重启 MosDNS。"
+    if _pdg_restore_ruleset_migration_before \
+         "$work" "$mc" "$agg" "$hijagg" "$agg_pre" "$hijagg_pre"; then
+      rm -rf -- "$work"
+      _pdg_sync_parent_dir "$work" || true
+      return 1
+    fi
+    c_y "  ⛔ [规则集手机直连] 严格校验失败且还原不完整；before-image 保留在 $work"
     return 1
   fi
   if systemctl restart mosdns 2>/dev/null && _core_kernel_stable mosdns; then
-    c_g "  已接入规则集手机本地直连聚合，并建立显式单域名代理优先级。"
-    rm -f "$bak"
+    if ! rm -rf -- "$work" || ! _pdg_sync_parent_dir "$work"; then
+      c_y "  ⛔ [规则集手机直连] 新配置已稳定，但 journal 清理未持久确认。"
+      return 1
+    fi
+    c_g "  已从当前规则集重建 direct/hijack DNS 聚合，并建立显式代理优先级。"
     return 0
   fi
-  c_y "  [规则集手机直连] MosDNS 重启后未稳定，正在原子还原。"
-  local runtime_rb_failed=0
-  _pdg_atomic_restore_file "$bak" "$mc" 2>/dev/null \
-    && cmp -s "$bak" "$mc" || runtime_rb_failed=1
-  if [[ "$agg_pre" != 1 ]]; then
-    rm -f "$agg" 2>/dev/null || runtime_rb_failed=1
-  fi
-  if [[ "$runtime_rb_failed" == 0 ]] \
+  c_y "  [规则集手机直连] MosDNS 重启后未稳定，正在还原三文件 before-image。"
+  if _pdg_restore_ruleset_migration_before \
+       "$work" "$mc" "$agg" "$hijagg" "$agg_pre" "$hijagg_pre" \
      && systemctl restart mosdns 2>/dev/null \
      && _core_kernel_stable mosdns; then
-    rm -f "$bak"
+    if ! rm -rf -- "$work" || ! _pdg_sync_parent_dir "$work"; then
+      c_y "  ⛔ [规则集手机直连] 旧配置已稳定，但 journal 清理未持久确认。"
+      return 1
+    fi
     c_y "  [规则集手机直连] 新接口未提交；旧配置已还原并确认稳定。"
     return 0
   fi
-  c_y "  ⛔ [规则集手机直连] 旧配置还原后 MosDNS 仍未稳定；before-image 保留在 $bak"
+  c_y "  ⛔ [规则集手机直连] 旧配置还原后 MosDNS 仍未稳定；before-image 保留在 $work"
   return 1
 }
 
@@ -3685,6 +4340,7 @@ run_all_migrations(){
   # 数据面前置迁移负责在任何写入前完成 mode-aware nft 冲突扫描；失败后继续跑
   # best-effort 迁移会破坏其“冲突现场零改动”保证，因此这里立即返回。
   migrate_dataplane_profile || return 1
+  migrate_default_direct_tag || return 1
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true

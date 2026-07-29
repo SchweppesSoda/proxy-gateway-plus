@@ -67,34 +67,56 @@ class Box:
     def _start_dns(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.bind(("127.0.0.1", 0))
+        s.settimeout(0.1)
         port = s.getsockname()[1]
-        self._probes.append(s)
+        stop = threading.Event()
+        ready = threading.Event()
+
         def loop():
-            while True:
+            ready.set()
+            while not stop.is_set():
                 try:
                     data, addr = s.recvfrom(512)
+                except socket.timeout:
+                    continue
                 except OSError:
                     return
                 try:
                     s.sendto(data[:2] + b"\x81\x83" + data[4:12], addr)   # 回一个 NXDOMAIN
                 except OSError:
                     return
-        threading.Thread(target=loop, daemon=True).start()
+        thread = threading.Thread(
+            target=loop, name="txbox-dns-%d" % port, daemon=True)
+        probe_server = ("dns:%d" % port, s, stop, ready, thread)
+        self._probes.append(probe_server)
+        thread.start()
+        if not ready.wait(timeout=1):
+            self._stop_probe(probe_server)
+            self._probes.remove(probe_server)
+            raise RuntimeError("沙箱 DNS 应答线程没有进入服务循环")
+
         # **就绪同步**: 线程起来之前(或解释器忙得没调度到它时)事务的 DNS 硬门会拿不到应答,
         # 于是"基线好、观察期坏"被误判成本次操作造成的退化 —— 那是沙箱的锅, 不是判据的锅。
         # 这里先自己问一次, 确认应答器真的在服务了再把端口交出去; 判据本身一行没改。
         probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         probe.settimeout(0.3)
+        query = b"\x00\x01\x01\x00" + b"\x00" * 8
         try:
-            deadline = time.time() + 5
-            while time.time() < deadline:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
                 try:
-                    probe.sendto(b"\x00\x01\x01\x00" + b"\x00" * 8, ("127.0.0.1", port))
-                    probe.recvfrom(512)
-                    break
+                    probe.sendto(query, ("127.0.0.1", port))
+                    response, _ = probe.recvfrom(512)
+                    if (
+                            len(response) >= 4
+                            and response[:2] == query[:2]
+                            and response[2:4] == b"\x81\x83"):
+                        break
                 except OSError:
                     continue
             else:
+                self._stop_probe(probe_server)
+                self._probes.remove(probe_server)
                 raise RuntimeError("沙箱 DNS 应答器 5 秒内没就绪")
         finally:
             probe.close()
@@ -103,24 +125,49 @@ class Box:
     def _start_tcp(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0)); s.listen(8)
+        s.settimeout(0.1)
         port = s.getsockname()[1]
-        self._probes.append(s)
+        stop = threading.Event()
+        ready = threading.Event()
+
         def loop():
-            while True:
+            ready.set()
+            while not stop.is_set():
                 try:
                     c, _ = s.accept(); c.close()
+                except socket.timeout:
+                    continue
                 except OSError:
                     return
-        threading.Thread(target=loop, daemon=True).start()
+        thread = threading.Thread(
+            target=loop, name="txbox-tcp-%d" % port, daemon=True)
+        probe_server = ("tcp:%d" % port, s, stop, ready, thread)
+        self._probes.append(probe_server)
+        thread.start()
+        if not ready.wait(timeout=1):
+            self._stop_probe(probe_server)
+            self._probes.remove(probe_server)
+            raise RuntimeError("沙箱 TCP 监听线程没有进入服务循环")
         return port
 
+    @staticmethod
+    def _stop_probe(probe):
+        name, sock, stop, _ready, thread = probe
+        stop.set()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        thread.join(timeout=2)
+        if thread.is_alive():
+            raise RuntimeError("沙箱探针线程未退出: %s" % name)
+
     def stop_probes(self):
-        for s in self._probes:
-            try:
-                s.close()
-            except OSError:
-                pass
-        self._probes = []
+        probes, self._probes = self._probes, []
+        for _name, _sock, stop, _ready, _thread in probes:
+            stop.set()
+        for probe in probes:
+            self._stop_probe(probe)
 
     def _write(self, name, body):
         p = os.path.join(self.bin, name)

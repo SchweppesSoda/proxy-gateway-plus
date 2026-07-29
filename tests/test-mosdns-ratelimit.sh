@@ -75,7 +75,7 @@ if [[ -z "${MD:-}" && -n "$ARCH" ]]; then
      && (cd "$WORK" && unzip -q m.zip); then MD="$WORK/mosdns"; chmod +x "$MD"; fi
 fi
 if [[ -n "${MD:-}" ]] && command -v dig >/dev/null; then
-  mkdir -p "$WORK/rules"; for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_direct unlock; do : > "$WORK/rules/$f.txt"; done
+  mkdir -p "$WORK/rules"; for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_direct ruleset_hijack unlock; do : > "$WORK/rules/$f.txt"; done
   echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"   # 劫持集: example.com 及子域被劫持到本机(黑洞), 限流实测不依赖外网
   : > "$WORK/rules/mitm_hijack.txt"
   sed -e "s|__SERVER_IP__|10.0.0.9|g" -e "s|__INTERNAL_CIDR__|127.0.0.0/8|g" \

@@ -9,6 +9,7 @@ never opened for writing here.
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
 import importlib
 import importlib.util
@@ -17,6 +18,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
@@ -30,7 +32,11 @@ _DOMAIN_RE = re.compile(
 )
 _SAFE_TYPE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,32}$")
 _SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9_.+:/ -]{1,96}$")
-_ROLLBACK_UNIT = "pdg-web-rollback.service"
+_JOB_ID_RE = re.compile(r"^[0-9]{8}t[0-9]{6}z-[a-f0-9]{12}$")
+_SNAPSHOT_ID_RE = re.compile(
+    r"^[0-9]{8}-[0-9]{6}(?:-[a-f0-9]{8})?$")
+_UTC_TIME_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _PROXY_LINK_RE = re.compile(
     r"(?i)\b(?:ss|ssr|vmess|vless|trojan|hysteria2?|hy2|tuic|anytls|"
     r"shadowtls|socks5?|https?)://[^\s\"'<>]+"
@@ -154,6 +160,14 @@ def load_bot_module():
     return _load_module_from_path(fallback)
 
 
+def load_job_module():
+    """Load the colocated maintenance runner without relying on its hyphenated name."""
+
+    path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "pdg-web-job.py"))
+    return _load_module_from_path(path)
+
+
 def _safe_text(value: Any, limit: int = 128) -> str:
     text = str(value or "")
     text = "".join(ch for ch in text if ch >= " " and ch not in "\x7f")
@@ -259,8 +273,10 @@ def sanitize_log_line(value: Any) -> str:
 class PDGControl:
     """Business operations for the frozen ``/api/v1`` surface."""
 
-    def __init__(self, bot_module=None):
+    def __init__(self, bot_module=None, job_store=None):
         self.bot = bot_module or load_bot_module()
+        self._job_store_instance = job_store
+        self._diagnostic_slots = threading.BoundedSemaphore(1)
 
     # ---- common ---------------------------------------------------------
     def _load(self) -> dict[str, Any]:
@@ -301,6 +317,45 @@ class PDGControl:
         if not callable(fn):
             raise UnavailableError()
         self._result(fn(op, **kwargs))
+
+    def _job_store(self):
+        if self._job_store_instance is not None:
+            return self._job_store_instance
+        try:
+            store = load_job_module().JobStore()
+        except Exception as exc:
+            raise UnavailableError() from exc
+        self._job_store_instance = store
+        return store
+
+    @staticmethod
+    def _raise_job_error(exc: Exception, *, request_value: bool = False):
+        name = type(exc).__name__
+        if name == "JobBusy":
+            raise BusyError() from exc
+        if name == "JobNotFound":
+            raise NotFoundError() from exc
+        if name == "JobInvalid" and request_value:
+            raise ValidationError() from exc
+        raise ControlError() from exc
+
+    @contextlib.contextmanager
+    def _maintenance_guard(self):
+        # The persistent runner is part of the installed Web bundle.  If its
+        # root-only state cannot be initialized, proceeding would bypass the
+        # active-job gate (rules-update even performs work before pdgtx), so all
+        # synchronous maintenance actions fail closed.
+        store = self._job_store()
+        guard = getattr(store, "maintenance_guard", None)
+        if not callable(guard):
+            raise UnavailableError()
+        try:
+            with guard():
+                yield
+        except ControlError:
+            raise
+        except Exception as exc:
+            self._raise_job_error(exc)
 
     def _service_states(self) -> dict[str, str]:
         states: dict[str, str] = {}
@@ -638,6 +693,231 @@ class PDGControl:
             pass
         return out
 
+    # ---- persistent maintenance state --------------------------------
+    @staticmethod
+    def _public_snapshot(item: Any) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        snapshot_id = item.get("id")
+        created = item.get("createdAt")
+        size = item.get("size")
+        if (
+                not isinstance(snapshot_id, str)
+                or not _SNAPSHOT_ID_RE.fullmatch(snapshot_id)
+                or not isinstance(created, str)
+                or not _UTC_TIME_RE.fullmatch(created)
+                or type(size) is not int or not 0 < size <= (1 << 63)):
+            return None
+        return {
+            "id": snapshot_id,
+            "createdAt": created,
+            "size": size,
+            "legacy": snapshot_id.count("-") == 1,
+        }
+
+    @staticmethod
+    def _public_job(item: Any) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        job_id = item.get("id")
+        kind = item.get("kind")
+        status = item.get("status")
+        created = item.get("createdAt")
+        if (
+                not isinstance(job_id, str) or not _JOB_ID_RE.fullmatch(job_id)
+                or kind not in {"rollback", "software-update"}
+                or status not in {
+                    "queued", "running", "succeeded", "failed", "interrupted"}
+                or not isinstance(created, str)
+                or not _UTC_TIME_RE.fullmatch(created)):
+            return None
+        out = {
+            "id": job_id,
+            "operation": kind,
+            "status": status,
+            "createdAt": created,
+        }
+        for source, target in (
+                ("startedAt", "startedAt"), ("finishedAt", "finishedAt")):
+            value = item.get(source)
+            if isinstance(value, str) and _UTC_TIME_RE.fullmatch(value):
+                out[target] = value
+        snapshot_id = item.get("snapshotId")
+        if (
+                isinstance(snapshot_id, str)
+                and _SNAPSHOT_ID_RE.fullmatch(snapshot_id)):
+            out["snapshotId"] = snapshot_id
+        return out
+
+    def snapshots(self) -> dict[str, Any]:
+        store = self._job_store()
+        try:
+            raw = store.list_snapshots()
+        except Exception as exc:
+            self._raise_job_error(exc)
+        if not isinstance(raw, list):
+            raise ControlError()
+        items = [
+            public for public in (self._public_snapshot(item) for item in raw[:10])
+            if public is not None
+        ]
+        return {"items": items}
+
+    def jobs(self) -> dict[str, Any]:
+        store = self._job_store()
+        try:
+            raw = store.list()
+        except Exception as exc:
+            self._raise_job_error(exc)
+        if not isinstance(raw, list):
+            raise ControlError()
+        items = [
+            public for public in (self._public_job(item) for item in raw[:50])
+            if public is not None
+        ]
+        return {"items": items}
+
+    def job(self, job_id: str) -> dict[str, Any]:
+        if not isinstance(job_id, str) or not _JOB_ID_RE.fullmatch(job_id):
+            raise ValidationError("job id is invalid.")
+        store = self._job_store()
+        try:
+            raw = store.get(job_id)
+        except Exception as exc:
+            self._raise_job_error(exc, request_value=True)
+        public = self._public_job(raw)
+        if public is None:
+            raise ControlError()
+        return public
+
+    # ---- bounded, sanitized diagnostics -------------------------------
+    def diagnose_exits(self, body: dict[str, Any]) -> dict[str, Any]:
+        _dict_keys(body, allowed=set())
+        fn = getattr(self.bot, "probe_exit_delays", None)
+        if not callable(fn):
+            raise UnavailableError()
+        if not self._diagnostic_slots.acquire(blocking=False):
+            raise BusyError()
+        try:
+            try:
+                raw = fn(
+                    allow_tcp_fallback=False, timeout_ms=5000, max_workers=4)
+            except Exception as exc:
+                raise ControlError() from exc
+        finally:
+            self._diagnostic_slots.release()
+        if not isinstance(raw, dict) or not isinstance(raw.get("items"), list):
+            raise ControlError()
+        model = self._load()
+        try:
+            allowed = set(self.bot.concrete_tags(model))
+        except Exception as exc:
+            raise ControlError() from exc
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw["items"][:128]:
+            if not isinstance(item, dict):
+                continue
+            tag = item.get("tag")
+            status = item.get("status")
+            if (
+                    not isinstance(tag, str) or not _TAG_RE.fullmatch(tag)
+                    or tag not in allowed or tag in seen
+                    or status not in {
+                        "ok", "timeout", "unreachable", "unavailable"}):
+                continue
+            public: dict[str, Any] = {"tag": tag, "status": status}
+            delay = item.get("delay_ms")
+            if (
+                    status == "ok" and type(delay) is int
+                    and 0 <= delay <= 600_000):
+                public["delayMs"] = delay
+            elif status == "ok":
+                continue
+            items.append(public)
+            seen.add(tag)
+        method = raw.get("method")
+        available = method == "clash" and bool(items)
+        return {"available": available, "items": items}
+
+    def diagnose_domain(self, body: dict[str, Any]) -> dict[str, Any]:
+        _dict_keys(body, allowed={"domain"}, required={"domain"})
+        domain = _domain(body["domain"])
+        fn = getattr(self.bot, "probe_domain_route", None)
+        if not callable(fn):
+            raise UnavailableError()
+        try:
+            raw = fn(domain)
+        except Exception as exc:
+            raise ControlError() from exc
+        if not isinstance(raw, dict):
+            raise ControlError()
+        path = raw.get("path")
+        reason = raw.get("reason")
+        verified = raw.get("verified")
+        confidence = raw.get("confidence")
+        dns_verified = raw.get("dns_verified")
+        route_confidence = raw.get("route_confidence")
+        if (
+                path not in {"direct", "gateway", "unknown"}
+                or reason not in {
+                    "dns_real", "explicit_domain", "keyword", "ruleset",
+                    "default", "dns_no_answer", "probe_busy",
+                    "probe_unavailable", "config_changed"}
+                or type(verified) is not bool
+                or confidence not in {"verified", "simulated", "unknown"}
+                or type(dns_verified) is not bool
+                or route_confidence not in {
+                    "verified", "simulated", "unknown"}
+                or confidence != route_confidence
+                or verified != (route_confidence == "verified")):
+            raise ControlError()
+        if reason in {"probe_busy", "config_changed"} and (
+                path != "unknown" or dns_verified or verified
+                or route_confidence != "unknown"):
+            raise ControlError()
+        if reason == "dns_real" and (
+                path != "direct" or not dns_verified
+                or route_confidence != "verified"):
+            raise ControlError()
+        if reason in {
+                "explicit_domain", "keyword", "ruleset", "default"} and (
+                path != "gateway" or not dns_verified
+                or route_confidence != "simulated"):
+            raise ControlError()
+        if reason == "dns_no_answer" and (
+                path != "unknown" or dns_verified
+                or route_confidence != "unknown"):
+            raise ControlError()
+        if reason == "probe_unavailable" and not (
+                (path == "unknown" and not dns_verified
+                 and route_confidence == "unknown")
+                or (path == "gateway" and dns_verified
+                    and route_confidence == "unknown")):
+            raise ControlError()
+        out: dict[str, Any] = {
+            "domain": domain,
+            "path": path,
+            "reason": reason,
+            "dnsVerified": dns_verified,
+            "routeConfidence": route_confidence,
+            # Frozen v1 compatibility for the already-deployed front-end.
+            "verified": verified,
+            "confidence": confidence,
+        }
+        target = raw.get("target")
+        if isinstance(target, str) and _TAG_RE.fullmatch(target):
+            try:
+                allowed = set(self._targets())
+            except Exception:
+                allowed = set()
+            if target in allowed:
+                out["target"] = target
+        label = raw.get("rule_label")
+        if isinstance(label, str):
+            out["ruleLabel"] = _safe_text(label, 40)
+        return out
+
     # ---- exits and groups ----------------------------------------------
     def add_exit(self, body: dict[str, Any]) -> dict[str, Any]:
         _dict_keys(body, allowed={"link"}, required={"link"})
@@ -688,6 +968,60 @@ class PDGControl:
         )
         return self._public_exit_item(item)
 
+    def replace_exit(self, tag: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Replace connection details while preserving tag, position and references."""
+
+        tag = _tag(tag)
+        _dict_keys(body, allowed={"link"}, required={"link"})
+        current = next(
+            (item for item in self._exit_items() if item["tag"] == tag), None)
+        if current is None or current.get("kind") != "proxy":
+            raise NotFoundError()
+        link = _string(body["link"], field="link", maximum=8192)
+        outbound: dict[str, Any] = {}
+        parsed: dict[str, Any] = {}
+        try:
+            try:
+                candidate = self.bot.parse_link(link)
+            except Exception as exc:
+                raise ValidationError("Proxy link is invalid.") from exc
+            finally:
+                link = ""
+            if not isinstance(candidate, dict):
+                raise ValidationError("Proxy link is invalid.")
+            parsed = candidate
+            if parsed.get("type") not in set(getattr(self.bot, "PROXY_TYPES", ())):
+                raise ValidationError("Proxy link is invalid.")
+            outbound = copy.deepcopy(parsed)
+            outbound["tag"] = tag
+
+            def modify(model):
+                outbounds = model.get("outbounds")
+                if not isinstance(outbounds, list):
+                    raise ValueError("outbounds missing")
+                indexes = [
+                    index for index, item in enumerate(outbounds)
+                    if isinstance(item, dict) and item.get("tag") == tag
+                ]
+                if len(indexes) != 1:
+                    raise ValueError("outbound changed")
+                index = indexes[0]
+                if outbounds[index].get("type") not in set(
+                        getattr(self.bot, "PROXY_TYPES", ())):
+                    raise ValueError("outbound is no longer replaceable")
+                outbounds[index] = copy.deepcopy(outbound)
+
+            self._tx("web_exit_replace", model_mod=modify)
+        finally:
+            link = ""
+            outbound.clear()
+            parsed.clear()
+        item = next(
+            (item for item in self._exit_items() if item["tag"] == tag),
+            {"tag": tag, "type": "unknown"},
+        )
+        return self._public_exit_item(item)
+
     def _delete_outbound(self, tag: str, *, group_only: bool = False) -> None:
         tag = _tag(tag)
         before = next((item for item in self._exit_items() if item["tag"] == tag), None)
@@ -696,6 +1030,21 @@ class PDGControl:
         if group_only and before["kind"] != "group":
             raise NotFoundError()
         files: dict[str, bytes] = {}
+        file_expects: dict[str, str | None] = {}
+        snapshot = getattr(self.bot, "_rs_meta_snapshot", None)
+        if not callable(snapshot):
+            raise UnavailableError()
+        try:
+            meta_snapshot, meta_sha = snapshot()
+        except Exception as exc:
+            raise UnavailableError() from exc
+        if (
+                not isinstance(meta_snapshot, dict)
+                or (meta_sha is not None and (
+                    not isinstance(meta_sha, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", meta_sha)))):
+            raise UnavailableError()
+        meta_snapshot = copy.deepcopy(meta_snapshot)
 
         def modify(model):
             outbounds = model.get("outbounds") or []
@@ -718,6 +1067,9 @@ class PDGControl:
                 item.get("tag") for item in model["outbounds"]
                 if isinstance(item, dict) and isinstance(item.get("tag"), str)
             }
+            # ``direct`` is a MosDNS/mobile pseudo-target, not an outbound tag.
+            # It remains valid regardless of which concrete proxy is deleted.
+            routable = live | {"direct"}
             final = (model.get("route") or {}).get("final")
             if final not in live:
                 final = next((
@@ -729,19 +1081,26 @@ class PDGControl:
                     raise ValueError("no fallback")
                 model.setdefault("route", {})["final"] = final
             for rule in (model.get("route") or {}).get("rules") or []:
-                if rule.get("outbound") not in live:
+                if rule.get("outbound") not in routable:
                     rule["outbound"] = final
-            meta = copy.deepcopy(self._meta())
             dirty = False
-            for value in meta.values():
-                if isinstance(value, dict) and value.get("outbound") not in live:
+            for value in meta_snapshot.values():
+                if (
+                        isinstance(value, dict)
+                        and value.get("outbound") not in routable):
                     value["outbound"] = final
                     dirty = True
             if dirty:
                 files["rs_meta"] = json.dumps(
-                    meta, ensure_ascii=False, indent=2).encode("utf-8")
+                    meta_snapshot, ensure_ascii=False, indent=2).encode("utf-8")
+                file_expects["rs_meta"] = meta_sha
 
-        self._tx("web_outbound_delete", model_mod=modify, files=files)
+        self._tx(
+            "web_outbound_delete",
+            model_mod=modify,
+            files=files,
+            file_expects=file_expects,
+        )
 
     def delete_exit(self, tag: str) -> dict[str, Any]:
         self._delete_outbound(tag)
@@ -960,6 +1319,24 @@ class PDGControl:
         return next((item for item in self._ruleset_items() if item["name"] == name),
                     {"name": name})
 
+    def set_ruleset_target(
+            self, name: str, body: dict[str, Any]) -> dict[str, Any]:
+        name = _tag(name, field="name")
+        _dict_keys(body, allowed={"target"}, required={"target"})
+        if name not in self._meta():
+            raise NotFoundError()
+        target = _tag(body["target"], field="target")
+        if target not in set(self._targets()):
+            raise ValidationError("target is invalid.")
+        fn = getattr(self.bot, "set_ruleset_target", None)
+        if not callable(fn):
+            raise UnavailableError()
+        self._result(fn(name, target))
+        return next(
+            (item for item in self._ruleset_items() if item["name"] == name),
+            {"name": name, "target": target},
+        )
+
     def delete_ruleset(self, name: str) -> dict[str, Any]:
         name = _tag(name, field="name")
         if name not in self._meta():
@@ -1001,10 +1378,23 @@ class PDGControl:
         if action in {"restart", "rules-update", "snapshot"}:
             _dict_keys(body, allowed=set())
         elif action == "rollback":
-            _dict_keys(body, allowed={"index"}, required={"index"})
-            index = body["index"]
-            if type(index) is not int or not 0 <= index <= 10000:
-                raise ValidationError("index is invalid.")
+            if isinstance(body, dict) and set(body) == {"index"}:
+                index = body["index"]
+                if type(index) is not int or not 0 <= index <= 10000:
+                    raise ValidationError("index is invalid.")
+                snapshot_id = None
+            elif (
+                    isinstance(body, dict)
+                    and set(body) == {"snapshotId", "confirm"}):
+                if body["confirm"] is not True:
+                    raise ValidationError("confirm must be true.")
+                snapshot_id = _string(
+                    body["snapshotId"], field="snapshotId", maximum=40)
+                if not _SNAPSHOT_ID_RE.fullmatch(snapshot_id):
+                    raise ValidationError("snapshotId is invalid.")
+                index = None
+            else:
+                raise ValidationError()
         elif action == "software-update":
             _dict_keys(body, allowed={"confirm"}, required={"confirm"})
             if body["confirm"] is not True:
@@ -1012,70 +1402,72 @@ class PDGControl:
         else:
             raise NotFoundError()
         if action == "restart":
-            self._tx("web_restart", services=("mihomo", "mosdns"))
+            with self._maintenance_guard():
+                self._tx("web_restart", services=("mihomo", "mosdns"))
             return ActionResult(action).view()
         if action == "rules-update":
-            script = getattr(self.bot, "UPDATE_SCRIPT", "/opt/pdg-bot/update-rules.sh")
-            try:
-                result = self.bot.sh(["/bin/bash", script])
-            except Exception as exc:
-                raise ControlError() from exc
-            if getattr(result, "returncode", 1) != 0:
-                raise ControlError()
-            fn = getattr(self.bot, "refresh_rulesets", None)
-            if not callable(fn):
-                raise UnavailableError()
-            try:
-                refreshed, failed = fn()
-            except Exception as exc:
-                raise ControlError() from exc
-            if not isinstance(refreshed, int) or isinstance(refreshed, bool) or refreshed < 0:
-                raise ControlError()
-            if isinstance(failed, (list, tuple)):
-                failed_count = len(failed)
-            elif failed in (None, False):
-                failed_count = 0
-            else:
-                failed_count = 1
-            if failed_count:
-                raise ControlError(
-                    "Rule update finished with one or more failed sources; "
-                    "valid previous copies remain in use."
-                )
+            with self._maintenance_guard():
+                script = getattr(
+                    self.bot, "UPDATE_SCRIPT", "/opt/pdg-bot/update-rules.sh")
+                try:
+                    result = self.bot.sh(["/bin/bash", script])
+                except Exception as exc:
+                    raise ControlError() from exc
+                if getattr(result, "returncode", 1) != 0:
+                    raise ControlError()
+                fn = getattr(self.bot, "refresh_rulesets", None)
+                if not callable(fn):
+                    raise UnavailableError()
+                try:
+                    refreshed, failed = fn()
+                except Exception as exc:
+                    raise ControlError() from exc
+                if (
+                        not isinstance(refreshed, int)
+                        or isinstance(refreshed, bool) or refreshed < 0):
+                    raise ControlError()
+                if isinstance(failed, (list, tuple)):
+                    failed_count = len(failed)
+                elif failed in (None, False):
+                    failed_count = 0
+                else:
+                    failed_count = 1
+                if failed_count:
+                    raise ControlError(
+                        "Rule update finished with one or more failed sources; "
+                        "valid previous copies remain in use."
+                    )
             return ActionResult(action, details={
                 "refreshed": refreshed,
                 "failed": 0,
             }).view()
         if action == "snapshot":
             cli = os.environ.get("PDG_CLI", "/usr/local/bin/pdg")
-            try:
-                result = self.bot.sh([cli, "snapshot"])
-            except Exception as exc:
-                raise ControlError() from exc
-            if getattr(result, "returncode", 1) != 0:
-                raise ControlError()
+            with self._maintenance_guard():
+                try:
+                    result = self.bot.sh([cli, "snapshot"])
+                except Exception as exc:
+                    raise ControlError() from exc
+                if getattr(result, "returncode", 1) != 0:
+                    raise ControlError()
             return ActionResult(action).view()
         if action == "rollback":
-            argv = [
-                "systemd-run",
-                "--collect",
-                "--unit=" + _ROLLBACK_UNIT,
-                "--",
-                "/usr/local/bin/pdg",
-                "rollback",
-                str(index),
-            ]
+            store = self._job_store()
             try:
-                result = self.bot.sh(argv)
+                if snapshot_id is None:
+                    snapshot_id = store.snapshot_id_for_index(index)
+                else:
+                    snapshot_id = store.resolve_snapshot_id(snapshot_id)
+                raw_job = store.start("rollback", snapshot_id=snapshot_id)
             except Exception as exc:
-                raise ControlError() from exc
-            if getattr(result, "returncode", 1) != 0:
+                self._raise_job_error(exc, request_value=True)
+            job = self._public_job(raw_job)
+            if job is None:
                 raise ControlError()
-            return ActionResult(action).view()
+            return ActionResult(action, details={"job": job}).view()
         if action == "software-update":
             check = getattr(self.bot, "update_check", None)
-            start = getattr(self.bot, "start_update", None)
-            if not callable(check) or not callable(start):
+            if not callable(check):
                 raise UnavailableError()
             try:
                 checked = check()
@@ -1088,11 +1480,13 @@ class PDGControl:
             ):
                 raise ControlError()
             checked = None
+            store = self._job_store()
             try:
-                accepted = start()
+                raw_job = store.start("software-update")
             except Exception as exc:
-                raise ControlError() from exc
-            if accepted is not True:
+                self._raise_job_error(exc)
+            job = self._public_job(raw_job)
+            if job is None:
                 raise ControlError()
-            return ActionResult(action).view()
+            return ActionResult(action, details={"job": job}).view()
         raise NotFoundError()

@@ -636,7 +636,7 @@ EOF
 e2e_seed_mosdns(){
   local mode="${1:-all}" platform="${2:-android}" tls_ports=443 f
   [[ "$platform" == android ]] && tls_ports=443,5228,5229,5230
-  for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_direct unlock mitm_hijack \
+  for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_direct ruleset_hijack unlock mitm_hijack \
            geosite_gfw 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
   printf 'domain:baidu.com\n' > /etc/mosdns/rules/geosite_cn.txt
   printf 'domain:blocked.test\n' > /etc/mosdns/rules/geosite_gfw.txt

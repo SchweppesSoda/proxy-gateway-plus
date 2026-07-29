@@ -151,7 +151,13 @@ SNI / Host / QUIC 与规则选择出口。提供 clash_api，可按需临时开�
   `DOMAIN-KEYWORD` 在同一配置事务中派生到独立
   `/etc/mosdns/rules/ruleset_direct.txt`，MosDNS 返回真实地址，手机不经 VPS。含
   `IP-CIDR/IP-CIDR6` 的规则集以及 `.mrs/.srs` 无法在 DNS 层兑现完整语义，会被明确拒绝。
-  内建 direct-type 出口（例如默认 `jp`）含义不同：流量已经到达 VPS，再由 VPS 本机直出。
+  内建 direct-type 出口（默认 `JP`）含义不同：流量已经到达 VPS，再由 VPS 本机直出。
+  旧版默认 tag `jp` 会在 `pdg update` / `pdg migrate` 的受锁迁移中连同分流规则、故障组、
+  默认出口、规则集元数据和派生 Mihomo 配置一起改为 `JP`；自定义 direct tag 不会被猜测改名。
+- 指向非 literal-direct 出口的可展开 source 规则集，会将其中的域名项事务派生到
+  `/etc/mosdns/rules/ruleset_hijack.txt`。MosDNS 在宽泛国内直连判断前先匹配该集合，避免
+  本应送入 Mihomo 的国内域名取得真实地址后绕过 VPS。编译后的二进制 `.mrs` 不做 DNS
+  展开，也不会猜测其中域名；诊断遇到可能由它命中的域名时会明确给出未知，而不是伪报出口。
 - 显式单域名代理规则优先于宽泛手机直连规则集。例如 `example.com` 在 direct 规则集中时，
   仍可将 `api.example.com` 显式指向 `hk`；MosDNS 会先匹配 `custom_hijack.txt` 并送入代理。
 - 只有确实需要代理、且业务使用非标准 HTTP/TLS 端口时，才扩展
@@ -211,6 +217,19 @@ sudo pdg web status
 Bot 同样只处理私聊；它的 Zashboard 观测面板仍是 10/30 分钟的临时诊断入口，不是这个常驻
 管理面。
 
+Web 可直接修改已有规则集的 target；这里的 literal `direct` 仍表示手机取得真实 DNS
+结果并在本地直连、不经过 VPS，而 direct-type `JP` 表示连接先到 VPS、再由 VPS 本机直出。
+普通节点可原位更新连接参数，保留原 tag、列表顺序和全部引用，无需删掉重建。出口延迟通过
+Mihomo Clash API 探测；域名诊断分别呈现 DNS 实测证据与配置规则推演，网关出口推演不冒充
+真实数据包的出口验证。
+
+Web 的本机快照使用带随机后缀的稳定 ID 精确选择，不会因新快照插入而改变回滚目标。回滚和
+软件更新由持久化异步任务执行，浏览器断连或重新打开后仍可按任务记录继续查看状态；同一时间
+只运行一个维护任务。软件更新任务在实际执行时调用 `pdg update` 并跟随届时最新发布版，提交
+任务时不会锁定预检看到的 tag。配置回滚恢复 live nft/profile 后，还会显式 enable 并
+restart 恢复前为 active/exited 的 `pdg-quic-routing` oneshot，再运行 helper status 验证；
+任一步失败都报告未完全回滚，不会只凭 unit 为 active 就判定成功。
+
 setup 要求证书和私钥最终指向由 root 拥有的普通文件，私钥必须保持 owner-only 权限；允许
 certbot 常见的 `/etc/letsencrypt/live/...` root-owned 符号链接，但整条链接链及解析后的
 父目录必须由 root 控制且不可被 group/world 写入。证书必须已生效、尚未过期、覆盖访问
@@ -255,7 +274,7 @@ sudo pdg hijack-mode <all|gfw>          # 切换劫持模式
 sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 ```
 
-`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）主要用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置可在 Telegram Bot 或可选 PDG Web 中管理。首版 Web 覆盖出口与默认出口、故障组、单域名规则、规则集、DNS 上游、TFO、状态/日志/流量查看、服务重启、规则库更新、本机配置快照与回滚，以及软件更新。Web 的本机快照不是可下载的完整配置备份包；DoT 域名和证书签发、配置包备份/恢复、iOS 描述文件、WLOC、平台切换、安装/卸载和 Bot token 管理仍仅通过 SSH 下的 `pdg` 或 Telegram Bot 完成。
+`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）主要用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置可在 Telegram Bot 或可选 PDG Web 中管理。首版 Web 覆盖出口与默认出口、故障组、单域名规则、规则集、DNS 上游、TFO、状态/日志/流量查看、服务重启、规则库更新、本机配置快照与回滚，以及软件更新；概览页自检按失败、警告和正常项分组展示，不再把全部结果挤成一段文本。Web 的本机快照不是可下载的完整配置备份包；DoT 域名和证书签发、配置包备份/恢复、iOS 描述文件、WLOC、平台切换、安装/卸载和 Bot token 管理仍仅通过 SSH 下的 `pdg` 或 Telegram Bot 完成。
 
 ## 10. iOS 位置改写（WLOC，可选）
 

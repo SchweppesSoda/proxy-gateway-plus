@@ -96,7 +96,7 @@
           <article class="metric-card skeleton-card"><span></span><span></span></article>
           <article class="metric-card skeleton-card"><span></span><span></span></article>
         </div>
-        <div class="two-column">
+        <div class="two-column overview-detail-grid">
           <section class="surface">
             <div class="section-heading">
               <div><p class="eyebrow">SERVICES</p><h2>服务状态</h2></div>
@@ -107,8 +107,11 @@
           <section class="surface">
             <div class="section-heading">
               <div><p class="eyebrow">DOCTOR</p><h2>自检摘要</h2></div>
+              <span id="doctor-health" class="status-pill neutral">检查中</span>
             </div>
-            <div id="doctor-summary" class="prose muted">正在获取自检结果…</div>
+            <div id="doctor-summary" class="doctor-panel" aria-live="polite">
+              <div class="doctor-loading">正在获取自检结果…</div>
+            </div>
           </section>
         </div>
       </section>
@@ -139,7 +142,9 @@
           <section class="surface">
             <div class="section-heading">
               <div><p class="eyebrow">EXITS</p><h2>出口列表</h2></div>
+              <button id="test-exits" class="button ghost compact" type="button">测速全部</button>
             </div>
+            <p class="field-help">测速检查所有实际出口节点（包括 VPS 直出锚点）；故障切换组本轮不单独测试。手机直连是分流伪目标，不在出口列表中。</p>
             <div id="exit-list" class="card-list" aria-live="polite"></div>
           </section>
           <div class="stack">
@@ -240,6 +245,21 @@
         <section class="surface">
           <div class="section-heading"><div><p class="eyebrow">RULESETS</p><h2>规则集</h2></div></div>
           <div id="ruleset-list" class="table-list" aria-live="polite"></div>
+        </section>
+        <section class="surface diagnostic-surface">
+          <div class="section-heading">
+            <div><p class="eyebrow">ROUTE DIAGNOSTIC</p><h2>域名路由诊断</h2></div>
+          </div>
+          <form id="route-diagnostic-form" class="inline-form">
+            <div class="grow">
+              <label for="route-diagnostic-domain">要检查的域名</label>
+              <input id="route-diagnostic-domain" name="domain" type="text" required
+                     autocapitalize="none" spellcheck="false" placeholder="example.com">
+            </div>
+            <button class="button secondary" type="submit">诊断路由</button>
+          </form>
+          <p class="field-help">结果会明确标注“实测验证”“规则推演”或“不确定”，不会把推演结果冒充网络实测。</p>
+          <div id="route-diagnostic-result" class="diagnostic-result" aria-live="polite"></div>
         </section>
       </section>
 
@@ -370,20 +390,32 @@
             <div class="section-heading"><div><p class="eyebrow">ROLLBACK</p><h2>回滚快照</h2></div></div>
             <form id="rollback-form" class="inline-form">
               <div class="grow">
-                <label for="rollback-index">快照序号</label>
-                <input id="rollback-index" name="index" type="number" min="0" step="1" value="0" required>
-                <p class="field-help">0 代表最近一次。回滚会覆盖当前受管配置。</p>
+                <label for="rollback-snapshot">精确快照</label>
+                <select id="rollback-snapshot" name="snapshotId" required disabled>
+                  <option value="">正在读取快照清单…</option>
+                </select>
+                <p id="rollback-snapshot-detail" class="field-help">回滚使用稳定快照 ID，不会因新快照插入而改变目标。</p>
               </div>
-              <button class="button danger" type="submit">确认回滚</button>
+              <button class="button danger" type="submit" data-maintenance-control disabled>确认回滚</button>
             </form>
           </section>
           <section class="surface upgrade-zone">
             <div class="section-heading"><div><p class="eyebrow">SOFTWARE</p><h2>软件升级</h2></div></div>
             <p class="muted">升级到最新发布版本。服务可能短暂中断；服务器会在升级前创建快照并执行健康门检查。</p>
-            <button id="software-update" class="button warning wide" type="button">检查并开始升级</button>
+            <button id="software-update" class="button warning wide" type="button"
+                    data-maintenance-control>检查并开始升级</button>
           </section>
         </div>
         <div id="operation-result" class="operation-result" aria-live="polite"></div>
+        <section class="surface jobs-surface">
+          <div class="section-heading">
+            <div><p class="eyebrow">MAINTENANCE JOBS</p><h2>最近维护任务</h2></div>
+            <span id="maintenance-job-health" class="status-pill neutral">正在读取</span>
+          </div>
+          <div id="maintenance-job-list" class="job-list" aria-live="polite">
+            <div class="loading-state">正在读取最近任务…</div>
+          </div>
+        </section>
       </section>
     </main>
   </div>
@@ -398,6 +430,24 @@
       <div class="dialog-actions">
         <button id="confirm-cancel" class="button ghost" value="cancel">取消</button>
         <button id="confirm-accept" class="button danger" value="confirm">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="replace-exit-dialog" class="confirm-dialog secure-entry-dialog"
+          aria-labelledby="replace-exit-title">
+    <form id="replace-exit-form" method="dialog" autocomplete="off">
+      <p class="eyebrow">SECURE REPLACE</p>
+      <h2 id="replace-exit-title">更新节点连接</h2>
+      <p id="replace-exit-message" class="muted"></p>
+      <label for="replace-exit-link">新的节点链接</label>
+      <textarea id="replace-exit-link" name="link" rows="4" required
+                autocomplete="off" autocapitalize="none" spellcheck="false"
+                placeholder="提交后会立即从页面清除"></textarea>
+      <p class="field-help">服务器会强制保留当前出口 tag；原始链接不会回显，也不会写入页面任务记录。</p>
+      <div class="dialog-actions">
+        <button class="button ghost" type="button" data-action="cancel-replace-exit">取消</button>
+        <button class="button warning" type="submit">继续确认</button>
       </div>
     </form>
   </dialog>

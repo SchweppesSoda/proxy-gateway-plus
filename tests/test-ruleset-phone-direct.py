@@ -52,7 +52,7 @@ plugins:
     args: { files: ["/etc/mosdns/rules/geosite_cn.txt","/etc/mosdns/rules/ruleset_direct.txt"] }
   - tag: explicit_hijack
     type: domain_set
-    args: { files: ["/etc/mosdns/rules/custom_hijack.txt"] }
+    args: { files: ["/etc/mosdns/rules/custom_hijack.txt","/etc/mosdns/rules/ruleset_hijack.txt"] }
   - tag: force_hijack_seq
     type: sequence
     args:
@@ -95,6 +95,9 @@ def setup_box(root: str):
         if name == "pdgtx":
             del os.sys.modules[name]
     tx = importlib.import_module("pdgtx")
+    # Bot production code pins the sibling bundle in _PDGTX_MODULE. Pin this
+    # temporary FSROOT-aware instance too; this test runs in its own process.
+    bot._PDGTX_MODULE = tx
     # Windows cannot open a directory with os.open(O_RDONLY); directory fsync is
     # exercised on Linux CI, while this shim keeps the desktop Python regression runnable.
     if os.name == "nt":
@@ -123,6 +126,7 @@ def setup_box(root: str):
     bot.MOSDNS_DIRECT = root + "/etc/mosdns/rules/custom_direct.txt"
     bot.MOSDNS_HIJACK = root + "/etc/mosdns/rules/custom_hijack.txt"
     bot.MOSDNS_RULESET_DIRECT = root + "/etc/mosdns/rules/ruleset_direct.txt"
+    bot.MOSDNS_RULESET_HIJACK = root + "/etc/mosdns/rules/ruleset_hijack.txt"
     bot.BACKEND_MARKER = root + "/etc/privdns-gateway/backend"
     bot.PROFILE_ENV = root + "/etc/privdns-gateway/profile.env"
     bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
@@ -142,6 +146,12 @@ def setup_box(root: str):
 
 def aggregate(root: str) -> str:
     return Path(root + "/etc/mosdns/rules/ruleset_direct.txt").read_text(
+        encoding="utf-8"
+    )
+
+
+def hijack_aggregate(root: str) -> str:
+    return Path(root + "/etc/mosdns/rules/ruleset_hijack.txt").read_text(
         encoding="utf-8"
     )
 
@@ -214,7 +224,10 @@ def main():
                 ["api.example.com"], ["example.com"], ["video"], []
             ),
             "https://x/two.list": (
-                ["api.example.com", "other.example"], ["example.com"], [], []
+                ["api.example.com", "other.example"],
+                ["example.com", "corp.cn"],
+                [],
+                [],
             ),
             "https://x/three.list": ([], [], ["old-keyword"], []),
             "https://x/proxy.list": (["proxy.only.example"], [], [], []),
@@ -245,6 +258,7 @@ def main():
         assert text.count("full:api.example.com\n") == 1
         assert text.count("domain:example.com\n") == 1
         assert "full:other.example\n" in text
+        assert "domain:corp.cn\n" in text
 
         ok, msg = bot.del_ruleset(name_one)
         assert ok, msg
@@ -293,6 +307,75 @@ def main():
         model = json.loads(Path(bot.SB).read_text(encoding="utf-8"))
         assert any(r.get("rule_set") == proxy_name for r in model["route"]["rules"])
         assert "proxy.only.example" not in aggregate(root)
+        assert "full:proxy.only.example\n" in hijack_aggregate(root)
+
+        # target 变更必须同时收敛 model/meta/direct+hijack；direct-type tag 与 literal
+        # direct 仍是两套语义。Bot 的通用 reassign 也必须复用同一个核心入口。
+        ok, msg = bot.set_ruleset_target(two_name, "hk")
+        assert ok, msg
+        current_meta = json.loads(Path(bot.RS_META).read_text(encoding="utf-8"))
+        assert current_meta[two_name]["outbound"] == "hk"
+        model = json.loads(Path(bot.SB).read_text(encoding="utf-8"))
+        matching_rules = [
+            item for item in model["route"]["rules"]
+            if item.get("rule_set") == two_name
+        ]
+        assert matching_rules == [{"rule_set": two_name, "outbound": "hk"}]
+        assert sum(
+            item.get("tag") == two_name
+            for item in model["route"].get("rule_set", [])
+        ) == 1
+        assert "full:other.example\n" not in aggregate(root)
+        assert "full:other.example\n" in hijack_aggregate(root)
+        assert "domain:corp.cn\n" not in aggregate(root)
+        assert "domain:corp.cn\n" in hijack_aggregate(root)
+
+        idx = next(
+            index for index, item in enumerate(model["route"]["rules"])
+            if item.get("rule_set") == two_name
+        )
+        ok, msg = bot.reassign_rule(idx, "jp")
+        assert ok, msg
+        current_meta = json.loads(Path(bot.RS_META).read_text(encoding="utf-8"))
+        assert current_meta[two_name]["outbound"] == "jp"
+
+        ok, msg = bot.set_ruleset_target(two_name, "direct")
+        assert ok, msg
+        current_meta = json.loads(Path(bot.RS_META).read_text(encoding="utf-8"))
+        assert current_meta[two_name]["outbound"] == "direct"
+        model = json.loads(Path(bot.SB).read_text(encoding="utf-8"))
+        assert not any(
+            item.get("rule_set") == two_name
+            for item in model["route"]["rules"]
+        )
+        assert "full:other.example\n" in aggregate(root)
+        assert "full:other.example\n" not in hijack_aggregate(root)
+        assert "domain:corp.cn\n" in aggregate(root)
+        assert "domain:corp.cn\n" not in hijack_aggregate(root)
+
+        # 同值请求也会修复历史 model/meta 漂移，不能只看 meta 后早退。
+        model["route"].setdefault("rule_set", []).append({
+            "tag": two_name,
+            "type": "local",
+            "format": "source",
+            "path": current_meta[two_name]["path"],
+        })
+        model["route"]["rules"].append({
+            "rule_set": two_name,
+            "outbound": "hk",
+        })
+        Path(bot.SB).write_text(json.dumps(model), encoding="utf-8")
+        ok, msg = bot.set_ruleset_target(two_name, "direct")
+        assert ok, msg
+        model = json.loads(Path(bot.SB).read_text(encoding="utf-8"))
+        assert not any(
+            item.get("rule_set") == two_name
+            for item in model["route"]["rules"]
+        )
+        assert not any(
+            item.get("tag") == two_name
+            for item in model["route"].get("rule_set", [])
+        )
 
         # Mutate a watched direct source after candidate assembly. PRECONDITION_FAILED
         # must leave model/meta/aggregate untouched (the simulated competing source write
@@ -400,6 +483,58 @@ def main():
             pass
         else:
             raise AssertionError("phone-direct source containing ip_cidr was accepted")
+        proxy_dns = bot._ruleset_hijack_bytes(
+            {
+                "rs_ip": {
+                    "url": "https://x/ip.list",
+                    "outbound": "hk",
+                    "format": "source",
+                    "path": "/etc/sing-box/rs/rs_ip.json",
+                },
+                "rs_mrs": {
+                    "url": "https://x/domain.mrs",
+                    "outbound": "hk",
+                    "format": "mrs",
+                    "path": "/etc/sing-box/rs/rs_mrs.mrs",
+                },
+            },
+            {
+                "ruleset:rs_ip.json": (
+                    b'{"version":1,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}'
+                )
+            },
+            {},
+        ).decode()
+        assert "IP-CIDR" in proxy_dns and "未猜测" in proxy_dns
+        assert "binary provider" in proxy_dns
+        assert not any(
+            line.startswith(("full:", "domain:", "keyword:"))
+            for line in proxy_dns.splitlines()
+        )
+        try:
+            bot._ruleset_hijack_bytes(
+                {
+                    "rs_conditional": {
+                        "url": "https://x/conditional.list",
+                        "outbound": "hk",
+                        "format": "source",
+                        "path": "/etc/sing-box/rs/rs_conditional.json",
+                    }
+                },
+                {
+                    "ruleset:rs_conditional.json": (
+                        b'{"version":1,"rules":[{"domain":["x.example"],'
+                        b'"network":["tcp"]}]}'
+                    )
+                },
+                {},
+            )
+        except refused as exc:
+            assert "不可展开字段" in str(exc)
+        else:
+            raise AssertionError(
+                "proxy source containing conditional/unknown fields was not fail-closed"
+            )
         for suffix in (".mrs", ".srs"):
             ok, msg = bot.add_ruleset("https://x/list" + suffix, "direct")
             assert not ok and "direct" in msg
@@ -413,6 +548,11 @@ def main():
                 '"/etc/mosdns/rules/custom_hijack.txt"',
                 "  - tag: explicit_hijack\n",
                 "/etc/mosdns/rules/custom_hijack.txt",
+            ),
+            (
+                ',"/etc/mosdns/rules/ruleset_hijack.txt"',
+                "  - tag: explicit_hijack\n",
+                "/etc/mosdns/rules/ruleset_hijack.txt",
             ),
         ):
             comment_only = MOSDNS_SHAPE.replace(actual, "", 1).replace(
@@ -523,6 +663,111 @@ plugins:
         assert "full:restored.example\n" in candidate_text
         assert "poison.example" not in candidate_text
 
+        # First-upgrade rollback compatibility: the snapshot's old MosDNS contract
+        # loaded ruleset_direct + custom_hijack but predated ruleset_hijack. A new
+        # CLI must faithfully rebuild only direct, ignore unrelated proxy metadata,
+        # and must not inject/trust a new aggregate member.
+        legacy_candidate = Path(root) / "legacy-snapshot-candidate"
+        (legacy_candidate / "etc/mosdns/rules").mkdir(parents=True)
+        (legacy_candidate / "etc/sing-box/rs").mkdir(parents=True)
+        (legacy_candidate / "opt/pdg-bot").mkdir(parents=True)
+        legacy_shape = MOSDNS_SHAPE.replace(
+            ',"/etc/mosdns/rules/ruleset_hijack.txt"', "", 1
+        )
+        (legacy_candidate / "etc/mosdns/config.yaml").write_text(
+            legacy_shape, encoding="utf-8"
+        )
+        legacy_meta = {
+            **restore_meta,
+            "rs_unrelated_proxy": {
+                "url": "https://x/proxy.list",
+                "outbound": "US",
+                "format": "source",
+                "path": "/etc/sing-box/rs/rs_unrelated_proxy.json",
+                "count": 1,
+            },
+        }
+        (legacy_candidate / "opt/pdg-bot/rulesets.json").write_text(
+            json.dumps(legacy_meta), encoding="utf-8"
+        )
+        (legacy_candidate / "etc/sing-box/rs/rs_restore.json").write_bytes(
+            restored_source
+        )
+        legacy_direct = (
+            legacy_candidate / "etc/mosdns/rules/ruleset_direct.txt"
+        )
+        legacy_hijack = (
+            legacy_candidate / "etc/mosdns/rules/ruleset_hijack.txt"
+        )
+        legacy_direct.write_text("domain:poison.example\n", encoding="utf-8")
+        legacy_hijack.write_text("domain:poison.example\n", encoding="utf-8")
+        assert bot._derive_ruleset_direct_tree(str(legacy_candidate))
+        assert "full:restored.example\n" in legacy_direct.read_text(
+            encoding="utf-8"
+        )
+        assert "poison.example" not in legacy_direct.read_text(encoding="utf-8")
+        assert not legacy_hijack.exists()
+
+        # A still older proxy-only snapshot neither needs nor references either
+        # aggregate. Poisoned archived caches are removed, no proxy source is
+        # required merely to restore that old contract, and the helper reports absent.
+        proxy_only_candidate = Path(root) / "legacy-proxy-only-candidate"
+        (proxy_only_candidate / "etc/mosdns/rules").mkdir(parents=True)
+        (proxy_only_candidate / "etc/sing-box/rs").mkdir(parents=True)
+        (proxy_only_candidate / "opt/pdg-bot").mkdir(parents=True)
+        proxy_only_shape = legacy_shape.replace(
+            ',"/etc/mosdns/rules/ruleset_direct.txt"', "", 1
+        )
+        (proxy_only_candidate / "etc/mosdns/config.yaml").write_text(
+            proxy_only_shape, encoding="utf-8"
+        )
+        proxy_only_meta = {
+            "rs_unrelated_proxy": legacy_meta["rs_unrelated_proxy"]
+        }
+        (proxy_only_candidate / "opt/pdg-bot/rulesets.json").write_text(
+            json.dumps(proxy_only_meta), encoding="utf-8"
+        )
+        proxy_only_direct = (
+            proxy_only_candidate / "etc/mosdns/rules/ruleset_direct.txt"
+        )
+        proxy_only_hijack = (
+            proxy_only_candidate / "etc/mosdns/rules/ruleset_hijack.txt"
+        )
+        proxy_only_direct.write_text(
+            "domain:poison.example\n", encoding="utf-8"
+        )
+        proxy_only_hijack.write_text(
+            "domain:poison.example\n", encoding="utf-8"
+        )
+        assert not bot._derive_ruleset_direct_tree(
+            str(proxy_only_candidate)
+        )
+        assert not proxy_only_direct.exists()
+        assert not proxy_only_hijack.exists()
+
+        # Legacy compatibility is schema-aware, not a validation bypass: explicit
+        # hijack must still precede the broad direct collection.
+        bad_legacy = legacy_shape.replace(
+            "      - matches: qname $explicit_hijack\n"
+            "        exec: goto force_hijack_seq\n"
+            "      - matches: qname $geosite_cn\n"
+            "        exec: $local_upstream\n",
+            "      - matches: qname $geosite_cn\n"
+            "        exec: $local_upstream\n"
+            "      - matches: qname $explicit_hijack\n"
+            "        exec: goto force_hijack_seq\n",
+            1,
+        )
+        (legacy_candidate / "etc/mosdns/config.yaml").write_text(
+            bad_legacy, encoding="utf-8"
+        )
+        try:
+            bot._derive_ruleset_direct_tree(str(legacy_candidate))
+        except bot._pdgtx().TxRefused:
+            pass
+        else:
+            raise AssertionError("旧接口错误优先级必须在落盘前被拒绝")
+
     template = (ROOT / "deploy/mosdns/config.yaml").read_text(encoding="utf-8")
     assert "/etc/mosdns/rules/ruleset_direct.txt" in template
     assert template.index("qname $explicit_hijack") < template.index(
@@ -532,7 +777,9 @@ plugins:
     lifecycle = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
     source = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
     assert ": > /etc/mosdns/rules/ruleset_direct.txt" in install
+    assert ": > /etc/mosdns/rules/ruleset_hijack.txt" in install
     assert "etc/mosdns/rules/ruleset_direct.txt" in lifecycle
+    assert "etc/mosdns/rules/ruleset_hijack.txt" in lifecycle
     assert "MOSDNS_RULESET_DIRECT" in source
     assert '_register_ruleset_direct_derive(t, staged_for_direct)' in source
     rollback_source = lifecycle[lifecycle.index("cmd_rollback(){"):]
@@ -548,7 +795,108 @@ plugins:
     assert '_pdg_ruleset_direct_interface_ready_file "$mc"' in migration_source
     assert 'grep -qF "$agg" "$mc"' not in migration_source
     assert "_core_kernel_stable mosdns" in migration_source
-    assert '_pdg_atomic_restore_file "$bak" "$mc"' in migration_source
+    assert (
+        'python3 - "$work/config.candidate" "$agg" "$hijagg"'
+        in migration_source
+    )
+    assert "_pdg_capture_ruleset_migration_before" in migration_source
+    assert "_pdg_ruleset_aggregate_candidates" in migration_source
+    assert migration_source.count(
+        "_pdg_restore_ruleset_migration_before"
+    ) >= 4
+    assert migration_source.index(
+        "_pdg_ruleset_aggregate_candidates"
+    ) < migration_source.index(
+        '_pdg_atomic_install_file "$work/direct.candidate" "$agg"'
+    )
+    direct_commit = migration_source.index(
+        '_pdg_atomic_install_file "$work/direct.candidate" "$agg"'
+    )
+    transition_commit = migration_source.index(
+        '_pdg_atomic_install_file "$work/hijack.transition" "$hijagg"'
+    )
+    hijack_commit = migration_source.index(
+        '_pdg_atomic_install_file "$work/hijack.candidate" "$hijagg"'
+    )
+    config_commit = migration_source.index(
+        '_pdg_atomic_install_file "$work/config.candidate" "$mc"'
+    )
+    strict_check = migration_source.index(
+        'if ! _pdg_ruleset_direct_interface_ready_file "$mc"; then'
+    )
+    restart = migration_source.index("if systemctl restart mosdns")
+    assert (
+        transition_commit < direct_commit < hijack_commit
+        < config_commit < strict_check < restart
+    )
+    journal_publish = migration_source.index('mv "$preparing" "$journal"')
+    journal_sync = migration_source.index(
+        '_pdg_sync_ruleset_migration_path "$work"'
+    )
+    assert journal_sync < journal_publish < transition_commit
+    assert (
+        migration_source.index('work="$journal"')
+        < transition_commit
+    )
+    assert migration_source.index(
+        "_pdg_recover_ruleset_migration_journal"
+    ) < transition_commit
+
+    # Simulate a kill after each ordered live replace.  An old config does not
+    # consume the new aggregate paths until both exist; an already-ready config
+    # starts with both paths present.  Therefore every bootable disk state keeps
+    # all aggregate paths referenced by its active config present, while the
+    # published journal supplies byte-exact recovery on the next migrate.
+    legacy_config = (
+        MOSDNS_SHAPE
+        .replace(',"/etc/mosdns/rules/ruleset_direct.txt"', "", 1)
+        .replace(',"/etc/mosdns/rules/ruleset_hijack.txt"', "", 1)
+    )
+    aggregate_paths = (
+        "/etc/mosdns/rules/ruleset_direct.txt",
+        "/etc/mosdns/rules/ruleset_hijack.txt",
+    )
+    for active_config, initial_files in (
+        (legacy_config, set()),
+        (MOSDNS_SHAPE, set(aggregate_paths)),
+    ):
+        files = set(initial_files)
+        disk_config = active_config
+        kill_states = [(disk_config, set(files))]
+        files.add(aggregate_paths[1])
+        kill_states.append((disk_config, set(files)))
+        files.add(aggregate_paths[0])
+        kill_states.append((disk_config, set(files)))
+        kill_states.append((disk_config, set(files)))
+        disk_config = MOSDNS_SHAPE
+        kill_states.append((disk_config, set(files)))
+        for config_at_kill, files_at_kill in kill_states:
+            geosite = bot._mosdns_plugin_block(config_at_kill, "geosite_cn")
+            explicit = bot._mosdns_plugin_block(
+                config_at_kill, "explicit_hijack"
+            )
+            referenced = {
+                path
+                for block, path in (
+                    (geosite, aggregate_paths[0]),
+                    (explicit, aggregate_paths[1]),
+                )
+                if bot._mosdns_domain_set_loads(block, path)
+            }
+            assert referenced <= files_at_kill
+    restore_source = lifecycle[
+        lifecycle.index("_pdg_restore_ruleset_migration_before(){"):
+        lifecycle.index("_pdg_legacy_snapshot_mihomo_prove(){")
+    ]
+    for before, target in (
+        ("config.before", '"$config"'),
+        ("direct.before", '"$direct"'),
+        ("hijack.before", '"$hijack"'),
+    ):
+        assert before in restore_source
+        assert target in restore_source
+    assert 'rm -f "$direct"' in restore_source
+    assert 'rm -f "$hijack"' in restore_source
     generated_tail = migration_source.split("\nRSDIRECTPY", 1)[1]
     assert generated_tail.index(
         'if ! _pdg_ruleset_direct_interface_ready_file "$mc"; then'
@@ -559,8 +907,99 @@ plugins:
         ):
         generated_tail.index("if systemctl restart mosdns")
     ]
-    assert '_pdg_atomic_restore_file "$bak" "$mc"' in validation_failure
+    assert "_pdg_restore_ruleset_migration_before" in validation_failure
     assert "return 1" in validation_failure
+    runtime_failure = generated_tail[
+        generated_tail.index(
+            'c_y "  [规则集手机直连] MosDNS 重启后未稳定，正在还原三文件 before-image。"'
+        ):
+    ]
+    assert "_pdg_restore_ruleset_migration_before" in runtime_failure
+
+    aggregate_script = lifecycle.split("<<'RSAGGPY'\n", 1)[1].split(
+        "\nRSAGGPY", 1
+    )[0]
+    with tempfile.TemporaryDirectory(prefix="pdg-rsagg-migrate-") as directory:
+        box = Path(directory)
+        rs_dir = box / "rs"
+        rs_dir.mkdir()
+        config_path = box / "config.yaml"
+        config_path.write_text(MOSDNS_SHAPE, encoding="utf-8")
+        direct_source = (
+            b'{"version":1,"rules":[{"domain_suffix":'
+            b'["corp.example","old-proxy.example"]}]}'
+        )
+        proxy_source = (
+            b'{"version":1,"rules":[{"domain":["ai.example"]}]}'
+        )
+        (rs_dir / "existing-direct.json").write_bytes(direct_source)
+        (rs_dir / "existing-proxy.json").write_bytes(proxy_source)
+        metadata = {
+            "existing_direct": {
+                "outbound": "direct",
+                "format": "source",
+                "path": "/etc/sing-box/rs/existing-direct.json",
+            },
+            "existing_proxy": {
+                "outbound": "US",
+                "format": "source",
+                "path": "/etc/sing-box/rs/existing-proxy.json",
+            },
+        }
+        metadata_path = box / "rulesets.json"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        direct_candidate = box / "direct.candidate"
+        hijack_candidate = box / "hijack.candidate"
+        transition_candidate = box / "hijack.transition"
+        old_hijack = box / "old-hijack.txt"
+        old_hijack.write_text(
+            "domain:old-proxy.example\n", encoding="utf-8"
+        )
+        aggregate_input = aggregate_script
+        if os.name == "nt":
+            aggregate_input = (
+                "import sys, types\n"
+                "sys.modules['fcntl'] = types.SimpleNamespace("
+                "LOCK_EX=1, LOCK_NB=2, LOCK_UN=8, flock=lambda *args: None)\n"
+                + aggregate_input
+            )
+        result = subprocess.run(
+            [
+                os.sys.executable,
+                "-",
+                str(BOT_DIR / "pdg-bot.py"),
+                str(config_path),
+                str(metadata_path),
+                str(rs_dir),
+                str(direct_candidate),
+                str(hijack_candidate),
+                str(transition_candidate),
+                str(old_hijack),
+            ],
+            input=aggregate_input,
+            text=True,
+            encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "domain:corp.example\n" in direct_candidate.read_text(
+            encoding="utf-8"
+        )
+        assert "domain:old-proxy.example\n" in direct_candidate.read_text(
+            encoding="utf-8"
+        )
+        assert "full:ai.example\n" in hijack_candidate.read_text(
+            encoding="utf-8"
+        )
+        assert "old-proxy.example" not in hijack_candidate.read_text(
+            encoding="utf-8"
+        )
+        transition = transition_candidate.read_text(encoding="utf-8")
+        assert "full:ai.example\n" in transition
+        assert "domain:old-proxy.example\n" in transition
+
     migration_script = lifecycle.split("<<'RSDIRECTPY'\n", 1)[1].split(
         "\nRSDIRECTPY", 1
     )[0]
@@ -584,6 +1023,7 @@ plugins:
                 "-",
                 str(config_path),
                 "/etc/mosdns/rules/ruleset_direct.txt",
+                "/etc/mosdns/rules/ruleset_hijack.txt",
             ],
             input=migration_script,
             text=True,
@@ -627,6 +1067,7 @@ plugins:
                 "-",
                 str(config_path),
                 "/etc/mosdns/rules/ruleset_direct.txt",
+                "/etc/mosdns/rules/ruleset_hijack.txt",
             ],
             input=migration_script,
             text=True,
@@ -635,7 +1076,14 @@ plugins:
             check=False,
         )
         assert result.returncode == 0, result.stderr
-        bot._ruleset_direct_interface_bytes(config_path.read_bytes())
+        migrated = config_path.read_text(encoding="utf-8")
+        active = "\n".join(
+            line.split("#", 1)[0] for line in migrated.splitlines()
+        )
+        assert "/etc/mosdns/rules/ruleset_direct.txt" in active
+        assert "/etc/mosdns/rules/custom_hijack.txt" in active
+        assert "/etc/mosdns/rules/ruleset_hijack.txt" in active
+        bot._ruleset_direct_interface_bytes(migrated.encode())
     print("[OK] ruleset literal direct phone-local lifecycle")
 
 

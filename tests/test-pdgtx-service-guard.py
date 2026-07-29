@@ -27,6 +27,54 @@ def main():
         tx = load_tx(root)
         runtime = {"state": "inactive", "query_ok": True}
 
+        # A joint mosdns_conf + derived ruleset_hijack candidate must probe the
+        # staged aggregate, never the old live symlink.
+        live_hijack = root + "/etc/mosdns/rules/ruleset_hijack.txt"
+        with open(live_hijack, "wb") as f:
+            f.write(b"domain:old.example\n")
+        staged_hijack = b"domain:new.example\n"
+        original_bin = tx._mosdns_bin
+        original_run = tx._mosdns_probe_run
+        original_rewrite = tx._rewrite_listen
+        old_probe_mode = os.environ.get("PDG_TX_MOSDNS_PROBE_MODE")
+        observed = {}
+
+        def inspect_probe(_cmd, _wait, directory, marker=None):
+            del marker
+            with open(
+                    os.path.join(
+                        directory, "rules", "ruleset_hijack.txt"
+                    ),
+                    "rb") as f:
+                observed["ruleset_hijack"] = f.read()
+            return True, ""
+
+        tx._mosdns_bin = lambda: "/bin/true"
+        tx._mosdns_probe_run = inspect_probe
+        tx._rewrite_listen = lambda data: (data, 1)
+        os.environ["PDG_TX_MOSDNS_PROBE_MODE"] = "port"
+        try:
+            ok, error = tx._v_mosdns_probe(
+                root + "/etc/mosdns/config.yaml",
+                b"plugins: []\n",
+                SimpleNamespace(targets={
+                    "ruleset_hijack": {
+                        "path": live_hijack,
+                        "data": staged_hijack,
+                    }
+                }),
+            )
+        finally:
+            tx._mosdns_bin = original_bin
+            tx._mosdns_probe_run = original_run
+            tx._rewrite_listen = original_rewrite
+            if old_probe_mode is None:
+                os.environ.pop("PDG_TX_MOSDNS_PROBE_MODE", None)
+            else:
+                os.environ["PDG_TX_MOSDNS_PROBE_MODE"] = old_probe_mode
+        assert ok, error
+        assert observed["ruleset_hijack"] == staged_hijack
+
         def prop(_unit, name):
             if name == "ActiveState":
                 return (runtime["state"], runtime["query_ok"])

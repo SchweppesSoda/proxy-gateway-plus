@@ -50,11 +50,14 @@ HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
 # ruleset_direct 重建助手会从 REPO_DIR 读取可信 Bot 实现；给假仓库补齐该只读依赖。
 mkdir -p "$REPO/deploy/bot"
 cp "$ROOT/deploy/bot/pdg-bot.py" "$REPO/deploy/bot/pdg-bot.py"
+cp "$ROOT/deploy/bot/pdgtx.py" "$REPO/deploy/bot/pdgtx.py"
 
 # ── 抽取 cmd_rollback + 打桩 ──────────────────────────────────────────────────
-for fn in _pdg_snapshot_rederive_ruleset_direct cmd_rollback; do
+for fn in _pdg_snapshot_rederive_ruleset_direct _pdg_rollback_restore_quic cmd_rollback; do
   sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
 done | sed \
+  -e 's#^\([[:space:]]*local cur_qhelper=\)/usr/local/libexec/pdg-quic-routing[.]sh#\1"$SB/usr/local/libexec/pdg-quic-routing.sh"#' \
+  -e 's#^\([[:space:]]*\)/usr/local/libexec/pdg-quic-routing[.]sh #\1"$SB/usr/local/libexec/pdg-quic-routing.sh" #' \
   -e 's#> /etc/privdns-gateway/backend#> "$SB/etc/privdns-gateway/backend"#' \
   -e 's# /etc/nftables\.conf# "$SB/etc/nftables.conf"#g' \
   -e 's# /etc/mihomo/config\.yaml# "$SB/etc/mihomo/config.yaml"#g' \
@@ -70,6 +73,7 @@ cat > "$WORK/harness.sh" <<EOF
 SNAP_DIR="$SNAP"
 REPO_DIR="$REPO"
 SB="$SB"
+PROFILE_ENV="$SB/etc/privdns-gateway/profile.env"
 need_root(){ :; }; _lock(){ :; }
 c_g(){ echo "\$*"; }; c_y(){ echo "\$*"; }
 _pdg_core(){ echo singbox; }
@@ -78,13 +82,23 @@ _pdg_mktemp_dir(){ mktemp -d; }
 _sb_panel_managed_on(){ return 1; }
 _core_kernel_activate(){ return 0; }
 _pdg_nft_bin(){ return 1; }
-_pdg_snapshot_abort(){ echo "unexpected rollback abort" >&2; return 1; }
+_pdg_snapshot_abort(){
+  echo "unexpected rollback abort: \${7:-missing reason}" >&2
+  return 1
+}
 # cmd_rollback 会用到的 units.sh / 归属助手: 沙箱里没有真 /etc, 一并打桩(与 systemctl/nft 同理)
 pdg_write_unit(){ return 0; }
 pdg_unit_mihomo(){ echo "[Unit]"; }
 _pdg_drop_singbox_files(){ :; }
 _pdg_singbox_is_ours(){ return 1; }
-systemctl(){ return 0; }
+systemctl(){
+  [[ -n "\${QUIC_LOG:-}" ]] && printf 'systemctl %s\n' "\$*" >>"\$QUIC_LOG"
+  if [[ "\${1:-}" == restart && "\${2:-}" == pdg-quic-routing \
+        && "\${FAIL_QUIC_RESTART:-0}" == 1 ]]; then
+    return 1
+  fi
+  return 0
+}
 nft(){ return 0; }
 # 覆写落盘: 不碰真 /, 把被应用快照的判别标记抄到沙箱, 供断言"回滚到了哪份"
 APPLIED="$WORK/applied_snapid"
@@ -102,6 +116,65 @@ rm -f "$WORK/applied_snapid"; out=$(run "--dir '$SNAP/A'")
 rm -f "$WORK/applied_snapid"; out=$(run "0")
 [[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == NEW ]] \
   && ok "无 --dir → 默认 index0 仍回滚到最近 B" || bad "A2: applied=$(cat "$WORK/applied_snapid" 2>/dev/null) out=$out"
+
+# 首次升级失败：更新后的 CLI 必须能回滚“有规则集、但 MosDNS 尚未声明
+# ruleset_hijack”的旧快照。无关的 proxy source 元数据故意不放文件，证明旧契约
+# 只重建 direct，不会拿升级后的新聚合 schema 反向否决旧好档。
+LEGACY="$SNAP/LEGACY"; LT="$LEGACY/tree"
+mkdir -p "$LT/etc/privdns-gateway" "$LT/etc/mosdns/rules" \
+  "$LT/etc/sing-box/rs" "$LT/opt/pdg-bot"
+printf 'singbox\n' > "$LT/etc/privdns-gateway/backend"
+printf 'LEGACY\n' > "$LT/etc/privdns-gateway/snapid"
+cat > "$LT/etc/mosdns/config.yaml" <<'EOF'
+plugins:
+  - tag: geosite_cn
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/geosite_cn.txt","/etc/mosdns/rules/ruleset_direct.txt"] }
+  - tag: explicit_hijack
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/custom_hijack.txt"] }
+  - tag: force_hijack_seq
+    type: sequence
+    args:
+      - matches: qtype 1
+        exec: black_hole 203.0.113.10
+  - tag: internal_sequence
+    type: sequence
+    args:
+      - matches: qname $explicit_hijack
+        exec: goto force_hijack_seq
+      - matches: qname $geosite_cn
+        exec: $local_upstream
+EOF
+cat > "$LT/opt/pdg-bot/rulesets.json" <<'EOF'
+{
+  "rs_direct": {
+    "url": "https://x/direct.list",
+    "outbound": "direct",
+    "format": "source",
+    "path": "/etc/sing-box/rs/rs_direct.json"
+  },
+  "rs_unrelated_proxy": {
+    "url": "https://x/proxy.list",
+    "outbound": "US",
+    "format": "source",
+    "path": "/etc/sing-box/rs/rs_unrelated_proxy.json"
+  }
+}
+EOF
+printf '%s\n' \
+  '{"version":1,"rules":[{"domain_suffix":["legacy.example"]}]}' \
+  > "$LT/etc/sing-box/rs/rs_direct.json"
+printf 'domain:poison.example\n' > "$LT/etc/mosdns/rules/ruleset_direct.txt"
+printf 'domain:poison.example\n' > "$LT/etc/mosdns/rules/ruleset_hijack.txt"
+tar czf "$LEGACY/snap.tar.gz" -C "$LT" etc opt 2>/dev/null
+rm -rf "$LT"
+rm -f "$WORK/applied_snapid"
+out=$(run "--dir '$LEGACY'") || rc=$?
+[[ "${rc:-0}" == 0 && "$(cat "$WORK/applied_snapid" 2>/dev/null)" == LEGACY ]] \
+  && ok "首次升级失败 → 新 CLI 可按旧 MosDNS 契约回滚旧规则集快照" \
+  || bad "A3: rc=${rc:-0} applied=$(cat "$WORK/applied_snapid" 2>/dev/null) out=$out"
+unset rc
 
 # ── B. --git 复位仓库 ────────────────────────────────────────────────────────
 git -C "$REPO" reset --hard -q "$HEAD_REF"
@@ -160,6 +233,67 @@ mkmihomo_snap M_BAD 1           # 快照自带的 mihomo 也拒绝 → 这份快
 rm -f "$WORK/applied_snapid"; rc=0; out=$(runm "--dir '$SNAP/M_BAD'") || rc=$?
 { [[ "$rc" != 0 ]] && [[ ! -e "$WORK/applied_snapid" ]]; } \
   && ok "快照内核也拒绝旧配置 → 落盘前中止(不写坏现网)" || bad "C4b: rc=$rc applied=$(cat "$WORK/applied_snapid" 2>/dev/null)"
+
+# ── C5. QUIC oneshot 必须显式 restart；restart/status 失败均为未完全回滚 ─────
+Q="$SNAP/Q"; QT="$Q/tree"
+mkdir -p "$QT/etc/privdns-gateway" "$QT/etc/systemd/system" \
+  "$QT/usr/local/libexec" "$QT/opt/pdg-bot"
+printf 'singbox\n' > "$QT/etc/privdns-gateway/backend"
+printf 'Q\n' > "$QT/etc/privdns-gateway/snapid"
+printf 'PDG_QUIC_MODE=tproxy\n' > "$QT/etc/privdns-gateway/profile.env"
+printf '[Unit]\nDescription=test\n' > "$QT/etc/systemd/system/pdg-quic-routing.service"
+printf '#!/bin/sh\nexit 0\n' > "$QT/usr/local/libexec/pdg-quic-routing.sh"
+printf '# test profile tool\n' > "$QT/opt/pdg-bot/pdgprofile.py"
+chmod 755 "$QT/usr/local/libexec/pdg-quic-routing.sh"
+tar czf "$Q/snap.tar.gz" -C "$QT" \
+  etc/privdns-gateway/backend etc/privdns-gateway/snapid \
+  etc/privdns-gateway/profile.env \
+  etc/systemd/system/pdg-quic-routing.service \
+  usr/local/libexec/pdg-quic-routing.sh opt/pdg-bot/pdgprofile.py \
+  2>/dev/null
+rm -rf "$QT"
+
+# 现网 helper 映射到沙箱；早期 cleanup-status/remove 均成功，最终 status 可独立注错。
+mkdir -p "$SB/usr/local/libexec"
+cat > "$SB/usr/local/libexec/pdg-quic-routing.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'helper %s\n' "${1:-}" >>"${QUIC_LOG:?}"
+if [[ "${1:-}" == status && "${FAIL_QUIC_STATUS:-0}" == 1 ]]; then
+  exit 1
+fi
+exit 0
+EOF
+chmod 755 "$SB/usr/local/libexec/pdg-quic-routing.sh"
+export QUIC_LOG="$WORK/quic.log"
+
+export FAIL_QUIC_RESTART=0 FAIL_QUIC_STATUS=0
+: >"$QUIC_LOG"; rc=0; out=$(run "--dir '$Q'") || rc=$?
+enable_line="$(grep -n '^systemctl enable pdg-quic-routing$' "$QUIC_LOG" | tail -1 | cut -d: -f1)"
+restart_line="$(grep -n '^systemctl restart pdg-quic-routing$' "$QUIC_LOG" | tail -1 | cut -d: -f1)"
+status_line="$(grep -n '^helper status$' "$QUIC_LOG" | tail -1 | cut -d: -f1)"
+{ [[ "$rc" == 0 && -n "$enable_line" && -n "$restart_line" && -n "$status_line" ]] \
+  && (( enable_line < restart_line && restart_line < status_line )); } \
+  && ok "QUIC rollback: enable 后显式 restart oneshot，再执行 helper status" \
+  || bad "C5a: rc=$rc enable=$enable_line restart=$restart_line status=$status_line out=$out log=$(cat "$QUIC_LOG")"
+
+export FAIL_QUIC_RESTART=1 FAIL_QUIC_STATUS=0
+: >"$QUIC_LOG"; rc=0; out=$(run "--dir '$Q'") || rc=$?
+{ [[ "$rc" == 1 ]] && grep -q '未完全回滚' <<<"$out" \
+  && grep -q 'QUIC routing恢复(enable/restart/status)' <<<"$out" \
+  && grep -q '^systemctl restart pdg-quic-routing$' "$QUIC_LOG" \
+  && ! grep -q '^helper status$' "$QUIC_LOG"; } \
+  && ok "QUIC rollback: restart 失败 → 非0 + 未完全回滚，且不继续伪验 status" \
+  || bad "C5b: rc=$rc out=$out log=$(cat "$QUIC_LOG")"
+
+export FAIL_QUIC_RESTART=0 FAIL_QUIC_STATUS=1
+: >"$QUIC_LOG"; rc=0; out=$(run "--dir '$Q'") || rc=$?
+{ [[ "$rc" == 1 ]] && grep -q '未完全回滚' <<<"$out" \
+  && grep -q 'QUIC routing恢复(enable/restart/status)' <<<"$out" \
+  && grep -q '^systemctl restart pdg-quic-routing$' "$QUIC_LOG" \
+  && grep -q '^helper status$' "$QUIC_LOG"; } \
+  && ok "QUIC rollback: restart 后 status 失败 → 非0 + 未完全回滚" \
+  || bad "C5c: rc=$rc out=$out log=$(cat "$QUIC_LOG")"
+unset FAIL_QUIC_RESTART FAIL_QUIC_STATUS QUIC_LOG
 
 # ── D. 静态断言: cmd_update / cmd_snapshot / 越界守卫 ─────────────────────────
 u="$ROOT/deploy/bot/pdg.sh"

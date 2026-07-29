@@ -11,6 +11,7 @@ has(){ grep -qF "$2" "$ROOT/$1"; }
 
 required=(
   deploy/web/pdg-web.py
+  deploy/web/pdg-web-job.py
   deploy/web/pdgcontrol.py
   deploy/web/pdg-web-setup.py
   deploy/web/pdgwebconfig.py
@@ -38,7 +39,7 @@ done
 [[ "$syntax_ok" == 1 ]] && ok "相关 shell 脚本通过 bash -n" || bad "shell 语法错误"
 
 install_ok=1
-for path in pdg-web.py pdgcontrol.py pdg-web-setup.py pdgwebconfig.py index.html app.js style.css \
+for path in pdg-web.py pdg-web-job.py pdgcontrol.py pdg-web-setup.py pdgwebconfig.py index.html app.js style.css \
             manifest.webmanifest icon.svg pdg-webctl.sh pdg-web.service; do
   grep -qF "deploy/web/${path}" "$ROOT/install.sh" \
     || grep -qF "deploy/web/static/${path}" "$ROOT/install.sh" \
@@ -116,7 +117,7 @@ fi
 
 inventory_ok=1
 for exact in \
-  "opt/pdg-web/pdg-web.py" "opt/pdg-web/pdgcontrol.py" \
+  "opt/pdg-web/pdg-web.py" "opt/pdg-web/pdg-web-job.py" "opt/pdg-web/pdgcontrol.py" \
   "opt/pdg-web/pdg-web-setup.py" "opt/pdg-web/pdgwebconfig.py" \
   "opt/pdg-web/static/manifest.webmanifest" \
   "usr/local/bin/pdg-webctl" "etc/systemd/system/pdg-web.service"; do
@@ -127,6 +128,115 @@ grep -qF "python3 /opt/pdg-web/pdg-web-setup.py --validate-only" \
 [[ "$inventory_ok" == 1 ]] \
   && ok "update/snapshot/rollback 清单跟踪 Web 且更新时校验配置" \
   || bad "update/snapshot/rollback Web 清单不完整"
+
+aggregate_inventory_ok=1
+for exact in \
+  "etc/mosdns/rules/ruleset_direct.txt" \
+  "etc/mosdns/rules/ruleset_hijack.txt"; do
+  grep -qF "$exact" "$ROOT/deploy/bot/pdg.sh" || aggregate_inventory_ok=0
+done
+grep -qF ': > /etc/mosdns/rules/ruleset_hijack.txt' \
+  "$ROOT/install.sh" || aggregate_inventory_ok=0
+grep -qF 'p="$rsdirect_member" -v q="$rshijack_member"' \
+  "$ROOT/deploy/bot/pdg.sh" || aggregate_inventory_ok=0
+grep -qF 'python3 - "$work/config.candidate" "$agg" "$hijagg"' \
+  "$ROOT/deploy/bot/pdg.sh" || aggregate_inventory_ok=0
+grep -qF 's = ensure_domain_set_file(s, "explicit_hijack", hijagg)' \
+  "$ROOT/deploy/bot/pdg.sh" || aggregate_inventory_ok=0
+[[ "$aggregate_inventory_ok" == 1 ]] \
+  && ok "快照回滚与安装清单同时跟踪并重建 direct/hijack 规则集 DNS 聚合" \
+  || bad "规则集 DNS 聚合生命周期清单不完整"
+
+capture_source="$(awk '
+  /^_pdg_capture_ruleset_migration_before\(\)\{/ { active=1 }
+  active { print }
+  active && /^}$/ { exit }
+' "$ROOT/deploy/bot/pdg.sh")"
+capture_root="$(mktemp -d)"
+capture_ok=1
+if [[ -z "$capture_source" || -z "$capture_root" ]]; then
+  capture_ok=0
+else
+  eval "$capture_source"
+  printf 'config-before\n' >"$capture_root/config"
+  mkdir "$capture_root/absent" "$capture_root/present"
+  _pdg_capture_ruleset_migration_before \
+    "$capture_root/absent" "$capture_root/config" \
+    "$capture_root/direct" "$capture_root/hijack" 0 0 \
+    || capture_ok=0
+  [[ -f "$capture_root/absent/config.before" \
+     && ! -e "$capture_root/absent/direct.before" \
+     && ! -e "$capture_root/absent/hijack.before" ]] || capture_ok=0
+  printf 'direct-before\n' >"$capture_root/direct"
+  printf 'hijack-before\n' >"$capture_root/hijack"
+  _pdg_capture_ruleset_migration_before \
+    "$capture_root/present" "$capture_root/config" \
+    "$capture_root/direct" "$capture_root/hijack" 1 1 \
+    || capture_ok=0
+  cmp -s "$capture_root/config" "$capture_root/present/config.before" \
+    || capture_ok=0
+  cmp -s "$capture_root/direct" "$capture_root/present/direct.before" \
+    || capture_ok=0
+  cmp -s "$capture_root/hijack" "$capture_root/present/hijack.before" \
+    || capture_ok=0
+  restore_source="$(awk '
+    /^_pdg_restore_ruleset_migration_before\(\)\{/ { active=1 }
+    active { print }
+    active && /^}$/ { exit }
+  ' "$ROOT/deploy/bot/pdg.sh")"
+  eval "$restore_source"
+  _pdg_atomic_restore_file(){ cp "$1" "$2"; }
+  printf 'changed-config\n' >"$capture_root/config"
+  printf 'changed-direct\n' >"$capture_root/direct"
+  printf 'changed-hijack\n' >"$capture_root/hijack"
+  _pdg_restore_ruleset_migration_before \
+    "$capture_root/present" "$capture_root/config" \
+    "$capture_root/direct" "$capture_root/hijack" 1 1 \
+    || capture_ok=0
+  cmp -s "$capture_root/config" "$capture_root/present/config.before" \
+    || capture_ok=0
+  cmp -s "$capture_root/direct" "$capture_root/present/direct.before" \
+    || capture_ok=0
+  cmp -s "$capture_root/hijack" "$capture_root/present/hijack.before" \
+    || capture_ok=0
+  printf 'changed-direct\n' >"$capture_root/direct"
+  printf 'changed-hijack\n' >"$capture_root/hijack"
+  _pdg_restore_ruleset_migration_before \
+    "$capture_root/absent" "$capture_root/config" \
+    "$capture_root/direct" "$capture_root/hijack" 0 0 \
+    || capture_ok=0
+  [[ ! -e "$capture_root/direct" && ! -L "$capture_root/direct" \
+     && ! -e "$capture_root/hijack" && ! -L "$capture_root/hijack" ]] \
+    || capture_ok=0
+fi
+[[ -n "$capture_root" && -d "$capture_root" ]] && rm -rf -- "$capture_root"
+[[ "$capture_ok" == 1 ]] \
+  && ok "规则集迁移对 aggregate 缺失/已存在均真实捕获并恢复三文件 before-image" \
+  || bad "规则集迁移 before-image 捕获/恢复执行失败"
+
+atomic_source="$(awk '
+  /^_pdg_atomic_install_file\(\)\{/ { active=1 }
+  active { print }
+  active && /^}$/ { exit }
+' "$ROOT/deploy/bot/pdg.sh")"
+if grep -qF 'out.flush()' <<<"$atomic_source" \
+   && grep -qF 'os.fsync(out.fileno())' <<<"$atomic_source" \
+   && grep -qF 'os.replace(temporary, target)' <<<"$atomic_source" \
+   && grep -qF 'os.fsync(directory_fd)' <<<"$atomic_source"; then
+  ok "原子文件安装在 replace 前 fsync 数据、replace 后 fsync 父目录"
+else
+  bad "原子文件安装缺少 durable data/metadata fsync"
+fi
+
+if grep -qF "secrets.token_hex(4)" "$ROOT/deploy/bot/pdg.sh" \
+   && grep -qF 'mkdir -m700 "$d"' "$ROOT/deploy/bot/pdg.sh" \
+   && grep -qF 'PDG_WEB_JOB_STATE_DIR' "$ROOT/deploy/web/pdg-web-job.py" \
+   && grep -qF 'install -d -o root -g root -m700 /var/lib/privdns-gateway/web-jobs' \
+      "$ROOT/install.sh"; then
+  ok "快照使用排他随机稳定 ID，Web 维护任务状态持久化到 root-only 目录"
+else
+  bad "快照稳定 ID 或维护任务持久化契约缺失"
+fi
 
 purge_line="$(grep -nF 'if [[ "${1:-}" == "--purge" ]]' "$ROOT/uninstall.sh" | head -n1 | cut -d: -f1)"
 config_remove_line="$(grep -nF 'rm -f /etc/privdns-gateway/web.json' "$ROOT/uninstall.sh" | head -n1 | cut -d: -f1)"

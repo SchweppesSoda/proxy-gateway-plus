@@ -349,7 +349,7 @@ _rams="$(xt run_all_migrations)"
   _pdg_dataplane_mode_readonly(){ echo managed; }
   _pdg_dataplane_nft_preflight(){ return 0; }
   for f in migrate_platform_marker migrate_backend_marker migrate_botenv migrate_firewall_to_pdg \
-           migrate_dataplane_profile \
+           migrate_dataplane_profile migrate_default_direct_tag \
            migrate_mosdns_concurrent migrate_mosdns_unlock migrate_fw_gms migrate_mosdns_ratelimit \
            migrate_lowmem migrate_mihomo_safepaths migrate_deploy_botfiles migrate_deploy_units \
            migrate_mosdns_hijack_shape migrate_custom_hijack migrate_mosdns_mitm \

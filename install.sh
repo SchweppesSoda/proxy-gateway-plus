@@ -787,6 +787,9 @@ fi
 install -d /etc/mosdns/rules /etc/sing-box/rs /opt/pdg-bot /opt/pdg-web/static "$CERT_DIR" \
   /etc/letsencrypt/renewal-hooks/deploy /etc/systemd/journald.conf.d \
   /usr/local/libexec
+# Persistent Web maintenance records are command authority.  Pre-create their
+# final directory root:root/0700 instead of relying on a later chmod-only fixup.
+install -d -o root -g root -m700 /var/lib/privdns-gateway/web-jobs
 if [[ "$MOSDNS_INSTALLED" == 1 ]]; then
   pdg_write_mosdns_attestation "$PDG_MOSDNS_ATTESTATION" "$MARCH" \
     "$MOSDNS_PREPARED_ARTIFACT_SHA" "$MOSDNS_PREPARED_BINARY_SHA" \
@@ -811,6 +814,7 @@ install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/pdgprofile.py        /opt/pdg-bot/
 # 可选 Web 管理面只铺设代码与 unit，默认不配置、不启用，也不修改任何 input/firewall。
 install -m755 "$REPO_DIR"/deploy/web/pdg-web.py           /opt/pdg-web/
+install -m755 "$REPO_DIR"/deploy/web/pdg-web-job.py       /opt/pdg-web/
 install -m755 "$REPO_DIR"/deploy/web/pdgcontrol.py        /opt/pdg-web/
 install -m755 "$REPO_DIR"/deploy/web/pdg-web-setup.py     /opt/pdg-web/
 install -m644 "$REPO_DIR"/deploy/web/pdgwebconfig.py      /opt/pdg-web/
@@ -880,6 +884,7 @@ fi
 : > /etc/mosdns/rules/custom_direct.txt
 : > /etc/mosdns/rules/ruleset_direct.txt  # target=direct 规则集聚合；Bot 仅在同一 pdgtx 事务内派生
 : > /etc/mosdns/rules/custom_hijack.txt   # bot 指到出口的域名(必须被 mosdns 劫持才会进代理)
+: > /etc/mosdns/rules/ruleset_hijack.txt # 指到 VPS 出口的 source 规则集聚合；与路由事务同步派生
 : > /etc/mosdns/rules/unlock.txt          # WDA 解锁域名集(空=休眠; bot『🔓 解锁走 WDA』填充)
 : > /etc/mosdns/rules/mitm_hijack.txt     # MITM 接管域名集(空=休眠; iOS 启用 MITM 插件时填充)
 
@@ -1224,7 +1229,7 @@ cat <<EOF
   1) $( [[ "$PLATFORM" == ios ]] && echo "iOS:见第 3 步生成并安装 iOS 描述文件(DoT 域名:$DOT_DOMAIN)" || echo "手机「私密 DNS」填:  $DOT_DOMAIN" )
   $( [[ -z "$BOT_TOKEN" || -z "$ALLOWED_IDS" ]] && echo "2) 启用管理 bot:  sudo pdg-set-token  (之后再发 /start)" || echo "2) Telegram 给你的 bot 发 /start, 然后:" )
        • 「📤 出口管理 → 添加」粘贴 ss:// / vmess:// / trojan:// / vless:// 落地节点
-       • 「📑 分流管理」按需把域名/规则集指到出口 (默认其余国际走 jp 直出)
+       • 「📑 分流管理」按需把域名/规则集指到出口 (默认其余国际走 JP 直出)
   $( [[ "$PLATFORM" == ios ]] && echo "3) iOS:bot「📱 客户端 → iOS 描述文件」生成并安装(Wi-Fi/蜂窝由 :81 探测激活)" || echo "3) Android:私密 DNS 填上面的 DoT 域名即可" )
   4) 换域名随时用 bot「🌐 DoT 自定义域名」
   5) 可选 Web 管理面默认禁用: sudo pdg web setup

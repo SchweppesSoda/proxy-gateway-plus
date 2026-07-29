@@ -13,7 +13,15 @@
     exitOrder: [],
     exitTargets: [],
     ruleTargets: [],
-    runtimeLoading: false
+    runtimeLoading: false,
+    exitDiagnostics: new Map(),
+    exitDiagnosticsTesting: false,
+    replaceExitTag: "",
+    snapshots: [],
+    maintenanceJobs: [],
+    trackedMaintenanceJobs: new Set(),
+    maintenancePollTimer: 0,
+    maintenancePollDisconnected: false
   };
 
   class ApiError extends Error {
@@ -128,6 +136,30 @@
       version: "版本"
     };
     return labels[key] || String(key).replaceAll("_", " ");
+  }
+
+  function formatExitName(tag) {
+    const value = String(tag ?? "");
+    return value === "jp" ? "JP" : value;
+  }
+
+  function exitByTag(tag) {
+    return state.exits.find((item) => item.tag === tag);
+  }
+
+  function isProbeableExit(item) {
+    return Boolean(item && item.tag !== "direct" && item.type !== "urltest");
+  }
+
+  function isReplaceableProxy(item) {
+    return Boolean(item && item.tag !== "direct" && !["direct", "urltest"].includes(item.type));
+  }
+
+  function ruleTargetLabel(tag, phoneDirectLabel = "手机直连（不经 VPS）") {
+    if (tag === "direct") return phoneDirectLabel;
+    const item = exitByTag(tag);
+    if (item?.type === "direct") return `${formatExitName(tag)}（VPS 本机直出）`;
+    return formatExitName(tag) || "未指定";
   }
 
   function renderKeyValues(target, data, emptyText = "暂无数据") {
@@ -270,6 +302,7 @@
     $("#login-view").hidden = authenticated;
     $("#app-view").hidden = !authenticated;
     if (!authenticated) {
+      stopMaintenancePolling();
       state.csrf = "";
       state.sessionExpiresAt = 0;
       $("#login-submit").disabled = true;
@@ -302,6 +335,7 @@
         showAuthenticated(true);
         updateSessionLabel();
         await loadTab("overview");
+        await loadMaintenanceJobs({ silent: true });
       } else {
         showAuthenticated(false);
         state.csrf = typeof data?.csrf === "string" ? data.csrf : "";
@@ -330,6 +364,7 @@
       showAuthenticated(true);
       updateSessionLabel();
       await loadTab("overview");
+      await loadMaintenanceJobs({ silent: true });
     } catch (error) {
       password = "";
       $("#login-message").textContent = loginErrorMessage(error);
@@ -428,24 +463,134 @@
     return "状态未知";
   }
 
-  function doctorSummaryText(doctor) {
-    if (typeof doctor === "string") return safeString(doctor, 3000);
+  function doctorLevel(item) {
+    const level = String(item?.level || item?.status || "").toLowerCase();
+    if (/(fail|failed|error|critical|失败|异常)/.test(level)) return "fail";
+    if (/(warn|warning|degraded|unknown|警告|未知)/.test(level)) return "warn";
+    if (/(ok|good|pass|passed|success|正常|通过)/.test(level)) return "ok";
+    return "warn";
+  }
+
+  function doctorEntries(doctor) {
     if (Array.isArray(doctor)) {
-      const failures = doctor.filter((item) =>
-        String(item?.level || item?.status).toLowerCase() === "fail"
-      );
-      const warnings = doctor.filter((item) =>
-        String(item?.level || item?.status).toLowerCase() === "warn"
-      );
-      const lines = doctor.slice(0, 12).map((item) => {
-        if (typeof item === "string") return safeString(item, 240);
-        const title = item.check || item.name || item.title || "检查项";
-        const detail = item.detail || item.message || item.status || "";
-        return `${title}：${safeString(detail, 240)}`;
+      return doctor.slice(0, 50).map((item, index) => {
+        if (typeof item === "string") {
+          return {
+            level: "warn",
+            title: `检查项 ${index + 1}`,
+            detail: safeString(item, 1200)
+          };
+        }
+        const clean = safeObject(item) || {};
+        return {
+          level: doctorLevel(clean),
+          title: safeString(clean.check || clean.name || clean.title || `检查项 ${index + 1}`, 80),
+          detail: safeString(clean.detail || clean.message || clean.status || "未提供说明", 1200)
+        };
       });
-      return `${failures.length} 项失败，${warnings.length} 项警告\n${lines.join("\n")}`;
     }
-    return readableValue(doctor);
+    if (doctor !== null && doctor !== undefined && doctor !== "") {
+      return [{
+        level: "warn",
+        title: "原始自检输出",
+        detail: safeString(readableValue(doctor), 3000)
+      }];
+    }
+    return [];
+  }
+
+  function doctorGroup(title) {
+    const groups = [
+      { key: "runtime", label: "运行环境", match: /(平台|服务|凭据|版本|mihomo|mosdns|bot)/i },
+      { key: "dns", label: "私密 DNS", match: /(dot|dns|域名|解析|证书|tls 会话)/i },
+      { key: "dataplane", label: "网络与数据面", match: /(内网|网卡|透明|数据面|代理入口|gms|fcm|quic|路由|出口|劫持)/i },
+      { key: "security", label: "安全边界", match: /(防火墙|input|暴露|开放中继|端口冲突)/i },
+      { key: "transactions", label: "配置与维护", match: /(事务|更新|升级|回滚|快照|残留)/i }
+    ];
+    return groups.find((group) => group.match.test(title)) || { key: "other", label: "其他检查" };
+  }
+
+  function doctorTone(level) {
+    return level === "fail" ? "bad" : level === "warn" ? "warn" : "good";
+  }
+
+  function renderDoctorSummary(target, doctor) {
+    empty(target);
+    const entries = doctorEntries(doctor);
+    const healthPill = $("#doctor-health");
+    if (!entries.length) {
+      healthPill.className = "status-pill warn";
+      healthPill.textContent = "结果不可用";
+      target.append(node("div", "empty-state", "暂时没有可显示的自检结果"));
+      return;
+    }
+
+    const counts = entries.reduce((result, item) => {
+      result[item.level] += 1;
+      return result;
+    }, { ok: 0, warn: 0, fail: 0 });
+    const tone = counts.fail ? "bad" : counts.warn ? "warn" : "good";
+    healthPill.className = `status-pill ${tone}`;
+    healthPill.textContent = counts.fail
+      ? `${counts.fail} 项失败`
+      : counts.warn ? `${counts.warn} 项警告` : `${counts.ok} 项通过`;
+
+    const result = node("div", `doctor-result ${tone}`);
+    const resultIcon = node("span", "doctor-result-icon", tone === "good" ? "✓" : tone === "warn" ? "!" : "×");
+    resultIcon.setAttribute("aria-hidden", "true");
+    const resultCopy = node("div", "doctor-result-copy");
+    resultCopy.append(node("strong", "", tone === "good"
+      ? "全部检查通过"
+      : tone === "warn" ? "有项目需要留意" : "发现需要处理的问题"));
+    resultCopy.append(node("span", "", tone === "good"
+      ? `${counts.ok} 项检查均未发现问题`
+      : `通过 ${counts.ok} 项 · 警告 ${counts.warn} 项 · 失败 ${counts.fail} 项`));
+    result.append(resultIcon, resultCopy);
+
+    const stats = node("div", "doctor-stats");
+    [
+      { key: "fail", label: "失败" },
+      { key: "warn", label: "警告" },
+      { key: "ok", label: "通过" }
+    ].forEach((item) => {
+      const stat = node("div", `doctor-stat ${item.key}`);
+      stat.append(node("strong", "", counts[item.key]));
+      stat.append(node("span", "", item.label));
+      stats.append(stat);
+    });
+    result.append(stats);
+    target.append(result);
+
+    const grouped = new Map();
+    entries.forEach((entry) => {
+      const group = doctorGroup(entry.title);
+      if (!grouped.has(group.key)) grouped.set(group.key, { label: group.label, items: [] });
+      grouped.get(group.key).items.push(entry);
+    });
+
+    const groups = node("div", "doctor-groups");
+    grouped.forEach((group) => {
+      const section = node("section", "doctor-group");
+      const heading = node("div", "doctor-group-heading");
+      heading.append(node("h3", "", group.label));
+      heading.append(node("span", "", `${group.items.length} 项`));
+      section.append(heading);
+      const list = node("div", "doctor-check-list");
+      group.items.forEach((entry) => {
+        const item = node("article", `doctor-check ${doctorTone(entry.level)}`);
+        const marker = node("span", "doctor-check-marker", entry.level === "ok" ? "✓" : entry.level === "warn" ? "!" : "×");
+        marker.setAttribute("aria-hidden", "true");
+        const copy = node("div", "doctor-check-copy");
+        copy.append(node("strong", "", entry.title));
+        copy.append(node("span", "", entry.detail));
+        const stateLabel = entry.level === "ok" ? "正常" : entry.level === "warn" ? "警告" : "失败";
+        item.append(marker, copy, node("span", `doctor-check-state ${doctorTone(entry.level)}`, stateLabel));
+        list.append(item);
+      });
+      section.append(list);
+      groups.append(section);
+    });
+    target.append(groups);
   }
 
   function serviceEntries(status) {
@@ -503,7 +648,7 @@
       row.append(node("span", "status-value", value));
       services.append(row);
     });
-    $("#doctor-summary").textContent = doctorSummaryText(info.doctor);
+    renderDoctorSummary($("#doctor-summary"), info.doctor);
   }
 
   function makeActionButton(label, action, tone = "") {
@@ -511,6 +656,54 @@
     button.type = "button";
     button.dataset.action = action;
     return button;
+  }
+
+  function exitDiagnosticBadge(item) {
+    const badge = node("span", "latency-badge neutral", "未测速");
+    if (item.type === "urltest") {
+      badge.textContent = "故障组本轮不单测";
+      return badge;
+    }
+    if (!isProbeableExit(item)) {
+      badge.textContent = "无需测速";
+      return badge;
+    }
+    if (state.exitDiagnosticsTesting) {
+      badge.className = "latency-badge testing";
+      badge.textContent = "测试中…";
+      return badge;
+    }
+    const result = state.exitDiagnostics.get(item.tag);
+    if (!result) return badge;
+    const status = String(result.status || "").toLowerCase();
+    if (status === "ok" && Number.isFinite(result.delayMs) && result.delayMs >= 0) {
+      badge.className = "latency-badge good";
+      badge.textContent = `${Math.round(result.delayMs)} ms`;
+      return badge;
+    }
+    if (status === "ok") {
+      badge.className = "latency-badge good";
+      badge.textContent = "可用";
+      return badge;
+    }
+    if (["timeout", "unreachable"].includes(status)) {
+      badge.className = "latency-badge bad";
+      badge.textContent = status === "timeout" ? "超时" : "不可达";
+      return badge;
+    }
+    if (["skipped", "unsupported"].includes(status)) {
+      badge.className = "latency-badge neutral";
+      badge.textContent = status === "skipped" ? "已跳过" : "不支持测速";
+      return badge;
+    }
+    if (status === "unavailable") {
+      badge.className = "latency-badge bad";
+      badge.textContent = "Mihomo API 不可用";
+      return badge;
+    }
+    badge.className = "latency-badge bad";
+    badge.textContent = "测速失败";
+    return badge;
   }
 
   function renderExitList() {
@@ -526,17 +719,21 @@
       card.dataset.tag = item.tag;
       const main = node("div", "list-card-main");
       const title = node("div", "list-card-title");
-      title.append(node("b", "", item.tag));
+      title.append(node("b", "", formatExitName(item.tag)));
       title.append(node("span", "type-badge", item.type || "unknown"));
+      title.append(exitDiagnosticBadge(item));
       main.append(title);
       const endpoint = item.server
         ? `${safeString(item.server, 180)}${item.server_port ? `:${item.server_port}` : ""}`
-        : Array.isArray(item.members) ? item.members.join(" › ") : "由服务器管理";
+        : Array.isArray(item.members) ? item.members.map(formatExitName).join(" › ") : "由服务器管理";
       main.append(node("span", "list-card-detail", endpoint));
       card.append(main);
 
       const actions = node("div", "list-actions");
       const locked = item.type === "direct" || item.tag === "direct";
+      if (isReplaceableProxy(item)) {
+        actions.append(makeActionButton("更新连接", "replace"));
+      }
       const rename = makeActionButton("改名", "rename");
       rename.disabled = locked;
       if (locked) rename.title = "内建直连出口不能改名";
@@ -571,18 +768,18 @@
     state.exitOrder.forEach((tag, index) => {
       const row = node("li");
       row.dataset.index = String(index);
-      row.append(node("span", "order-name", tag));
+      row.append(node("span", "order-name", formatExitName(tag)));
       const actions = node("span", "order-actions");
       const up = node("button", "", "↑");
       up.type = "button";
       up.dataset.direction = "up";
       up.disabled = index === 0;
-      up.setAttribute("aria-label", `上移 ${tag}`);
+      up.setAttribute("aria-label", `上移 ${formatExitName(tag)}`);
       const down = node("button", "", "↓");
       down.type = "button";
       down.dataset.direction = "down";
       down.disabled = index === state.exitOrder.length - 1;
-      down.setAttribute("aria-label", `下移 ${tag}`);
+      down.setAttribute("aria-label", `下移 ${formatExitName(tag)}`);
       actions.append(up, down);
       row.append(actions);
       target.append(row);
@@ -611,7 +808,7 @@
     }
     select.disabled = false;
     unique.forEach((value) => {
-      const label = value === "direct" ? directLabel : value;
+      const label = value === "direct" ? directLabel : formatExitName(value);
       const option = node("option", "", label);
       option.value = value;
       option.selected = value === selected;
@@ -634,7 +831,8 @@
       title.append(node("b", "", group.tag));
       title.append(node("span", "type-badge", "FAILOVER"));
       main.append(title);
-      main.append(node("span", "list-card-detail", (group.members || []).join(" › ") || "无成员"));
+      main.append(node("span", "list-card-detail",
+        (group.members || []).map(formatExitName).join(" › ") || "无成员"));
       const actions = node("div", "list-actions");
       actions.append(makeActionButton("改成员", "edit-group"));
       actions.append(makeActionButton("删除", "delete-group", "danger"));
@@ -643,28 +841,84 @@
     });
   }
 
-  async function loadExits() {
-    const [exitResponse, groupResponse] = await Promise.all([api("/exits"), api("/groups")]);
-    const exitData = exitResponse.data || {};
-    const groupData = groupResponse.data || {};
-    state.exits = Array.isArray(exitData.items) ? exitData.items.map((item) => ({
+  function normalizeExitItems(items) {
+    return Array.isArray(items) ? items.map((item) => ({
       tag: safeString(item.tag, 80),
       type: safeString(item.type, 40),
       server: item.server ? safeString(item.server, 200) : "",
       server_port: item.server_port,
-      members: Array.isArray(item.members) ? item.members.map((member) => safeString(member, 80)) : []
+      members: Array.isArray(item.members)
+        ? item.members.map((member) => safeString(member, 80))
+        : []
     })) : [];
+  }
+
+  async function loadExits() {
+    const [exitResponse, groupResponse] = await Promise.all([api("/exits"), api("/groups")]);
+    const exitData = exitResponse.data || {};
+    const groupData = groupResponse.data || {};
+    state.exits = normalizeExitItems(
+      Array.isArray(exitData.items) ? exitData.items : []
+    );
     state.groups = Array.isArray(groupData.items) ? groupData.items.map((item) => ({
       tag: safeString(item.tag, 80),
       members: Array.isArray(item.members) ? item.members.map((member) => safeString(member, 80)) : []
     })) : [];
     state.exitTargets = Array.isArray(exitData.targets) ? exitData.targets.map(String) : state.exits.map((item) => item.tag);
+    const currentTags = new Set(state.exits.map((item) => item.tag));
+    Array.from(state.exitDiagnostics.keys()).forEach((tag) => {
+      if (!currentTags.has(tag)) state.exitDiagnostics.delete(tag);
+    });
     state.exitOrder = normalizeExitOrder(exitData.order);
     renderExitList();
     renderExitOrder();
     renderGroups();
     populateSelect($("#default-exit"), state.exitTargets, String(exitData.default || ""));
     $("#save-order").disabled = true;
+  }
+
+  async function testExits() {
+    const button = $("#test-exits");
+    state.exitDiagnosticsTesting = true;
+    setButtonBusy(button, true, "测速中…");
+    renderExitList();
+    try {
+      const { data, message } = await api("/diagnostics/exits", {
+        method: "POST",
+        body: {}
+      });
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const results = new Map();
+      items.slice(0, 256).forEach((item) => {
+        const tag = safeString(item?.tag || "", 80);
+        if (!tag || !exitByTag(tag)) return;
+        const delay = Number(item?.delayMs);
+        results.set(tag, {
+          status: safeString(item?.status || "error", 32),
+          delayMs: Number.isFinite(delay) && delay >= 0 ? delay : undefined
+        });
+      });
+      state.exitDiagnostics = results;
+      if (data?.available !== true) {
+        state.exits.filter(isProbeableExit).forEach((item) => {
+          if (!state.exitDiagnostics.has(item.tag)) {
+            state.exitDiagnostics.set(item.tag, {
+              status: "unavailable",
+              delayMs: undefined
+            });
+          }
+        });
+        toast("Mihomo API unavailable（出口测速不可用）", "bad");
+      } else {
+        toast(message || `已完成 ${results.size} 个出口的结构化测速`, "good");
+      }
+    } catch (error) {
+      toast(errorMessage(error), "bad");
+    } finally {
+      state.exitDiagnosticsTesting = false;
+      setButtonBusy(button, false);
+      renderExitList();
+    }
   }
 
   async function addExit(event) {
@@ -690,12 +944,91 @@
     }
   }
 
+  function clearReplaceExitDialog() {
+    $("#replace-exit-link").value = "";
+    state.replaceExitTag = "";
+  }
+
+  function openReplaceExitDialog(tag) {
+    const dialog = $("#replace-exit-dialog");
+    clearReplaceExitDialog();
+    state.replaceExitTag = tag;
+    $("#replace-exit-message").textContent =
+      `正在更新“${formatExitName(tag)}”的连接参数；出口 tag 将由服务器强制保持不变。`;
+    if (typeof dialog.showModal !== "function") {
+      toast("当前浏览器不支持安全节点更新对话框，请升级浏览器后再试", "bad");
+      clearReplaceExitDialog();
+      return;
+    }
+    dialog.showModal();
+    window.setTimeout(() => $("#replace-exit-link").focus(), 0);
+  }
+
+  function cancelReplaceExit() {
+    const dialog = $("#replace-exit-dialog");
+    clearReplaceExitDialog();
+    if (dialog.open) dialog.close("cancel");
+  }
+
+  async function replaceExit(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const dialog = $("#replace-exit-dialog");
+    const tag = state.replaceExitTag;
+    const input = $("#replace-exit-link");
+    let link = input.value.trim();
+    input.value = "";
+    if (dialog.open) dialog.close("submitted");
+    state.replaceExitTag = "";
+    if (!tag || !link) {
+      link = "";
+      return;
+    }
+    const confirmed = await confirmAction(
+      "确认更新节点连接",
+      `确认替换“${formatExitName(tag)}”的连接参数？出口 tag 与现有分流引用将保持不变。`,
+      "确认更新",
+      "warning"
+    );
+    if (!confirmed) {
+      link = "";
+      return;
+    }
+    const button = $("button[type='submit']", form);
+    setButtonBusy(button, true, "校验更新中…");
+    const body = { link };
+    try {
+      const result = await api(`/exits/${encodeURIComponent(tag)}`, {
+        method: "PUT",
+        body
+      });
+      link = "";
+      body.link = "";
+      toast(result.message || `出口 ${formatExitName(tag)} 的连接已安全更新`, "good");
+      await loadExits();
+    } catch (error) {
+      link = "";
+      body.link = "";
+      toast(errorMessage(error, "节点"), "bad");
+    } finally {
+      link = "";
+      body.link = "";
+      input.value = "";
+      setButtonBusy(button, false);
+    }
+  }
+
   async function handleExitAction(event) {
     const button = event.target.closest("button[data-action]");
     if (!button) return;
     const card = button.closest("[data-tag]");
     const tag = card?.dataset.tag;
     if (!tag) return;
+
+    if (button.dataset.action === "replace") {
+      openReplaceExitDialog(tag);
+      return;
+    }
 
     if (button.dataset.action === "rename") {
       const name = window.prompt(`把出口“${tag}”改名为：`, tag);
@@ -847,6 +1180,11 @@
       true,
       "手机直连（MosDNS 返回真实地址，不经过 VPS）"
     );
+    Array.from(select.options).forEach((option) => {
+      if (option.value && option.value !== "direct") {
+        option.textContent = ruleTargetLabel(option.value);
+      }
+    });
   }
 
   function renderRules(items) {
@@ -890,11 +1228,16 @@
       const info = node("div");
       const targetLabel = item.target === "direct"
         ? "手机直连（不经 VPS）"
-        : (item.target || "未指定");
+        : ruleTargetLabel(item.target);
       info.append(node("div", "table-primary", item.label || item.name));
       info.append(node("div", "table-secondary",
         `${safeString(item.url || "地址由服务器管理", 260)} · ${item.behavior || "自动"} → ${targetLabel}`));
       const controls = node("div", "table-controls");
+      const select = node("select");
+      select.setAttribute("aria-label", `${item.label || item.name} 的出口目标`);
+      targetOptions(select, item.target);
+      controls.append(select);
+      controls.append(makeActionButton("保存出口", "target-ruleset"));
       controls.append(makeActionButton("改名称", "label-ruleset"));
       controls.append(makeActionButton("删除", "delete-ruleset", "danger"));
       row.append(info, controls);
@@ -903,9 +1246,18 @@
   }
 
   async function loadRules() {
-    const [rulesResponse, rulesetResponse] = await Promise.all([api("/rules"), api("/rulesets")]);
+    const [rulesResponse, rulesetResponse, exitResponse] = await Promise.all([
+      api("/rules"),
+      api("/rulesets"),
+      api("/exits")
+    ]);
     const rulesData = rulesResponse.data || {};
     const rulesetData = rulesetResponse.data || {};
+    const exitData = exitResponse.data || {};
+    state.exits = normalizeExitItems(exitData.items);
+    state.exitTargets = Array.isArray(exitData.targets)
+      ? exitData.targets.map(String)
+      : state.exits.map((item) => item.tag);
     state.ruleTargets = Array.isArray(rulesData.targets) ? rulesData.targets.map(String) : state.exitTargets.slice();
     targetOptions($("#rule-target"));
     targetOptions($("#ruleset-target"));
@@ -1020,6 +1372,24 @@
     const row = button.closest("[data-name]");
     const name = row?.dataset.name;
     if (!name) return;
+    if (button.dataset.action === "target-ruleset") {
+      const target = $("select", row)?.value;
+      if (!target) return;
+      setButtonBusy(button, true, "保存中…");
+      try {
+        const result = await api(`/rulesets/${encodeURIComponent(name)}/target`, {
+          method: "PUT",
+          body: { target }
+        });
+        toast(result.message || `规则集出口已改为 ${ruleTargetLabel(target)}`, "good");
+        await loadRules();
+      } catch (error) {
+        toast(errorMessage(error), "bad");
+      } finally {
+        setButtonBusy(button, false);
+      }
+      return;
+    }
     if (button.dataset.action === "label-ruleset") {
       const label = window.prompt(`规则集“${name}”的新显示名称（留空清除）：`, "");
       if (label === null) return;
@@ -1047,6 +1417,167 @@
       } catch (error) {
         toast(errorMessage(error), "bad");
       }
+    }
+  }
+
+  function diagnosticEvidence(result) {
+    const path = String(result?.path || "unknown").toLowerCase();
+    const reason = String(result?.reason || "").toLowerCase();
+    const dnsVerified = result?.dnsVerified === true;
+    const routeConfidence = String(result?.routeConfidence || "unknown").toLowerCase();
+    if (reason === "config_changed") {
+      return {
+        label: "配置已变化",
+        tone: "neutral",
+        detail: "诊断期间配置发生变化，本次结果已作废，请重新诊断"
+      };
+    }
+    if (reason === "probe_busy") {
+      return {
+        label: "诊断繁忙",
+        tone: "neutral",
+        detail: "本次尚未执行诊断，请稍后重试"
+      };
+    }
+    if (reason === "dns_no_answer") {
+      return {
+        label: "DNS 无应答",
+        tone: "neutral",
+        detail: "没有取得 DNS 答案，无法判断手机连接路径"
+      };
+    }
+    if (path === "direct" && dnsVerified) {
+      return {
+        label: "DNS 实测直连",
+        tone: "good",
+        detail: "DNS 已返回真实地址；验证的是 DNS 直连路径"
+      };
+    }
+    if (path === "gateway" && dnsVerified) {
+      return {
+        label: "DNS 入口实测 + 出口规则推演",
+        tone: "warn",
+        detail: "DNS 已确认连接进入 VPS；具体出口依据规则推演，未进行出口连接实测"
+      };
+    }
+    if (routeConfidence === "simulated") {
+      return {
+        label: "规则推演",
+        tone: "warn",
+        detail: "依据当前配置推演，未进行网络路径实测"
+      };
+    }
+    return { label: "不确定", tone: "neutral", detail: "现有信息不足，无法确认实际路径" };
+  }
+
+  function diagnosticPathLabel(path) {
+    const labels = {
+      direct: "手机直连",
+      gateway: "经 VPS 网关",
+      unknown: "路径未知"
+    };
+    return labels[String(path || "unknown").toLowerCase()] || "路径未知";
+  }
+
+  function diagnosticReasonLabel(reason) {
+    const labels = {
+      dns_real: "DNS 返回真实地址",
+      explicit_domain: "命中显式域名规则",
+      keyword: "命中域名关键词规则",
+      ruleset: "命中规则集",
+      default: "采用默认出口",
+      dns_no_answer: "DNS 无应答",
+      probe_busy: "诊断繁忙，本次未执行",
+      probe_unavailable: "诊断服务不可用",
+      config_changed: "诊断期间配置发生变化，结果作废"
+    };
+    return labels[String(reason || "").toLowerCase()] || "服务器未提供明确理由";
+  }
+
+  function diagnosticDnsEvidence(result) {
+    const reason = String(result?.reason || "").toLowerCase();
+    const path = String(result?.path || "unknown").toLowerCase();
+    if (reason === "config_changed") return "配置发生变化；没有可采信的 DNS 证据";
+    if (reason === "probe_busy") return "诊断尚未执行；没有 DNS 实测证据";
+    if (reason === "dns_no_answer") return "DNS 无应答；路径无法验证";
+    if (reason === "probe_unavailable") return "诊断服务不可用；没有 DNS 实测证据";
+    if (result?.dnsVerified === true && path === "direct") {
+      return "已实测：DNS 返回真实地址，手机可直接连接";
+    }
+    if (result?.dnsVerified === true && path === "gateway") {
+      return "已实测：DNS 返回网关地址，连接入口为 VPS";
+    }
+    return "未取得可验证的 DNS 路径证据";
+  }
+
+  function diagnosticRouteConfidence(result) {
+    const path = String(result?.path || "unknown").toLowerCase();
+    const confidence = String(result?.routeConfidence || "unknown").toLowerCase();
+    if (path === "gateway") {
+      return confidence === "unknown"
+        ? "不确定（无法确认具体出口）"
+        : "规则推演（未实测具体出口）";
+    }
+    const labels = {
+      verified: "已验证 DNS 路径；不表示代理出口测速",
+      simulated: "规则推演（未进行网络实测）",
+      unknown: "不确定"
+    };
+    return labels[confidence] || labels.unknown;
+  }
+
+  function renderRouteDiagnostic(result) {
+    const target = $("#route-diagnostic-result");
+    empty(target);
+    const evidence = diagnosticEvidence(result);
+    const card = node("article", `diagnostic-card ${evidence.tone}`);
+    const heading = node("div", "diagnostic-heading");
+    heading.append(node("strong", "", safeString(result?.domain || "域名诊断", 253)));
+    heading.append(node("span", `status-pill ${evidence.tone}`, evidence.label));
+    card.append(heading);
+    card.append(node("p", "diagnostic-evidence", evidence.detail));
+
+    const details = node("dl", "diagnostic-details");
+    const rows = [
+      ["目标出口", result?.target ? ruleTargetLabel(String(result.target)) : "无法确定"],
+      ["判定路径", diagnosticPathLabel(result?.path)],
+      ["DNS 路径证据", diagnosticDnsEvidence(result)],
+      ["出口判定置信度", diagnosticRouteConfidence(result)],
+      ["判定理由", diagnosticReasonLabel(result?.reason)],
+      ["匹配规则", safeString(result?.ruleLabel || "未标明", 300)],
+    ];
+    rows.forEach(([label, value]) => {
+      details.append(node("dt", "", label));
+      details.append(node("dd", "", value));
+    });
+    card.append(details);
+    target.append(card);
+  }
+
+  async function diagnoseDomain(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const domain = $("#route-diagnostic-domain").value.trim().toLowerCase();
+    const resultTarget = $("#route-diagnostic-result");
+    if (!domain) return;
+    empty(resultTarget);
+    resultTarget.append(node("div", "loading-state", "正在诊断，尚未得出结论…"));
+    const button = $("button[type='submit']", form);
+    setButtonBusy(button, true, "诊断中…");
+    try {
+      const { data } = await api("/diagnostics/domain", {
+        method: "POST",
+        body: { domain }
+      });
+      renderRouteDiagnostic(data || { domain });
+    } catch (error) {
+      empty(resultTarget);
+      const failure = node("div", "diagnostic-unavailable");
+      failure.append(node("strong", "", "不确定"));
+      failure.append(node("span", "", errorMessage(error)));
+      resultTarget.append(failure);
+    } finally {
+      setButtonBusy(button, false);
     }
   }
 
@@ -1140,9 +1671,350 @@
     }
   }
 
+  function formatDateTime(value) {
+    if (value === null || value === undefined || value === "") return "时间未知";
+    let date;
+    if (typeof value === "number") {
+      date = new Date(value < 1e12 ? value * 1000 : value);
+    } else {
+      date = new Date(String(value));
+    }
+    if (Number.isNaN(date.getTime())) return safeString(value, 80);
+    return new Intl.DateTimeFormat("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    }).format(date);
+  }
+
+  function formatBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes < 0) return "大小未知";
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
+    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+    return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  }
+
+  function normalizeSnapshot(item) {
+    const id = safeString(item?.id || "", 96);
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$/.test(id)) return null;
+    return {
+      id,
+      createdAt: item?.createdAt,
+      size: Number(item?.size),
+      legacy: item?.legacy === true
+    };
+  }
+
+  function selectedSnapshot() {
+    const id = $("#rollback-snapshot").value;
+    return state.snapshots.find((item) => item.id === id);
+  }
+
+  function updateSnapshotDetail() {
+    const detail = $("#rollback-snapshot-detail");
+    const snapshot = selectedSnapshot();
+    if (!snapshot) {
+      detail.textContent = state.snapshots.length
+        ? "请选择一份精确快照。"
+        : "没有可回滚的本机快照。";
+      return;
+    }
+    detail.textContent = `${formatDateTime(snapshot.createdAt)} · ${formatBytes(snapshot.size)}${
+      snapshot.legacy ? " · 旧版快照" : ""
+    } · 稳定 ID：${snapshot.id}`;
+  }
+
+  function renderSnapshots(message = "") {
+    const select = $("#rollback-snapshot");
+    empty(select);
+    if (!state.snapshots.length) {
+      const option = node("option", "", message || "没有可用快照");
+      option.value = "";
+      select.append(option);
+      select.disabled = true;
+      updateSnapshotDetail();
+      setMaintenanceControls();
+      return;
+    }
+    state.snapshots.forEach((snapshot, index) => {
+      const option = node("option", "", `${formatDateTime(snapshot.createdAt)} · ${
+        formatBytes(snapshot.size)
+      }${snapshot.legacy ? " · 旧版" : ""}`);
+      option.value = snapshot.id;
+      option.selected = index === 0;
+      select.append(option);
+    });
+    select.disabled = false;
+    updateSnapshotDetail();
+    setMaintenanceControls();
+  }
+
+  async function loadSnapshots() {
+    const { data } = await api("/snapshots");
+    state.snapshots = (Array.isArray(data?.items) ? data.items : [])
+      .slice(0, 100)
+      .map(normalizeSnapshot)
+      .filter(Boolean);
+    renderSnapshots();
+  }
+
+  function normalizeMaintenanceStatus(value) {
+    const status = String(value || "").toLowerCase();
+    if (["queued", "pending", "accepted", "waiting"].includes(status)) return "queued";
+    if (["running", "active", "activating", "started"].includes(status)) return "running";
+    if (["succeeded", "success", "completed", "complete", "done"].includes(status)) {
+      return "succeeded";
+    }
+    if (["failed", "failure", "error"].includes(status)) return "failed";
+    if (["interrupted", "cancelled", "canceled", "aborted"].includes(status)) {
+      return "interrupted";
+    }
+    return "unknown";
+  }
+
+  function normalizeMaintenanceJob(item, fallbackOperation = "") {
+    const id = safeString(item?.id || "", 64);
+    if (!/^[0-9]{8}[Tt][0-9]{6}[Zz]-[a-f0-9]{12}$/.test(id)) return null;
+    return {
+      id,
+      operation: safeString(
+        item?.operation || item?.action || item?.kind || fallbackOperation || "maintenance",
+        40
+      ),
+      status: normalizeMaintenanceStatus(item?.status || item?.state),
+      requestedAt: item?.requestedAt ?? item?.createdAt,
+      startedAt: item?.startedAt,
+      finishedAt: item?.finishedAt,
+      snapshotId: safeString(item?.snapshotId || "", 96),
+      target: safeString(item?.target || "", 96)
+    };
+  }
+
+  function maintenanceOperationLabel(operation) {
+    const labels = {
+      rollback: "回滚快照",
+      "software-update": "软件升级",
+      update: "软件升级",
+      snapshot: "创建快照"
+    };
+    return labels[operation] || "维护操作";
+  }
+
+  function maintenanceStatusView(status) {
+    const views = {
+      queued: { label: "已排队", tone: "neutral", detail: "任务尚未完成" },
+      running: { label: "执行中", tone: "warn", detail: "服务或本页面可能短暂断开" },
+      succeeded: { label: "成功", tone: "good", detail: "任务已由后台确认完成" },
+      failed: { label: "失败", tone: "bad", detail: "任务未成功；请运行自检后再处理" },
+      interrupted: { label: "已中断", tone: "bad", detail: "任务状态未能完整收尾；请运行自检" },
+      unknown: { label: "待确认", tone: "neutral", detail: "服务器尚未提供可确认的最终状态" }
+    };
+    return views[status] || views.unknown;
+  }
+
+  function hasActiveMaintenanceJob() {
+    return state.maintenanceJobs.some((job) => ["queued", "running"].includes(job.status));
+  }
+
+  function setMaintenanceControls() {
+    const unavailable = state.maintenancePollDisconnected || hasActiveMaintenanceJob();
+    $$("[data-operation], [data-maintenance-control]").forEach((control) => {
+      control.disabled = unavailable;
+      if (unavailable) {
+        control.title = state.maintenancePollDisconnected
+          ? "维护任务状态暂时无法确认"
+          : "已有维护任务正在执行";
+      } else {
+        control.removeAttribute("title");
+      }
+    });
+    const select = $("#rollback-snapshot");
+    select.disabled = unavailable || !state.snapshots.length;
+    const rollbackButton = $("button[type='submit']", $("#rollback-form"));
+    rollbackButton.disabled = unavailable || !selectedSnapshot();
+  }
+
+  function renderMaintenanceJobs() {
+    const target = $("#maintenance-job-list");
+    const health = $("#maintenance-job-health");
+    empty(target);
+    if (state.maintenancePollDisconnected) {
+      health.className = "status-pill warn";
+      health.textContent = "状态待确认";
+      const note = node("div", "job-connection-note");
+      note.append(node("strong", "", "暂时无法刷新任务"));
+      note.append(node("span", "", "网络恢复或重新登录后会继续查询；现有任务不会被误判为失败。"));
+      target.append(note);
+    } else if (hasActiveMaintenanceJob()) {
+      health.className = "status-pill warn";
+      health.textContent = "任务执行中";
+    } else {
+      health.className = "status-pill good";
+      health.textContent = "无活动任务";
+    }
+    if (!state.maintenanceJobs.length) {
+      target.append(node("div", "empty-state", "暂无维护任务记录"));
+      setMaintenanceControls();
+      return;
+    }
+    state.maintenanceJobs.slice(0, 20).forEach((job) => {
+      const view = maintenanceStatusView(job.status);
+      const card = node("article", "job-card");
+      card.dataset.jobId = job.id;
+      const heading = node("div", "job-card-heading");
+      heading.append(node("strong", "", maintenanceOperationLabel(job.operation)));
+      heading.append(node("span", `status-pill ${view.tone}`, view.label));
+      card.append(heading);
+      const targetText = job.snapshotId
+        ? `快照 ${job.snapshotId}`
+        : (job.target ? `目标 ${job.target}` : `任务 ${job.id}`);
+      card.append(node("span", "job-card-target", targetText));
+      card.append(node("span", "job-card-detail", view.detail));
+      const times = node("span", "job-card-time", `提交：${formatDateTime(job.requestedAt)}`);
+      if (job.finishedAt) {
+        times.textContent += ` · 完成：${formatDateTime(job.finishedAt)}`;
+      } else if (job.startedAt) {
+        times.textContent += ` · 开始：${formatDateTime(job.startedAt)}`;
+      }
+      card.append(times);
+      target.append(card);
+    });
+    setMaintenanceControls();
+  }
+
+  function mergeMaintenanceJob(job) {
+    const index = state.maintenanceJobs.findIndex((item) => item.id === job.id);
+    if (index >= 0) {
+      state.maintenanceJobs[index] = job;
+    } else {
+      state.maintenanceJobs.unshift(job);
+    }
+    state.maintenanceJobs = state.maintenanceJobs.slice(0, 20);
+  }
+
+  function announceMaintenanceResult(job) {
+    if (!state.trackedMaintenanceJobs.has(job.id)) return;
+    if (!["succeeded", "failed", "interrupted"].includes(job.status)) return;
+    state.trackedMaintenanceJobs.delete(job.id);
+    const label = maintenanceOperationLabel(job.operation);
+    if (job.status === "succeeded") {
+      const message = `${label}已由后台确认成功`;
+      showOperationResult(message, true);
+      toast(message, "good");
+      if (job.operation === "rollback") loadSnapshots().catch(() => {});
+      return;
+    }
+    const message = job.status === "interrupted"
+      ? `${label}被中断，结果不确定；请运行自检`
+      : `${label}未成功；请运行自检后再处理`;
+    showOperationResult(message, false);
+    toast(message, "bad");
+  }
+
+  function stopMaintenancePolling() {
+    if (state.maintenancePollTimer) window.clearTimeout(state.maintenancePollTimer);
+    state.maintenancePollTimer = 0;
+  }
+
+  function scheduleMaintenancePolling(delay = 3500) {
+    stopMaintenancePolling();
+    if ($("#app-view").hidden) return;
+    if (!hasActiveMaintenanceJob() && !state.maintenancePollDisconnected) return;
+    state.maintenancePollTimer = window.setTimeout(pollMaintenanceJobs, delay);
+  }
+
+  async function pollMaintenanceJobs() {
+    state.maintenancePollTimer = 0;
+    if ($("#app-view").hidden) return;
+    const active = state.maintenanceJobs.filter((job) =>
+      ["queued", "running"].includes(job.status)
+    );
+    if (!active.length) {
+      await loadMaintenanceJobs({ silent: true });
+      return;
+    }
+    const results = await Promise.allSettled(active.map((job) =>
+      api(`/jobs/${encodeURIComponent(job.id)}`)
+    ));
+    let disconnected = false;
+    results.forEach((result, index) => {
+      if (result.status !== "fulfilled") {
+        disconnected = true;
+        return;
+      }
+      const job = normalizeMaintenanceJob(
+        result.value.data,
+        active[index].operation
+      );
+      if (!job) {
+        disconnected = true;
+        return;
+      }
+      mergeMaintenanceJob(job);
+      announceMaintenanceResult(job);
+    });
+    state.maintenancePollDisconnected = disconnected;
+    renderMaintenanceJobs();
+    scheduleMaintenancePolling(disconnected ? 8000 : 3500);
+  }
+
+  async function loadMaintenanceJobs(options = {}) {
+    try {
+      const { data } = await api("/jobs");
+      const jobs = (Array.isArray(data?.items) ? data.items : [])
+        .slice(0, 20)
+        .map((item) => normalizeMaintenanceJob(item))
+        .filter(Boolean);
+      state.maintenanceJobs = jobs;
+      jobs.filter((job) => ["queued", "running"].includes(job.status))
+        .forEach((job) => state.trackedMaintenanceJobs.add(job.id));
+      state.maintenancePollDisconnected = false;
+      renderMaintenanceJobs();
+      scheduleMaintenancePolling();
+    } catch (error) {
+      state.maintenancePollDisconnected = true;
+      renderMaintenanceJobs();
+      scheduleMaintenancePolling(8000);
+      if (!options.silent && !(error instanceof ApiError && error.status === 401)) {
+        toast(errorMessage(error), "bad");
+      }
+    }
+  }
+
+  function registerMaintenanceJob(item, fallbackOperation) {
+    const job = normalizeMaintenanceJob(item, fallbackOperation);
+    if (!job) {
+      loadMaintenanceJobs({ silent: true });
+      return null;
+    }
+    mergeMaintenanceJob(job);
+    if (["queued", "running"].includes(job.status)) {
+      state.trackedMaintenanceJobs.add(job.id);
+    }
+    state.maintenancePollDisconnected = false;
+    renderMaintenanceJobs();
+    scheduleMaintenancePolling(1500);
+    return job;
+  }
+
   async function loadSettings() {
-    const { data } = await api("/settings");
-    const settings = data || {};
+    const [settingsResult, snapshotResult] = await Promise.allSettled([
+      api("/settings"),
+      loadSnapshots()
+    ]);
+    if (settingsResult.status !== "fulfilled") throw settingsResult.reason;
+    if (snapshotResult.status !== "fulfilled") {
+      state.snapshots = [];
+      renderSnapshots("快照清单暂时不可用");
+    }
+    await loadMaintenanceJobs({ silent: true });
+    const settings = settingsResult.value.data || {};
     renderKeyValues($("#settings-summary"), {
       hijack_mode: settings.hijack_mode,
       quic_mode: settings.quic_mode,
@@ -1200,15 +2072,26 @@
     showOperationResult(details?.pending || "正在执行操作…", true);
     try {
       const result = await api(`/actions/${name}`, { method: "POST", body });
-      showOperationResult(result.message || "操作已提交并完成", true);
-      toast(result.message || "操作已完成", "good");
+      const job = result.data?.job
+        ? registerMaintenanceJob(result.data.job, name)
+        : null;
+      if (job && ["queued", "running", "unknown"].includes(job.status)) {
+        const message = `${maintenanceOperationLabel(job.operation)}任务已提交，尚未确认完成`;
+        showOperationResult(message, true);
+        toast(message, "good");
+      } else {
+        showOperationResult(result.message || "操作已提交并完成", true);
+        toast(result.message || "操作已完成", "good");
+      }
       if (name === "restart" || name === "rules-update") await loadOverview();
+      if (name === "snapshot" && !job) await loadSnapshots();
     } catch (error) {
       const message = errorMessage(error);
       showOperationResult(message, false);
       toast(message, "bad");
     } finally {
       setButtonBusy(sourceButton, false);
+      setMaintenanceControls();
     }
   }
 
@@ -1225,32 +2108,47 @@
 
   async function rollback(event) {
     event.preventDefault();
-    const index = Number($("#rollback-index").value);
-    if (!Number.isInteger(index) || index < 0) {
-      toast("快照序号必须是大于或等于 0 的整数", "bad");
+    const snapshot = selectedSnapshot();
+    if (!snapshot) {
+      toast("请选择清单中的一份精确快照", "bad");
       return;
     }
     const confirmed = await confirmAction(
       "回滚本机快照",
-      `即将回滚到序号 ${index} 的快照，当前受管配置和服务状态会被覆盖，连接可能中断。`,
+      `即将回滚到 ${formatDateTime(snapshot.createdAt)} 的快照（稳定 ID：${snapshot.id}）。当前受管配置和服务状态会被覆盖，连接可能中断。`,
       "确认回滚",
       "danger"
     );
     if (!confirmed) return;
     const button = $("button[type='submit']", event.currentTarget);
-    setButtonBusy(button, true, "正在回滚…");
-    showOperationResult(`正在回滚快照 ${index}…`, true);
+    setButtonBusy(button, true, "正在启动…");
+    showOperationResult(`正在提交快照 ${snapshot.id} 的精确回滚任务…`, true);
     try {
-      await api("/actions/rollback", { method: "POST", body: { index } });
-      const message = "回滚任务已启动，连接可能中断";
+      const result = await api("/actions/rollback", {
+        method: "POST",
+        body: { snapshotId: snapshot.id, confirm: true }
+      });
+      const job = registerMaintenanceJob(result.data?.job, "rollback");
+      const message = job
+        ? "回滚任务已提交，尚未确认完成；连接可能中断"
+        : "回滚启动请求已接受，正在查询后台任务状态";
       showOperationResult(message, true);
       toast(message, "good");
+      if (!job) await loadMaintenanceJobs({ silent: true });
     } catch (error) {
-      const message = errorMessage(error);
-      showOperationResult(message, false);
-      toast(message, "bad");
+      if (error instanceof ApiError && error.code === "network_error") {
+        const message = "连接在启动响应前中断，回滚是否开始尚待确认；正在查询最近任务";
+        showOperationResult(message, true);
+        toast(message, "neutral");
+        await loadMaintenanceJobs({ silent: true });
+      } else {
+        const message = errorMessage(error);
+        showOperationResult(message, false);
+        toast(message, "bad");
+      }
     } finally {
       setButtonBusy(button, false);
+      setMaintenanceControls();
     }
   }
 
@@ -1266,17 +2164,30 @@
     setButtonBusy(button, true, "正在启动升级…");
     showOperationResult("正在检查可用发布版本并启动升级…", true);
     try {
-      await api("/actions/software-update", {
+      const result = await api("/actions/software-update", {
         method: "POST", body: { confirm: true }
       });
-      const message = "升级任务已启动，连接可能中断；请稍后重新登录核验";
+      const job = registerMaintenanceJob(result.data?.job, "software-update");
+      const message = job
+        ? "升级任务已提交，尚未确认完成；连接中断后请重新登录查看任务"
+        : "升级启动请求已接受，正在查询后台任务状态";
       showOperationResult(message, true);
       toast(message, "good");
+      if (!job) await loadMaintenanceJobs({ silent: true });
     } catch (error) {
-      const message = errorMessage(error);
-      showOperationResult(message, false);
-      toast(message, "bad");
+      if (error instanceof ApiError && error.code === "network_error") {
+        const message = "连接在启动响应前中断，升级是否开始尚待确认；重新登录后会继续查询";
+        showOperationResult(message, true);
+        toast(message, "neutral");
+        await loadMaintenanceJobs({ silent: true });
+      } else {
+        const message = errorMessage(error);
+        showOperationResult(message, false);
+        toast(message, "bad");
+      }
+    } finally {
       setButtonBusy(button, false);
+      setMaintenanceControls();
     }
   }
 
@@ -1313,7 +2224,14 @@
     });
     $("#refresh-button").addEventListener("click", () => loadTab(state.activeTab));
     $("#exit-form").addEventListener("submit", addExit);
+    $("#test-exits").addEventListener("click", testExits);
     $("#exit-list").addEventListener("click", handleExitAction);
+    $("#replace-exit-form").addEventListener("submit", replaceExit);
+    $("[data-action='cancel-replace-exit']").addEventListener("click", cancelReplaceExit);
+    $("#replace-exit-dialog").addEventListener("close", () => {
+      $("#replace-exit-link").value = "";
+      state.replaceExitTag = "";
+    });
     $("#exit-order").addEventListener("click", moveExitOrder);
     $("#save-order").addEventListener("click", saveExitOrder);
     $("#default-exit-form").addEventListener("submit", saveDefaultExit);
@@ -1323,17 +2241,23 @@
     $("#rule-list").addEventListener("click", handleRuleAction);
     $("#ruleset-form").addEventListener("submit", addRuleset);
     $("#ruleset-list").addEventListener("click", handleRulesetAction);
+    $("#route-diagnostic-form").addEventListener("submit", diagnoseDomain);
     $("#dns-remote-form").addEventListener("submit", (event) => saveDns(event, "remote"));
     $("#dns-local-form").addEventListener("submit", (event) => saveDns(event, "local"));
     $("#runtime-refresh").addEventListener("click", loadRuntime);
     $("#log-lines").addEventListener("change", loadRuntime);
     $("#tfo-form").addEventListener("submit", saveTfo);
     $("#panel-ops").addEventListener("click", handleOperationButton);
+    $("#rollback-snapshot").addEventListener("change", () => {
+      updateSnapshotDetail();
+      setMaintenanceControls();
+    });
     $("#rollback-form").addEventListener("submit", rollback);
     $("#software-update").addEventListener("click", softwareUpdate);
 
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && state.activeTab === "runtime") loadRuntime();
+      if (!document.hidden && hasActiveMaintenanceJob()) scheduleMaintenancePolling(250);
     });
     window.setInterval(() => {
       updateSessionLabel();

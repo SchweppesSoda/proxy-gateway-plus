@@ -2,8 +2,33 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
-## 2026-07-28 — 未发布（MosDNS DoT 禁用 TLS 会话恢复）
+## 2026-07-29 — 未发布（DoT 兼容、Web 控制台与 JP 规范化）
 
+- 默认 direct-type 出口的底层 tag 统一为大写 `JP`。旧模型只在存在唯一、精确的旧默认
+  `jp` 锚点时迁移，并在同一锁内候选事务中级联分流规则、故障组、`route.final`、规则集
+  元数据和派生 Mihomo 配置；候选校验、重启或稳定门失败会恢复 before-image。恢复旧备份
+  时也在 pdgtx 候选阶段完成同一转换；自定义 direct tag 不猜测改名，`JP` 冲突则 fail closed。
+- WDA 不再硬编码 `jp`：开启时只使用当前模型唯一的 direct-type 锚点；缺失或不唯一时拒绝
+  猜测目标，关闭 WDA 仍可安全移除旧规则。Mihomo 继续按出站类型把该锚点映射到内建
+  `DIRECT`，手机 literal `direct` 的本地直连语义不变。
+- Web 概览自检改为结构化健康摘要，分别展示失败、警告和正常检查项，并优化窄屏排版；
+  出口名对旧服务器载荷中的 `jp` 仍做显示兼容，新模型与写回值均为 `JP`。
+- Web 规则集列表支持事务化修改已有 target；literal `direct` 明确表示手机取得真实 DNS 后
+  本地直连、不经过 VPS，direct-type `JP` 则表示流量先到 VPS 再本机直出。普通节点连接参数
+  可原位替换，保留 tag、顺序及规则/组引用，不再要求删除重建。
+- Web 出口延迟改由 Mihomo Clash API 探测；域名诊断将 DNS 实测和出口规则推演分层呈现，
+  不把网关出口的配置推演伪装成真实数据包验证。可展开、目标非 literal-direct 的 source
+  规则集域名项同步聚合到 `ruleset_hijack.txt`，并在国内直连判断前强制劫持；二进制 `.mrs`
+  不做 DNS 展开也不猜测，可能命中时诊断明确返回未知。
+- Web 回滚按带随机后缀的稳定快照 ID 精确选择；回滚与软件更新改为 root-only 持久异步任务，
+  浏览器断连后可重连查看状态，且同一时间只运行一个维护任务。软件更新任务在执行时调用
+  `pdg update`、跟随届时最新发布版，并不锁定提交任务时预检到的 tag。
+- 配置回滚在恢复 live nft/profile 后，会显式 enable 并 restart 恢复前为 active/exited 的
+  `pdg-quic-routing` oneshot，再运行 helper status 验证路由状态；任一步失败都报告未完全
+  回滚，不再只凭 unit 为 active 就判定成功。
+- 修正规则集事务对 Mihomo `.mrs` 的格式校验：先验证完整 Zstandard 帧，再读取解压后的
+  `MRS` 版本与 domain/ipcidr behavior；不再错误地要求压缩字节中出现明文 `MRS`，损坏帧、
+  未知版本/类型或缺少严格校验工具时仍 fail closed。
 - MosDNS 保持官方 v5.3.4 源码 pin，但生产二进制改为可跟踪的
   `v5.3.4-pdg-notickets.1` flavor；`tcp_server` 的 `tls.Config` 设置
   `SessionTicketsDisabled=true`。stock v5.3.4 即使版本字符串相同也会被安装、更新与
