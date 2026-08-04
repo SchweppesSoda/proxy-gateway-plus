@@ -1722,13 +1722,13 @@ _PDG_SNAP_CREATED=""
 cmd_snapshot(){
   need_root snapshot; _lock
   _PDG_SNAP_CREATED=""
-  local ts d="" suffix attempt
+  local ts d="" suffix
   ts=$(date +%Y%m%d-%H%M%S)
   install -d -m700 "$SNAP_DIR" || {
     c_y "❌ 快照根目录不可用"; return 1; }
   # 时间戳便于人读，随机后缀让同一秒内并发/连续创建也有稳定、不可猜错的目录 ID。
   # mkdir 的排他创建很重要；install -d 遇到同名目录会成功，反而可能覆盖旧快照。
-  for attempt in {1..10}; do
+  for _ in {1..10}; do
     suffix="$(python3 -c 'import secrets; print(secrets.token_hex(4))')" || {
       c_y "❌ 无法生成快照 ID"; return 1; }
     d="$SNAP_DIR/$ts-$suffix"

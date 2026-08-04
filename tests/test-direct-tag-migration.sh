@@ -98,7 +98,7 @@ PDG_BOT_PY="$WORK/runtime/bot.py"
 export PDG_SB_MODEL PDG_MIHOMO_CFG PDG_RS_META PDG_STATE_DIR PDG_BOT_PY
 
 reset_tree(){
-  rm -rf "$WORK/etc" "$WORK/opt" "$WORK/state"
+  rm -rf "${WORK:?}/etc" "${WORK:?}/opt" "${WORK:?}/state"
   mkdir -p "$(dirname "$PDG_SB_MODEL")" "$(dirname "$PDG_MIHOMO_CFG")" \
            "$(dirname "$PDG_RS_META")" "$PDG_STATE_DIR"
   cat >"$PDG_SB_MODEL" <<'JSON'

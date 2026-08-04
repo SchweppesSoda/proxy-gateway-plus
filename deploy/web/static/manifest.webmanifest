@@ -1,7 +1,7 @@
 {
-  "name": "PDG 控制台",
-  "short_name": "PDG",
-  "description": "PrivDNS Gateway 原生管理控制台",
+  "name": "私有 DNS 网关",
+  "short_name": "私有 DNS 网关",
+  "description": "私有 DNS 网关管理页面",
   "lang": "zh-CN",
   "dir": "ltr",
   "id": "/",
