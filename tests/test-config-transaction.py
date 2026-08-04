@@ -54,6 +54,11 @@ def _isolate_bot_runtime(bot, box):
     )
     box.put("/etc/privdns-gateway/backend", b"mihomo\n", 0o644)
     box.put("/etc/privdns-gateway/platform", b"android\n", 0o644)
+    box.put(
+        "/etc/mosdns/config.yaml",
+        (ROOT / "deploy" / "mosdns" / "config.yaml").read_bytes(),
+        0o644,
+    )
     bot.PROFILE_ENV = profile
     bot.BACKEND_MARKER = box.path("/etc/privdns-gateway/backend")
     # _platform currently has no path constant, so replace that read seam directly.
