@@ -81,9 +81,6 @@ def setup(tmp):
     os.environ["PDG_TX_ROOT"] = tmp + "/var/lib/privdns-gateway/tx"
     os.environ["PDG_LOCKFILE"] = tmp + "/run/pdg.lock"
     os.environ["PDG_STABLE_SAMPLES"] = "1"
-    for m in list(sys.modules):
-        if m.startswith("pdgtx"):
-            del sys.modules[m]
     bot.SB = tmp + "/etc/sing-box/config.json"
     bot.RS_DIR = tmp + "/etc/sing-box/rs"
     bot.RS_META = tmp + "/opt/pdg-bot/rulesets.json"
@@ -96,11 +93,11 @@ def setup(tmp):
         json.dump(SAMPLE, f)
     with open(bot.BACKEND_MARKER, "w") as f:
         f.write("mihomo")
+    shutil.copyfile(ROOT / "deploy" / "mosdns" / "config.yaml", tmp + "/etc/mosdns/config.yaml")
     fake = FakeSh()
     bot.sh = fake
-    sys.path.insert(0, str(ROOT / "deploy" / "bot"))
-    import importlib
-    tx = importlib.import_module("pdgtx")
+    bot._PDGTX_MODULE = None
+    tx = bot._pdgtx()
     tx.svc_stable = lambda unit, **k: (True, "")            # 服务动力学由事务专属用例覆盖
     tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
     # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。
