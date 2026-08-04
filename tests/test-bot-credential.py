@@ -11,7 +11,6 @@ import importlib.util
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -189,12 +188,8 @@ bot.MIHOMO_DIR = _sbroot + "/etc/mihomo"; bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/co
 bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
 _json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, open(bot.SB, "w"))
 bot.apply_sb = _REAL_APPLY_SB
-sys.path.insert(0, str(ROOT / "deploy" / "bot"))
-import importlib
-for _m in list(sys.modules):
-    if _m.startswith("pdgtx"):
-        del sys.modules[_m]
-_tx = importlib.import_module("pdgtx")
+bot._PDGTX_MODULE = None
+_tx = bot._pdgtx()
 _tx.svc_stable = lambda unit, **k: (True, "")
 _tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}
 # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。
@@ -232,9 +227,7 @@ os.environ["PDG_TX_ROOT"] = _lkroot + "/var/lib/privdns-gateway/tx"
 os.environ["PDG_LOCKFILE"] = tmp.name
 bot.SB = _lkroot + "/etc/sing-box/config.json"
 _json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, open(bot.SB, "w"))
-for _m in list(sys.modules):
-    if _m.startswith("pdgtx"):
-        del sys.modules[_m]
+bot._PDGTX_MODULE = None
 holder = subprocess.Popen(["flock", "-x", tmp.name, "-c", "sleep 3"])
 time.sleep(0.4)
 with bot._cfg_guard() as got:
