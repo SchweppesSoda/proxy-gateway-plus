@@ -29,3 +29,15 @@ grep -q 'merge-base 判断失败' "$ROOT/deploy/bot/pdg-bot.py" \
 
 ! grep -q '1\.12\.9' "$ROOT/docs/INSTALL.md" \
   || fail "INSTALL.md must not mention stale sing-box 1.12.9"
+
+for doc in \
+  "$ROOT/README.md" \
+  "$ROOT/docs/INSTALL.md" \
+  "$ROOT/docs/QUICKSTART.md" \
+  "$ROOT/docs/MOSDNS-PATCHED-BUILD.md" \
+  "$ROOT/docs/forum-post.md"; do
+  ! grep -q '派生仓库目前还没有兼容' "$doc" \
+    || fail "$(basename "$doc") must not claim that no compatible Release exists"
+  ! grep -Eq '^[[:space:]]*(sudo[[:space:]]+)?(env[[:space:]]+)?PDG_TAG_BOOTSTRAPPED=1([[:space:]\\]|$)' "$doc" \
+    || fail "$(basename "$doc") must not instruct formal installs to bypass release tags"
+done

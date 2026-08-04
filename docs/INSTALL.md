@@ -18,17 +18,19 @@
 
 ## 2. 跑安装
 
-派生仓库目前还没有兼容的 `v*` 发布 tag。首次派生版本发布前,请克隆当前默认分支并
-显式跳过发布 tag 自举:
+仓库已有兼容的 `v*` Release。克隆仓库后运行标准入口；安装器会自动切换到最新正式
+发布 tag，不安装 `main` 上尚未发布的中间提交：
 
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
 cd proxy-gateway-plus
-sudo PDG_TAG_BOOTSTRAPPED=1 ./install.sh
+sudo env \
+  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
+  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
+  ./install.sh
 ```
 
-`PDG_TAG_BOOTSTRAPPED=1` 只用于这段首次发布前的开发验证。创建首个派生 `v*` tag 后,
-标准入口脚本会自动切到最新发布 tag,不安装 main 上未发布的中间提交。
+正式安装不得用 `PDG_TAG_BOOTSTRAPPED=1` 绕过发布 tag 校验。
 
 > MosDNS 使用 v5.3.4 no-session-ticket 修补 flavor。当前没有自有长期 release asset，
 > 所以还须先在本机/KFC 构建并通过 `PDG_MOSDNS_ARTIFACT` 与显式 SHA256 交给安装器；

@@ -58,13 +58,12 @@ artifact。Actions artifact 不是长期安装源，不能把临时下载 URL �
 `/root/pdg-artifacts/mosdns-v5.3.4-pdg-notickets.1-linux-amd64`。从构建机的 `.sha256`
 独立复制哈希，不在目标机下载后“现算现信”。
 
-全新安装：
+全新正式安装（标准入口会自动切换到最新 `v*` Release）：
 
 ```bash
 sudo env \
   PDG_MOSDNS_ARTIFACT=/root/pdg-artifacts/mosdns-v5.3.4-pdg-notickets.1-linux-amd64 \
   PDG_MOSDNS_ARTIFACT_SHA256=<构建机记录的64位SHA256> \
-  PDG_TAG_BOOTSTRAPPED=1 \
   ./install.sh
 ```
 

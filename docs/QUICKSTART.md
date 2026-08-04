@@ -70,17 +70,20 @@ VPS 用的是 **kfchost** — 官网:<https://kfchost.com/center/> · 邀请注�
 
 ## 4. 一键安装
 
-派生仓库目前还没有兼容的 `v*` 发布 tag。SSH 登录 VPS 后,克隆当前默认分支并显式
-跳过发布 tag 自举:
+仓库已有兼容的 `v*` Release。SSH 登录 VPS 后克隆仓库，标准入口会自动切换到最新正式
+发布 tag，不安装 `main` 上尚未发布的中间提交：
 
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
 cd proxy-gateway-plus
-sudo PDG_TAG_BOOTSTRAPPED=1 ./install.sh
+sudo env \
+  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
+  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
+  ./install.sh
 ```
 
-> `PDG_TAG_BOOTSTRAPPED=1` 只用于首次派生版本发布前的开发验证。首个派生 `v*` tag
-> 创建后,标准安装入口会恢复为“自举并切到最新发布 tag”。
+> MosDNS 修补产物必须先按 [构建与部署说明](MOSDNS-PATCHED-BUILD.md) 在可信构建机准备并
+> 校验，正式安装不得使用 `PDG_TAG_BOOTSTRAPPED=1` 绕过发布 tag。
 
 过程中它会:**①** 自动检测公网 IP、SSH 端口、内网卡来源段(抓包识别,期间用手机走这张 SIM 访问一次本机);**②** 让你填 bot token / 你的 user id / DoT 域名(token 可留空,装完再设);**③** 确认 A 记录生效后自动签 Let's Encrypt 证书,起服务、应用防火墙。
 

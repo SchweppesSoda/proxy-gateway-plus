@@ -2,6 +2,14 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## Unreleased
+
+- 新增维护者侧 `tools/deploy-release.sh`：只通过本机私有 SSH alias 定位线上 PDG，先验证
+  远端 PDG 身份和预期 GitHub 仓库 origin，再固定执行更新预检、事务化更新、精确发布 tag、
+  核心服务状态和 `pdg doctor --deep`。默认 alias 为 `kfc-pdg`，仓库不保存真实 IP、端口或密钥路径。
+- CI 增加部署入口的隔离回归，覆盖安全执行顺序、非法 alias、非 PDG 目标和发布版本不符的
+  fail-closed 行为；安装文档同步切换到已有 `v*` Release 的标准 tag 自举流程。
+
 ## 2026-08-04 — v1.6.4（DoT 兼容、Web 管理与 JP 规范化）
 
 - Web 品牌英文名统一为 `PRIVATE DNS GATEWAY`，中文名、登录标题、浏览器标题与安装应用名

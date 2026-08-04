@@ -60,8 +60,8 @@ MosDNS
 
 ## 4. 安装
 
-Debian 12+ / Ubuntu 22+，需要 root。派生仓库目前还没有兼容的 `v*` 发布 tag；
-首次派生版本发布前，请克隆当前默认分支并显式跳过发布 tag 自举：
+Debian 12+ / Ubuntu 22+，需要 root。仓库已有兼容的 `v*` Release；标准入口会自动切换到
+最新正式发布 tag，不安装 `main` 上尚未发布的中间提交：
 
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
@@ -69,12 +69,10 @@ cd proxy-gateway-plus
 sudo env \
   PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
   PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  PDG_TAG_BOOTSTRAPPED=1 \
   ./install.sh
 ```
 
-`PDG_TAG_BOOTSTRAPPED=1` 只用于这段首次发布前的开发验证。创建首个派生 `v*` tag 后，
-标准入口脚本会自动切到最新发布 tag，不安装 main 上未发布的中间提交。
+`PDG_TAG_BOOTSTRAPPED=1` 只保留给首次派生发布前的隔离开发验证，正式安装不得使用。
 
 MosDNS 使用本项目的 v5.3.4 no-session-ticket 修补 flavor，stock v5.3.4 不会被接受。
 当前尚未发布自有长期 release asset；开发部署须先在可信构建机上可复现构建 raw binary，
@@ -345,6 +343,17 @@ Mihomo / nft 模板复制进本仓库；使用 `PDG_FIREWALL_MODE=external` 时�
 按所选端口和可信 CIDR 声明 service interface；直连入口要求
 `PDG_FIREWALL_MODE=external`，仓库不会假定或硬编码一个公网管理端口。`managed` 模式的
 默认支持路径是 loopback + SSH 隧道。
+
+本 fork 另提供一个不保存机器 inventory 的维护者侧薄封装，用于把已经创建的 Release 落到
+线上 PDG。它只引用维护者 `~/.ssh/config` 中的私有 alias，默认 `kfc-pdg`，并在更新前核验
+远端 PDG 身份及仓库 origin，避免把构建机、测试机或其他 fork 认成线上实例：
+
+```bash
+PDG_EXPECTED_VERSION=vX.Y.Z bash tools/deploy-release.sh
+```
+
+脚本依次执行只读预检、事务化 `pdg update`、精确发布 tag、核心服务状态和
+`pdg doctor --deep`；真实 IP、SSH 端口和密钥路径仍不进入仓库。
 
 ## 13. 文档
 

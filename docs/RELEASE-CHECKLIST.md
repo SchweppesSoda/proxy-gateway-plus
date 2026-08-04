@@ -3,8 +3,8 @@
 打 `v*` tag 前,在**一台 throwaway 机**(全新 Debian 12/13 或 Ubuntu 22/24)上把下面场景跑一遍。
 单元测试(`tests/`)覆盖不到"装机 / 升级 / sing-box→mihomo 迁移"这类集成问题——本清单专门抓它们。
 
-首次派生发布还要先创建并验证兼容的 `v*` tag,再把安装文档中的
-`PDG_TAG_BOOTSTRAPPED=1` 临时步骤替换为标准自举入口并实际验证。
+首次派生发布还要先创建并验证兼容的 `v*` tag；正式发布后安装文档必须使用标准 tag
+自举入口，不能保留 `PDG_TAG_BOOTSTRAPPED=1` 开发绕过步骤。
 
 > 本清单是照着真实翻过的车写的:v1.5.1(WLOC 开着时 `pdg update` 误回滚)、v1.5.2(从 v1.4.x 升级漏装 `sb2mihomo`/`mitm_*` → switch-core 报 ModuleNotFoundError)、v1.5.5(切 mihomo 后 TG 代理 :8445 没渲染)。这几个单测全绿、却都是部署才炸。
 
@@ -94,7 +94,21 @@ bash uninstall.sh --purge
 
 所有场景都过,再:
 ```bash
-git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin HEAD:main && git push origin vX.Y.Z
-gh release create vX.Y.Z --latest --title "vX.Y.Z" --notes ""   # 标题只写版本号, 正文留空
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin HEAD:main
+git push origin vX.Y.Z
+gh release create vX.Y.Z --latest --title "vX.Y.Z" --notes ""
 ```
-两台线上 `pdg update`,各 `pdg doctor --deep` 收尾。
+
+Release 发布成功后，从维护者本机使用私有 SSH alias 部署。当前 fork 的默认线上 alias 为
+`kfc-pdg`；真实 IP、端口和 IdentityFile 只写在 `~/.ssh/config`，绝不进入仓库：
+
+```bash
+PDG_EXPECTED_VERSION=vX.Y.Z bash tools/deploy-release.sh
+```
+
+多台线上实例可把 alias 依次写在命令末尾。该入口会先验证远端同时存在
+`/usr/local/bin/pdg`、`/opt/privdns-gateway`，且仓库 origin 为当前 GitHub fork，因此构建机、
+测试机、普通代理机或其他 fork 不会被误当成线上 PDG；随后固定执行
+`update --dry-run`、事务化更新、精确 tag、四项服务和
+`pdg doctor --deep` 核验。任一步失败立即停止，不继续部署下一台。

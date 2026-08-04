@@ -23,7 +23,7 @@ jobs:
         run: |
           bash -n install.sh uninstall.sh \
             deploy/bot/*.sh deploy/cert/*.sh deploy/firewall/*.sh \
-            deploy/web/*.sh lib/*.sh
+            deploy/web/*.sh lib/*.sh tools/*.sh
 
       - name: Web 前端 JavaScript 语法
         run: node --check deploy/web/static/app.js
@@ -184,7 +184,7 @@ jobs:
           command -v shellcheck >/dev/null || sudo apt-get install -y -q shellcheck
           shellcheck --severity=warning -e SC1091 \
             install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh \
-            deploy/firewall/*.sh deploy/web/*.sh lib/*.sh tests/*.sh
+            deploy/firewall/*.sh deploy/web/*.sh lib/*.sh tools/*.sh tests/*.sh
 
       - name: "原生 Web API/安全/前端回归"
         run: |
@@ -258,6 +258,9 @@ jobs:
 
       - name: "发布链路回归 (tag-only 安装/更新 + 文档版本)"
         run: bash tests/test-release-flow.sh
+
+      - name: "线上 Release SSH 部署入口 (目标身份/预检/版本/服务/doctor 顺序)"
+        run: bash tests/test-deploy-release-helper.sh
 
       - name: "更新快照+精确回滚回归 (--dir 精确目标/--git 复位/部分失败不谎报/快照覆盖脚本)"
         run: bash tests/test-update-rollback.sh
