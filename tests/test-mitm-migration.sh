@@ -62,6 +62,7 @@ s = remove_once(
     s,
     r"^  - tag: explicit_hijack\n"
     r"    type: domain_set\n"
+    r"(?:    #[^\n]*\n)*"
     r"    args: \{ files: \[[^\n]*custom_hijack\.txt[^\n]*\] \}\n",
     "explicit_hijack plugin",
 )
