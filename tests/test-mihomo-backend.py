@@ -72,9 +72,6 @@ def setup(tmp, backend="mihomo", svc_active=True):
     os.environ["PDG_TX_ROOT"] = tmp + "/var/lib/privdns-gateway/tx"
     os.environ["PDG_LOCKFILE"] = tmp + "/run/pdg.lock"
     os.environ["PDG_STABLE_SAMPLES"] = "1"
-    for m in list(sys.modules):
-        if m.startswith("pdgtx"):
-            del sys.modules[m]                       # 让事务核心按新的沙箱根重新加载
     bot.SB = tmp + "/etc/sing-box/config.json"
     bot.MIHOMO_DIR = tmp + "/etc/mihomo"
     bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
@@ -89,11 +86,8 @@ def setup(tmp, backend="mihomo", svc_active=True):
     bot._svc_active = lambda unit, **k: svc_active
     # 事务的观察期/基线走真 systemctl 与真探针; 单测里用最小桩顶上(与 FakeSh 同样的取向:
     # 本文件验的是 backend 分支与渲染, 服务动力学由 test-config-transaction*.py 覆盖)
-    import importlib
-    tx = importlib.import_module("pdgtx") if "pdgtx" in sys.modules else None
-    if tx is None:
-        sys.path.insert(0, str(ROOT / "deploy" / "bot"))
-        tx = importlib.import_module("pdgtx")
+    bot._PDGTX_MODULE = None
+    tx = bot._pdgtx()
     tx.svc_stable = lambda unit, **k: (svc_active, "" if svc_active else "%s 未稳定" % unit)
     tx.health_snapshot = lambda services, relax_units=(): {"svc:" + u: svc_active for u in services}
     # before-image 现在会带返回码去问 systemd(ActiveState/UnitFileState/NRestarts)。

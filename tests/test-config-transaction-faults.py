@@ -574,11 +574,9 @@ def main():
     b = _il.module_from_spec(spec); spec.loader.exec_module(b)
     b.MOSDNS_CONF = conf
     b.LOCKFILE = box7.env["PDG_LOCKFILE"]
-    # bot 内部 `import pdgtx` 用的是 sys.modules 里那一份 —— 必须按当前沙箱重新导入,
+    # bot 内部缓存自己的同 bundle pdgtx 实例 —— 必须按当前沙箱重建,
     # 并在**它**身上换校验器(换 tx7 的没用, 那是另一个模块实例)
-    for _m in list(sys.modules):
-        if _m == "pdgtx":
-            del sys.modules[_m]
+    b._PDGTX_MODULE = None
     sys.path.insert(0, str(ROOT / "deploy" / "bot"))
     bt = b._pdgtx()
     bt.svc_stable = tx7.svc_stable
@@ -900,9 +898,7 @@ def main():
     # ⑤ TxRefused(锁文件真的打不开)必须仍然说"锁文件不可用", 不能被统一成 BUSY
     b11.LOCKFILE = box11.path("/run/lock-is-a-dir")
     os.environ["PDG_LOCKFILE"] = box11.path("/run/lock-is-a-dir")
-    for _m in list(sys.modules):
-        if _m == "pdgtx":
-            del sys.modules[_m]
+    b11._PDGTX_MODULE = None
     okr13, msg13 = b11.tx_apply(
         "refused_probe", files={"mosdns_rule:custom_direct.txt": b"domain:after13.example\n"})
     os.environ["PDG_LOCKFILE"] = box11.env["PDG_LOCKFILE"]

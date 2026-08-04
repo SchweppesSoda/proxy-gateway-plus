@@ -85,7 +85,7 @@ assert "run_all_migrations" not in "\n".join(
 assert "migrate)       cmd_migrate;;" in pdg, "必须提供显式的事务化迁移命令 pdg migrate"
 
 # P2-2: snapshot 包含 journald drop-in(正确+历史错路径), rollback 重启 journald
-snapshot = block_after(pdg, "cmd_snapshot()", window=2600)   # cand 扩到含已装脚本 + 全部 unit 后更长
+snapshot = shell_function(pdg, "cmd_snapshot")
 assert "etc/systemd/journald.conf.d/50-pdg.conf" in snapshot, "snapshot must include journald drop-in (correct path)"
 assert "etc/systemd/system/journald.conf.d/50-pdg.conf" in snapshot, "snapshot should also capture legacy wrong-path file"
 assert "systemctl restart systemd-journald" in rollback, (
