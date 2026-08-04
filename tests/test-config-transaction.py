@@ -355,7 +355,8 @@ def main():
          "route": {"rules": []}, "inbounds": []}
     ).encode()
     box8.put("/etc/sing-box/config.json", ruleset_model)
-    good_old, bad_old = b"OLD-GOOD\n", b"OLD-BAD\n"
+    good_old = b'{"version":1,"rules":[{"domain":["old-good.example"]}]}'
+    bad_old = b'{"version":1,"rules":[{"domain":["old-bad.example"]}]}'
     box8.put("/etc/sing-box/rs/rs_good.json", good_old, 0o644)
     box8.put("/etc/sing-box/rs/rs_bad.json", bad_old, 0o644)
     meta = {"rs_good": {"url": "https://x/good.list", "outbound": "jp", "format": "source",
