@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -45,27 +46,21 @@ SAMPLE = {
         "final": "jp",
     },
 }
-MOSDNS_SHAPE = """\
-plugins:
-  - tag: geosite_cn
-    type: domain_set
-    args: { files: ["/etc/mosdns/rules/geosite_cn.txt","/etc/mosdns/rules/ruleset_direct.txt"] }
-  - tag: explicit_hijack
-    type: domain_set
-    args: { files: ["/etc/mosdns/rules/custom_hijack.txt","/etc/mosdns/rules/ruleset_hijack.txt"] }
-  - tag: force_hijack_seq
-    type: sequence
-    args:
-      - matches: qtype 1
-        exec: black_hole 203.0.113.10
-  - tag: internal_sequence
-    type: sequence
-    args:
-      - matches: qname $explicit_hijack
-        exec: goto force_hijack_seq
-      - matches: qname $geosite_cn
-        exec: $local_upstream
-"""
+MOSDNS_TEMPLATE = (ROOT / "deploy/mosdns/config.yaml").read_text(encoding="utf-8")
+# ``origin`` v1.6.4 is this fork's supported historical backup boundary.  Pin
+# the complete managed graph so a future HEAD edit cannot silently redefine
+# what this compatibility regression claims to exercise.
+assert hashlib.sha256(MOSDNS_TEMPLATE.encode("utf-8")).hexdigest() == (
+    "eee9a07dfb599708f47e523941a42bd9151cf6eb1f1da5edef48a4c2d9f01574"
+)
+MOSDNS_SHAPE = (
+    MOSDNS_TEMPLATE
+    .replace("__SERVER_IP__", "203.0.113.10")
+    .replace("__INTERNAL_CIDR__", "10.0.0.0/24")
+    .replace("__CERT_DIR__", "/etc/mosdns/certs")
+    .replace("__HIJACK_SET_FILE__", "geosite_geolocation-!cn.txt")
+    .replace("__MOSDNS_CACHE__", "8192")
+)
 
 PROFILE_SENTINEL_TLS_PORTS = [443, 10443]
 PROFILE_SHAPE = """\
@@ -160,7 +155,20 @@ def ruleset_path(root: str, metadata_path: str) -> Path:
     return Path(root + metadata_path.replace("\\", "/"))
 
 
-def backup_blob(entries) -> bytes:
+def backup_blob(entries, *, manifest=False) -> bytes:
+    entries = list(entries)
+    if manifest:
+        inventory = [
+            {"path": name, "size": len(data),
+             "sha256": hashlib.sha256(data).hexdigest()}
+            for name, data in sorted(entries)
+        ]
+        manifest_data = json.dumps({
+            "version": 2,
+            "createdAt": "2026-08-11T00:00:00Z",
+            "files": inventory,
+        }, ensure_ascii=True, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+        entries.append(("manifest.json", manifest_data))
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for name, data in entries:
@@ -538,6 +546,95 @@ def main():
         for suffix in (".mrs", ".srs"):
             ok, msg = bot.add_ruleset("https://x/list" + suffix, "direct")
             assert not ok and "direct" in msg
+
+        # Bot restore must accept both the repository's compact YAML and the
+        # block-style YAML rendered by the Web importer, while binding checks
+        # to the actual top-level plugins list.  Strict parser failures and a
+        # duplicated broad rule before the explicit override all fail closed.
+        bot._ruleset_direct_interface_bytes(MOSDNS_SHAPE.encode())
+        config_io = bot._pdg_config_io()
+        assert Path(config_io.__file__).resolve() == (
+            ROOT / "deploy/web/pdgconfigio.py").resolve()
+        block_yaml = config_io._safe_yaml_dump(
+            config_io._safe_yaml_load(MOSDNS_SHAPE.encode()))
+        bot._ruleset_direct_interface_bytes(block_yaml)
+        original_isfile = bot.os.path.isfile
+        bot._PDG_CONFIG_IO_MODULE = None
+        bot.os.path.isfile = lambda _path: False
+        try:
+            try:
+                bot._pdg_config_io()
+            except ModuleNotFoundError:
+                pass
+            else:
+                raise AssertionError("missing strict YAML parser was accepted")
+        finally:
+            bot.os.path.isfile = original_isfile
+            bot._PDG_CONFIG_IO_MODULE = config_io
+        original_bot_file = bot.__file__
+        original_abspath = bot.os.path.abspath
+        production_candidates = []
+        bot._PDG_CONFIG_IO_MODULE = None
+        bot.__file__ = "/opt/pdg-bot/bot.py"
+        bot.os.path.abspath = lambda path: path
+        bot.os.path.isfile = lambda path: (
+            production_candidates.append(path) or False)
+        try:
+            try:
+                bot._pdg_config_io()
+            except ModuleNotFoundError:
+                pass
+            else:
+                raise AssertionError("missing production YAML parser was accepted")
+        finally:
+            bot.os.path.isfile = original_isfile
+            bot.os.path.abspath = original_abspath
+            bot.__file__ = original_bot_file
+            bot._PDG_CONFIG_IO_MODULE = config_io
+        assert production_candidates == ["/opt/pdg-web/pdgconfigio.py"]
+        explicit_rule = (
+            "      - matches: qname $explicit_hijack\n"
+            "        exec: goto force_hijack_seq\n"
+        )
+        broad_rule = (
+            "      - matches: qname $geosite_cn\n"
+            "        exec: $local_upstream\n"
+        )
+        unsafe_interfaces = {
+            "nested fake plugins": MOSDNS_SHAPE.replace(
+                "plugins:\n", "plugins: []\nevil:\n", 1),
+            "duplicate plugin tag": MOSDNS_SHAPE.replace(
+                "  - tag: explicit_hijack\n",
+                "  - tag: geosite_cn\n", 1),
+            "duplicate broad rule": MOSDNS_SHAPE.replace(
+                explicit_rule, broad_rule + explicit_rule, 1),
+            "unexpected broad execution": MOSDNS_SHAPE.replace(
+                explicit_rule,
+                "      - matches: qname $geosite_cn\n"
+                "        exec: $remote_upstream\n" + explicit_rule, 1),
+            "shadow explicit execution": MOSDNS_SHAPE.replace(
+                explicit_rule,
+                "      - matches: qname $explicit_hijack\n"
+                "        exec: $remote_upstream\n" + explicit_rule, 1),
+            "second black hole": MOSDNS_SHAPE.replace(
+                "        exec: black_hole 203.0.113.10\n",
+                "        exec: black_hole 203.0.113.10\n"
+                "      - exec: black_hole not-an-ip\n", 1),
+            "duplicate YAML key": MOSDNS_SHAPE.replace(
+                "plugins:\n", "plugins:\nplugins:\n", 1),
+            "YAML alias": b"plugins: &p []\ncopy: *p\n",
+            "YAML tag": b"plugins: !unsafe []\n",
+            "multiple YAML documents": b"plugins: []\n---\nplugins: []\n",
+        }
+        for label, unsafe in unsafe_interfaces.items():
+            payload = unsafe.encode() if isinstance(unsafe, str) else unsafe
+            try:
+                bot._ruleset_direct_interface_bytes(payload)
+            except refused:
+                pass
+            else:
+                raise AssertionError(label + " MosDNS interface was accepted")
+
         for actual, marker, path_in_comment in (
             (
                 ',"/etc/mosdns/rules/ruleset_direct.txt"',
@@ -545,7 +642,7 @@ def main():
                 "/etc/mosdns/rules/ruleset_direct.txt",
             ),
             (
-                '"/etc/mosdns/rules/custom_hijack.txt"',
+                '"/etc/mosdns/rules/custom_hijack.txt",',
                 "  - tag: explicit_hijack\n",
                 "/etc/mosdns/rules/custom_hijack.txt",
             ),
@@ -584,7 +681,9 @@ def main():
         assert not ok and "保留字" in msg
 
         # Restore treats archived aggregate as untrusted cache and derives it from the
-        # archived source JSON + metadata inside the same repair transaction.
+        # archived source JSON + metadata inside the same repair transaction.  The
+        # supported fork boundary is v1.6.4, whose compact managed graph is byte-for-
+        # byte the current template; this legacy no-manifest package must remain valid.
         restore_meta = {
             "rs_restore": {
                 "url": "https://x/restore.list",
@@ -595,18 +694,131 @@ def main():
             }
         }
         restored_source = b'{"version":1,"rules":[{"domain":["restored.example"]}]}'
-        data = backup_blob([
-            ("etc/sing-box/config.json", json.dumps(SAMPLE).encode()),
-            ("etc/mosdns/config.yaml", MOSDNS_SHAPE.encode()),
-            ("etc/mosdns/rules/ruleset_direct.txt", b"domain:poison.example\n"),
-            ("opt/pdg-bot/rulesets.json", json.dumps(restore_meta).encode()),
-            ("etc/sing-box/rs/rs_restore.json", restored_source),
-        ])
+
+        def restore_entries(mosdns):
+            return [
+                ("etc/sing-box/config.json", json.dumps(SAMPLE).encode()),
+                ("etc/mosdns/config.yaml", mosdns),
+                ("etc/mosdns/rules/ruleset_direct.txt",
+                 b"domain:poison.example\n"),
+                ("opt/pdg-bot/rulesets.json", json.dumps(restore_meta).encode()),
+                ("etc/sing-box/rs/rs_restore.json", restored_source),
+            ]
+
+        data = backup_blob(restore_entries(MOSDNS_SHAPE.encode()))
         ok, msg = bot.restore_from(data)
         assert ok, msg
         text = aggregate(root)
         assert "full:restored.example\n" in text
         assert "poison.example" not in text
+
+        # Web preview renders a v2 candidate in block style.  Exercise the strict
+        # manifest path and prove every machine-owned identity is rebound from the
+        # CAS-protected live graph.  An incoming local path is allowed only because
+        # the contract removes it before the candidate is staged.
+        foreign = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        foreign_plugins = {item["tag"]: item for item in foreign["plugins"]}
+        foreign_plugins["npn_clients"]["args"]["ips"] = ["172.31.0.0/24"]
+        foreign_plugins["lazy_cache"]["args"]["size"] = 2048
+        foreign_plugins["geosite_cn"]["args"]["files"].append("/etc/shadow")
+        for tag, listen in (("udp_server", "127.0.0.1:1053"),
+                            ("tcp_server", "127.0.0.1:1053"),
+                            ("dot_server", "127.0.0.1:1853")):
+            foreign_plugins[tag]["args"]["listen"] = listen
+        foreign_plugins["dot_server"]["args"].update({
+            "cert": "/foreign/fullchain.pem", "key": "/foreign/privkey.pem",
+        })
+        for plugin in foreign["plugins"]:
+            if plugin["type"] == "sequence":
+                for item in plugin["args"]:
+                    if item.get("exec", "").startswith("black_hole "):
+                        item["exec"] = "black_hole 198.51.100.44"
+        foreign_block_yaml = config_io._safe_yaml_dump(foreign)
+        data = backup_blob(restore_entries(foreign_block_yaml), manifest=True)
+        ok, msg = bot.restore_from(data)
+        assert ok, msg
+        restored_mosdns = config_io._safe_yaml_load(
+            Path(bot.MOSDNS_CONF).read_bytes())
+        restored_plugins = {
+            item["tag"]: item for item in restored_mosdns["plugins"]
+        }
+        local = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        local_plugins = {item["tag"]: item for item in local["plugins"]}
+        for tag, plugin in local_plugins.items():
+            if plugin["type"] == "domain_set":
+                assert restored_plugins[tag]["args"]["files"] == plugin["args"]["files"]
+        assert "/etc/shadow" not in json.dumps(restored_mosdns)
+        assert restored_plugins["npn_clients"]["args"] == local_plugins[
+            "npn_clients"]["args"]
+        assert restored_plugins["lazy_cache"]["args"]["size"] == 8192
+        for tag in ("udp_server", "tcp_server", "dot_server"):
+            assert restored_plugins[tag]["args"] == local_plugins[tag]["args"]
+        restored_black_holes = {
+            item["exec"] for plugin in restored_plugins.values()
+            if plugin["type"] == "sequence" for item in plugin["args"]
+            if item.get("exec", "").startswith("black_hole ")
+        }
+        assert restored_black_holes == {"black_hole 203.0.113.10"}
+
+        # A valid MosDNS process is not necessarily a PDG-managed graph.  These
+        # takeover attempts all travel through the real v2 restore envelope and
+        # must fail before any production target changes.
+        takeover_docs = {}
+        doc = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        doc["api"] = {"http": "0.0.0.0:8080"}
+        takeover_docs["top-level API"] = doc
+        doc = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        doc["plugins"].append({
+            "tag": "attacker", "type": "domain_set",
+            "args": {"files": ["/etc/shadow"]},
+        })
+        takeover_docs["extra file-reading plugin"] = doc
+        doc = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        force = next(item for item in doc["plugins"]
+                     if item["tag"] == "force_hijack_seq")
+        black_hole = next(item for item in force["args"]
+                          if item.get("exec", "").startswith("black_hole "))
+        black_hole["matches"] = "qtype 28"
+        takeover_docs["black-hole on qtype 28"] = doc
+        doc = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        internal = next(item for item in doc["plugins"]
+                        if item["tag"] == "internal_sequence")
+        explicit_at = next(index for index, item in enumerate(internal["args"])
+                           if item.get("matches") == "qname $explicit_hijack")
+        internal["args"][explicit_at:explicit_at] = [
+            {"exec": "$remote_upstream"}, {"exec": "jump has_resp"},
+        ]
+        takeover_docs["unconditional pre-explicit response"] = doc
+        doc = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        internal = next(item for item in doc["plugins"]
+                        if item["tag"] == "internal_sequence")
+        explicit_at = next(index for index, item in enumerate(internal["args"])
+                           if item.get("matches") == "qname $explicit_hijack")
+        internal["args"].insert(explicit_at, {
+            "matches": "  qname  $geosite_cn  ", "exec": "$local_upstream",
+        })
+        takeover_docs["whitespace-equivalent shadow broad rule"] = doc
+        doc = config_io._safe_yaml_load(MOSDNS_SHAPE.encode())
+        internal = next(item for item in doc["plugins"]
+                        if item["tag"] == "internal_sequence")
+        explicit = next(item for item in internal["args"]
+                        if item.get("matches") == "qname $explicit_hijack")
+        explicit["matches"] = "  qname  $explicit_hijack  "
+        takeover_docs["whitespace-equivalent explicit rule"] = doc
+
+        for label, takeover in takeover_docs.items():
+            before = {
+                path: Path(path).read_bytes()
+                for path in (bot.SB, bot.RS_META, bot.MOSDNS_CONF,
+                             bot.MOSDNS_RULESET_DIRECT, bot.MIHOMO_CFG)
+            }
+            payload = backup_blob(
+                restore_entries(config_io._safe_yaml_dump(takeover)),
+                manifest=True)
+            ok, msg = bot.restore_from(payload)
+            assert not ok, label + ": " + msg
+            for path, content in before.items():
+                assert Path(path).read_bytes() == content, label
 
         # A restore containing direct metadata cannot pair it with an old MosDNS config
         # that never loads the aggregate. Candidate validation fails before production.
@@ -747,17 +959,17 @@ plugins:
 
         # Legacy compatibility is schema-aware, not a validation bypass: explicit
         # hijack must still precede the broad direct collection.
-        bad_legacy = legacy_shape.replace(
+        explicit_block = (
             "      - matches: qname $explicit_hijack\n"
             "        exec: goto force_hijack_seq\n"
-            "      - matches: qname $geosite_cn\n"
-            "        exec: $local_upstream\n",
-            "      - matches: qname $geosite_cn\n"
-            "        exec: $local_upstream\n"
-            "      - matches: qname $explicit_hijack\n"
-            "        exec: goto force_hijack_seq\n",
-            1,
         )
+        first_broad = (
+            "      - matches: qname $geosite_cn\n"
+            "        exec: $ecs_china\n"
+        )
+        bad_legacy = legacy_shape.replace(explicit_block, "", 1).replace(
+            first_broad, first_broad + explicit_block, 1)
+        assert bad_legacy != legacy_shape
         (legacy_candidate / "etc/mosdns/config.yaml").write_text(
             bad_legacy, encoding="utf-8"
         )
@@ -871,17 +1083,18 @@ plugins:
         disk_config = MOSDNS_SHAPE
         kill_states.append((disk_config, set(files)))
         for config_at_kill, files_at_kill in kill_states:
-            geosite = bot._mosdns_plugin_block(config_at_kill, "geosite_cn")
-            explicit = bot._mosdns_plugin_block(
-                config_at_kill, "explicit_hijack"
-            )
+            by_tag = bot._mosdns_plugin_map(config_at_kill.encode())
+            geosite = bot._mosdns_managed_plugin(
+                by_tag, "geosite_cn", "domain_set")
+            explicit = bot._mosdns_managed_plugin(
+                by_tag, "explicit_hijack", "domain_set")
             referenced = {
                 path
-                for block, path in (
-                    (geosite, aggregate_paths[0]),
-                    (explicit, aggregate_paths[1]),
+                for plugin, label, path in (
+                    (geosite, "geosite_cn", aggregate_paths[0]),
+                    (explicit, "explicit_hijack", aggregate_paths[1]),
                 )
-                if bot._mosdns_domain_set_loads(block, path)
+                if path in bot._mosdns_domain_set_files(plugin, label)
             }
             assert referenced <= files_at_kill
     restore_source = lifecycle[
@@ -1040,7 +1253,7 @@ plugins:
         comment_only = (
             MOSDNS_SHAPE
             .replace(',"/etc/mosdns/rules/ruleset_direct.txt"', "", 1)
-            .replace('"/etc/mosdns/rules/custom_hijack.txt"', "", 1)
+            .replace('"/etc/mosdns/rules/custom_hijack.txt",', "", 1)
             .replace(
                 explicit_rule,
                 "      # - matches: qname $explicit_hijack\n"

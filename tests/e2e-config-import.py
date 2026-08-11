@@ -294,8 +294,11 @@ def main() -> int:
             if return_code != 0 or terminal["status"] != "succeeded":
                 print("[DIAG] unexpected config-import job result: " + json.dumps(
                     terminal, ensure_ascii=False, sort_keys=True), flush=True)
+                expected_op = (
+                    "restore" if preview["kind"] == "pdg"
+                    else "web_import_" + preview["kind"])
                 print("[DIAG] transaction: " + transaction_diagnostic(
-                    "web_import_" + preview["kind"], audit_start), flush=True)
+                    expected_op, audit_start), flush=True)
             check(return_code == 0 and terminal["status"] == "succeeded",
                   preview["kind"] + " config-import job succeeds")
         else:

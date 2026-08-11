@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PrivDNS Gateway — Telegram 管理 bot v3 (纯标准库, long-poll)。
+"""PrivDNS Gateway — Telegram 管理 bot v3 (Python + PyYAML, long-poll)。
 
 出口  : 列表 / 添加(ss/vmess/trojan/vless 链接) / 删除 / 改名(级联更新引用) / 设默认出口 / 故障切换组(urltest)
 分流  : 规则列表 / 添加(域名→出口|direct) / 删除 / 添加规则集(Surge .list URL→出口) / 删除规则集
@@ -1119,6 +1119,7 @@ def busy_msg():
     return NOLOCK_MSG if _cfg_lock_error() else BUSY_MSG
 
 _PDGTX_MODULE = None
+_PDG_CONFIG_IO_MODULE = None
 
 
 def _pdgtx():
@@ -1133,6 +1134,34 @@ def _pdgtx():
         spec.loader.exec_module(module)
         _PDGTX_MODULE = module
     return _PDGTX_MODULE
+
+
+def _pdg_config_io():
+    """Load ConfigIO's strict YAML parser from the managed project bundle.
+
+    MosDNS configuration is external input when restored through Telegram and
+    is also re-rendered by the Web importer.  Reusing the one hardened loader
+    keeps duplicate-key, alias, tag, multi-document and complexity rejection
+    identical on both paths instead of growing a second permissive YAML parser.
+    """
+    global _PDG_CONFIG_IO_MODULE
+    if _PDG_CONFIG_IO_MODULE is None:
+        bot_dir = os.path.dirname(os.path.abspath(__file__))
+        path = ("/opt/pdg-web/pdgconfigio.py" if bot_dir == "/opt/pdg-bot"
+                else os.path.abspath(os.path.join(
+                    bot_dir, "..", "web", "pdgconfigio.py")))
+        if not os.path.isfile(path) or os.path.islink(path):
+            raise ModuleNotFoundError("PDG strict configuration parser unavailable")
+        spec = importlib.util.spec_from_file_location("_pdg_config_io_strict", path)
+        if spec is None or spec.loader is None:
+            raise ModuleNotFoundError("PDG strict configuration parser unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        required = ("_safe_yaml_load", "_safe_yaml_dump", "_mosdns_contract")
+        if any(not callable(getattr(module, name, None)) for name in required):
+            raise ModuleNotFoundError("PDG strict configuration parser unavailable")
+        _PDG_CONFIG_IO_MODULE = module
+    return _PDG_CONFIG_IO_MODULE
 
 
 def _model_bytes(c):
@@ -2714,90 +2743,146 @@ def _register_ruleset_direct_derive(t, staged_files):
     )
 
 
-def _mosdns_plugin_block(text, tag):
-    """取唯一的标准 MosDNS plugin 块；重复 tag 与非标准形状都拒绝。"""
-    pattern = re.compile(
-        r"(?m)^  - tag:[ \t]*" + re.escape(tag)
-        + r"[ \t]*(?:#[^\r\n]*)?\r?\n"
-        r"(?:(?!^  - tag:)[\s\S])*(?=^  - tag:|\Z)"
-    )
-    blocks = pattern.findall(text)
-    if len(blocks) != 1:
-        raise _pdgtx().TxRefused("MosDNS 候选缺少唯一的 %s plugin" % tag)
-    return blocks[0]
+def _mosdns_plugin_map(data):
+    """Parse the real top-level plugin graph with ConfigIO's strict loader."""
+    refused = _pdgtx().TxRefused
+    try:
+        document = _pdg_config_io()._safe_yaml_load(data)
+    except Exception as exc:  # noqa: BLE001 - fail closed across loader errors
+        raise refused("MosDNS 候选配置不是安全 YAML") from exc
+    plugins = document.get("plugins") if isinstance(document, dict) else None
+    if not isinstance(plugins, list):
+        raise refused("MosDNS 候选缺少 plugins 列表")
+    by_tag = {}
+    for plugin in plugins:
+        tag = plugin.get("tag") if isinstance(plugin, dict) else None
+        if not isinstance(tag, str) or not tag or tag in by_tag:
+            raise refused("MosDNS 候选 plugin tag 非法或重复")
+        by_tag[tag] = plugin
+    return by_tag
 
 
-def _mosdns_sequence_rule(block, matcher, execution):
-    pattern = re.compile(
-        r"(?m)^[ \t]*- matches:\s*" + re.escape(matcher)
-        + r"[ \t]*(?:#[^\r\n]*)?\r?\n[ \t]+exec:\s*" + re.escape(execution)
-        + r"[ \t]*(?:#[^\r\n]*)?\r?$"
-    )
-    match = pattern.search(block)
-    return -1 if match is None else match.start()
+def _managed_mosdns_restore_bytes(candidate_data, current_data):
+    """Return the only MosDNS bytes a Bot/Telegram restore may stage.
+
+    Backup files are external input.  A successful ``mosdns start`` probe only
+    proves that MosDNS understands a graph; it does not prove that the graph is
+    PDG-owned (an extra listener, file-reading plugin, or earlier catch-all
+    sequence can all be valid MosDNS).  Reuse ConfigIO's complete fixed-graph
+    contract here, including strict YAML parsing and rebinding of every local
+    identity/path/profile field to the transaction's current configuration.
+
+    The supported fork's previous release, v1.6.4, already shipped this exact
+    managed graph.  There is intentionally no permissive raw/foreign-graph
+    fallback: unsupported shapes must be repaired by a controlled upgrade, not
+    activated through Telegram restore.
+    """
+    refused = _pdgtx().TxRefused
+    try:
+        module = _pdg_config_io()
+        candidate = module._safe_yaml_load(candidate_data)
+        current = module._safe_yaml_load(current_data)
+        managed = module._mosdns_contract(candidate, current)
+        rendered = module._safe_yaml_dump(managed)
+        # Defense in depth: prove the renderer did not return an unparsable or
+        # structurally different document before its bytes reach pdgtx.
+        module._mosdns_contract(module._safe_yaml_load(rendered), current)
+        return rendered
+    except Exception as exc:  # noqa: BLE001 - every loader/contract fault closes restore
+        raise refused("MosDNS 备份不符合 PDG 受管配置契约") from exc
 
 
-def _mosdns_domain_set_loads(block, path):
-    """只认实际 args/files 中的精确双引号路径；注释里的文字不算已加载。"""
-    active = "\n".join(line.split("#", 1)[0].rstrip() for line in block.splitlines())
-    match = re.search(
-        r"(?m)^[ \t]*args:\s*\{\s*files:\s*\[([^\]]*)\]\s*\}\s*$",
-        active,
-    )
-    if match is None:
-        return False
-    return path in re.findall(r'"([^"\r\n]+)"', match.group(1))
+def _mosdns_managed_plugin(by_tag, tag, plugin_type):
+    refused = _pdgtx().TxRefused
+    plugin = by_tag.get(tag)
+    if (not isinstance(plugin, dict) or set(plugin) != {"tag", "type", "args"}
+            or plugin.get("type") != plugin_type):
+        raise refused("MosDNS 候选缺少唯一的 %s plugin" % tag)
+    return plugin
+
+
+def _mosdns_domain_set_files(plugin, label):
+    refused = _pdgtx().TxRefused
+    args = plugin.get("args")
+    files = args.get("files") if isinstance(args, dict) else None
+    if (not isinstance(args, dict) or set(args) != {"files"}
+            or not isinstance(files, list) or not files
+            or any(not isinstance(path, str) or not path or "\x00" in path
+                   for path in files)
+            or len(files) != len(set(files))):
+        raise refused("MosDNS %s domain_set 文件列表不合法" % label)
+    return files
+
+
+def _mosdns_sequence_args(plugin, label):
+    refused = _pdgtx().TxRefused
+    args = plugin.get("args")
+    if not isinstance(args, list) or not args:
+        raise refused("MosDNS %s sequence 不合法" % label)
+    for item in args:
+        if (not isinstance(item, dict) or set(item) not in (
+                {"exec"}, {"matches", "exec"})
+                or not isinstance(item.get("exec"), str)
+                or ("matches" in item
+                    and not isinstance(item["matches"], str))):
+            raise refused("MosDNS %s sequence 不合法" % label)
+    return args
 
 
 def _ruleset_direct_interface_bytes(data, *, require_ruleset_hijack=True):
     """验证 MosDNS 直连接口；现网/新版候选还必须声明规则集代理聚合。"""
     refused = _pdgtx().TxRefused
-    try:
-        text = data.decode("utf-8")
-    except (AttributeError, UnicodeDecodeError) as exc:
-        raise refused("MosDNS 候选配置不是 UTF-8") from exc
-    geosite = _mosdns_plugin_block(text, "geosite_cn")
-    explicit_set = _mosdns_plugin_block(text, "explicit_hijack")
-    internal = _mosdns_plugin_block(text, "internal_sequence")
-    force_seq = _mosdns_plugin_block(text, "force_hijack_seq")
-    if (
-        not _mosdns_domain_set_loads(
-            geosite, "/etc/mosdns/rules/ruleset_direct.txt"
-        )
-        or not re.search(r"(?m)^[ \t]*type:\s*domain_set\s*(?:#.*)?$", geosite)
-    ):
+    by_tag = _mosdns_plugin_map(data)
+    geosite = _mosdns_managed_plugin(by_tag, "geosite_cn", "domain_set")
+    explicit_set = _mosdns_managed_plugin(
+        by_tag, "explicit_hijack", "domain_set")
+    internal = _mosdns_managed_plugin(
+        by_tag, "internal_sequence", "sequence")
+    force_seq = _mosdns_managed_plugin(
+        by_tag, "force_hijack_seq", "sequence")
+
+    if "/etc/mosdns/rules/ruleset_direct.txt" not in _mosdns_domain_set_files(
+            geosite, "geosite_cn"):
         raise refused("MosDNS geosite_cn 未加载 ruleset_direct 聚合")
-    if (
-        not _mosdns_domain_set_loads(
-            explicit_set, "/etc/mosdns/rules/custom_hijack.txt"
-        )
-        or (
-            require_ruleset_hijack
-            and not _mosdns_domain_set_loads(
-                explicit_set, "/etc/mosdns/rules/ruleset_hijack.txt"
-            )
-        )
-        or not re.search(r"(?m)^[ \t]*type:\s*domain_set\s*(?:#.*)?$", explicit_set)
-    ):
-        expected = (
-            "custom_hijack/ruleset_hijack"
-            if require_ruleset_hijack else "custom_hijack"
-        )
+    explicit_files = _mosdns_domain_set_files(explicit_set, "explicit_hijack")
+    if ("/etc/mosdns/rules/custom_hijack.txt" not in explicit_files
+            or require_ruleset_hijack and (
+                "/etc/mosdns/rules/ruleset_hijack.txt" not in explicit_files)):
+        expected = ("custom_hijack/ruleset_hijack"
+                    if require_ruleset_hijack else "custom_hijack")
         raise refused("MosDNS explicit_hijack 未加载 %s" % expected)
-    explicit = _mosdns_sequence_rule(
-        internal, "qname $explicit_hijack", "goto force_hijack_seq"
-    )
-    broad = _mosdns_sequence_rule(internal, "qname $geosite_cn", "$ecs_china")
-    if broad < 0:
-        broad = _mosdns_sequence_rule(
-            internal, "qname $geosite_cn", "$local_upstream"
-        )
-    if explicit < 0 or broad < 0 or explicit >= broad:
+
+    internal_args = _mosdns_sequence_args(internal, "internal_sequence")
+    explicit_rules = [
+        (index, item) for index, item in enumerate(internal_args)
+        if item.get("matches") == "qname $explicit_hijack"
+    ]
+    broad_rules = [
+        (index, item) for index, item in enumerate(internal_args)
+        if item.get("matches") == "qname $geosite_cn"
+    ]
+    if (len(explicit_rules) != 1
+            or explicit_rules[0][1]["exec"] != "goto force_hijack_seq"
+            or not broad_rules
+            or any(item["exec"] not in {"$ecs_china", "$local_upstream"}
+                   for _index, item in broad_rules)
+            or len({item["exec"] for _index, item in broad_rules})
+            != len(broad_rules)):
+        raise refused("MosDNS 手机直连规则缺失或重复")
+    if explicit_rules[0][0] >= min(index for index, _item in broad_rules):
         raise refused("MosDNS 显式代理覆盖必须在宽泛手机直连规则之前")
-    if not re.search(
-        r"(?m)^[ \t]*exec:\s*black_hole(?:\s+|$)", force_seq
-    ):
-        raise refused("MosDNS force_hijack_seq 未配置 A 记录劫持")
+
+    force_args = _mosdns_sequence_args(force_seq, "force_hijack_seq")
+    black_holes = [
+        item["exec"] for item in force_args
+        if item["exec"].split(maxsplit=1)
+        and item["exec"].split(maxsplit=1)[0] == "black_hole"
+    ]
+    if (len(black_holes) != 1
+            or re.fullmatch(
+                r"black_hole(?:[ \t]+[0-9A-Fa-f:.]+)?",
+                black_holes[0]) is None):
+        raise refused("MosDNS force_hijack_seq 未配置唯一的 A 记录劫持")
     return True
 
 
@@ -2893,16 +2978,20 @@ def _derive_ruleset_direct_tree(tree):
     hijack_referenced = False
     if conf_data is not None:
         try:
-            conf_text = conf_data.decode("utf-8")
-            direct_referenced = _mosdns_domain_set_loads(
-                _mosdns_plugin_block(conf_text, "geosite_cn"),
-                "/etc/mosdns/rules/ruleset_direct.txt",
-            )
-            hijack_referenced = _mosdns_domain_set_loads(
-                _mosdns_plugin_block(conf_text, "explicit_hijack"),
-                "/etc/mosdns/rules/ruleset_hijack.txt",
-            )
-        except (UnicodeDecodeError, _pdgtx().TxRefused):
+            by_tag = _mosdns_plugin_map(conf_data)
+            direct_referenced = (
+                "/etc/mosdns/rules/ruleset_direct.txt"
+                in _mosdns_domain_set_files(
+                    _mosdns_managed_plugin(
+                        by_tag, "geosite_cn", "domain_set"),
+                    "geosite_cn"))
+            hijack_referenced = (
+                "/etc/mosdns/rules/ruleset_hijack.txt"
+                in _mosdns_domain_set_files(
+                    _mosdns_managed_plugin(
+                        by_tag, "explicit_hijack", "domain_set"),
+                    "explicit_hijack"))
+        except _pdgtx().TxRefused:
             direct_referenced = False
             hijack_referenced = False
     # 首次升级前的快照没有 ruleset_hijack 接口。用新版 CLI 回滚该快照时，
@@ -5324,6 +5413,20 @@ def _restore_commit(tmp, expected=None):
             if current_sha != preview_sha:
                 raise tx.TxRefused(
                     "PRECONDITION_FAILED: %s 自预览后已变化" % target)
+        mos_new = None
+        if os.path.exists(newmos):
+            limit = _restore_member_limit("etc/mosdns/config.yaml")
+            try:
+                with open(newmos, "rb") as stream:
+                    incoming_mos = stream.read(limit + 1)
+            except OSError as exc:
+                raise tx.TxRefused("无法读取备份里的 MosDNS 配置") from exc
+            if len(incoming_mos) > limit:
+                raise tx.TxRefused("备份里的 MosDNS 配置超过恢复上限")
+            # This is deliberately before every t.stage(): a Telegram backup
+            # can only become a candidate after the complete PDG graph contract
+            # has rebound it to the CAS-protected current machine identity.
+            mos_new = _managed_mosdns_restore_bytes(incoming_mos, cur_mos)
         cur_meta_raw, meta_sha = t.read_for_update("rs_meta")
         watched_meta = t.watch("rs_meta", optional=True)
         watched_meta_sha = (
@@ -5408,7 +5511,6 @@ def _restore_commit(tmp, expected=None):
                 t.stage(provider_target, None, expect=expected["providers"][leaf])
             else:
                 t.stage(provider_target, None)
-        mos_new = _subbed(newmos) if os.path.exists(newmos) else None
         if mos_new is not None:
             t.stage("mosdns_conf", mos_new, expect=expected.get("mosdns", mos_sha))
             restored.append("mosdns/config.yaml")
