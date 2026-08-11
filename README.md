@@ -68,27 +68,24 @@ Debian 12+ / Ubuntu 22+，需要 root。仓库已有兼容的 `v*` Release；标
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
 cd proxy-gateway-plus
-sudo env \
-  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
-  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  ./install.sh
+sudo ./install.sh
 ```
 
 `PDG_TAG_BOOTSTRAPPED=1` 只保留给首次派生发布前的隔离开发验证，正式安装不得使用。
 
 MosDNS 使用本项目的 v5.3.4 no-session-ticket 修补 flavor，stock v5.3.4 不会被接受。
-当前尚未发布自有长期 release asset；开发部署须先在可信构建机上可复现构建 raw binary，
-通过可信通道把 binary 与预先取得的仓库 pin 交给安装器。不能在目标机下载后再“现算现信”，
-VPS 也不安装 Go。完整步骤见
+从 v1.9.0 起，安装器按架构从同一个项目 tag 的 GitHub Release 下载 raw binary，并用
+`lib/versions.sh` 中的独立 SHA256 pin 和 build marker 校验；不会信任下载点提供的哈希，
+也不会在 VPS 安装 Go。完整供应链与离线部署步骤见
 [MosDNS 修补版构建与部署](docs/MOSDNS-PATCHED-BUILD.md)。
 
-已经安装 stock MosDNS 或其他非项目 flavor 的机器在执行更新时，同样须显式提供产物：
+发版前验证或离线部署仍可显式提供本地 raw binary：
 
 ```bash
 sudo env \
-  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
+  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1-linux-amd64 \
   PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  pdg update
+  ./install.sh
 ```
 
 路径必须是普通文件而不是符号链接。产物 SHA256 必须与 `lib/versions.sh` 中对应架构的

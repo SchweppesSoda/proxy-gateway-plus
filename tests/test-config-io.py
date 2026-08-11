@@ -83,6 +83,26 @@ def v2_pdg_bytes(entries):
     return tar_bytes(entries)
 
 
+_MOSDNS_GFW_GATES = [
+    {"matches": "!qname $hijack_set", "exec": "$ecs_neutral"},
+    {"matches": "!qname $hijack_set", "exec": "$remote_upstream"},
+]
+
+
+def mosdns_plugin(document, tag):
+    return next(item for item in document["plugins"] if item.get("tag") == tag)
+
+
+def mosdns_all_mode(document):
+    """Apply the exact all-mode shape used by lib/mosdns.sh."""
+    candidate = copy.deepcopy(document)
+    sequence = mosdns_plugin(candidate, "internal_sequence")["args"]
+    if sequence[8:10] != _MOSDNS_GFW_GATES:
+        raise AssertionError("test fixture is not the managed gfw MosDNS shape")
+    del sequence[8:10]
+    return candidate
+
+
 def load_bot_module():
     """Load the production backup parser; provide only Windows' absent fcntl."""
     previous = sys.modules.get("fcntl")
@@ -289,7 +309,12 @@ class ArchiveTests(unittest.TestCase):
                     "__MOSDNS_CACHE__": "1024",
             }.items():
                 mosdns_text = mosdns_text.replace(old, new)
-            mosdns.write_text(mosdns_text, encoding="utf-8")
+            # Production's ``all`` profile removes exactly the two managed
+            # negative-hijack gates.  Back up that legitimate runtime shape
+            # so this round trip covers the Web import regression from CI.
+            mosdns_document = mosdns_all_mode(
+                cio._safe_yaml_load(mosdns_text.encode("utf-8")))
+            mosdns.write_bytes(cio._safe_yaml_dump(mosdns_document))
             fixed_rules = {
                 "custom_direct.txt": "direct.example\n",
                 "ruleset_direct.txt": "cn.example\n",
@@ -342,6 +367,12 @@ class ArchiveTests(unittest.TestCase):
                     enforce_root_owner=False)
                 preview = manager.preview("pdg", payload, "application/gzip")
                 self.assertTrue(preview["summary"]["bundleMosdns"])
+                record = manager._record(preview["importId"])
+                staged = cio._safe_yaml_load(base64.b64decode(
+                    record["candidate"]["mosdns"]))
+                self.assertEqual(
+                    mosdns_plugin(staged, "internal_sequence")["args"],
+                    mosdns_plugin(mosdns_document, "internal_sequence")["args"])
                 manager.cancel(preview["importId"])
             finally:
                 (cio.MODEL_PATH, cio.MOSDNS_PATH,
@@ -971,6 +1002,53 @@ class MosdnsContractTests(unittest.TestCase):
             current_text = current_text.replace(old, new)
         self.current = cio._safe_yaml_load(current_text.encode())
         self.incoming = cio._safe_yaml_load(example.encode())
+
+    def test_accepts_both_managed_hijack_shapes_and_preserves_live_mode(self):
+        current_all = mosdns_all_mode(self.current)
+        incoming_all = mosdns_all_mode(self.incoming)
+        cases = (
+            ("gfw-to-gfw", self.incoming, self.current, self.current),
+            ("all-to-all", incoming_all, current_all, current_all),
+            ("gfw-to-all", self.incoming, current_all, current_all),
+            ("all-to-gfw", incoming_all, self.current, self.current),
+        )
+        for label, incoming, current, expected in cases:
+            with self.subTest(label=label):
+                candidate = cio._mosdns_contract(
+                    copy.deepcopy(incoming), copy.deepcopy(current))
+                self.assertEqual(
+                    mosdns_plugin(candidate, "internal_sequence")["args"],
+                    mosdns_plugin(expected, "internal_sequence")["args"])
+
+    def test_rejects_damaged_incoming_and_current_managed_sequences(self):
+        def delete_wrong_step(document):
+            del mosdns_plugin(document, "internal_sequence")["args"][7]
+
+        def reorder_steps(document):
+            args = mosdns_plugin(document, "internal_sequence")["args"]
+            args[0], args[1] = args[1], args[0]
+
+        def change_execution(document):
+            mosdns_plugin(document, "internal_sequence")["args"][0]["exec"] = "reject 4"
+
+        for side in ("incoming", "current"):
+            for label, mutate in (
+                    ("wrong-delete", delete_wrong_step),
+                    ("reorder", reorder_steps),
+                    ("changed-exec", change_execution)):
+                with self.subTest(side=side, damage=label):
+                    incoming = copy.deepcopy(self.incoming)
+                    current = copy.deepcopy(self.current)
+                    mutate(incoming if side == "incoming" else current)
+                    with self.assertRaisesRegex(cio.ImportInvalid, "sequence"):
+                        cio._mosdns_contract(incoming, current)
+
+        # Removing just half of the managed two-entry gate is not a third
+        # profile and must never be mistaken for all mode.
+        half_gate = copy.deepcopy(self.incoming)
+        del mosdns_plugin(half_gate, "internal_sequence")["args"][8]
+        with self.assertRaisesRegex(cio.ImportInvalid, "sequence"):
+            cio._mosdns_contract(half_gate, self.current)
 
     def test_full_graph_rebinds_machine_identity(self):
         candidate = cio._mosdns_contract(copy.deepcopy(self.incoming), self.current)

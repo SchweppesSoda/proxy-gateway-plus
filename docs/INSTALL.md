@@ -24,17 +24,14 @@
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
 cd proxy-gateway-plus
-sudo env \
-  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
-  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  ./install.sh
+sudo ./install.sh
 ```
 
 正式安装不得用 `PDG_TAG_BOOTSTRAPPED=1` 绕过发布 tag 校验。
 
-> MosDNS 使用 v5.3.4 no-session-ticket 修补 flavor。当前没有自有长期 release asset，
-> 所以还须先在本机/KFC 构建并通过 `PDG_MOSDNS_ARTIFACT` 与显式 SHA256 交给安装器；
-> 不会回退安装官方 stock v5.3.4，也不在 VPS 临时安装 Go。见
+> MosDNS 使用 v5.3.4 no-session-ticket 修补 flavor。v1.9.0 起从同 tag 的 GitHub Release
+> 下载 raw binary，并用仓库独立钉死的架构 SHA256 与 build marker 校验；不会回退安装
+> 官方 stock v5.3.4，也不在 VPS 临时安装 Go。离线/发版前本地产物通道见
 > [MosDNS 修补版构建与部署](MOSDNS-PATCHED-BUILD.md)。
 
 过程中:

@@ -1279,50 +1279,80 @@ def _mosdns_contract(doc: dict[str, Any], current: dict[str, Any] | None) -> dic
     if (pathlib.PurePosixPath(cert) != expected_cert_root / "fullchain.pem"
             or pathlib.PurePosixPath(key) != expected_cert_root / "privkey.pem"):
         raise ImportInvalid("current managed MosDNS certificate paths are invalid")
+    gfw_internal_sequence = [
+        ("!$client_limiter", "reject 5"), (None, "$lazy_cache"),
+        (None, "jump has_resp"), ("qname $force_hijack", "goto force_hijack_seq"),
+        ("qname $explicit_hijack", "goto force_hijack_seq"),
+        ("qname $geosite_cn", "$ecs_china"),
+        ("qname $geosite_cn", "$local_upstream"),
+        (None, "jump has_resp"), ("!qname $hijack_set", "$ecs_neutral"),
+        ("!qname $hijack_set", "$remote_upstream"),
+        (None, "jump has_resp"), ("qtype 28", "reject 0"),
+        ("qtype 65", "reject 0"), (None, "jump has_resp"),
+        ("qtype 1", "black_hole "), (None, "jump has_resp"),
+        (None, "$ecs_neutral"), (None, "$remote_upstream"),
+    ]
+    # ``lib/mosdns.sh::_mosdns_hijack_shape`` is the runtime source of truth:
+    # all mode removes exactly these two negative-hijack gates, while gfw mode
+    # installs them at this precise priority.  Both are managed production
+    # shapes; no other deletion, insertion or reordering is accepted.
+    all_internal_sequence = (
+        gfw_internal_sequence[:8] + gfw_internal_sequence[10:])
     expected_sequences = {
         "force_hijack_seq": [
-            ("qtype 28", "reject 0"), ("qtype 65", "reject 0"),
-            (None, "jump has_resp"), ("qtype 1", "black_hole "),
+            [("qtype 28", "reject 0"), ("qtype 65", "reject 0"),
+             (None, "jump has_resp"), ("qtype 1", "black_hole ")],
         ],
-        "internal_sequence": [
-            ("!$client_limiter", "reject 5"), (None, "$lazy_cache"),
-            (None, "jump has_resp"), ("qname $force_hijack", "goto force_hijack_seq"),
-            ("qname $explicit_hijack", "goto force_hijack_seq"),
-            ("qname $geosite_cn", "$ecs_china"),
-            ("qname $geosite_cn", "$local_upstream"),
-            (None, "jump has_resp"), ("!qname $hijack_set", "$ecs_neutral"),
-            ("!qname $hijack_set", "$remote_upstream"),
-            (None, "jump has_resp"), ("qtype 28", "reject 0"),
-            ("qtype 65", "reject 0"), (None, "jump has_resp"),
-            ("qtype 1", "black_hole "), (None, "jump has_resp"),
-            (None, "$ecs_neutral"), (None, "$remote_upstream"),
-        ],
+        "internal_sequence": [gfw_internal_sequence, all_internal_sequence],
         "main_sequence": [
-            ("client_ip $npn_clients", "goto internal_sequence"),
-            ("qname $geosite_unlock", "$unlock_upstream"),
-            (None, "jump has_resp"), (None, "$remote_upstream"),
+            [("client_ip $npn_clients", "goto internal_sequence"),
+             ("qname $geosite_unlock", "$unlock_upstream"),
+             (None, "jump has_resp"), (None, "$remote_upstream")],
         ],
     }
-    for tag, expected in expected_sequences.items():
-        args = by_tag[tag].get("args")
+
+    def sequence_error(args: Any, expected: list[tuple[str | None, str]]) -> str | None:
         if not isinstance(args, list) or len(args) != len(expected):
-            raise ImportInvalid("MosDNS managed sequence shape is invalid")
+            return "MosDNS managed sequence shape is invalid"
         for item, (matches, execution) in zip(args, expected):
             if not isinstance(item, dict) or set(item) - {"matches", "exec"}:
-                raise ImportInvalid("MosDNS managed sequence entry is invalid")
+                return "MosDNS managed sequence entry is invalid"
             if matches is None:
                 if "matches" in item:
-                    raise ImportInvalid("MosDNS managed sequence order is invalid")
+                    return "MosDNS managed sequence order is invalid"
             elif item.get("matches") != matches:
-                raise ImportInvalid("MosDNS managed sequence order is invalid")
+                return "MosDNS managed sequence order is invalid"
             actual = item.get("exec")
             if not isinstance(actual, str) or not (
                     actual.startswith(execution) if execution == "black_hole "
                     else actual == execution):
-                raise ImportInvalid("MosDNS managed sequence order is invalid")
-    has_resp_args = by_tag["has_resp"].get("args")
-    if has_resp_args != [{"matches": "has_resp", "exec": "accept"}]:
-        raise ImportInvalid("MosDNS has_resp sequence is invalid")
+                return "MosDNS managed sequence order is invalid"
+        return None
+
+    def validate_managed_sequences(graph: dict[str, dict[str, Any]]) -> None:
+        for tag, variants in expected_sequences.items():
+            args = graph[tag].get("args")
+            errors = [sequence_error(args, expected) for expected in variants]
+            if all(error is not None for error in errors):
+                # Prefer the more specific diagnostic from a same-length
+                # managed variant; otherwise every sanctioned variant
+                # rejected the shape.
+                specific = next((
+                    error for error, expected in zip(errors, variants)
+                    if isinstance(args, list) and len(args) == len(expected)
+                ), None)
+                raise ImportInvalid(
+                    specific or "MosDNS managed sequence shape is invalid")
+        if graph["has_resp"].get("args") != [
+                {"matches": "has_resp", "exec": "accept"}]:
+            raise ImportInvalid("MosDNS has_resp sequence is invalid")
+
+    validate_managed_sequences(by_tag)
+    if current:
+        # The current sequence is copied below to preserve the PDG profile's
+        # hijack mode.  Prove it is a sanctioned managed shape first rather
+        # than trusting live YAML merely because its tag inventory is valid.
+        validate_managed_sequences(current_by_tag)
     # Every explicit plugin reference must resolve inside this graph.  This
     # catches typos before the expensive isolated mosdns probe.
     references = re.compile(r"(?:^|\s)\$([A-Za-z0-9_.-]+)|(?:jump|goto)\s+([A-Za-z0-9_.-]+)")
@@ -1341,6 +1371,12 @@ def _mosdns_contract(doc: dict[str, Any], current: dict[str, Any] | None) -> dic
                     if target not in by_tag:
                         raise ImportInvalid("MosDNS sequence has an unresolved plugin reference")
     if current:
+        # Hijack mode lives in PDG's profile and is changed through its own
+        # transaction.  Importing MosDNS must not silently switch that mode or
+        # leave profile/config inconsistent.  Both sides were independently
+        # proven to be one of the two exact managed shapes above.
+        by_tag["internal_sequence"]["args"] = copy.deepcopy(
+            current_by_tag["internal_sequence"]["args"])
         npn = (current_by_tag.get("npn_clients") or {}).get("args")
         if isinstance(npn, dict) and isinstance(npn.get("ips"), list):
             by_tag["npn_clients"].setdefault("args", {})["ips"] = copy.deepcopy(npn["ips"])

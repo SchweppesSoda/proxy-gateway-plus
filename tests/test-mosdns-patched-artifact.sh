@@ -22,6 +22,17 @@ pdg_verify_sha256 "$PATCH" "${PDG_SHA256[mosdns-patch]}" "MosDNS patch" \
    && "$MOSDNS_BUILD_VERSION" == v5.3.4-pdg-notickets.1 ]] \
   && ok "官方 commit、Go 与 flavor marker 均精确 pin" || bad "provenance pin 漂移"
 
+EXPECTED_RELEASE_BASE="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.9.0"
+AMD64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-amd64"
+ARM64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-arm64"
+[[ "$MOSDNS_PDG_ASSET_BASE_URL" == "$EXPECTED_RELEASE_BASE" \
+   && "$(pdg_mosdns_asset_name amd64)" == "$AMD64_ASSET" \
+   && "$(pdg_mosdns_asset_name arm64)" == "$ARM64_ASSET" \
+   && $(grep -Fc 'ASSET="mosdns-${MOSDNS_VER}-${MOSDNS_PATCH_REV}-linux-${ARCH}"' \
+        "$ROOT/tools/build-mosdns-patched.sh") == 1 ]] \
+  && ok "v1.9.0 Release 目录、helper 与构建产物名精确一致" \
+  || bad "Release 目录或 MosDNS asset 命名漂移"
+
 cat >"$WORK/stock" <<'EOF'
 #!/bin/sh
 [ "$1" = version ] && echo v5.3.4
@@ -59,11 +70,72 @@ PDG_MOSDNS_ARTIFACT_SHA256="0000000000000000000000000000000000000000000000000000
 pdg_prepare_mosdns_candidate amd64 "$WORK/candidate" >/dev/null 2>&1 \
   && bad "错误 raw SHA256 仍被接受" || ok "错误 raw SHA256 fail closed"
 
-rm -rf "$WORK/candidate"; mkdir "$WORK/candidate"
 unset PDG_MOSDNS_ARTIFACT PDG_MOSDNS_ARTIFACT_SHA256
+cat >"$WORK/patched-arm64" <<EOF
+#!/bin/sh
+# distinct arm64 fixture bytes
+[ "\$1" = version ] && echo "$MOSDNS_BUILD_VERSION"
+EOF
+chmod 755 "$WORK/patched-arm64"
+AMD64_FIXTURE_SHA="$RAW_SHA"
+ARM64_FIXTURE_SHA="$(sha256sum "$WORK/patched-arm64" | awk '{print $1}')"
+ARM64_REPO_PIN="${PDG_SHA256[mosdns-pdg-arm64]}"
+PDG_SHA256[mosdns-pdg-amd64]="$AMD64_FIXTURE_SHA"
+PDG_SHA256[mosdns-pdg-arm64]="$ARM64_FIXTURE_SHA"
+export PDG_TEST_RELEASE_BASE="$EXPECTED_RELEASE_BASE"
+export PDG_TEST_AMD64_SOURCE="$WORK/patched"
+export PDG_TEST_ARM64_SOURCE="$WORK/patched-arm64"
+export PDG_TEST_CURL_LOG="$WORK/curl.urls"
+: >"$PDG_TEST_CURL_LOG"
+curl(){
+  local src=""
+  [[ "$#" == 4 && "$1" == -fsSL && "$3" == -o ]] || return 90
+  printf '%s\n' "$2" >>"$PDG_TEST_CURL_LOG"
+  case "$2" in
+    "$PDG_TEST_RELEASE_BASE/$AMD64_ASSET") src="$PDG_TEST_AMD64_SOURCE";;
+    "$PDG_TEST_RELEASE_BASE/$ARM64_ASSET") src="$PDG_TEST_ARM64_SOURCE";;
+    *) return 91;;
+  esac
+  cp -- "$src" "$4"
+}
+
+mkdir "$WORK/release-amd64" "$WORK/release-arm64"
+release_ok=1
+pdg_prepare_mosdns_candidate amd64 "$WORK/release-amd64" \
+  && [[ "$PDG_MOSDNS_PREPARED_CHANNEL" == release \
+        && "$(basename "$PDG_MOSDNS_PREPARED_BIN")" == "$AMD64_ASSET" \
+        && "$(_pdg_mosdns_sha256 "$PDG_MOSDNS_PREPARED_BIN")" == "$AMD64_FIXTURE_SHA" ]] \
+  || release_ok=0
+pdg_prepare_mosdns_candidate arm64 "$WORK/release-arm64" \
+  && [[ "$PDG_MOSDNS_PREPARED_CHANNEL" == release \
+        && "$(basename "$PDG_MOSDNS_PREPARED_BIN")" == "$ARM64_ASSET" \
+        && "$(_pdg_mosdns_sha256 "$PDG_MOSDNS_PREPARED_BIN")" == "$ARM64_FIXTURE_SHA" ]] \
+  || release_ok=0
+[[ "$release_ok" == 1 \
+   && $(grep -Fxc "$EXPECTED_RELEASE_BASE/$AMD64_ASSET" "$PDG_TEST_CURL_LOG") == 1 \
+   && $(grep -Fxc "$EXPECTED_RELEASE_BASE/$ARM64_ASSET" "$PDG_TEST_CURL_LOG") == 1 ]] \
+  && ok "amd64/arm64 均只从精确 tag asset URL 下载并校验" \
+  || bad "双架构 Release 下载 URL、命名或候选校验失败"
+
+rm -rf "$WORK/candidate"; mkdir "$WORK/candidate"
+PDG_SHA256[mosdns-pdg-amd64]="0000000000000000000000000000000000000000000000000000000000000000"
 pdg_prepare_mosdns_candidate amd64 "$WORK/candidate" >/dev/null 2>&1 \
-  && bad "无自有 release asset 时回退下载 stock" \
-  || ok "无 release asset/本地产物时 fail closed，不回退 stock"
+  && bad "Release raw SHA256 不符仍被接受" \
+  || ok "Release raw SHA256 不符时 fail closed"
+
+rm -rf "$WORK/candidate"; mkdir "$WORK/candidate"
+PDG_SHA256[mosdns-pdg-amd64]="$AMD64_FIXTURE_SHA"
+MOSDNS_PDG_ASSET_BASE_URL=""
+: >"$PDG_TEST_CURL_LOG"
+pdg_prepare_mosdns_candidate amd64 "$WORK/candidate" >/dev/null 2>&1 \
+  && bad "空 Release URL 仍产生候选" \
+  || { [[ ! -s "$PDG_TEST_CURL_LOG" ]] \
+       && ok "空 Release URL 时下载前 fail closed" \
+       || bad "空 Release URL 仍触发了下载"; }
+unset -f curl
+MOSDNS_PDG_ASSET_BASE_URL="$EXPECTED_RELEASE_BASE"
+PDG_SHA256[mosdns-pdg-amd64]="$REPO_PIN"
+PDG_SHA256[mosdns-pdg-arm64]="$ARM64_REPO_PIN"
 
 grep -Fq -- '-buildvcs=false' "$ROOT/tools/build-mosdns-patched.sh" \
   && grep -Fq -- '-buildid=' "$ROOT/tools/build-mosdns-patched.sh" \

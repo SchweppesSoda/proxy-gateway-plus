@@ -328,11 +328,26 @@ def main() -> int:
     bot = manager._load_bot()
     exported_components = install_nonmodel_generation(bot, "bundle-a", "plain-node")
     exported_model = copy.deepcopy(current)
+    live_mosdns_at_export = MOSDNS.read_bytes()
     bundle, filename, media_type = manager.export("pdg")
     check(filename == "pdg-config-v2.tar.gz" and media_type == "application/gzip",
           "PDG v2 export returns the stable archive contract")
     with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive_file:
         names = set(archive_file.getnames())
+        archived_mosdns_file = archive_file.extractfile("etc/mosdns/config.yaml")
+        check(archived_mosdns_file is not None,
+              "PDG v2 export contains the managed MosDNS configuration")
+        archived_mosdns_bytes = archived_mosdns_file.read()
+    check(archived_mosdns_bytes == live_mosdns_at_export,
+          "PDG v2 export captures the exact live MosDNS bytes")
+    exported_mosdns = yaml.safe_load(archived_mosdns_bytes)
+    exported_internal_sequence = next(
+        item["args"] for item in exported_mosdns["plugins"]
+        if item.get("tag") == "internal_sequence")
+    check(not any(
+        item.get("matches") == "!qname $hijack_set"
+        for item in exported_internal_sequence),
+        "PDG E2E archive contains the managed all-mode MosDNS shape")
     check("manifest.json" in names and "etc/mihomo/providers/" + leaf in names,
           "PDG v2 manifest archive covers the local provider")
     check({
@@ -401,6 +416,12 @@ def main() -> int:
           "PDG v2 export-preview-apply roundtrip restores canonical model")
     check((PROVIDERS / leaf).read_bytes() == provider,
           "PDG v2 roundtrip restores provider payload")
+    restored_mosdns = yaml.safe_load(MOSDNS.read_bytes())
+    restored_internal_sequence = next(
+        item["args"] for item in restored_mosdns["plugins"]
+        if item.get("tag") == "internal_sequence")
+    check(restored_internal_sequence == exported_internal_sequence,
+          "PDG v2 roundtrip preserves the live managed MosDNS hijack mode")
     for path, expected in exported_components["files"].items():
         check(path.read_bytes() == expected,
               "PDG v2 roundtrip restores non-model bytes: " + str(path))
