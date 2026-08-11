@@ -86,6 +86,7 @@ def setup(tmp):
     bot.RS_META = tmp + "/opt/pdg-bot/rulesets.json"
     bot.MIHOMO_DIR = tmp + "/etc/mihomo"
     bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
+    bot.MOSDNS_CONF = tmp + "/etc/mosdns/config.yaml"
     bot.BACKEND_MARKER = os.path.join(tmp, "backend")
     bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
     os.makedirs(bot.RS_DIR, exist_ok=True)
@@ -93,7 +94,22 @@ def setup(tmp):
         json.dump(SAMPLE, f)
     with open(bot.BACKEND_MARKER, "w") as f:
         f.write("mihomo")
-    shutil.copyfile(ROOT / "deploy" / "mosdns" / "config.yaml", tmp + "/etc/mosdns/config.yaml")
+    mosdns = (ROOT / "deploy" / "mosdns" / "config.yaml").read_text(encoding="utf-8")
+    replacements = {
+        "__SERVER_IP__": "203.0.113.10",
+        "__INTERNAL_CIDR__": "10.0.0.0/24",
+        "__CERT_DIR__": "/etc/mosdns/certs",
+        "__HIJACK_SET_FILE__": "geosite_geolocation-!cn.txt",
+        "__MOSDNS_CACHE__": "8192",
+    }
+    placeholder = re.compile(r"__[A-Z0-9_]+__")
+    assert set(placeholder.findall(mosdns)) == set(replacements), "MosDNS 模板占位符契约漂移"
+    for old, new in replacements.items():
+        mosdns = mosdns.replace(old, new)
+    assert not placeholder.search(mosdns), "MosDNS fixture 写入前仍有占位符"
+    Path(bot.MOSDNS_CONF).write_text(mosdns, encoding="utf-8")
+    assert not placeholder.search(Path(bot.MOSDNS_CONF).read_text(encoding="utf-8")), \
+        "MosDNS fixture 写入后仍有占位符"
     fake = FakeSh()
     bot.sh = fake
     bot._PDGTX_MODULE = None
