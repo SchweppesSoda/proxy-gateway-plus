@@ -55,7 +55,7 @@ git -C "$WORK/client" tag -f v1.9.0 "$C1" >/dev/null
 pdg_origin_release_select "$WORK/client" v1.9.0
 [[ "$PDG_RELEASE_COMMIT" == "$C2" ]] || fail "同名 local poison 覆盖了 origin namespace"
 pdg_origin_release_materialize "$WORK/client"
-[[ "$(git -C "$WORK/client" rev-parse v1.9.0^{commit})" == "$C2" ]] \
+[[ "$(git -C "$WORK/client" rev-parse "v1.9.0^{commit}")" == "$C2" ]] \
   || fail "materialize 未把本地 tag 固定为 origin object"
 ok "同名 local poison 不参与选择，apply 时被精确 origin tag 替换"
 

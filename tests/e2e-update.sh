@@ -105,7 +105,7 @@ out=$(bash /usr/local/bin/pdg update --target v9.9.9 2>&1); rc=$?
   || bad "更新失败 rc=$rc: $(tail -5 <<<"$out")"
 grep -q 'NEWVERSION-MARKER' /opt/pdg-bot/checks.py \
   && ok "新版文件真的装到了 /opt/pdg-bot(不是只动了 git)" || bad "部署文件仍是旧版"
-[[ "$(git -C "$REPO" rev-parse v99.0.0^{commit})" != "$(git -C "$REPO" rev-parse HEAD)" ]] \
+[[ "$(git -C "$REPO" rev-parse "v99.0.0^{commit}")" != "$(git -C "$REPO" rev-parse HEAD)" ]] \
   && ok "精确 target 忽略本地更高 poison tag" || bad "更新错误落到了本地 poison tag"
 [[ "$(git -C "$REPO" describe --tags 2>/dev/null)" == v9.9.9 ]] \
   && ok "仓库已切到最新发布 tag v9.9.9" || bad "仓库 tag=$(git -C "$REPO" describe --tags 2>/dev/null)"

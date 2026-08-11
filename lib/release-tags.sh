@@ -35,6 +35,9 @@ _pdg_release_num_cmp(){
   while [[ "$a" == 0* && "$a" != 0 ]]; do a="${a#0}"; done
   while [[ "$b" == 0* && "$b" != 0 ]]; do b="${b#0}"; done
   [[ -n "$a" ]] || a=0; [[ -n "$b" ]] || b=0
+  # Equal-length normalized decimal strings are compared lexically so the
+  # comparison remains exact beyond the shell's integer range.
+  # shellcheck disable=SC2071
   if ((${#a} > ${#b})); then printf '1\n'
   elif ((${#a} < ${#b})); then printf '%s\n' '-1'
   elif [[ "$a" > "$b" ]]; then printf '1\n'
@@ -100,7 +103,7 @@ pdg_origin_release_refresh(){
       '+refs/tags/v*:refs/pdg-origin-tags/v*' \
       || { echo "无法完整获取 origin release 历史" >&2; return 1; }
   fi
-  git -C "$repo" rev-parse --verify refs/remotes/origin/main^{commit} >/dev/null 2>&1 \
+  git -C "$repo" rev-parse --verify "refs/remotes/origin/main^{commit}" >/dev/null 2>&1 \
     || { echo "origin/main 不可解析" >&2; return 1; }
 }
 

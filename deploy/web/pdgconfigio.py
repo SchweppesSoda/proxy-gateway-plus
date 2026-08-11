@@ -1413,20 +1413,25 @@ def _read_optional_yaml(path: str) -> dict[str, Any] | None:
         return None
 
 
+def _ruleset_names(data: bytes, *, source: str) -> set[str]:
+    if not isinstance(data, bytes) or not data or len(data) > MAX_ARCHIVE_FILE:
+        raise ImportInvalid(source + " PDG ruleset metadata is too large or empty")
+    doc = _strict_json(data)
+    if not isinstance(doc, dict) or any(
+            not isinstance(name, str) or not _TAG_RE.fullmatch(name) for name in doc):
+        raise ImportInvalid(source + " PDG ruleset metadata is invalid")
+    return set(doc)
+
+
 def _current_ruleset_names() -> set[str]:
     try:
-        data = pathlib.Path(RULESET_META_PATH).read_bytes()
+        with open(RULESET_META_PATH, "rb") as stream:
+            data = stream.read(MAX_ARCHIVE_FILE + 1)
     except FileNotFoundError:
         return set()
     except OSError as exc:
         raise ImportInvalid("current PDG ruleset metadata is unavailable") from exc
-    if len(data) > MAX_UPLOAD:
-        raise ImportInvalid("current PDG ruleset metadata is too large")
-    doc = _strict_json(data)
-    if not isinstance(doc, dict) or any(
-            not isinstance(name, str) or not _TAG_RE.fullmatch(name) for name in doc):
-        raise ImportInvalid("current PDG ruleset metadata is invalid")
-    return set(doc)
+    return _ruleset_names(data, source="current")
 
 
 def _model_bytes(model: dict[str, Any]) -> bytes:
@@ -2124,6 +2129,11 @@ class ConfigIO:
                     raise ImportInvalid("PDG managed provider content is invalid") from exc
                 if archived != expected:
                     raise ImportInvalid("PDG managed provider content does not match the model")
+            incoming_ruleset_meta = files.get("opt/pdg-bot/rulesets.json")
+            incoming_ruleset_names: set[str] = set()
+            if incoming_ruleset_meta is not None:
+                incoming_ruleset_names = _ruleset_names(
+                    incoming_ruleset_meta, source="imported")
             conflicts = [
                 {"name": item, "kind": "name", "default": "incoming"}
                 for item in sorted(
@@ -2142,6 +2152,18 @@ class ConfigIO:
                     "etc/sing-box/rs/") for name in files):
                 conflicts.append({"name": "rulesets", "kind": "component", "default": "existing"})
             candidate = {"model": incoming}
+            rule_provider_names = set(
+                incoming["_pdg"]["mihomo"]["rule-providers"])
+            # Preview precedes the merge/replace and component choices.  Keep
+            # both namespace checks in the root-only staged record, then make
+            # prepare_apply reject the selected unsafe state before a durable
+            # job can start.  This permits a safe merge that keeps live
+            # rulesets even when an unused incoming metadata file collides.
+            candidate["rulesetCollisions"] = {
+                "incomingPresent": incoming_ruleset_meta is not None,
+                "incoming": sorted(rule_provider_names & incoming_ruleset_names),
+                "existing": sorted(rule_provider_names & _current_ruleset_names()),
+            }
             incoming_mosdns = files.get("etc/mosdns/config.yaml")
             if incoming_mosdns is not None:
                 current_mosdns = _read_optional_yaml(MOSDNS_PATH)
@@ -2193,7 +2215,7 @@ class ConfigIO:
             summary = {"plugins": len(managed["plugins"]), "mode": "replace"}
             warnings.append("MosDNS plugin graphs are replace-only; local identity will be rebound.")
 
-        if kind != "mosdns":
+        if kind == "mihomo":
             collision = set(candidate["model"]["_pdg"]["mihomo"]["rule-providers"]) & (
                 _current_ruleset_names())
             if collision:
@@ -2308,6 +2330,37 @@ class ConfigIO:
                     value != "incoming" for value in resolutions.values()):
                 raise ImportInvalid(
                     "replace mode requires all conflicts to use imported content")
+            if record["kind"] == "pdg":
+                collision_state = (record.get("candidate") or {}).get(
+                    "rulesetCollisions")
+                if (not isinstance(collision_state, dict)
+                        or set(collision_state) != {
+                            "incomingPresent", "incoming", "existing"}
+                        or type(collision_state["incomingPresent"]) is not bool
+                        or any(not isinstance(values, list)
+                               or any(not isinstance(name, str)
+                                      or not _TAG_RE.fullmatch(name)
+                                      for name in values)
+                               for values in (
+                                   collision_state["incoming"],
+                                   collision_state["existing"]))):
+                    raise ImportInvalid("ruleset collision state is invalid")
+                ruleset_choice = "existing"
+                ruleset_conflict = next((
+                    item for item in record.get("conflicts") or []
+                    if item.get("kind") == "component"
+                    and item.get("name") == "rulesets"), None)
+                if collision_state["incomingPresent"] and (
+                        mode == "replace" or (
+                            ruleset_conflict is not None
+                            and resolutions.get(ruleset_conflict["conflictId"])
+                            == "incoming")):
+                    ruleset_choice = "incoming"
+                selected_collisions = collision_state[ruleset_choice]
+                if selected_collisions:
+                    raise ImportInvalid(
+                        "imported rule-provider collides with the selected PDG ruleset state: "
+                        + ", ".join(sorted(selected_collisions)))
             record["apply"] = {
                 "mode": mode, "conflicts": resolutions, "confirmed": True,
                 "claimed": True, "claimedAt": int(time.time())}

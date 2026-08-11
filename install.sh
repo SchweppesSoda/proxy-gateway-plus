@@ -41,7 +41,8 @@ ask(){
 }
 
 pdg_checkout_latest_tag(){
-  local dir="$1" tag cur target helper="$dir/lib/release-tags.sh"
+  local dir="$1" tag cur target helper
+  helper="$dir/lib/release-tags.sh"
   [[ -f "$helper" ]] || die "发布标签校验器缺失: $helper"
   # shellcheck source=lib/release-tags.sh
   source "$helper"

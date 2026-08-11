@@ -133,14 +133,20 @@ for leaf in {
 
 if tx is not None:
     class CandidateContext:
-        def __init__(self, candidate):
+        def __init__(self, candidate, rs_meta=None, extra_targets=None):
             self.targets = {"model": {
                 "data": json.dumps(candidate, ensure_ascii=False).encode("utf-8")}}
+            if rs_meta is not None:
+                self.targets["rs_meta"] = {
+                    "data": json.dumps(rs_meta, ensure_ascii=False).encode("utf-8")}
+            self.targets.update(extra_targets or {})
 
     original_run = tx._run
     observed_provider_paths = []
+    runner_calls = []
 
     def isolated_run(argv, *args, **kwargs):
+        runner_calls.append(argv)
         if argv and pathlib.Path(argv[0]).name == "mihomo" and "-f" in argv:
             config_path = pathlib.Path(argv[argv.index("-f") + 1])
             checked = json.loads(config_path.read_text(encoding="utf-8"))
@@ -182,9 +188,204 @@ if tx is not None:
         if not valid:
             raise RuntimeError("production Mihomo validator rejected local provider: " + error)
 
-        valid, _error = tx._v_mihomo_check("bad-mihomo.yaml", b"{not-json", None)
-        if valid:
-            raise RuntimeError("production Mihomo validator accepted a broken candidate")
+        # PDG-owned HTTP rule-providers intentionally keep the stable
+        # ./ruleset/<name> cache ABI.  They are allowed only when every field is
+        # derived exactly from candidate rulesets.json, and their probe cache is
+        # materialized outside the production tree.
+        pdg_meta = {"runtime-pdg": {
+            "url": "https://example.invalid/runtime-pdg.json",
+            "outbound": "JP", "format": "source",
+        }}
+        pdg_rendered = copy.deepcopy(rendered)
+        pdg_rendered.setdefault("rule-providers", {})["runtime-pdg"] = {
+            "type": "http",
+            "url": "https://example.invalid/runtime-pdg.json",
+            "behavior": "classical", "format": "text",
+            "path": "./ruleset/runtime-pdg.txt", "interval": 86400,
+        }
+
+        for bad_url in (
+                "file:///etc/shadow", "missing-scheme.example/rules.txt",
+                "https://example.invalid/has whitespace.txt",
+                "https://example.invalid/nul\x00suffix",
+                "https://" + "a" * (8193 - len("https://"))):
+            invalid_meta = copy.deepcopy(pdg_meta)
+            invalid_meta["runtime-pdg"]["url"] = bad_url
+            calls_before_invalid_url = len(runner_calls)
+            valid, _error = tx._v_mihomo_check(
+                "mihomo-invalid-candidate-ruleset-url.yaml",
+                json.dumps(pdg_rendered, ensure_ascii=False).encode("utf-8"),
+                CandidateContext(candidate_model, invalid_meta))
+            if valid or len(runner_calls) != calls_before_invalid_url:
+                raise RuntimeError(
+                    "production validator ran mihomo for invalid candidate ruleset URL")
+
+        invalid_direct_meta = {"runtime-direct": {
+            "url": "file:///etc/shadow", "outbound": "direct", "format": "source",
+        }}
+        calls_before_invalid_direct = len(runner_calls)
+        valid, _error = tx._v_mihomo_check(
+            "mihomo-invalid-direct-ruleset-url.yaml",
+            json.dumps(rendered, ensure_ascii=False).encode("utf-8"),
+            CandidateContext(candidate_model, invalid_direct_meta))
+        if valid or len(runner_calls) != calls_before_invalid_direct:
+            raise RuntimeError(
+                "production validator ran mihomo for invalid direct ruleset URL")
+
+        boundary_url = "http://" + "a" * (8192 - len("http://"))
+        boundary_meta = copy.deepcopy(pdg_meta)
+        boundary_meta["runtime-pdg"]["url"] = boundary_url
+        boundary_ok, _boundary_providers, _boundary_sources, boundary_error = (
+            tx._pdg_mihomo_rule_providers(
+                CandidateContext(candidate_model, boundary_meta)))
+        if not boundary_ok:
+            raise RuntimeError(
+                "production validator rejected 8192-byte HTTP ruleset URL: "
+                + boundary_error)
+
+        # Legacy MRS metadata may lack behavior.  Mirror the Bot by proving it
+        # from the staged managed source, then use those exact bytes as the
+        # isolated probe cache.
+        mrs_raw = (ROOT / "tests/fixtures/ruleset-domain.mrs").read_bytes()
+        mrs_meta = {"runtime-mrs": {
+            "url": "https://example.invalid/runtime.mrs", "outbound": "JP",
+            "format": "mrs", "path": "/etc/sing-box/rs/runtime-mrs.mrs",
+        }}
+        mrs_rendered = copy.deepcopy(rendered)
+        mrs_rendered.setdefault("rule-providers", {})["runtime-mrs"] = {
+            "type": "http", "url": "https://example.invalid/runtime.mrs",
+            "behavior": "domain", "format": "mrs",
+            "path": "./ruleset/runtime-mrs.mrs", "interval": 86400,
+        }
+        valid, error = tx._v_mihomo_check(
+            "mihomo-pdg-mrs.yaml",
+            json.dumps(mrs_rendered, ensure_ascii=False).encode("utf-8"),
+            CandidateContext(candidate_model, mrs_meta, {
+                "ruleset:runtime-mrs.mrs": {"data": mrs_raw}}))
+        if not valid:
+            raise RuntimeError("production validator rejected staged legacy MRS: " + error)
+
+        live_root = WORK / "pdgtx-live"
+        (live_root / "opt/pdg-bot").mkdir(parents=True, exist_ok=True)
+        live_meta = {"live-pdg": {
+            "url": "https://example.invalid/live-pdg.json",
+            "outbound": "JP", "format": "source",
+        }, "live-mrs": {
+            "url": "https://example.invalid/live.mrs", "outbound": "JP",
+            "format": "mrs", "path": "/etc/sing-box/rs/live-mrs.mrs",
+        }}
+        (live_root / "opt/pdg-bot/rulesets.json").write_text(
+            json.dumps(live_meta), encoding="utf-8")
+        (live_root / "etc/sing-box/rs").mkdir(parents=True, exist_ok=True)
+        (live_root / "etc/sing-box/rs/live-mrs.mrs").write_bytes(mrs_raw)
+        # A poisoned production Mihomo cache must never affect validation.
+        (live_root / "etc/mihomo/ruleset").mkdir(parents=True, exist_ok=True)
+        (live_root / "etc/mihomo/ruleset/live-pdg.txt").write_bytes(b"poison")
+        original_fsroot = tx.FSROOT
+        tx.FSROOT = str(live_root)
+        try:
+            # Candidate metadata wins over conflicting live metadata.
+            valid, error = tx._v_mihomo_check(
+                "mihomo-pdg-ruleset.yaml",
+                json.dumps(pdg_rendered, ensure_ascii=False).encode("utf-8"),
+                CandidateContext(candidate_model, pdg_meta))
+            if not valid:
+                raise RuntimeError("production validator rejected PDG rule-provider: " + error)
+
+            live_rendered = copy.deepcopy(rendered)
+            live_rendered.setdefault("rule-providers", {})["live-pdg"] = {
+                "type": "http", "url": "https://example.invalid/live-pdg.json",
+                "behavior": "classical", "format": "text",
+                "path": "./ruleset/live-pdg.txt", "interval": 86400,
+            }
+            live_rendered["rule-providers"]["live-mrs"] = {
+                "type": "http", "url": "https://example.invalid/live.mrs",
+                "behavior": "domain", "format": "mrs",
+                "path": "./ruleset/live-mrs.mrs", "interval": 86400,
+            }
+            valid, error = tx._v_mihomo_check(
+                "mihomo-live-pdg-ruleset.yaml",
+                json.dumps(live_rendered, ensure_ascii=False).encode("utf-8"),
+                CandidateContext(candidate_model))
+            if not valid:
+                raise RuntimeError("production validator rejected live PDG metadata: " + error)
+
+            for bad_url in (
+                    "file:///etc/shadow", "missing-scheme.example/rules.txt",
+                    "https://example.invalid/has whitespace.txt",
+                    "https://example.invalid/nul\x00suffix",
+                    "https://" + "a" * (8193 - len("https://"))):
+                invalid_live_meta = copy.deepcopy(live_meta)
+                invalid_live_meta["live-pdg"]["url"] = bad_url
+                (live_root / "opt/pdg-bot/rulesets.json").write_text(
+                    json.dumps(invalid_live_meta), encoding="utf-8")
+                calls_before_invalid_url = len(runner_calls)
+                valid, _error = tx._v_mihomo_check(
+                    "mihomo-invalid-live-ruleset-url.yaml",
+                    json.dumps(live_rendered, ensure_ascii=False).encode("utf-8"),
+                    CandidateContext(candidate_model))
+                if valid or len(runner_calls) != calls_before_invalid_url:
+                    raise RuntimeError(
+                        "production validator ran mihomo for invalid live ruleset URL")
+            invalid_live_direct = {"live-direct": {
+                "url": "file:///etc/shadow", "outbound": "direct", "format": "source",
+            }}
+            (live_root / "opt/pdg-bot/rulesets.json").write_text(
+                json.dumps(invalid_live_direct), encoding="utf-8")
+            calls_before_invalid_direct = len(runner_calls)
+            valid, _error = tx._v_mihomo_check(
+                "mihomo-invalid-live-direct-ruleset-url.yaml",
+                json.dumps(rendered, ensure_ascii=False).encode("utf-8"),
+                CandidateContext(candidate_model))
+            if valid or len(runner_calls) != calls_before_invalid_direct:
+                raise RuntimeError(
+                    "production validator ran mihomo for invalid live direct ruleset URL")
+            (live_root / "opt/pdg-bot/rulesets.json").write_text(
+                json.dumps(live_meta), encoding="utf-8")
+
+            for field, bad_value in (
+                    ("url", "https://example.invalid/tampered.json"),
+                    ("behavior", "domain"),
+                    ("path", "../ruleset/runtime-pdg.txt"),
+                    ("interval", 1)):
+                tampered_pdg = copy.deepcopy(pdg_rendered)
+                tampered_pdg["rule-providers"]["runtime-pdg"][field] = bad_value
+                calls_before_tampered_pdg = len(runner_calls)
+                valid, _error = tx._v_mihomo_check(
+                    "mihomo-tampered-pdg-%s.yaml" % field,
+                    json.dumps(tampered_pdg, ensure_ascii=False).encode("utf-8"),
+                    CandidateContext(candidate_model, pdg_meta))
+                if valid or len(runner_calls) != calls_before_tampered_pdg:
+                    raise RuntimeError(
+                        "production validator ran mihomo for tampered PDG field: " + field)
+
+            unowned = copy.deepcopy(rendered)
+            unowned.setdefault("rule-providers", {})["unowned"] = {
+                "type": "http", "url": "https://example.invalid/unowned.txt",
+                "behavior": "classical", "format": "text",
+                "path": "./ruleset/unowned.txt", "interval": 86400,
+            }
+            calls_before_unowned = len(runner_calls)
+            valid, _error = tx._v_mihomo_check(
+                "mihomo-unowned-ruleset.yaml",
+                json.dumps(unowned, ensure_ascii=False).encode("utf-8"),
+                CandidateContext(candidate_model, {}))
+            if valid or len(runner_calls) != calls_before_unowned:
+                raise RuntimeError("production validator ran mihomo for unowned ./ruleset path")
+        finally:
+            tx.FSROOT = original_fsroot
+
+        calls_before_bad_candidates = len(runner_calls)
+        for bad_name, bad_data in (
+                ("non-utf8-mihomo.yaml", b"\xff\xfe"),
+                ("non-json-mihomo.yaml", b"{not-json"),
+                ("non-object-mihomo.yaml", b"[]")):
+            valid, _error = tx._v_mihomo_check(bad_name, bad_data, None)
+            if valid:
+                raise RuntimeError(
+                    "production Mihomo validator accepted broken candidate: " + bad_name)
+        if len(runner_calls) != calls_before_bad_candidates:
+            raise RuntimeError("production Mihomo validator ran mihomo for malformed bytes")
     finally:
         tx._run = original_run
 

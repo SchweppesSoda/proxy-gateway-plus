@@ -32,6 +32,7 @@ MOSDNS_RULES = Path("/etc/mosdns/rules")
 RS_META = Path("/opt/pdg-bot/rulesets.json")
 RS_DIR = Path("/etc/sing-box/rs")
 MOSDNS_ATTESTATION = Path("/etc/privdns-gateway/mosdns-build.env")
+TX_AUDIT = Path("/var/lib/privdns-gateway/tx/index.jsonl")
 
 
 def load(name: str, path: Path):
@@ -70,6 +71,39 @@ def choices(preview: dict, value: str | None = None) -> dict[str, str]:
         item["conflictId"]: value or item["default"]
         for item in preview.get("conflicts", [])
     }
+
+
+def transaction_audit_line_count() -> int:
+    try:
+        return len(TX_AUDIT.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return 0
+
+
+def transaction_diagnostic(expected_op: str, start_line: int) -> str:
+    """Return only pdgtx's already-redacted audit fields for CI failures."""
+    try:
+        lines = TX_AUDIT.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return "audit unavailable (" + type(exc).__name__ + ")"
+    if len(lines) < start_line:
+        return "audit rotated before the failed job could be diagnosed"
+    for line in reversed(lines[start_line:]):
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("op") != expected_op:
+            continue
+        safe = {
+            key: record.get(key)
+            for key in (
+                "txid", "op", "state", "error_class", "error",
+                "targets", "services", "warnings",
+            )
+        }
+        return json.dumps(safe, ensure_ascii=False, sort_keys=True)
+    return "no matching transaction audit"
 
 
 def claim(manager, preview: dict, mode: str, value: str | None = None) -> None:
@@ -252,10 +286,16 @@ def main() -> int:
                   *, succeeds: bool = True, claimed: bool = False) -> dict:
         if not claimed:
             claim(manager, preview, mode, value)
+        audit_start = transaction_audit_line_count()
         queued = job_store.start("config-import", import_id=preview["importId"])
         return_code = job_store.run(queued["id"])
         terminal = job_store.get(queued["id"])
         if succeeds:
+            if return_code != 0 or terminal["status"] != "succeeded":
+                print("[DIAG] unexpected config-import job result: " + json.dumps(
+                    terminal, ensure_ascii=False, sort_keys=True), flush=True)
+                print("[DIAG] transaction: " + transaction_diagnostic(
+                    "web_import_" + preview["kind"], audit_start), flush=True)
             check(return_code == 0 and terminal["status"] == "succeeded",
                   preview["kind"] + " config-import job succeeds")
         else:
@@ -311,6 +351,24 @@ def main() -> int:
         bot, "bundle-b", "replacement-node")
 
     preview = manager.preview("mihomo", mihomo("replacement-node"), "application/yaml")
+    staged = manager._record(preview["importId"])
+    derived_model = cio._merge_model(
+        model(), staged["candidate"]["model"], "replace", {})
+    derived_bytes, derived_meta = bot._render_mihomo_bytes(derived_model)
+    derived_mihomo = json.loads(derived_bytes.decode("utf-8"))
+    check(
+        derived_mihomo.get("rule-providers", {}).get("bundle-b-proxy") == {
+            "type": "http",
+            "url": "https://example.invalid/e2e-bundle-b-proxy.json",
+            "behavior": "classical",
+            "format": "text",
+            "path": "./ruleset/bundle-b-proxy.txt",
+            "interval": 86400,
+        }
+        and "bundle-b-direct" not in derived_mihomo.get("rule-providers", {})
+        and derived_meta == {"dropped": [], "unknown_proxies": []},
+        "Mihomo replace candidate includes the bundle-b PDG HTTP ruleset cache",
+    )
     apply_job(preview, "replace", "incoming")
     replacement = model()
     replacement_proxies = {

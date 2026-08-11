@@ -129,6 +129,7 @@ _MOSDNS_RULE_RE = re.compile(r"^[A-Za-z0-9_!.-]+\.txt$")
 _RULESET_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
 _MIHOMO_PROVIDER_RE = re.compile(r"^[a-f0-9]{64}\.(yaml|yml|json|txt|mrs)$")
+_PDG_RULESET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 # 目标 → 该目标牵动哪个服务(决定基线范围、观察范围)
 _TARGET_SVC = {
@@ -484,6 +485,51 @@ def _v_json_any(path, data, ctx):
     return True, ""
 
 
+def _candidate_ruleset_meta(ctx):
+    """Load the transaction's effective rulesets.json with a fixed read cap.
+
+    A staged ``rs_meta`` target is authoritative, including an explicit
+    deletion.  Falling back to the live file while that candidate exists can
+    validate the model against a different provider namespace than the one
+    committed by the transaction.  The shared loader also keeps model and
+    Mihomo derivation on the same bounded parsing path.
+    """
+    targets = getattr(ctx, "targets", {}) if ctx else {}
+    if not isinstance(targets, dict):
+        targets = {}
+    candidate = "rs_meta" in targets
+    try:
+        if candidate:
+            target = targets.get("rs_meta")
+            if not isinstance(target, dict):
+                return False, {}, "候选 rulesets.json 目标不合法"
+            raw = target.get("data")
+            if raw is None:
+                meta = {}
+            else:
+                if (not isinstance(raw, bytes) or not raw
+                        or len(raw) > MAX_MANAGED_FILE):
+                    return False, {}, "候选 rulesets.json 为空或过大"
+                meta = json.loads(raw.decode("utf-8"))
+        else:
+            try:
+                with open(FSROOT + "/opt/pdg-bot/rulesets.json", "rb") as stream:
+                    raw = stream.read(MAX_MANAGED_FILE + 1)
+            except FileNotFoundError:
+                return True, {}, ""
+            if len(raw) > MAX_MANAGED_FILE:
+                return False, {}, "现网 rulesets.json 超过受管上限"
+            meta = json.loads(raw.decode("utf-8"))
+    except (AttributeError, UnicodeError, ValueError, TypeError,
+            OSError, RecursionError):
+        label = "候选" if candidate else "现网"
+        return False, {}, "%s rulesets.json 无法安全解析" % label
+    if not isinstance(meta, dict):
+        label = "候选" if candidate else "现网"
+        return False, {}, "%s rulesets.json 不是映射" % label
+    return True, meta, ""
+
+
 def _v_json_model(path, data, ctx):
     if not data or len(data) > MAX_MODEL_FILE:
         return False, "config.json 为空或超过受管模型上限"
@@ -781,18 +827,94 @@ def _v_json_model(path, data, ctx):
             return True
         if not all(visit_group(name) for name in graph):
             return False, "config.json 的 proxy-group 存在循环引用"
-        try:
-            with open(FSROOT + "/opt/pdg-bot/rulesets.json", encoding="utf-8") as stream:
-                rule_meta = json.load(stream)
-            if not isinstance(rule_meta, dict):
-                raise ValueError("not object")
-        except FileNotFoundError:
-            rule_meta = {}
-        except Exception:  # noqa: BLE001
-            return False, "现网 rulesets.json 无法安全解析"
+        ruleset_ok, rule_meta, ruleset_error = _candidate_ruleset_meta(ctx)
+        if not ruleset_ok:
+            return False, ruleset_error
+        # Use every PDG metadata key, not only providers rendered at runtime.
+        # ``direct`` and legacy ``.srs`` entries still occupy the PDG-owned
+        # namespace and could otherwise become latent imported providers after
+        # a later metadata edit.
         if set(mihomo["rule-providers"]) & set(rule_meta):
             return False, "导入 rule-provider 与 PDG 规则集同名"
     return True, ""
+
+
+def _pdg_mihomo_rule_providers(ctx):
+    """Return the exact PDG-owned HTTP rule-providers for this candidate.
+
+    Imported providers remain content-addressed under /etc/mihomo/providers.
+    PDG's own rulesets have a separate stable cache ABI under ./ruleset; only
+    entries derived exactly from candidate/live rulesets.json are allowed into
+    that namespace.
+    """
+    targets = getattr(ctx, "targets", {}) if ctx else {}
+    if not isinstance(targets, dict):
+        targets = {}
+    meta_ok, meta, meta_error = _candidate_ruleset_meta(ctx)
+    if not meta_ok:
+        return False, {}, {}, meta_error
+
+    expected = {}
+    probe_sources = {}
+    extensions = {"text": "txt", "yaml": "yaml", "mrs": "mrs"}
+    for name, info in meta.items():
+        if not isinstance(name, str) or not isinstance(info, dict):
+            return False, {}, {}, "候选 rulesets.json 条目不合法"
+        if not _PDG_RULESET_NAME_RE.fullmatch(name):
+            return False, {}, {}, "候选 PDG rule-provider 名称不是安全叶"
+        url = info.get("url", "")
+        if (not isinstance(url, str) or len(url) > 8192
+                or not re.fullmatch(r"https?://[^\s\x00]+", url, re.I)):
+            return False, {}, {}, "候选 ruleset URL 不合法"
+        if info.get("outbound") == "direct":
+            continue
+        low = url.lower().split("?", 1)[0]
+        recorded_format = str(info.get("format", ""))
+        if low.endswith(".srs") or recorded_format == "binary":
+            continue
+        if low.endswith((".yaml", ".yml")):
+            behavior, provider_format = "classical", "yaml"
+        elif low.endswith(".mrs") or recorded_format == "mrs":
+            behavior = str(info.get("behavior", ""))
+            source_path = info.get("path", "")
+            if not isinstance(source_path, str):
+                return False, {}, {}, "候选 MRS 源路径不合法"
+            leaf = os.path.basename(source_path)
+            canonical = "/etc/sing-box/rs/" + leaf
+            if (not _RULESET_RE.fullmatch(leaf) or not leaf.endswith(".mrs")
+                    or source_path != canonical):
+                return False, {}, {}, "候选 MRS 源路径不受管"
+            source_target = targets.get("ruleset:" + leaf)
+            try:
+                if source_target is not None:
+                    source_data = source_target.get("data")
+                else:
+                    with open(FSROOT + canonical, "rb") as stream:
+                        source_data = stream.read(MAX_MANAGED_FILE + 1)
+            except (AttributeError, OSError):
+                return False, {}, {}, "候选 MRS 源文件不可读"
+            if (not isinstance(source_data, bytes) or not source_data
+                    or len(source_data) > MAX_MANAGED_FILE):
+                return False, {}, {}, "候选 MRS 源文件为空或过大"
+            head, mrs_error = _mrs_validation_head(source_data)
+            if mrs_error or len(head) < 5 or head[:4] != b"MRS\x01":
+                return False, {}, {}, "候选 MRS 源文件无法严格识别"
+            sniffed = {0: "domain", 1: "ipcidr"}.get(head[4])
+            if behavior not in ("domain", "ipcidr"):
+                behavior = sniffed or ""
+            if behavior not in ("domain", "ipcidr") or behavior != sniffed:
+                return False, {}, {}, "候选 MRS behavior 与源文件不一致"
+            provider_format = "mrs"
+            probe_sources[name] = source_data
+        else:
+            behavior, provider_format = "classical", "text"
+        expected[name] = {
+            "type": "http", "url": url, "behavior": behavior,
+            "format": provider_format,
+            "path": "./ruleset/%s.%s" % (name, extensions[provider_format]),
+            "interval": 86400,
+        }
+    return True, expected, probe_sources, ""
 
 
 def _v_mihomo_check(path, data, ctx):
@@ -807,12 +929,19 @@ def _v_mihomo_check(path, data, ctx):
         # complete candidate set, never candidate config + live provider files.
         # sb2mihomo renders JSON (valid YAML), so paths can be rebound without a
         # second YAML dependency in the transaction engine.
-        probe_data = data
         try:
             document = json.loads(data.decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError, RecursionError):
+            return False, "候选 Mihomo 配置不是合法 UTF-8 JSON"
+        if not isinstance(document, dict):
+            return False, "候选 Mihomo 配置不是映射"
+        try:
             probe_dir = os.path.join(d, "providers")
             os.makedirs(probe_dir, mode=0o700, exist_ok=True)
             targets = getattr(ctx, "targets", {}) if ctx else {}
+            ok, pdg_rule_providers, pdg_probe_sources, error = _pdg_mihomo_rule_providers(ctx)
+            if not ok:
+                return False, error
             managed = {}
             model_target = targets.get("model") if isinstance(targets, dict) else None
             try:
@@ -827,9 +956,29 @@ def _v_mihomo_check(path, data, ctx):
                 providers = document.get(section) or {}
                 if not isinstance(providers, dict):
                     return False, "候选 provider 集合不是映射"
-                for provider in providers.values():
+                if (section == "rule-providers"
+                        and not set(pdg_rule_providers).issubset(providers)):
+                    return False, "候选配置缺少 rulesets.json 派生的 PDG rule-provider"
+                for name, provider in providers.items():
                     if not isinstance(provider, dict):
                         return False, "候选 provider 条目不合法"
+                    if section == "rule-providers" and name in pdg_rule_providers:
+                        expected = pdg_rule_providers[name]
+                        if provider != expected:
+                            return False, "候选 PDG rule-provider 与 rulesets.json 不一致"
+                        extension = expected["format"]
+                        provider_data = ({
+                            "text": b"DOMAIN,example.invalid\n",
+                            "yaml": b"payload:\n  - DOMAIN,example.invalid\n",
+                            "mrs": pdg_probe_sources.get(name),
+                        }[extension])
+                        if provider_data is None:
+                            return False, "候选 PDG rule-provider 缺少隔离 probe 数据"
+                        destination = os.path.join(
+                            probe_dir, os.path.basename(expected["path"]))
+                        atomic_write(destination, provider_data, 0o600)
+                        provider["path"] = destination
+                        continue
                     source = provider.get("path")
                     if not isinstance(source, str):
                         return False, "候选 provider 缺少受管路径"
@@ -861,8 +1010,8 @@ def _v_mihomo_check(path, data, ctx):
                     if provider["path"].startswith("/etc/mihomo/providers/"):
                         return False, "候选 provider 未与生产目录隔离"
             probe_data = json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8")
-        except (UnicodeError, ValueError, TypeError):
-            pass
+        except (UnicodeError, ValueError, TypeError, RecursionError):
+            return False, "候选 Mihomo 配置无法安全处理"
         atomic_write(cand, probe_data, 0o600)
         rc, out = _run([exe, "-t", "-d", d, "-f", cand], timeout=60)
         return (rc == 0), ("" if rc == 0 else redact(out[-400:]))

@@ -20,6 +20,7 @@ import types
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "web"))
@@ -27,10 +28,22 @@ sys.path.insert(0, str(ROOT / "deploy" / "bot"))
 
 import pdgconfigio as cio  # noqa: E402
 import sb2mihomo  # noqa: E402
-if os.name != "nt":
-    import pdgtx  # noqa: E402
+if os.name == "nt":
+    # Validator-only tests do not exercise file locking.  Supply Windows'
+    # absent module long enough to load the production validator so its pure
+    # candidate/live namespace checks run on every development host.
+    _previous_fcntl = sys.modules.get("fcntl")
+    sys.modules["fcntl"] = types.SimpleNamespace(
+        flock=lambda *_args: None, LOCK_EX=1, LOCK_UN=8)
+    try:
+        import pdgtx  # noqa: E402
+    finally:
+        if _previous_fcntl is None:
+            sys.modules.pop("fcntl", None)
+        else:
+            sys.modules["fcntl"] = _previous_fcntl
 else:
-    pdgtx = None
+    import pdgtx  # noqa: E402
 
 
 def model(*outbounds):
@@ -53,6 +66,21 @@ def tar_bytes(entries, *, symlink=None):
             info.linkname = "target"
             archive.addfile(info)
     return out.getvalue()
+
+
+def v2_pdg_bytes(entries):
+    entries = dict(entries)
+    manifest = {
+        "version": 2,
+        "createdAt": "2026-08-11T00:00:00Z",
+        "files": [
+            {"path": name, "size": len(data), "sha256": cio._sha(data)}
+            for name, data in sorted(entries.items())
+        ],
+    }
+    entries["manifest.json"] = json.dumps(
+        manifest, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    return tar_bytes(entries)
 
 
 def load_bot_module():
@@ -538,7 +566,7 @@ class ModelAndConversionTests(unittest.TestCase):
         ok, error = pdgtx._v_json_model(
             "config.json", json.dumps(candidate).encode(), None)
         self.assertFalse(ok)
-        self.assertIn("类型不一致", error)
+        self.assertIn("不一致", error)
 
     @unittest.skipIf(pdgtx is None, "pdgtx requires POSIX fcntl")
     def test_transaction_validator_independently_enforces_runtime_metadata(self):
@@ -595,6 +623,111 @@ class ModelAndConversionTests(unittest.TestCase):
         ok, _error = pdgtx._v_json_model(
             "config.json", json.dumps(bad_group).encode(), None)
         self.assertFalse(ok)
+
+    @unittest.skipIf(pdgtx is None, "pdgtx requires POSIX fcntl")
+    def test_transaction_ruleset_collision_uses_candidate_first_and_bounded_live_read(self):
+        provider_name = "shared"
+        provider_hash = hashlib.sha256(
+            ("rule-provider:" + provider_name).encode("utf-8")).hexdigest()
+        candidate = model()
+        candidate["_pdg"]["mihomo"]["rule-providers"] = {
+            provider_name: {
+                "type": "http",
+                "url": "https://provider.example/shared.txt",
+                "path": "/etc/mihomo/providers/" + provider_hash + ".txt",
+                "format": "text",
+                "behavior": "classical",
+            }
+        }
+        candidate_data = cio._model_bytes(candidate)
+
+        def context(meta):
+            return types.SimpleNamespace(targets={
+                "rs_meta": {"data": json.dumps(meta).encode("utf-8")}
+            })
+
+        occupied_variants = {
+            "runtime": {
+                "url": "https://rules.example/shared.txt",
+                "outbound": "JP", "format": "source",
+            },
+            "direct": {
+                "url": "https://rules.example/direct.txt",
+                "outbound": "direct", "format": "source",
+            },
+            "legacy-srs": {
+                "url": "https://rules.example/shared.srs",
+                "outbound": "JP", "format": "binary",
+            },
+        }
+        for variant, metadata in occupied_variants.items():
+            with self.subTest(variant=variant):
+                ok, error = pdgtx._v_json_model(
+                    "config.json", candidate_data,
+                    context({provider_name: metadata}))
+                self.assertFalse(ok)
+                self.assertIn("同名", error)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live_path = root / "opt/pdg-bot/rulesets.json"
+            live_path.parent.mkdir(parents=True)
+            live_path.write_text(json.dumps({
+                provider_name: occupied_variants["runtime"]
+            }), encoding="utf-8")
+            old_root = pdgtx.FSROOT
+            pdgtx.FSROOT = str(root)
+            try:
+                # A staged rs_meta candidate is authoritative and must not be
+                # contaminated by a colliding live namespace.
+                staged = context({"candidate-only": {
+                    "url": "https://rules.example/candidate.txt",
+                    "outbound": "JP", "format": "source",
+                }})
+                ok, error = pdgtx._v_json_model(
+                    "config.json", candidate_data, staged)
+                self.assertTrue(ok, error)
+                providers_ok, providers, _sources, providers_error = (
+                    pdgtx._pdg_mihomo_rule_providers(staged))
+                self.assertTrue(providers_ok, providers_error)
+                self.assertEqual(set(providers), {"candidate-only"})
+
+                deleted = types.SimpleNamespace(targets={
+                    "rs_meta": {"data": None}
+                })
+                ok, error = pdgtx._v_json_model(
+                    "config.json", candidate_data, deleted)
+                self.assertTrue(ok, error)
+                providers_ok, providers, _sources, providers_error = (
+                    pdgtx._pdg_mihomo_rule_providers(deleted))
+                self.assertTrue(providers_ok, providers_error)
+                self.assertEqual(providers, {})
+
+                ok, error = pdgtx._v_json_model(
+                    "config.json", candidate_data, None)
+                self.assertFalse(ok)
+                self.assertIn("同名", error)
+            finally:
+                pdgtx.FSROOT = old_root
+
+        reads = []
+
+        class OversizedRulesetFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, amount=-1):
+                reads.append(amount)
+                return b"x" * amount
+
+        with mock.patch("builtins.open", return_value=OversizedRulesetFile()):
+            ok, _meta, error = pdgtx._candidate_ruleset_meta(None)
+        self.assertFalse(ok)
+        self.assertIn("超过", error)
+        self.assertEqual(reads, [pdgtx.MAX_MANAGED_FILE + 1])
 
     def test_proxy_advanced_round_trip_and_canonical_fields_win(self):
         current = model()
@@ -931,6 +1064,121 @@ class StagingTests(unittest.TestCase):
         self.manager.apply(preview["importId"])
         _args, kwargs = self.manager.bot.calls[-1]
         self.assertEqual(kwargs["model_expect"], expected)
+
+    def test_pdg_ruleset_collisions_follow_selected_component_state(self):
+        provider_name = "shared"
+        provider_hash = hashlib.sha256(
+            ("rule-provider:" + provider_name).encode("utf-8")).hexdigest()
+        incoming_model = model()
+        incoming_model["_pdg"]["mihomo"]["rule-providers"] = {
+            provider_name: {
+                "type": "http",
+                "url": "https://provider.example/shared.txt",
+                "path": "/etc/mihomo/providers/" + provider_hash + ".txt",
+                "format": "text", "behavior": "classical",
+            }
+        }
+
+        def archive(meta_name, *, direct=False):
+            leaf = meta_name + ".json"
+            metadata = {
+                meta_name: {
+                    "url": "https://rules.example/" + leaf,
+                    "outbound": "direct" if direct else "JP",
+                    "format": "source",
+                    "path": "/etc/sing-box/rs/" + leaf,
+                }
+            }
+            return v2_pdg_bytes({
+                "etc/sing-box/config.json": cio._model_bytes(incoming_model),
+                "opt/pdg-bot/rulesets.json": json.dumps(metadata).encode("utf-8"),
+                "etc/sing-box/rs/" + leaf: b'{"version":1,"rules":[]}',
+            })
+
+        def choices(preview, rulesets):
+            return {
+                item["conflictId"]: (
+                    rulesets if item["kind"] == "component"
+                    and item["name"] == "rulesets" else "incoming")
+                for item in preview["conflicts"]
+            }
+
+        # The imported metadata occupies "shared" even though this direct
+        # ruleset is not rendered as a Mihomo provider.  Incoming modes are
+        # unsafe, while merge-existing is safe and must remain usable.
+        Path(cio.RULESET_META_PATH).write_text("{}\n", encoding="utf-8")
+        payload = archive(provider_name, direct=True)
+        preview = self.manager.preview("pdg", payload, "application/gzip")
+        record = self.manager._record(preview["importId"])
+        self.assertEqual(record["candidate"]["rulesetCollisions"], {
+            "incomingPresent": True,
+            "incoming": [provider_name],
+            "existing": [],
+        })
+        with self.assertRaisesRegex(cio.ImportInvalid, "selected PDG ruleset"):
+            self.manager.prepare_apply(preview["importId"], {
+                "confirm": True, "mode": "replace",
+                "conflicts": choices(preview, "incoming")})
+        with self.assertRaisesRegex(cio.ImportInvalid, "selected PDG ruleset"):
+            self.manager.prepare_apply(preview["importId"], {
+                "confirm": True, "mode": "merge",
+                "conflicts": choices(preview, "incoming")})
+        self.manager.prepare_apply(preview["importId"], {
+            "confirm": True, "mode": "merge",
+            "conflicts": choices(preview, "existing")})
+        self.manager.apply(preview["importId"])
+        restored = cio._archive_files(self.manager.bot.calls[-1][0][0])
+        self.assertNotIn("opt/pdg-bot/rulesets.json", restored)
+        self.assertEqual(Path(cio.RULESET_META_PATH).read_text(encoding="utf-8"), "{}\n")
+
+        # Conversely, a live collision is unsafe only when merge keeps the
+        # existing component.  Selecting the non-colliding incoming metadata
+        # must pass the pre-job gate.
+        self.manager.bot.current = model()
+        Path(cio.MODEL_PATH).write_bytes(cio._model_bytes(self.manager.bot.current))
+        Path(cio.RULESET_META_PATH).write_text(json.dumps({
+            provider_name: {
+                "url": "https://rules.example/live.json", "outbound": "JP",
+                "format": "source", "path": "/etc/sing-box/rs/live.json",
+            }
+        }), encoding="utf-8")
+        payload = archive("incoming-only")
+        preview = self.manager.preview("pdg", payload, "application/gzip")
+        record = self.manager._record(preview["importId"])
+        self.assertEqual(record["candidate"]["rulesetCollisions"], {
+            "incomingPresent": True,
+            "incoming": [],
+            "existing": [provider_name],
+        })
+        with self.assertRaisesRegex(cio.ImportInvalid, "selected PDG ruleset"):
+            self.manager.prepare_apply(preview["importId"], {
+                "confirm": True, "mode": "merge",
+                "conflicts": choices(preview, "existing")})
+        self.manager.prepare_apply(preview["importId"], {
+            "confirm": True, "mode": "merge",
+            "conflicts": choices(preview, "incoming")})
+        self.manager.apply(preview["importId"])
+        restored = cio._archive_files(self.manager.bot.calls[-1][0][0])
+        self.assertIn("opt/pdg-bot/rulesets.json", restored)
+
+    def test_current_ruleset_names_reads_only_the_fixed_envelope(self):
+        reads = []
+
+        class OversizedRulesetFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, amount=-1):
+                reads.append(amount)
+                return b"x" * amount
+
+        with mock.patch("builtins.open", return_value=OversizedRulesetFile()):
+            with self.assertRaisesRegex(cio.ImportInvalid, "too large"):
+                cio._current_ruleset_names()
+        self.assertEqual(reads, [cio.MAX_ARCHIVE_FILE + 1])
 
     def test_legacy_direct_tag_rebinds_for_json_and_manifestless_tar_apply(self):
         incoming = model(

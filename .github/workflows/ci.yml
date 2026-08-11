@@ -465,7 +465,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            python3-yaml curl ca-certificates gzip unzip openssl >/dev/null
+            python3-yaml curl ca-certificates gzip unzip openssl zstd >/dev/null
           python3 -c 'import yaml'
       - name: 配置导入模板 (真实 preview/渲染器/Mihomo/MosDNS)
         run: bash tests/test-import-template-runtime.sh
