@@ -45,6 +45,12 @@ PDG_NONINTERACTIVE=1 PDG_SERVER_IP=<公网IP> PDG_INTERNAL_CIDR=172.22.0.0/16 \
 - [ ] **防火墙模式一致**:`managed` 的 owned `inet pdg` 有 input hook 和 `policy drop`;
   `external` 无 input hook / input policy,但仍保留 source-scoped REDIRECT,并在 `tproxy`
   模式保留 source-scoped QUIC TPROXY。
+- [ ] **PDG Web 配置 I/O**：保持默认 disabled/inactive；完成 loopback setup/enable 后，
+  Mihomo/MosDNS 模板可下载。错误管理密码不能导出，重新验证正确密码后 PDG/Mihomo/MosDNS
+  三类附件均可下载。分别上传两份示例模板执行预览，确认生产模型/config SHA 未变化；取消后
+  暂存立即删除。再在 throwaway 机确认 Mihomo 的 merge/replace 与 MosDNS replace-only
+  各完成一次，维护任务成功、`pdg-web`/`mihomo`/`mosdns` 稳定、`pdg-bot` 符合其凭据配置
+  状态，且 `pdg doctor --deep` 通过。
 
 ## ② 从上一个发布版升级(最容易翻车)
 

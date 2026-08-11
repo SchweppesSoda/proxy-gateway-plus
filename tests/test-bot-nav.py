@@ -69,6 +69,15 @@ assert_near('if data == "upd_check":', 'edit(chat, mid, "🔄 检查更新中…
 assert 'edit(chat, mid, "🔄 检查更新中…", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
 )
+assert '"callback_data": "upd_apply:" + target' in bot, (
+    "update confirmation must bind the exact origin release checked by the user"
+)
+assert 'start_update(target)' in bot and '"--target", target' in bot, (
+    "background update must carry the confirmed exact target"
+)
+assert 'if data == "upd_apply":' in bot and "旧更新确认已失效" in bot, (
+    "unbound legacy update buttons must be rejected"
+)
 none_progress_edits = re.findall(r"edit\(chat, mid, [^\n]+, None\)", bot)
 assert not none_progress_edits, (
     "progress/result edits must pass an explicit keyboard; None falls back to the full first-level MENU: "

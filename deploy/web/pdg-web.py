@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native PDG HTTPS management API and static-file server (stdlib only)."""
+"""Native PDG HTTPS management API and static-file server."""
 from __future__ import annotations
 
 import argparse
@@ -53,6 +53,8 @@ COOKIE_NAME = "__Host-pdg_session"
 CSRF_HEADER = "X-CSRF-Token"
 MAX_JSON_BYTES = 64 * 1024
 MAX_PASSWORD_BYTES = 1024
+MAX_IMPORT_BYTES = 36 * 1024 * 1024
+MAX_LEGACY_PDG_IMPORT_BYTES = 68 * 1024 * 1024
 MAX_STATIC_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 PRELOGIN_CSRF_SECONDS = 300
@@ -92,6 +94,8 @@ _MIME_TYPES = {
     ".woff": "font/woff",
     ".woff2": "font/woff2",
     ".txt": "text/plain; charset=utf-8",
+    ".yaml": "application/yaml; charset=utf-8",
+    ".yml": "application/yaml; charset=utf-8",
 }
 
 
@@ -629,8 +633,10 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _send(
             self, status: int, body: bytes, content_type: str, *,
-            cookie: str | None = None, allow: str | None = None):
-        if len(body) > MAX_RESPONSE_BYTES:
+            cookie: str | None = None, allow: str | None = None,
+            headers: dict[str, str] | None = None,
+            maximum: int = MAX_RESPONSE_BYTES):
+        if len(body) > maximum:
             status = 500
             body = b'{"ok":false,"error":{"code":"response_too_large","message":"Response is too large."}}'
             content_type = "application/json; charset=utf-8"
@@ -642,6 +648,8 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", cookie)
         if allow is not None:
             self.send_header("Allow", allow)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
@@ -770,6 +778,31 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
             return None
         return value
 
+    def _binary_meta(self, maximum: int = MAX_IMPORT_BYTES) -> tuple[int, str] | None:
+        if self.headers.get_all("Transfer-Encoding"):
+            self._error(400, "invalid_request", "Request body is invalid.")
+            return None
+        types = self.headers.get_all("Content-Type") or []
+        if len(types) != 1:
+            self._error(415, "unsupported_media_type", "Content-Type is required.")
+            return None
+        content_type = types[0].split(";", 1)[0].strip().lower()
+        if content_type not in {
+                "application/octet-stream", "application/yaml", "text/yaml",
+                "application/x-yaml", "application/zip", "application/gzip",
+                "application/x-gzip", "application/json"}:
+            self._error(415, "unsupported_media_type", "Upload type is not supported.")
+            return None
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            self._error(411, "length_required", "A valid Content-Length is required.")
+            return None
+        size = int(lengths[0])
+        if not 0 < size <= maximum:
+            self._error(413, "body_too_large", "Upload size is invalid.")
+            return None
+        return size, content_type
+
     def _new_cookie(self, token: str) -> str:
         return (
             f"{COOKIE_NAME}={token}; Path=/; Max-Age={self.config.session_seconds}; "
@@ -861,6 +894,32 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
                 {"authenticated": False, "csrf": self.security.prelogin_csrf(
                     self._client_ip(), self._request_host() or "")},
                 cookie=self._expired_cookie())
+            return
+
+        match = re.fullmatch(r"/api/v1/exports/(pdg|mihomo|mosdns)", path)
+        if match and self.command == "POST":
+            self._export_config(match.group(1), client_ip)
+            return
+        match = re.fullmatch(r"/api/v1/imports/(pdg|mihomo|mosdns)/preview", path)
+        if match and self.command == "POST":
+            upload = self._binary_meta(
+                MAX_LEGACY_PDG_IMPORT_BYTES if match.group(1) == "pdg"
+                else MAX_IMPORT_BYTES)
+            if upload is not None:
+                size, content_type = upload
+                self._call(lambda: self.control.preview_import_stream(
+                    match.group(1), self.rfile, size, content_type), status=201)
+            return
+        match = re.fullmatch(r"/api/v1/imports/(imp-[a-f0-9]{32})/apply", path)
+        if match and self.command == "POST":
+            body = self._read_json()
+            if body is not None:
+                self._call(lambda: self.control.apply_import(
+                    match.group(1), body), status=202)
+            return
+        match = re.fullmatch(r"/api/v1/imports/(imp-[a-f0-9]{32})", path)
+        if match and self.command == "DELETE":
+            self._call(lambda: self.control.cancel_import(match.group(1)))
             return
 
         get_routes = {
@@ -1032,6 +1091,75 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
             if isinstance(body, dict) and isinstance(body.get("password"), str):
                 body["password"] = ""
             if not attempt_finished:
+                self.security.finish_login_attempt(client_ip, failed=True)
+
+    def _export_config(self, kind: str, client_ip: str):
+        """Password re-authenticated attachment response.
+
+        Export passwords are never forwarded to the control layer, jobs or
+        logs.  The login KDF slot/rate limiter is intentionally shared so an
+        export endpoint cannot become a second unlimited password oracle.
+        """
+        if not self.security.reserve_login_attempt(client_ip):
+            self._error(429, "rate_limited", "Too many authentication attempts.")
+            return
+        finished = False
+        body = None
+        password = b""
+        try:
+            body = self._read_json(password=True)
+            if body is None:
+                return
+            if set(body) != {"password"} or not isinstance(body.get("password"), str):
+                self.security.finish_login_attempt(client_ip, failed=True)
+                finished = True
+                self._error(401, "invalid_credentials", "Invalid credentials.")
+                return
+            try:
+                password = body["password"].encode("utf-8", "strict")
+            except UnicodeError:
+                password = b""
+            if not 1 <= len(password) <= MAX_PASSWORD_BYTES:
+                password = b""
+            valid = self.security.verify_password(password)
+            if valid is None:
+                self.security.finish_login_attempt(client_ip, failed=False)
+                finished = True
+                self._error(429, "rate_limited", "Too many authentication attempts.")
+                return
+            self.security.finish_login_attempt(client_ip, failed=not valid)
+            finished = True
+            if not valid:
+                self._error(401, "invalid_credentials", "Invalid credentials.")
+                return
+            self.security.clear_login_failures(client_ip)
+            try:
+                data, filename, content_type = self.control.export_config(kind)
+            except ValidationError as exc:
+                self._error(exc.status, exc.code, exc.public_message)
+                return
+            except NotFoundError as exc:
+                self._error(exc.status, exc.code, exc.public_message)
+                return
+            except ControlError as exc:
+                self._error(exc.status, exc.code, exc.public_message)
+                return
+            except Exception:
+                self._error(500, "internal_error", "Operation could not be completed.")
+                return
+            if (not isinstance(data, bytes) or not 0 < len(data) <= MAX_IMPORT_BYTES
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", filename)):
+                self._error(500, "internal_error", "Operation could not be completed.")
+                return
+            self._send(
+                200, data, content_type,
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                maximum=MAX_IMPORT_BYTES)
+        finally:
+            password = b""
+            if isinstance(body, dict) and isinstance(body.get("password"), str):
+                body["password"] = ""
+            if not finished:
                 self.security.finish_login_attempt(client_ip, failed=True)
 
     def _call(self, fn, *, status: int = 200):

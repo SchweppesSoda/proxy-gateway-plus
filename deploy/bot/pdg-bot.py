@@ -13,6 +13,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 from __future__ import annotations
 import base64, contextlib, copy, fcntl, hashlib, http.client, io, ipaddress, json, os, plistlib, posixpath, re, shutil, socket, stat, subprocess, sys, tarfile, tempfile, threading, time, uuid
 import concurrent.futures
+import datetime
 import importlib.util
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
@@ -378,8 +379,40 @@ def clash_up():
         return False
 
 # ── sing-box ──
+def _model_schema_v2(c):
+    """Return an in-memory v2 view without writing the canonical model.
+
+    Legacy models become durable v2 only when a later ``tx_apply`` succeeds;
+    merely reading status or rendering Mihomo must never cause an unguarded
+    migration write.
+    """
+    if not isinstance(c, dict):
+        raise ValueError("model must be an object")
+    meta = c.get("_pdg")
+    if meta is None:
+        meta = {}
+    if not isinstance(meta, dict) or meta.get("schema", 1) not in (1, 2):
+        raise ValueError("unsupported model schema")
+    mihomo = meta.get("mihomo") or {}
+    if not isinstance(mihomo, dict):
+        raise ValueError("invalid mihomo metadata")
+    defaults = {
+        "proxy-providers": {}, "rule-providers": {}, "proxy-groups": [],
+        "advanced": {}, "managed-files": {},
+    }
+    normalized = {}
+    for key, default in defaults.items():
+        value = mihomo.get(key, default)
+        if not isinstance(value, type(default)):
+            raise ValueError("invalid mihomo metadata field")
+        normalized[key] = value
+    c["_pdg"] = {"schema": 2, "mihomo": normalized}
+    return c
+
+
 def load():
-    return json.load(open(SB))
+    with open(SB, encoding="utf-8") as stream:
+        return _model_schema_v2(json.load(stream))
 
 def _svc_active(unit, need=3, delay=0.6, max_polls=15):
     """确认服务"稳定" active: 要求连续 need 次观测都是 active。
@@ -1130,8 +1163,12 @@ def _mihomo_derive(staged):
     return data
 
 
+_MODEL_EXPECT_UNSET = object()
+
+
 def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode="normal",
-             warnings=(), ruleset_direct=False, file_expects=None):
+             warnings=(), ruleset_direct=False, file_expects=None,
+             model_expect=_MODEL_EXPECT_UNSET):
     """Bot 侧所有生产写入的**唯一**入口: 一笔事务把 model、mosdns 规则、profile 等一起落盘。
 
     以前是"model 走 apply_sb(锁内), mosdns 文件在锁外再补一刀" —— 于是内核里有规则、DNS 侧
@@ -1143,6 +1180,8 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
     tfo_intent: 指定本次 TFO 意图(set_tfo 用); None = 沿用 profile.env 里的当前意图
     file_expects: {逻辑目标名: sha256|None}。候选内容基于较早读取的文件生成时必须传入，
                   避免 stage 时才取基线而覆盖并发提交；None 表示读取候选时文件不存在。
+    model_expect: Web preview 等较早读取的 model 原始文件 sha256。它会成为事务锁内的
+                  model 前置条件；未传时沿用本函数自己 read_for_update 的基线。
     返回 (ok, msg)
     """
     tx = _pdgtx()
@@ -1157,12 +1196,24 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
         if model_mod is not None:
             # 先记下"候选依据的是哪一份 model": 之后 stage 用它当前置条件。
             # 否则 load() 与 stage() 之间别人提交的修改会被当成前置条件, 最后被我们覆盖(丢更新)。
-            t.read_for_update("model")
-            c = load()
+            model_raw, model_sha = t.read_for_update("model")
+            if model_expect is not _MODEL_EXPECT_UNSET:
+                if (model_expect is not None and not re.fullmatch(
+                        r"[a-f0-9]{64}", str(model_expect))):
+                    raise tx.TxRefused("model 前置条件不合法")
+                if model_sha != model_expect:
+                    raise tx.TxRefused("PRECONDITION_FAILED: model 自预览后已变化")
+            if model_raw is None:
+                raise tx.TxRefused("model 不存在")
+            c = _model_schema_v2(json.loads(model_raw.decode("utf-8")))
             intent = _tfo_intent(c) if tfo_intent is None else tfo_intent
             model_mod(c)
             _tfo_apply(c, intent)                 # 加/改出口不冲掉 TFO 状态(语义与旧实现一致)
-            t.stage("model", _model_bytes(c))
+            if model_expect is _MODEL_EXPECT_UNSET:
+                t.stage("model", _model_bytes(c))
+            else:
+                # pdgtx repeats this exact CAS while holding the global lock.
+                t.stage("model", _model_bytes(c), expect=model_expect)
             svc.add("mihomo")
 
             t.derive("mihomo_cfg", _mihomo_derive)
@@ -1232,7 +1283,8 @@ def proxy_outbounds(c):
 
 def exit_tags(c):
     """可作分流目标/默认出口的全部出口 (含 direct 与 urltest 故障组)。"""
-    return [o["tag"] for o in c["outbounds"] if o.get("type") in PROXY_TYPES + ("direct", "urltest")]
+    return [o["tag"] for o in c["outbounds"]
+            if o.get("type") in PROXY_TYPES + ("direct", "urltest", "selector")]
 
 def concrete_tags(c):
     """具体出口 (可作故障组成员; 排除 urltest 组自身, 防嵌套环)。"""
@@ -1240,7 +1292,8 @@ def concrete_tags(c):
 
 def deletable_tags(c):
     """可删除的出口/组 (代理出口 + urltest 组; 不含内建 direct 锚点)。"""
-    return [o["tag"] for o in c["outbounds"] if o.get("type") in PROXY_TYPES + ("urltest",)]
+    return [o["tag"] for o in c["outbounds"]
+            if o.get("type") in PROXY_TYPES + ("urltest", "selector")]
 
 
 DEFAULT_DIRECT_TAG = "JP"
@@ -1254,6 +1307,59 @@ def _direct_anchor_tag(c):
         if o.get("type") == "direct" and isinstance(o.get("tag"), str) and o.get("tag")
     ]
     return tags[0] if len(tags) == 1 else None
+
+
+def _mihomo_group_metadata(c):
+    meta = c.get("_pdg") if isinstance(c, dict) else None
+    mihomo = meta.get("mihomo") if isinstance(meta, dict) else None
+    groups = mihomo.get("proxy-groups") if isinstance(mihomo, dict) else None
+    return groups if isinstance(groups, list) else []
+
+
+def _mihomo_group_rename(c, old, new):
+    for group in _mihomo_group_metadata(c):
+        if not isinstance(group, dict):
+            continue
+        if group.get("name") == old:
+            group["name"] = new
+        if isinstance(group.get("proxies"), list):
+            group["proxies"] = [new if item == old else item for item in group["proxies"]]
+
+
+def _mihomo_group_delete(c, removed):
+    removed = set(removed)
+    groups = _mihomo_group_metadata(c)
+    groups[:] = [group for group in groups if not (
+        isinstance(group, dict) and group.get("name") in removed)]
+    for group in groups:
+        if isinstance(group, dict) and isinstance(group.get("proxies"), list):
+            group["proxies"] = [item for item in group["proxies"] if item not in removed]
+
+
+def _mihomo_group_update(c, name):
+    canonical = next((item for item in c.get("outbounds", [])
+                      if isinstance(item, dict) and item.get("tag") == name
+                      and item.get("type") in ("selector", "urltest")), None)
+    if canonical is None:
+        return
+    direct_tags = {item.get("tag") for item in c.get("outbounds", [])
+                   if isinstance(item, dict) and item.get("type") == "direct"}
+    for group in _mihomo_group_metadata(c):
+        if not isinstance(group, dict) or group.get("name") != name:
+            continue
+        group["type"] = "select" if canonical["type"] == "selector" else "url-test"
+        group["proxies"] = ["DIRECT" if item in direct_tags else item
+                            for item in canonical.get("outbounds", [])]
+        group.pop("use", None)
+        if canonical["type"] == "urltest":
+            group["url"] = canonical.get("url", DELAY_URL)
+            raw_interval = str(canonical.get("interval", "3m"))
+            match = re.fullmatch(r"(\d+)([smh]?)", raw_interval)
+            scale = {"": 1, "s": 1, "m": 60, "h": 3600}
+            group["interval"] = (int(match.group(1)) * scale[match.group(2)]
+                                 if match else 180)
+            group["tolerance"] = canonical.get("tolerance", 50)
+        return
 
 
 def _normalize_default_direct_tag(c):
@@ -1273,7 +1379,7 @@ def _normalize_default_direct_tag(c):
 
     direct[0]["tag"] = DEFAULT_DIRECT_TAG
     for outbound in c.get("outbounds", []):
-        if outbound.get("type") == "urltest":
+        if outbound.get("type") in ("urltest", "selector"):
             outbound["outbounds"] = [
                 DEFAULT_DIRECT_TAG if tag == LEGACY_DIRECT_TAG else tag
                 for tag in outbound.get("outbounds", [])
@@ -1518,7 +1624,9 @@ def add_group(name, members):
     name = _tag(name, "", "")
     if name in _RESERVED_EXIT_TAGS:
         return False, f"组名 {name} 是保留字, 换个名字"
-    if name in cands:
+    existing = next((o for o in c.get("outbounds", []) if o.get("tag") == name), None)
+    if name in cands or existing is not None and existing.get("type") not in (
+            "urltest", "selector"):
         return False, f"组名 {name} 和现有出口冲突, 换个名字"
     bad = [m for m in members if m not in cands]
     if bad:
@@ -1526,13 +1634,16 @@ def add_group(name, members):
     if len(members) < 2:
         return False, "故障切换组至少要 2 个出口"
     def mod(cc):
-        for o in cc["outbounds"]:           # 已存在则原地改成员(保留在列表中的位置)
-            if o.get("tag") == name and o.get("type") == "urltest":
+        for o in cc["outbounds"]:           # 已存在则原地改成员(保留在列表中的位置/类型)
+            if o.get("tag") == name and o.get("type") in ("urltest", "selector"):
                 o["outbounds"] = members
-                o.setdefault("url", DELAY_URL); o.setdefault("interval", "3m"); o.setdefault("tolerance", 50)
+                if o.get("type") == "urltest":
+                    o.setdefault("url", DELAY_URL); o.setdefault("interval", "3m"); o.setdefault("tolerance", 50)
+                _mihomo_group_update(cc, name)
                 return
         cc["outbounds"].append({"type": "urltest", "tag": name, "outbounds": members,
                                 "url": DELAY_URL, "interval": "3m", "tolerance": 50})
+        _mihomo_group_update(cc, name)
     ok, msg = apply_sb(mod)
     return ok, (f"✅ 故障切换组 <b>{name}</b> = {' › '.join(members)}\n"
                 "按探测延迟选择出口，并在出口不可用时切换。可在「🎯 设默认出口」或分流规则里选它。" if ok else msg)
@@ -1901,7 +2012,8 @@ def _load_zashboard_pin():
     repo_versions = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "lib", "versions.sh"))
     for path in dict.fromkeys((VERSIONS_FILE, repo_versions)):
         try:
-            text = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as stream:
+                text = stream.read()
         except OSError:
             continue
         ver = re.search(r'^ZASHBOARD_VER="([^"]+)"', text, re.M)
@@ -3541,51 +3653,66 @@ def _esc(s):
 def _git(*args, t=60):
     return subprocess.run(["git", "-C", PDG_REPO, *args], capture_output=True, text=True, timeout=t)
 
-def _fetch_release_tags():
-    r = _git("fetch", "-q", "--tags", "origin", "main", t=120)
+def _select_origin_release(target=""):
+    """Return the origin-advertised (tag, peeled commit), never a local tag."""
+    helper = os.path.join(PDG_REPO, "lib", "release-tags.sh")
+    argv = ["bash", helper, "select", PDG_REPO]
+    if target:
+        argv.append(target)
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=180)
     if r.returncode != 0:
-        return False, (r.stderr or r.stdout or "git fetch 失败").strip()
-    shallow = _git("rev-parse", "--is-shallow-repository")
-    if shallow.stdout.strip() == "true":
-        r = _git("fetch", "-q", "--unshallow", "--tags", "origin", "main", t=180)
-        if r.returncode != 0:
-            return False, (r.stderr or r.stdout or "git fetch --unshallow 失败").strip()
-    return True, ""
+        return False, (r.stderr or r.stdout or "origin release 选择失败").strip(), "", ""
+    fields = r.stdout.strip().split("\t")
+    semver_tag = (r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+                  r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+                  r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+    if len(fields) != 3 or not re.fullmatch(semver_tag, fields[0]):
+        return False, "origin release 校验器返回异常", "", ""
+    return True, "", fields[0], fields[1]
 
-def update_check():
-    """检查是否有更新的发布 tag(只跟 tag, 不拉 main 中间提交)。返回 (有更新?, 文本)。"""
+def update_check_target():
+    """检查 origin release。返回 (有更新?, 文本, 精确目标 tag)。"""
     try:
-        ok, err = _fetch_release_tags()
+        ok, err, tgt, tcommit = _select_origin_release()
         if not ok:
-            return False, f"检查更新失败: {err}"
+            return False, f"检查更新失败: {err}", ""
         cur = _git("describe", "--tags", "--always").stdout.strip()
-        tags = _git("tag", "-l", "v*", "--sort=-v:refname").stdout.split()
     except Exception as e:  # noqa: BLE001
-        return False, f"检查更新失败: {e}"
-    if not tags:
-        return False, "🟢 仓库还没有发布 tag。"
-    tgt = tags[0]
+        return False, f"检查更新失败: {e}", ""
     head = _git("rev-parse", "HEAD").stdout.strip()
-    tcommit = _git("rev-parse", tgt + "^{commit}").stdout.strip()
     if head == tcommit:
-        return False, f"🟢 已是最新发布 <b>{tgt}</b>。"
-    mb = _git("merge-base", "--is-ancestor", "HEAD", tgt)
+        return False, f"🟢 已是最新发布 <b>{tgt}</b>。", ""
+    mb = _git("merge-base", "--is-ancestor", "HEAD", tcommit)
     if mb.returncode == 0:
         pass
     elif mb.returncode == 1:
-        return False, f"🟢 已是最新(当前 <code>{cur}</code> 不落后于最新发布 {tgt})。"
+        return False, f"🟢 已是最新(当前 <code>{cur}</code> 不落后于最新发布 {tgt})。", ""
     else:
-        return False, f"检查更新失败: merge-base 判断失败: {(mb.stderr or mb.stdout).strip()}"
-    log = _git("log", "--oneline", "HEAD.." + tgt).stdout.strip()
+        return False, f"检查更新失败: merge-base 判断失败: {(mb.stderr or mb.stdout).strip()}", ""
+    log = _git("log", "--oneline", "HEAD.." + tcommit).stdout.strip()
     n = len(log.splitlines())
     return True, (f"🔄 有新发布 <b>{tgt}</b>(当前 <code>{cur}</code>,含 {n} 个提交):\n"
-                  f"<pre>{_esc(log)}</pre>\n确认后后台执行 pdg update → 更新到 {tgt}(约 30-60 秒, bot 自动重启回来)。\n"
-                  "更新会同时安装该 PrivDNS Gateway 发布版指定并校验过的内核版本。")
+                  f"<pre>{_esc(log)}</pre>\n确认后后台执行精确目标更新 → {tgt}(约 30-60 秒, bot 自动重启回来)。\n"
+                  "更新会同时安装该 PrivDNS Gateway 发布版指定并校验过的内核版本。"), tgt
 
-def start_update():
-    """在独立的 systemd 瞬时单元里跑 pdg update, 不受 pdg-bot 自身重启影响。"""
+def update_check():
+    """Backward-compatible two-field API used by the Web maintenance wrapper."""
+    has_update, message, _target = update_check_target()
+    return has_update, message
+
+def start_update(target):
+    """在独立 systemd 单元里跑经过 origin 复核的精确目标更新。"""
+    semver_tag = (r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+                  r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+                  r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?")
+    if not re.fullmatch(semver_tag, target or ""):
+        return False
     try:
-        r = subprocess.run(["systemd-run", "--collect", "/usr/local/bin/pdg", "update"],
+        ok, _err, selected, _commit = _select_origin_release(target)
+        if not ok or selected != target:
+            return False
+        r = subprocess.run(["systemd-run", "--collect", "/usr/local/bin/pdg", "update",
+                            "--target", target],
                            capture_output=True, text=True, timeout=15)
         return r.returncode == 0
     except Exception:  # noqa: BLE001
@@ -3847,13 +3974,14 @@ def rename_exit(old, new):
         for o in cc["outbounds"]:
             if o.get("tag") == old:
                 o["tag"] = new
-            if o.get("type") == "urltest":
+            if o.get("type") in ("urltest", "selector"):
                 o["outbounds"] = [new if m == old else m for m in o.get("outbounds", [])]
         for r in cc["route"]["rules"]:
             if r.get("outbound") == old:
                 r["outbound"] = new
         if cc["route"].get("final") == old:
             cc["route"]["final"] = new
+        _mihomo_group_rename(cc, old, new)
     # 规则集元数据也记着目标出口 —— 与 model 同一笔事务改, 免得内核改完名、元数据还指着旧的
     try:
         rsm, meta_sha = _rs_meta_snapshot()
@@ -3876,7 +4004,8 @@ def rename_exit(old, new):
     return True, f"✅ 出口 <b>{old}</b> 已改名 <b>{new}</b>, 分流规则/故障组/默认出口里的引用已同步。"
 
 def urltest_groups(c):
-    return [o["tag"] for o in c["outbounds"] if o.get("type") == "urltest"]
+    return [o["tag"] for o in c["outbounds"]
+            if o.get("type") in ("urltest", "selector")]
 
 # ── Telegram 独立 SOCKS5(tg-proxy 入口)的出口选择 ──
 TG_INBOUND = "tg-proxy"
@@ -4554,6 +4683,8 @@ RESTORE_MAP = {
 }
 # 备份包是**外部输入**(bot 从 Telegram 收文件, 谁都能发一个) → 解包必须按白名单来。
 RESTORE_RS_PREFIX = RS_DIR.lstrip("/") + "/"
+RESTORE_PROVIDER_PREFIX = "etc/mihomo/providers/"
+BACKUP_MANIFEST = "manifest.json"
 # 受管规则集的文件名白名单: 与 pdgtx 的 ruleset:<name> 目标同形(只认单个文件名 + 当前支持的
 # 两种扩展名)。历史遗留的 .srs 是 sing-box 二进制格式, mihomo 读不了 → 明确拒绝, 不隐式转换。
 _RS_LEAF_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
@@ -4612,20 +4743,43 @@ RESTORE_MAX_MEMBERS = _restore_limit(                 # 成员数量上限
     "PDG_RESTORE_MAX_MEMBERS", 512, 16, 20000)
 RESTORE_MAX_FILE_BYTES = _restore_limit(              # 单文件上限
     "PDG_RESTORE_MAX_FILE_BYTES", 8 * 1024 * 1024, 64 * 1024, 512 * 1024 * 1024)
+RESTORE_MAX_MODEL_BYTES = 24 * 1024 * 1024             # base64 managed providers live here
 RESTORE_MAX_TOTAL_BYTES = _restore_limit(             # 解出总量上限(压缩炸弹)
     "PDG_RESTORE_MAX_TOTAL_BYTES", 64 * 1024 * 1024, 1024 * 1024, _restore_total_ceiling())
 # 单文件上限比总量还大是自相矛盾的配置 —— 照那么算任何文件都过不了, 恢复直接不可用
-RESTORE_MAX_TOTAL_BYTES = max(RESTORE_MAX_TOTAL_BYTES, RESTORE_MAX_FILE_BYTES)
+RESTORE_MAX_TOTAL_BYTES = max(
+    RESTORE_MAX_TOTAL_BYTES, RESTORE_MAX_FILE_BYTES, RESTORE_MAX_MODEL_BYTES)
+# Web v2 package generation is deliberately fixed for 512 MiB hosts.  Restore
+# retains the historical 64 MiB default so legacy CLI/Bot backups remain
+# readable; every newly generated standard package remains Web-previewable.
+BACKUP_MAX_MEMBERS = 512
+BACKUP_MAX_FILE_BYTES = 8 * 1024 * 1024
+BACKUP_MAX_MODEL_BYTES = 24 * 1024 * 1024
+BACKUP_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+BACKUP_MAX_WIRE_BYTES = 36 * 1024 * 1024
 
 
 def _restore_member_allowed(name):
     """成员是否在恢复白名单内: RESTORE_MAP 的键, 或 rs/ 下的规则集文件。"""
-    if name in RESTORE_MAP:
+    if name in RESTORE_MAP or name == BACKUP_MANIFEST:
         return True
     if name.startswith(RESTORE_RS_PREFIX):
         rest = name[len(RESTORE_RS_PREFIX):]
-        return bool(rest) and "/" not in rest        # 只收 rs/ 下一层, 不收子目录
+        return bool(_RS_LEAF_RE.fullmatch(rest))      # 单层且只收当前 json/mrs
+    if name.startswith(RESTORE_PROVIDER_PREFIX):
+        leaf = name[len(RESTORE_PROVIDER_PREFIX):]
+        return bool(re.fullmatch(r"[a-f0-9]{64}\.(?:ya?ml|json|txt|mrs)", leaf, re.I))
     return False
+
+
+def _restore_member_limit(name):
+    return (RESTORE_MAX_MODEL_BYTES
+            if name == "etc/sing-box/config.json" else RESTORE_MAX_FILE_BYTES)
+
+
+def _backup_member_limit(name):
+    return (BACKUP_MAX_MODEL_BYTES
+            if name == "etc/sing-box/config.json" else BACKUP_MAX_FILE_BYTES)
 
 
 def _safe_extract(tar, dest):
@@ -4699,8 +4853,9 @@ def _safe_extract_loop(tar, root, written):
         if not _restore_member_allowed(name):
             raise ValueError("备份含白名单之外的成员, 拒绝整个备份: %s" % raw)
         # 4) 限额: 声明值先卡一道(便宜), 实际读取再卡一道(声明值是攻击者写的, 不可信)
-        if m.size > RESTORE_MAX_FILE_BYTES:
-            raise ValueError("备份内文件过大(%s, >%d 字节), 拒绝整个备份" % (raw, RESTORE_MAX_FILE_BYTES))
+        member_limit = _restore_member_limit(name)
+        if m.size > member_limit:
+            raise ValueError("备份内文件过大(%s, >%d 字节), 拒绝整个备份" % (raw, member_limit))
         declared_total += m.size
         if declared_total > RESTORE_MAX_TOTAL_BYTES:
             raise ValueError("备份声明总量过大(>%d 字节), 拒绝整个备份" % RESTORE_MAX_TOTAL_BYTES)
@@ -4728,23 +4883,244 @@ def _safe_extract_loop(tar, root, written):
         os.chmod(target, 0o600)
         written.append(target)
 
+
+def _verify_backup_manifest(root):
+    """Verify v2 manifest hashes and exact member closure; legacy has none."""
+    path = os.path.join(root, BACKUP_MANIFEST)
+    if not os.path.exists(path):
+        return False
+    def unique(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError("manifest duplicate key")
+            out[key] = value
+        return out
+    with open(path, "rb") as stream:
+        raw_manifest = stream.read(1024 * 1024 + 1)
+    if len(raw_manifest) > 1024 * 1024:
+        raise ValueError("备份 manifest 过大")
+    def reject_constant(value):
+        raise ValueError("manifest non-finite number: %s" % value)
+    manifest = json.loads(
+        raw_manifest.decode("utf-8"), object_pairs_hook=unique,
+        parse_constant=reject_constant)
+    created_at = manifest.get("createdAt") if isinstance(manifest, dict) else None
+    if (not isinstance(manifest, dict) or set(manifest) != {"version", "createdAt", "files"}
+            or manifest.get("version") != 2
+            or not isinstance(created_at, str)
+            or not re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+                created_at)
+            or not isinstance(manifest.get("files"), list)
+            or not manifest["files"]):
+        raise ValueError("备份 manifest 版本不支持")
+    try:
+        datetime.datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise ValueError("备份 manifest 时间不合法") from exc
+    listed = set()
+    for item in manifest["files"]:
+        if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+            raise ValueError("备份 manifest 条目不合法")
+        name = item.get("path")
+        if (not isinstance(name, str) or name in listed or name == BACKUP_MANIFEST
+                or not _restore_member_allowed(name)
+                or type(item.get("size")) is not int
+                or not 0 <= item["size"] <= _restore_member_limit(name)
+                or not re.fullmatch(r"[a-f0-9]{64}", str(item.get("sha256")))):
+            raise ValueError("备份 manifest 引用了非法成员")
+        target = os.path.join(root, *name.split("/"))
+        if not os.path.isfile(target) or os.path.islink(target):
+            raise ValueError("备份 manifest 成员缺失")
+        with open(target, "rb") as stream:
+            data = stream.read(_restore_member_limit(name) + 1)
+        if len(data) != item.get("size") or hashlib.sha256(data).hexdigest() != item["sha256"]:
+            raise ValueError("备份 manifest 完整性校验失败")
+        listed.add(name)
+    actual = set()
+    for base, _dirs, files in os.walk(root):
+        for leaf in files:
+            full = os.path.join(base, leaf)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            if rel != BACKUP_MANIFEST:
+                actual.add(rel)
+    if not listed or listed != actual:
+        raise ValueError("备份 manifest 未完整覆盖归档成员")
+    return True
+
+def _backup_read(path, maximum=None):
+    maximum = BACKUP_MAX_FILE_BYTES if maximum is None else maximum
+    flags = (os.O_RDONLY | getattr(os, "O_BINARY", 0)
+             | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_size > maximum):
+            raise ValueError("受管备份路径不是普通文件: %s" % path)
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(64 * 1024, maximum + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise ValueError("受管备份文件过大: %s" % path)
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if (total != before.st_size or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns):
+            raise ValueError("受管备份文件读取期间发生变化: %s" % path)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _backup_entries_once():
+    """Read one complete managed generation into memory (no tar metadata)."""
+    canonical = {
+        SB: "etc/sing-box/config.json",
+        MOSDNS_CONF: "etc/mosdns/config.yaml",
+        MOSDNS_DIRECT: "etc/mosdns/rules/custom_direct.txt",
+        MOSDNS_RULESET_DIRECT: "etc/mosdns/rules/ruleset_direct.txt",
+        MOSDNS_RULESET_HIJACK: "etc/mosdns/rules/ruleset_hijack.txt",
+        MOSDNS_HIJACK: "etc/mosdns/rules/custom_hijack.txt",
+        RS_META: "opt/pdg-bot/rulesets.json",
+    }
+    entries = {}
+    running_total = 0
+
+    def available_for(arc):
+        if arc in entries:
+            raise ValueError("受管配置成员重复: %s" % arc)
+        # Reserve one member for manifest.json.  Check this before opening the
+        # candidate so an over-inventory cannot cause even a body read.
+        if len(entries) >= BACKUP_MAX_MEMBERS - 1:
+            raise ValueError("受管配置成员过多, 无法生成可恢复备份")
+        return min(_backup_member_limit(arc),
+                   max(0, BACKUP_MAX_TOTAL_BYTES - running_total))
+
+    def read_candidate(path, arc):
+        return _backup_read(path, available_for(arc))
+
+    def add_candidate(arc, data):
+        nonlocal running_total
+        if arc in entries:
+            raise ValueError("受管配置成员重复: %s" % arc)
+        if len(entries) >= BACKUP_MAX_MEMBERS - 1:
+            raise ValueError("受管配置成员过多, 无法生成可恢复备份")
+        if (len(data) > _backup_member_limit(arc)
+                or len(data) > BACKUP_MAX_TOTAL_BYTES - running_total):
+            raise ValueError("受管配置总量过大, 无法生成可恢复备份")
+        entries[arc] = data
+        running_total += len(data)
+
+    for path in BACKUP_FILES:
+        arc = canonical.get(path, path.lstrip("/"))
+        data = read_candidate(path, arc)
+        if data is None:
+            continue
+        if path == SB:
+            cfg = _model_schema_v2(json.loads(data.decode("utf-8")))
+            _panel_sanitize_config(cfg)
+            data = _model_bytes(cfg) + b"\n"
+        add_candidate(arc, data)
+    if "etc/sing-box/config.json" not in entries:
+        raise ValueError("规范配置模型缺失, 无法生成可恢复备份")
+    try:
+        meta = json.loads(entries.get("opt/pdg-bot/rulesets.json", b"{}").decode("utf-8"))
+        for _name, leaf in _managed_rulesets(meta).items():
+            arc = "etc/sing-box/rs/" + leaf
+            data = read_candidate(os.path.join(RS_DIR, leaf), arc)
+            if data is None:
+                raise ValueError("受管规则集文件缺失: %s" % leaf)
+            add_candidate(arc, data)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("规则集元数据损坏, 无法生成一致备份") from exc
+    model = json.loads(entries.get("etc/sing-box/config.json", b"{}").decode("utf-8"))
+    managed = (((model.get("_pdg") or {}).get("mihomo") or {}).get("managed-files") or {})
+    if not isinstance(managed, dict):
+        raise ValueError("model 的 managed provider 元数据损坏")
+    for leaf, encoded in sorted(managed.items()):
+        if not re.fullmatch(r"[a-f0-9]{64}\.(?:ya?ml|json|txt|mrs)", str(leaf), re.I):
+            raise ValueError("managed provider 文件名非法")
+        arc = RESTORE_PROVIDER_PREFIX + leaf
+        remaining = available_for(arc)
+        try:
+            encoded_bytes = encoded.encode("ascii")
+            if len(encoded_bytes) % 4:
+                raise ValueError("invalid base64 length")
+            padding = (2 if encoded_bytes.endswith(b"==") else
+                       1 if encoded_bytes.endswith(b"=") else 0)
+            decoded_size = len(encoded_bytes) // 4 * 3 - padding
+            if decoded_size > remaining:
+                raise ValueError("managed provider exceeds backup remainder")
+            expected = base64.b64decode(encoded_bytes, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("managed provider 内容非法") from exc
+        data = _backup_read(
+            os.path.join(MIHOMO_DIR, "providers", leaf), remaining)
+        if data is None:
+            data = expected
+        if data != expected or hashlib.sha256(data).hexdigest() != leaf.split(".", 1)[0]:
+            raise ValueError("managed provider 文件与 model 不一致: %s" % leaf)
+        add_candidate(arc, data)
+    return entries
+
+
 def backup_blob():
+    """Return a v2 manifest bundle from one stable managed generation.
+
+    A pre/post generation digest is used instead of holding the config flock
+    while compressing.  Concurrent commits therefore cause a bounded retry or
+    a refusal, never a torn archive.  Telegram backup and Web export share this
+    exact function and restore whitelist.
+    """
+    entries = None
+    for _attempt in range(3):
+        first = _backup_entries_once()
+        second = _backup_entries_once()
+        if first == second:
+            entries = first
+            break
+    if entries is None:
+        raise RuntimeError("配置持续变化, 无法取得一致备份")
+    manifest = {
+        "version": 2,
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).replace(
+            microsecond=0).isoformat().replace("+00:00", "Z"),
+        "files": [
+            {"path": name, "size": len(data),
+             "sha256": hashlib.sha256(data).hexdigest()}
+            for name, data in sorted(entries.items())
+        ],
+    }
+    entries[BACKUP_MANIFEST] = json.dumps(
+        manifest, ensure_ascii=True, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    if len(entries) > BACKUP_MAX_MEMBERS:
+        raise ValueError("受管配置成员过多, 无法生成可恢复备份")
+    if any(len(data) > _backup_member_limit(name) for name, data in entries.items()):
+        raise ValueError("受管配置成员过大, 无法生成可恢复备份")
+    if sum(len(data) for data in entries.values()) > BACKUP_MAX_TOTAL_BYTES:
+        raise ValueError("受管配置总量过大, 无法生成可恢复备份")
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for p in BACKUP_FILES:
-            if os.path.exists(p):
-                if p == SB:
-                    cfg = json.load(open(p))
-                    if _panel_sanitize_config(cfg):
-                        raw = json.dumps(cfg, ensure_ascii=False, indent=2).encode()
-                        info = tar.gettarinfo(p, arcname=p.lstrip("/"))
-                        info.size = len(raw)
-                        tar.addfile(info, io.BytesIO(raw))
-                        continue
-                tar.add(p, arcname=p.lstrip("/"))
-        if os.path.isdir(RS_DIR):
-            tar.add(RS_DIR, arcname=RS_DIR.lstrip("/"))
-    return buf.getvalue()
+        for name, data in sorted(entries.items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o600
+            info.mtime = int(time.time())
+            tar.addfile(info, io.BytesIO(data))
+    result = buf.getvalue()
+    if len(result) > BACKUP_MAX_WIRE_BYTES:
+        raise ValueError("受管配置归档过大, 无法生成 Web 可导入备份")
+    return result
 
 def _machine_id(sb_path, mos_path):
     """取一对 sing-box/mosdns 配置**文件**里的「本机身份」(备份包那边用: 内容在盘上)。"""
@@ -4870,7 +5246,7 @@ def _restore_ruleset_plan(tmp, cur_meta, bak_meta):
     return plan, notes
 
 
-def restore_from(data):
+def restore_from(data, expected=None):
     """从 Telegram 收到的备份包恢复配置。
 
     分两段:
@@ -4892,14 +5268,15 @@ def restore_from(data):
         # tmp 内, 并有体积/数量上限。备份包来自 Telegram(外部输入), 不能用不受限的 extract。
         try:
             _safe_extract(tar, tmp)
+            _verify_backup_manifest(tmp)
         except Exception as e:  # noqa: BLE001
             return False, "备份包不安全或已损坏, 拒绝恢复: %s" % e
-        return _restore_commit(tmp)
+        return _restore_commit(tmp, expected=expected)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _restore_commit(tmp):
+def _restore_commit(tmp, expected=None):
     """把解包出来的内容组装成候选并提交一笔事务。返回 (ok, msg)。"""
     newsb = os.path.join(tmp, "etc/sing-box/config.json")
     newmos = os.path.join(tmp, "etc/mosdns/config.yaml")
@@ -4912,8 +5289,41 @@ def _restore_commit(tmp):
         return False, "无法开始配置事务(%s)" % type(e).__name__
     notes = []
     try:
+        if expected is None:
+            expected = {}
+        if (not isinstance(expected, dict)
+                or set(expected) - {"model", "mosdns", "providers", "files"}
+                or not isinstance(expected.get("providers", {}), dict)
+                or not isinstance(expected.get("files", {}), dict)):
+            raise tx.TxRefused("恢复前置条件不合法")
+        for label, value in (("model", expected.get("model")),
+                             ("mosdns", expected.get("mosdns"))):
+            if label in expected and value is not None and not re.fullmatch(
+                    r"[a-f0-9]{64}", str(value)):
+                raise tx.TxRefused("恢复前置条件不合法")
+        for leaf, value in expected.get("providers", {}).items():
+            if (not isinstance(leaf, str) or not re.fullmatch(
+                    r"[a-f0-9]{64}\.(?:ya?ml|json|txt|mrs)", leaf, re.I)
+                    or value is not None and not re.fullmatch(r"[a-f0-9]{64}", str(value))):
+                raise tx.TxRefused("恢复 provider 前置条件不合法")
+        allowed_file_target = re.compile(
+            r"^(?:rs_meta|mosdns_rule:(?:custom_direct|custom_hijack|ruleset_direct|ruleset_hijack)\.txt|ruleset:[A-Za-z0-9_.-]+\.(?:json|mrs))$")
+        for target, value in expected.get("files", {}).items():
+            if (not isinstance(target, str) or not allowed_file_target.fullmatch(target)
+                    or value is not None
+                    and not re.fullmatch(r"[a-f0-9]{64}", str(value))):
+                raise tx.TxRefused("恢复组件前置条件不合法")
         cur_sb, sb_sha = t.read_for_update("model")
         cur_mos, mos_sha = t.read_for_update("mosdns_conf")
+        if "model" in expected and sb_sha != expected["model"]:
+            raise tx.TxRefused("PRECONDITION_FAILED: model 自预览后已变化")
+        if "mosdns" in expected and mos_sha != expected["mosdns"]:
+            raise tx.TxRefused("PRECONDITION_FAILED: MosDNS 自预览后已变化")
+        for target, preview_sha in sorted(expected.get("files", {}).items()):
+            _current_data, current_sha = t.read_for_update(target)
+            if current_sha != preview_sha:
+                raise tx.TxRefused(
+                    "PRECONDITION_FAILED: %s 自预览后已变化" % target)
         cur_meta_raw, meta_sha = t.read_for_update("rs_meta")
         watched_meta = t.watch("rs_meta", optional=True)
         watched_meta_sha = (
@@ -4956,16 +5366,51 @@ def _restore_commit(tmp):
         _panel_sanitize_config(cfg)
         _platform_sanitize_model(cfg)
         try:
+            cfg = _model_schema_v2(cfg)
+            current_cfg = _model_schema_v2(json.loads(cur_sb.decode("utf-8")))
+        except Exception as e:  # noqa: BLE001
+            return False, "备份或现网的 PDG v2 元数据不合法(%s)" % type(e).__name__
+        try:
             normalized_direct = _normalize_default_direct_tag(cfg)
         except ValueError as e:
             return False, "备份里的旧 direct 出口不能安全迁移: %s" % e
         if normalized_direct:
             notes.append("旧 direct 出口 jp 及其引用已迁移为 JP")
-        t.stage("model", _model_bytes(cfg), expect=sb_sha)
+        t.stage("model", _model_bytes(cfg), expect=expected.get("model", sb_sha))
         restored = ["config.json"]
+        current_provider_files = current_cfg["_pdg"]["mihomo"]["managed-files"]
+        backup_provider_files = cfg["_pdg"]["mihomo"]["managed-files"]
+        for leaf, encoded in sorted(backup_provider_files.items()):
+            if not re.fullmatch(r"[a-f0-9]{64}\.(?:ya?ml|json|txt|mrs)", leaf, re.I):
+                return False, "备份里的 managed provider 文件名不合法"
+            try:
+                provider_data = base64.b64decode(encoded, validate=True)
+            except Exception:  # noqa: BLE001
+                return False, "备份里的 managed provider 内容不合法"
+            if hashlib.sha256(provider_data).hexdigest() != leaf.split(".", 1)[0]:
+                return False, "备份里的 managed provider 哈希不匹配"
+            archived = os.path.join(tmp, RESTORE_PROVIDER_PREFIX, leaf)
+            if os.path.isfile(archived):
+                with open(archived, "rb") as stream:
+                    archived_data = stream.read(RESTORE_MAX_FILE_BYTES + 1)
+                if archived_data != provider_data:
+                    return False, "备份里的 managed provider 与 model 不一致"
+            provider_target = "mihomo_provider:" + leaf
+            if leaf in expected.get("providers", {}):
+                t.stage(provider_target, provider_data,
+                        expect=expected["providers"][leaf])
+            else:
+                t.stage(provider_target, provider_data)
+            restored.append("provider:" + leaf[:12])
+        for leaf in sorted(set(current_provider_files) - set(backup_provider_files)):
+            provider_target = "mihomo_provider:" + leaf
+            if leaf in expected.get("providers", {}):
+                t.stage(provider_target, None, expect=expected["providers"][leaf])
+            else:
+                t.stage(provider_target, None)
         mos_new = _subbed(newmos) if os.path.exists(newmos) else None
         if mos_new is not None:
-            t.stage("mosdns_conf", mos_new, expect=mos_sha)
+            t.stage("mosdns_conf", mos_new, expect=expected.get("mosdns", mos_sha))
             restored.append("mosdns/config.yaml")
         # 可选文件: **备份里有才恢复**, 缺了就保持现网(绝不擅自清空)
         for arc, target in (("etc/mosdns/rules/custom_direct.txt", "mosdns_rule:custom_direct.txt"),
@@ -5072,7 +5517,7 @@ def _dot_host():
     return _DOT_HOST
 
 def _groups_desc(c):
-    g = [o for o in c["outbounds"] if o.get("type") == "urltest"]
+    g = [o for o in c["outbounds"] if o.get("type") in ("urltest", "selector")]
     return "\n".join(f"🔀 故障组 <b>{o['tag']}</b>: {' › '.join(o.get('outbounds', []))}" for o in g)
 
 def status_text():
@@ -5105,7 +5550,7 @@ def exits_text():
     for o in c["outbounds"]:
         if o.get("type") == "direct":
             lines.append(f'• <b>{o["tag"]}</b>  direct（本机直出）')
-        elif o.get("type") == "urltest":
+        elif o.get("type") in ("urltest", "selector"):
             lines.append(f'• <b>{o["tag"]}</b>  故障组 → {" › ".join(o.get("outbounds", []))}')
     return "出口:\n" + ("\n".join(lines) or "(无)")
 
@@ -5169,12 +5614,15 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "🩺 自检中(几秒)…", BACK); edit(chat, mid, doctor_text(), BACK); return
     if data == "upd_check":
         edit(chat, mid, "🔄 检查更新中…", BACK)
-        has, txt = update_check()
-        kb = ({"inline_keyboard": [[{"text": "✅ 确认更新", "callback_data": "upd_apply"}],
+        has, txt, target = update_check_target()
+        kb = ({"inline_keyboard": [[{"text": "✅ 确认更新", "callback_data": "upd_apply:" + target}],
                                    [{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]} if has else BACK)
         edit(chat, mid, txt, kb); return
     if data == "upd_apply":
-        ok = start_update()
+        edit(chat, mid, "❌ 旧更新确认已失效，请重新检查更新。", BACK); return
+    if data.startswith("upd_apply:"):
+        target = data.split(":", 1)[1]
+        ok = start_update(target)
         edit(chat, mid, ("🚀 已开始后台更新, 约 30-60 秒后 bot 自动回来(期间可能短暂无响应)。\n"
                          "完成后点「🩺 自检」确认。" if ok
                          else "❌ 启动更新失败, 请在终端跑 sudo pdg update。"), BACK); return
@@ -5223,7 +5671,7 @@ def handle_cb(chat, mid, data):
     if data.startswith("egrp:"):
         name = data[5:]; state[chat] = "edit_grp:" + name
         cur = next((o.get("outbounds", []) for o in load()["outbounds"]
-                    if o.get("tag") == name and o.get("type") == "urltest"), [])
+                    if o.get("tag") == name and o.get("type") in ("urltest", "selector")), [])
         edit(chat, mid, f"发 <b>{name}</b> 组的新成员(空格分隔, 按顺序, 至少2个)。\n"
              f"当前: <code>{' '.join(cur) or '空'}</code>\n可选: {', '.join(concrete_tags(load()))}\n"
              f"例: <code>hk tw us</code>\n/cancel 取消。", EXIT_BACK); return
@@ -5498,12 +5946,16 @@ def handle_cb(chat, mid, data):
     if data.startswith("delx:"):
         tag = data[5:]
         def mod(c):
+            before_tags = {o.get("tag") for o in c["outbounds"] if isinstance(o, dict)}
             c["outbounds"] = [o for o in c["outbounds"] if o.get("tag") != tag]
             for o in c["outbounds"]:
-                if o.get("type") == "urltest":
+                if o.get("type") in ("urltest", "selector"):
                     o["outbounds"] = [m for m in o.get("outbounds", []) if m != tag]
             c["outbounds"] = [o for o in c["outbounds"]
-                              if not (o.get("type") == "urltest" and not o.get("outbounds"))]
+                              if not (o.get("type") in ("urltest", "selector")
+                                      and not o.get("outbounds"))]
+            after_tags = {o.get("tag") for o in c["outbounds"] if isinstance(o, dict)}
+            _mihomo_group_delete(c, before_tags - after_tags)
             live = {o["tag"] for o in c["outbounds"]}
             for r in c["route"]["rules"]:
                 if r.get("outbound") and r["outbound"] not in live:

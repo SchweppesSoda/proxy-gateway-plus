@@ -168,6 +168,12 @@ def load_job_module():
     return _load_module_from_path(path)
 
 
+def load_config_io_module():
+    path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "pdgconfigio.py"))
+    return _load_module_from_path(path)
+
+
 def _safe_text(value: Any, limit: int = 128) -> str:
     text = str(value or "")
     text = "".join(ch for ch in text if ch >= " " and ch not in "\x7f")
@@ -273,9 +279,17 @@ def sanitize_log_line(value: Any) -> str:
 class PDGControl:
     """Business operations for the frozen ``/api/v1`` surface."""
 
-    def __init__(self, bot_module=None, job_store=None):
+    def __init__(self, bot_module=None, job_store=None, config_io=None):
         self.bot = bot_module or load_bot_module()
         self._job_store_instance = job_store
+        self._config_io_instance = config_io
+        # These services are normally initialized by the first HTTP request.
+        # ThreadingHTTPServer can run several such requests at once after a
+        # restart, so publication must be atomic.  In particular, every
+        # ConfigIO owns a preview semaphore and a janitor thread; publishing
+        # more than one would split both process-wide coordination domains.
+        self._job_store_init_lock = threading.Lock()
+        self._config_io_init_lock = threading.Lock()
         self._diagnostic_slots = threading.BoundedSemaphore(1)
 
     # ---- common ---------------------------------------------------------
@@ -321,12 +335,42 @@ class PDGControl:
     def _job_store(self):
         if self._job_store_instance is not None:
             return self._job_store_instance
-        try:
-            store = load_job_module().JobStore()
-        except Exception as exc:
-            raise UnavailableError() from exc
-        self._job_store_instance = store
-        return store
+        with self._job_store_init_lock:
+            if self._job_store_instance is not None:
+                return self._job_store_instance
+            try:
+                store = load_job_module().JobStore()
+            except Exception as exc:
+                raise UnavailableError() from exc
+            self._job_store_instance = store
+            return store
+
+    def _config_io(self):
+        if self._config_io_instance is not None:
+            return self._config_io_instance
+        with self._config_io_init_lock:
+            if self._config_io_instance is not None:
+                return self._config_io_instance
+            try:
+                io_module = load_config_io_module()
+                manager = io_module.ConfigIO(bot=self.bot)
+            except Exception as exc:
+                raise UnavailableError() from exc
+            # Construction happens under the lock, so there is no losing
+            # ConfigIO whose bound janitor target could keep it alive.
+            self._config_io_instance = manager
+            return manager
+
+    @staticmethod
+    def _raise_config_io_error(exc: Exception):
+        name = type(exc).__name__
+        if name == "ImportInvalid":
+            raise ValidationError() from exc
+        if name in {"ImportNotFound", "ImportExpired"}:
+            raise NotFoundError() from exc
+        if name == "ImportConflict":
+            raise ConflictError() from exc
+        raise ControlError() from exc
 
     @staticmethod
     def _raise_job_error(exc: Exception, *, request_value: bool = False):
@@ -384,8 +428,9 @@ class PDGControl:
                 continue
             if not isinstance(typ, str) or not _SAFE_TYPE_RE.fullmatch(typ):
                 typ = "unknown"
-            kind = "group" if typ == "urltest" else ("direct" if typ == "direct" else "proxy")
-            if typ not in proxy_types | {"urltest", "direct"}:
+            kind = ("group" if typ in {"urltest", "selector"}
+                    else ("direct" if typ == "direct" else "proxy"))
+            if typ not in proxy_types | {"urltest", "selector", "direct"}:
                 kind = "other"
             view: dict[str, Any] = {
                 "tag": tag,
@@ -694,6 +739,94 @@ class PDGControl:
         return out
 
     # ---- persistent maintenance state --------------------------------
+    def export_config(self, kind: str) -> tuple[bytes, str, str]:
+        if kind not in {"pdg", "mihomo", "mosdns"}:
+            raise NotFoundError()
+        try:
+            with self._maintenance_guard():
+                result = self._config_io().export(kind)
+        except Exception as exc:
+            if isinstance(exc, ControlError):
+                raise
+            self._raise_config_io_error(exc)
+        if (not isinstance(result, tuple) or len(result) != 3
+                or not isinstance(result[0], bytes)
+                or not isinstance(result[1], str)
+                or not isinstance(result[2], str)):
+            raise ControlError()
+        return result
+
+    def preview_import(
+            self, kind: str, payload: bytes, content_type: str) -> dict[str, Any]:
+        if kind not in {"pdg", "mihomo", "mosdns"}:
+            raise NotFoundError()
+        try:
+            with self._maintenance_guard():
+                result = self._config_io().preview(kind, payload, content_type)
+        except Exception as exc:
+            if isinstance(exc, ControlError):
+                raise
+            self._raise_config_io_error(exc)
+        if not isinstance(result, dict):
+            raise ControlError()
+        return result
+
+    def preview_import_stream(
+            self, kind: str, stream, size: int,
+            content_type: str) -> dict[str, Any]:
+        if kind not in {"pdg", "mihomo", "mosdns"}:
+            raise NotFoundError()
+        try:
+            # Acquire the maintenance gate before the first body read.  The
+            # guard remains held through parsing and staging so a new durable
+            # maintenance job cannot create a torn multi-component preview.
+            with self._maintenance_guard():
+                result = self._config_io().preview_stream(
+                    kind, stream, size, content_type)
+        except Exception as exc:
+            if isinstance(exc, ControlError):
+                raise
+            self._raise_config_io_error(exc)
+        if not isinstance(result, dict):
+            raise ControlError()
+        return result
+
+    def apply_import(self, import_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(import_id, str) or not re.fullmatch(
+                r"imp-[a-f0-9]{32}", import_id):
+            raise ValidationError("importId is invalid.")
+        try:
+            prepared = self._config_io().prepare_apply(import_id, body)
+        except Exception as exc:
+            self._raise_config_io_error(exc)
+        if not isinstance(prepared, dict) or prepared.get("importId") != import_id:
+            raise ControlError()
+        store = self._job_store()
+        try:
+            raw_job = store.start("config-import", import_id=import_id)
+        except Exception as exc:
+            can_release = getattr(store, "can_release_import", None)
+            if callable(can_release) and can_release(import_id):
+                try:
+                    self._config_io().release_claim(import_id)
+                except Exception:
+                    pass
+            self._raise_job_error(exc, request_value=True)
+        job = self._public_job(raw_job)
+        if job is None:
+            raise ControlError()
+        return ActionResult("config-import", details={"job": job}).view()
+
+    def cancel_import(self, import_id: str) -> dict[str, Any]:
+        if not isinstance(import_id, str) or not re.fullmatch(
+                r"imp-[a-f0-9]{32}", import_id):
+            raise ValidationError("importId is invalid.")
+        try:
+            self._config_io().cancel(import_id)
+        except Exception as exc:
+            self._raise_config_io_error(exc)
+        return ActionResult("config-import-preview-cancelled").view()
+
     @staticmethod
     def _public_snapshot(item: Any) -> dict[str, Any] | None:
         if not isinstance(item, dict):
@@ -725,7 +858,7 @@ class PDGControl:
         created = item.get("createdAt")
         if (
                 not isinstance(job_id, str) or not _JOB_ID_RE.fullmatch(job_id)
-                or kind not in {"rollback", "software-update"}
+                or kind not in {"rollback", "software-update", "config-import"}
                 or status not in {
                     "queued", "running", "succeeded", "failed", "interrupted"}
                 or not isinstance(created, str)
@@ -1048,21 +1181,28 @@ class PDGControl:
 
         def modify(model):
             outbounds = model.get("outbounds") or []
+            before_tags = {item.get("tag") for item in outbounds if isinstance(item, dict)}
             target = next((item for item in outbounds if item.get("tag") == tag), None)
             if target is None or target.get("type") == "direct":
                 raise ValueError("not deletable")
-            if group_only and target.get("type") != "urltest":
+            if group_only and target.get("type") not in {"urltest", "selector"}:
                 raise ValueError("not group")
             model["outbounds"] = [item for item in outbounds if item.get("tag") != tag]
             for item in model["outbounds"]:
-                if item.get("type") == "urltest":
+                if item.get("type") in {"urltest", "selector"}:
                     item["outbounds"] = [
                         member for member in item.get("outbounds", []) if member != tag
                     ]
             model["outbounds"] = [
                 item for item in model["outbounds"]
-                if not (item.get("type") == "urltest" and len(item.get("outbounds", [])) < 2)
+                if not (item.get("type") in {"urltest", "selector"}
+                        and len(item.get("outbounds", [])) < 2)
             ]
+            sync_delete = getattr(self.bot, "_mihomo_group_delete", None)
+            if callable(sync_delete):
+                after_tags = {item.get("tag") for item in model["outbounds"]
+                              if isinstance(item, dict)}
+                sync_delete(model, before_tags - after_tags)
             live = {
                 item.get("tag") for item in model["outbounds"]
                 if isinstance(item, dict) and isinstance(item.get("tag"), str)
@@ -1075,7 +1215,7 @@ class PDGControl:
                 final = next((
                     item.get("tag") for item in model["outbounds"]
                     if item.get("type") in set(getattr(self.bot, "PROXY_TYPES", ())) | {
-                        "urltest", "direct"}
+                        "urltest", "selector", "direct"}
                 ), None)
                 if final is None:
                     raise ValueError("no fallback")

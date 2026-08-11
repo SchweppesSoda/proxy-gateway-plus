@@ -94,15 +94,19 @@ git -C "$REPO" checkout -q v9.9.8
 { [[ "$(git -C "$REPO" describe --tags)" == v9.9.8 ]] && [[ -z "$(git -C "$REPO" tag -l v9.9.9)" ]]; } \
   && ok "发布源就位: 工作仓库停在 v9.9.8, 新 tag v9.9.9 只在 origin 上(要靠 fetch 才拿得到)" \
   || bad "发布源没造对: $(git -C "$REPO" describe --tags), tags=$(git -C "$REPO" tag -l)"
+# 本地伪造的更高 tag 绝不能参与 release 选择；它不在 origin 上。
+git -C "$REPO" tag v99.0.0
 
 # ── 1. 正常更新: 应装上新版文件并显示成功 ════════════════════════════════════
 echo; echo "── 1. 正常更新 ──"
-out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
+out=$(bash /usr/local/bin/pdg update --target v9.9.9 2>&1); rc=$?
 { [[ "$rc" == 0 ]] && grep -q '✅ 已更新' <<<"$out"; } \
   && ok "pdg update 成功走完(取 tag→装文件→迁移→内核→校验门→doctor)" \
   || bad "更新失败 rc=$rc: $(tail -5 <<<"$out")"
 grep -q 'NEWVERSION-MARKER' /opt/pdg-bot/checks.py \
   && ok "新版文件真的装到了 /opt/pdg-bot(不是只动了 git)" || bad "部署文件仍是旧版"
+[[ "$(git -C "$REPO" rev-parse v99.0.0^{commit})" != "$(git -C "$REPO" rev-parse HEAD)" ]] \
+  && ok "精确 target 忽略本地更高 poison tag" || bad "更新错误落到了本地 poison tag"
 [[ "$(git -C "$REPO" describe --tags 2>/dev/null)" == v9.9.9 ]] \
   && ok "仓库已切到最新发布 tag v9.9.9" || bad "仓库 tag=$(git -C "$REPO" describe --tags 2>/dev/null)"
 snaps=$(find /var/lib/privdns-gateway/backups -name snap.tar.gz 2>/dev/null | wc -l)

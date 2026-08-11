@@ -1472,6 +1472,82 @@ textarea::placeholder {
   color: var(--danger);
 }
 
+.config-io-surface {
+  margin-top: 0.8rem;
+}
+
+.config-io-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.config-io-column {
+  display: grid;
+  align-content: start;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.config-io-column h3,
+.import-preview h3 {
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.config-export-actions,
+.template-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.template-links a {
+  color: var(--accent);
+  font-size: 0.7rem;
+}
+
+.import-preview {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.import-warnings,
+.import-conflicts {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(255, 198, 100, 0.25);
+  border-radius: 10px;
+  color: var(--warning);
+  background: rgba(255, 198, 100, 0.04);
+  font-size: 0.72rem;
+}
+
+.import-warnings ul {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.import-conflict-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(10rem, auto);
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.import-conflict-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.import-apply-controls {
+  display: grid;
+  gap: 0.55rem;
+}
+
 .jobs-surface {
   margin-top: 1rem;
 }
@@ -1732,6 +1808,10 @@ textarea::placeholder {
   }
 
   .two-column {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .config-io-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
