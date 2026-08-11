@@ -36,29 +36,110 @@ die(){ echo "FAIL: $*" >&2; exit 1; }
 pass=0
 ok(){ echo "OK: $*"; pass=$((pass+1)); }
 
-# These are the only host paths that either namespace entry may write after
-# mounting.  Hash their exact contents before and after every injected failure.
-host_targets_fingerprint(){
-  local path digest
-  for path in \
-      /etc/gitconfig /etc/nftables.conf \
-      /usr/local/bin/pdg /usr/local/libexec/pdg-quic-routing.sh \
-      /opt/pdg-bot /opt/pdg-web /var/lib/privdns-gateway; do
-    if [[ -L "$path" ]]; then
-      printf 'link\t%s\t%s\n' "$path" "$(readlink "$path")"
-    elif [[ -f "$path" ]]; then
-      digest="$(sha256sum -- "$path" | awk '{print $1}')" || return 1
-      printf 'file\t%s\t%s\n' "$path" "$digest"
-    elif [[ -d "$path" ]]; then
-      digest="$(tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-        -cf - -C "$path" . | sha256sum | awk '{print $1}')" || return 1
-      printf 'dir\t%s\t%s\n' "$path" "$digest"
-    elif [[ -e "$path" ]]; then
-      printf 'other\t%s\t%s\n' "$path" "$(stat -c '%F:%a:%s' -- "$path")"
+# Known host paths protected by the namespace boundary.  Keep this explicit and
+# bounded: never replace it with a recursive fingerprint of all /usr/local.
+PDG_HOST_TARGETS=(
+  /etc/gitconfig /etc/nftables.conf
+  /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
+  /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh.pdg-preinstall
+  /etc/systemd/system/pdg-quic-routing.service
+  /etc/systemd/system/pdg-quic-routing.service.pdg-preinstall
+  /etc/systemd/system/pdg-web.service
+  /etc/systemd/system/pdg-web.service.pdg-preinstall
+  /usr/local/bin/pdg /usr/local/bin/pdg-webctl
+  /usr/local/bin/pdg-webctl.pdg-preinstall
+  /usr/local/bin/mihomo /usr/local/bin/mihomo.pdg-preinstall
+  /usr/local/bin/mosdns /usr/local/bin/mosdns.pdg-preinstall
+  /usr/local/bin/mosdns.e2e-real /usr/local/sbin
+  /usr/local/libexec/pdg-quic-routing.sh
+  /usr/local/libexec/pdg-quic-routing.sh.pdg-preinstall
+  /opt/pdg-bot /opt/pdg-web
+  /var/lib/privdns-gateway
+)
+
+host_target_listed(){
+  local wanted="$1" path
+  for path in "${PDG_HOST_TARGETS[@]}"; do
+    [[ "$path" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+validate_host_target_contract(){
+  local path call stash stash_count=0 declared_stash_count listed_stash_count=0
+  for path in /usr/local/bin/mosdns.e2e-real /usr/local/sbin \
+      /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh; do
+    host_target_listed "$path" || die "host fingerprint omits required target: $path"
+  done
+
+  # Lock the explicit list to the three production/E2E write surfaces.  Every
+  # install transaction stash requires both its target and deterministic
+  # .pdg-preinstall sibling; newly added _stash_bin calls fail this test until
+  # their host fingerprint coverage is added.
+  while IFS= read -r call; do
+    if [[ "$call" =~ ^[[:space:]]*_stash_bin[[:space:]]+(/[-A-Za-z0-9._+/]+)([[:space:]]|$) ]]; then
+      stash="${BASH_REMATCH[1]}"
     else
-      printf 'missing\t%s\n' "$path"
+      die "_stash_bin call must use one literal absolute target: $call"
     fi
-  done | sha256sum | awk '{print $1}'
+    stash_count=$((stash_count+1))
+    host_target_listed "$stash" \
+      || die "host fingerprint omits _stash_bin target: $stash"
+    host_target_listed "$stash.pdg-preinstall" \
+      || die "host fingerprint omits _stash_bin sibling: $stash.pdg-preinstall"
+  done < <(grep -E '^[[:space:]]*_stash_bin([[:space:]]|$)' "$ROOT/install.sh")
+  declared_stash_count="$(grep -Ec \
+    '^[[:space:]]*_stash_bin([[:space:]]|$)' "$ROOT/install.sh")"
+  for path in "${PDG_HOST_TARGETS[@]}"; do
+    [[ "$path" == *.pdg-preinstall ]] \
+      && listed_stash_count=$((listed_stash_count+1))
+  done
+  [[ "$stash_count" -gt 0 && "$stash_count" -eq "$declared_stash_count" \
+     && "$stash_count" -eq "$listed_stash_count" ]] \
+    || die "cannot close host fingerprint over install.sh _stash_bin calls"
+
+  grep -Fqx \
+    '        run: timeout --foreground --kill-after=5s 60s bash tests/test-e2e-overlay-safety.sh' \
+    "$ROOT/.github/workflows/ci.yml" \
+    || die "CI overlay safety step lacks the exact 60-second watchdog"
+  grep -Fq 'HOST_USR_LOCAL_BEFORE="$(pdg_usr_local_sentinel)"' \
+    "$ROOT/tests/e2e-serial-hermetic.sh" \
+    && grep -Fq 'HOST_USR_LOCAL_AFTER="$(pdg_usr_local_sentinel)"' \
+      "$ROOT/tests/e2e-serial-hermetic.sh" \
+    || die "normal serial path lost its before/after full /usr/local sentinel"
+}
+
+# Emit one stable record per target.  Callers compare the complete record set,
+# so a failure names the protected surface instead of hiding it behind one hash.
+fingerprint_path(){
+  local path="$1" digest metadata
+  if [[ -L "$path" ]]; then
+    metadata="$(stat -c '%F:%f:%a:%u:%g' -- "$path")" || return 1
+    printf 'link\t%s\t%s\t%s\n' "$path" "$metadata" "$(readlink "$path")"
+  elif [[ -f "$path" ]]; then
+    metadata="$(stat -c '%F:%f:%a:%u:%g' -- "$path")" || return 1
+    digest="$(timeout --kill-after=1s 10s sha256sum -- "$path" | awk '{print $1}')" \
+      || return 1
+    printf 'file\t%s\t%s\t%s\n' "$path" "$metadata" "$digest"
+  elif [[ -d "$path" ]]; then
+    metadata="$(stat -c '%F:%f:%a:%u:%g' -- "$path")" || return 1
+    digest="$(timeout --kill-after=1s 10s tar --sort=name --mtime='@0' \
+      --numeric-owner --one-file-system -cf - -C "$path" . \
+      | sha256sum | awk '{print $1}')" || return 1
+    printf 'dir\t%s\t%s\t%s\n' "$path" "$metadata" "$digest"
+  elif [[ -e "$path" ]]; then
+    metadata="$(stat -c '%F:%f:%a:%u:%g:%s' -- "$path")" || return 1
+    printf 'other\t%s\t%s\n' "$path" "$metadata"
+  else
+    printf 'missing\t%s\n' "$path"
+  fi
+}
+
+host_targets_fingerprint(){
+  local path
+  for path in "${PDG_HOST_TARGETS[@]}"; do
+    fingerprint_path "$path" || return 1
+  done
 }
 
 write_wrapper(){
@@ -86,6 +167,11 @@ STUB
 printf 'mktemp %s\n' "$*" >> "$PDG_FAULT_CALL_LOG"
 exit 96
 STUB
+  cat > "$bindir/tar" <<'STUB'
+#!/usr/bin/env bash
+printf 'tar %s\n' "$*" >> "$PDG_FAULT_CALL_LOG"
+printf 'bounded-overlay-safety-sentinel\n'
+STUB
   cat > "$bindir/mkdir" <<'STUB'
 #!/usr/bin/env bash
 printf 'mkdir %s\n' "$*" >> "$PDG_FAULT_WRITE_LOG"
@@ -95,6 +181,31 @@ STUB
 #!/usr/bin/env bash
 printf 'rm %s\n' "$*" >> "$PDG_FAULT_WRITE_LOG"
 exit 98
+STUB
+  chmod 700 "$bindir"/*
+}
+
+write_success_mktemp_stubs(){
+  local bindir="$1"
+  write_common_stubs "$bindir"
+  cat > "$bindir/unshare" <<'STUB'
+#!/usr/bin/env bash
+printf 'unshare %s\n' "$*" >> "$PDG_FAULT_CALL_LOG"
+exit 0
+STUB
+  cat > "$bindir/mktemp" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'mktemp %s\n' "$*" >> "$PDG_FAULT_CALL_LOG"
+created="$("$PDG_FAULT_REAL_MKTEMP" "$@")" || exit $?
+printf 'created %s\n' "$created" >> "$PDG_FAULT_CALL_LOG"
+printf '%s\n' "$created"
+STUB
+  cat > "$bindir/rm" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'rm %s\n' "$*" >> "$PDG_FAULT_WRITE_LOG"
+exec "$PDG_FAULT_REAL_RM" "$@"
 STUB
   chmod 700 "$bindir"/*
 }
@@ -132,6 +243,52 @@ assert_failure_is_inert(){
   [[ ! -s "$case_dir/write.log" ]] || die "$case_dir attempted a host write"
 }
 
+run_fingerprint_contract(){
+  local case_dir="$WORK/fingerprint-contract" baseline mode_changed restored content_changed
+  local before_mode after_mode mode_verified=0
+  local -a saved_targets=("${PDG_HOST_TARGETS[@]}")
+  mkdir -p "$case_dir/managed"
+  printf 'stable\n' > "$case_dir/managed/listed.txt"
+  printf 'alpha\n' > "$case_dir/managed/unlisted.txt"
+  chmod 700 "$case_dir/managed"
+  chmod 600 "$case_dir/managed/listed.txt" "$case_dir/managed/unlisted.txt"
+  PDG_HOST_TARGETS=("$case_dir/managed")
+
+  baseline="$(host_targets_fingerprint)" \
+    || die "cannot create baseline managed-fixture fingerprint"
+  before_mode="$(stat -c '%a' "$case_dir/managed/unlisted.txt")"
+  chmod 640 "$case_dir/managed/unlisted.txt"
+  after_mode="$(stat -c '%a' "$case_dir/managed/unlisted.txt")"
+  if [[ "$after_mode" != "$before_mode" ]]; then
+    mode_changed="$(host_targets_fingerprint)" \
+      || die "cannot fingerprint managed-fixture mode change"
+    [[ "$mode_changed" != "$baseline" ]] \
+      || die "managed directory fingerprint ignored a child mode-only change"
+    chmod "$before_mode" "$case_dir/managed/unlisted.txt"
+    restored="$(host_targets_fingerprint)" \
+      || die "cannot fingerprint restored managed fixture"
+    [[ "$restored" == "$baseline" ]] \
+      || die "managed directory fingerprint is unstable after restoring metadata"
+    mode_verified=1
+  else
+    [[ "$(uname -s)" != Linux ]] \
+      || die "Linux fixture filesystem failed to expose chmod metadata changes"
+    echo "SKIP: non-Linux fixture filesystem does not expose chmod metadata changes"
+  fi
+  printf 'bravo\n' > "$case_dir/managed/unlisted.txt"
+  content_changed="$(host_targets_fingerprint)" \
+    || die "cannot fingerprint unlisted managed-fixture content change"
+  [[ "$content_changed" != "$baseline" ]] \
+    || die "managed directory fingerprint ignored an unlisted child content change"
+
+  PDG_HOST_TARGETS=("${saved_targets[@]}")
+  if [[ "$mode_verified" -eq 1 ]]; then
+    ok "host fingerprint detects metadata-only and unlisted-child changes"
+  else
+    ok "host fingerprint detects unlisted-child content changes"
+  fi
+}
+
 run_common_mktemp_failure(){
   local case_dir="$WORK/common-mktemp" before after wrapper marker
   mkdir -p "$case_dir/tmp"
@@ -161,6 +318,7 @@ run_serial_mktemp_failure(){
       PDG_FAULT_CALL_LOG="$case_dir/calls.log" \
       PDG_FAULT_WRITE_LOG="$case_dir/write.log" \
       bash "$ROOT/tests/e2e-serial-hermetic.sh" \
+      __test-only-overlay-mktemp-failure \
       > "$case_dir/output.log" 2>&1; then
     die "serial helper accepted mktemp failure"
   fi
@@ -168,10 +326,61 @@ run_serial_mktemp_failure(){
   assert_failure_is_inert "$case_dir" "$before" "$after" "$case_dir/body.marker"
   grep -q '^mktemp ' "$case_dir/calls.log" \
     || die "serial mktemp fault was not reached"
+  if grep -q '^tar ' "$case_dir/calls.log"; then
+    die "test-only serial mktemp probe entered the full-tree sentinel"
+  fi
   if grep -q '^串行顺序:' "$case_dir/output.log"; then
     die "serial body started after mktemp failure"
   fi
   ok "serial helper fails closed when mktemp fails"
+}
+
+run_serial_success_mktemp_cleanup(){
+  local case_dir="$WORK/serial-mktemp-success" before after created rc=0
+  local real_mktemp real_rm
+  real_mktemp="$(command -v mktemp)"
+  real_rm="$(command -v rm)"
+  [[ "$real_mktemp" == /* && -x "$real_mktemp" \
+     && "$real_rm" == /* && -x "$real_rm" ]] \
+    || die "cannot resolve real mktemp/rm for serial cleanup contract"
+  mkdir -p "$case_dir/tmp"
+  write_success_mktemp_stubs "$case_dir/bin"
+  before="$(host_targets_fingerprint)" \
+    || die "cannot fingerprint host before successful serial mktemp case"
+  env PATH="$case_dir/bin:$PATH" TMPDIR="$case_dir/tmp" \
+      PDG_FAULT_REAL_MKTEMP="$real_mktemp" PDG_FAULT_REAL_RM="$real_rm" \
+      PDG_FAULT_CALL_LOG="$case_dir/calls.log" \
+      PDG_FAULT_WRITE_LOG="$case_dir/write.log" \
+      bash "$ROOT/tests/e2e-serial-hermetic.sh" \
+      __test-only-overlay-mktemp-failure \
+      > "$case_dir/output.log" 2>&1 || rc=$?
+  [[ "$rc" -eq 97 ]] \
+    || die "successful test-only serial mktemp returned $rc instead of 97"
+  after="$(host_targets_fingerprint)" \
+    || die "cannot fingerprint host after successful serial mktemp case"
+  [[ "$before" == "$after" ]] \
+    || die "successful serial mktemp cleanup changed a protected host target"
+  created="$(sed -n 's/^created //p' "$case_dir/calls.log")"
+  case "$created" in
+    "$case_dir"/tmp/pdg-e2e-serial.*) ;;
+    *) die "successful serial mktemp returned an unsafe path: $created" ;;
+  esac
+  [[ ! -e "$created" ]] || die "successful serial mktemp overlay was not removed"
+  [[ ! -e "$case_dir/body.marker" ]] \
+    || die "successful test-only serial mktemp executed an E2E body"
+  if grep -q '^串行顺序:' "$case_dir/output.log"; then
+    die "serial body started in successful test-only mktemp probe"
+  fi
+  if grep -q '^tar ' "$case_dir/calls.log"; then
+    die "successful test-only serial mktemp entered the full-tree sentinel"
+  fi
+  grep -q '^unshare ' "$case_dir/calls.log" \
+    || die "successful serial mktemp cleanup did not try namespace cleanup"
+  [[ "$(wc -l < "$case_dir/write.log")" -eq 1 ]] \
+    || die "successful serial mktemp cleanup issued unexpected writes"
+  grep -Fqx "rm -rf -- $created" "$case_dir/write.log" \
+    || die "successful serial mktemp did not use the validated direct-rm fallback"
+  ok "successful test-only mktemp cleans up after no-op unshare and returns 97"
 }
 
 run_common_mount_failure(){
@@ -222,12 +431,15 @@ run_serial_mount_failure(){
   ok "serial mount failure $fail_at prevents all body and host writes"
 }
 
+validate_host_target_contract
+run_fingerprint_contract
 run_common_mktemp_failure
 run_serial_mktemp_failure
+run_serial_success_mktemp_cleanup
 for failure in 1 2 3 4 5; do
   run_common_mount_failure "$failure"
   run_serial_mount_failure "$failure"
 done
 
 echo "OK: $pass overlay fault-injection cases passed"
-[[ "$pass" -eq 12 ]]
+[[ "$pass" -eq 14 ]]

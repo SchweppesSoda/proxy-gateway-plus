@@ -246,7 +246,7 @@ jobs:
         run: bash tests/test-e2e-probe-lifecycle.sh
 
       - name: "E2E overlay 安全边界(mktemp/mount 故障必须零主体、零宿主写)"
-        run: bash tests/test-e2e-overlay-safety.sh
+        run: timeout --foreground --kill-after=5s 60s bash tests/test-e2e-overlay-safety.sh
 
       - name: "GMS 推送端口迁移回归 (fw/sing-box 补 5228-5230, 自定义跳过, 失败回滚)"
         run: bash tests/test-gms-migration.sh

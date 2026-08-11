@@ -57,11 +57,49 @@ pdg_serial_cleanup(){
       [[ -n "$target" && -d "$target" && ! -L "$target" ]] || exit 65
       rm -rf -- "$target"
     ' _ "$target" "$root" 2>/dev/null; then
-    return 0
+    [[ ! -e "$target" ]] && return 0
   fi
   pdg_serial_overlay_valid || return 1
   rm -rf -- "$OVL"
 }
+
+# Resolve the trusted temporary root, create one serial overlay directory and
+# validate the exact path before callers may populate or mount it.  The normal
+# E2E path and the fault-injection probe deliberately share this boundary.
+pdg_serial_create_overlay_root(){
+  PDG_SERIAL_TMP_ROOT="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" \
+    || { echo "[FAIL] 无法解析 serial E2E 临时根" >&2; return 1; }
+  [[ -n "$PDG_SERIAL_TMP_ROOT" && -d "$PDG_SERIAL_TMP_ROOT" ]] \
+    || { echo "[FAIL] serial E2E 临时根不可信" >&2; return 1; }
+  OVL="$(mktemp -d "$PDG_SERIAL_TMP_ROOT/pdg-e2e-serial.XXXXXX")" \
+    || { echo "[FAIL] 无法建立 serial E2E overlay 临时目录" >&2; return 1; }
+  pdg_serial_overlay_valid \
+    || { echo "[FAIL] serial E2E overlay 临时目录验证失败" >&2; return 1; }
+}
+
+# Internal test contract: exercise only the trusted-TMP/mktemp/path-validation
+# boundary.  It can never enter a namespace or run an E2E body, and it always
+# exits non-zero.  An unexpected successful mktemp is validated and removed
+# before returning failure.  Exact argv dispatch below prevents this probe from
+# weakening the normal full-/usr/local sentinel path.
+pdg_serial_test_overlay_mktemp_failure(){
+  if pdg_serial_create_overlay_root; then
+    pdg_serial_cleanup \
+      || { echo "[FAIL] test-only serial overlay cleanup failed" >&2; return 1; }
+    echo "[FAIL] test-only serial mktemp unexpectedly succeeded" >&2
+    return 97
+  fi
+  return 96
+}
+
+if [[ "$#" -ne 0 ]]; then
+  if [[ "$#" -eq 1 && "$1" == "__test-only-overlay-mktemp-failure" ]]; then
+    pdg_serial_test_overlay_mktemp_failure
+    exit $?
+  fi
+  echo "[FAIL] unsupported e2e-serial-hermetic argument" >&2
+  exit 64
+fi
 
 # ── 外层: 造一个沙箱(等价于 CI 的一次性容器), 内层在里面串行跑 ────────────────
 if [[ "${PDG_SERIAL_INNER:-}" != 1 ]]; then
@@ -73,14 +111,7 @@ if [[ "${PDG_SERIAL_INNER:-}" != 1 ]]; then
     || { echo "[FAIL] 无法建立宿主 /usr/local sentinel"; exit 1; }
   [[ -n "$HOST_USR_LOCAL_BEFORE" ]] \
     || { echo "[FAIL] 宿主 /usr/local sentinel 为空"; exit 1; }
-  PDG_SERIAL_TMP_ROOT="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" \
-    || { echo "[FAIL] 无法解析 serial E2E 临时根" >&2; exit 1; }
-  [[ -n "$PDG_SERIAL_TMP_ROOT" && -d "$PDG_SERIAL_TMP_ROOT" ]] \
-    || { echo "[FAIL] serial E2E 临时根不可信" >&2; exit 1; }
-  OVL="$(mktemp -d "$PDG_SERIAL_TMP_ROOT/pdg-e2e-serial.XXXXXX")" \
-    || { echo "[FAIL] 无法建立 serial E2E overlay 临时目录" >&2; exit 1; }
-  pdg_serial_overlay_valid \
-    || { echo "[FAIL] serial E2E overlay 临时目录验证失败" >&2; exit 1; }
+  pdg_serial_create_overlay_root || exit 1
   mkdir -p "$OVL"/{eu,ew,bu,bw,ou,ow,vu,vw} \
     || { echo "[FAIL] 无法建立 serial E2E overlay 层" >&2; pdg_serial_cleanup; exit 1; }
   mkdir -p "$OVL"/eu/{mosdns/rules,sing-box,mihomo,privdns-gateway,systemd/system,systemd/journald.conf.d} \
