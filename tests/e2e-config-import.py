@@ -459,16 +459,17 @@ def main() -> int:
         (item["kind"], item["name"]): item["default"]
         for item in preview["conflicts"]
     }
-    check(conflict_shape.get(("outbound", "plain-node")) == "incoming",
-          "PDG merge preview exposes the same-name outbound conflict")
+    check(conflict_shape.get(("name", "plain-node")) == "incoming" and
+          conflict_shape.get(("name", "E2E-plain-node")) == "incoming",
+          "PDG merge preview exposes both unified name conflicts")
     check(conflict_shape.get(("component", "mosdns")) == "existing" and
           conflict_shape.get(("component", "rulesets")) == "existing",
           "PDG merge preview defaults incoming components to existing")
     merge_choices = choices(preview)
     for item in preview["conflicts"]:
         if (item["kind"], item["name"]) in {
-                ("outbound", "plain-node"),
-                ("proxy-group", "E2E-plain-node")}:
+                ("name", "plain-node"),
+                ("name", "E2E-plain-node")}:
             merge_choices[item["conflictId"]] = "existing"
     # Deliberately omit mode: prepare_apply's public contract must persist the
     # native PDG default of merge into the claim consumed by the job runner.
