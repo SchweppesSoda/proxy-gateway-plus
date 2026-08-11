@@ -88,8 +88,29 @@ chmod +x "$WORK/bin/ssh"
 LOG="$WORK/ssh.log"
 OUT="$WORK/out.log"
 export PDG_TEST_SSH_LOG="$LOG"
-LEGACY_PDG="$WORK/pdg-v1.6.4.sh"
-git show v1.6.4:deploy/bot/pdg.sh > "$LEGACY_PDG"
+LEGACY_PDG="$ROOT/tests/fixtures/pdg-v1.6.4.fixture"
+LEGACY_NOTE="$ROOT/tests/fixtures/pdg-v1.6.4.README.md"
+LEGACY_REL="tests/fixtures/pdg-v1.6.4.fixture"
+[[ -f "$LEGACY_PDG" && ! -L "$LEGACY_PDG" ]] \
+  || fail "v1.6.4 parser fixture 必须是普通文件"
+[[ "$(uname -s)" != Linux || ! -x "$LEGACY_PDG" ]] \
+  || fail "v1.6.4 parser fixture 在 Linux checkout 中不得可执行"
+LEGACY_ATTRS="$(git -C "$ROOT" check-attr text eol -- "$LEGACY_REL")"
+grep -Fqx "$LEGACY_REL: text: set" <<<"$LEGACY_ATTRS" \
+  && grep -Fqx "$LEGACY_REL: eol: lf" <<<"$LEGACY_ATTRS" \
+  || fail "v1.6.4 parser fixture 缺少精确 LF checkout 契约"
+[[ "$(wc -c < "$LEGACY_PDG" | tr -d ' ')" == 253360 ]] \
+  || fail "v1.6.4 parser fixture 字节数漂移"
+[[ "$(git hash-object --no-filters "$LEGACY_PDG")" == \
+   35e99a58707e448b206189162ca0b7446a09c204 ]] \
+  || fail "v1.6.4 parser fixture Git blob 漂移"
+[[ "$(sha256sum "$LEGACY_PDG" | awk '{print $1}')" == \
+   0068d5bc8e9f3b1e59ab5cc6791626a7d410461b1cd8b04ec1ecaed68575042e ]] \
+  || fail "v1.6.4 parser fixture SHA-256 漂移"
+grep -Fqx -- '- Tag object: `2ab5a7dfcd8b53c3c0960bd23553f39a582ca258`' "$LEGACY_NOTE" \
+  && grep -Fqx -- '- Peeled commit: `e070a9f5f0a463170e73f74c4505eba97300137d`' "$LEGACY_NOTE" \
+  && grep -Fqx -- '- Git blob: `35e99a58707e448b206189162ca0b7446a09c204`' "$LEGACY_NOTE" \
+  || fail "v1.6.4 parser fixture 来源契约漂移"
 grep -Fq 'if [[ "${1:-}" == "--dry-run" ]]' "$LEGACY_PDG" \
   || fail "v1.6.4 parser fixture 不再是单参数 dry-run parser"
 grep -Fq 'update|up)     shift || true; cmd_update "${1:-}";;' "$LEGACY_PDG" \
