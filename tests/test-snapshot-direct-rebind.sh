@@ -4,7 +4,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-REPO_DIR="$ROOT"
+export REPO_DIR="$ROOT"
 sed -n '/^_pdg_snapshot_rebind_direct(){/,/^}/p' \
   "$ROOT/deploy/bot/pdg.sh" >"$WORK/function.sh"
 # shellcheck disable=SC1090

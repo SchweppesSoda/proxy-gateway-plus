@@ -14,7 +14,15 @@ import sys
 import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+BOT_DIR = (ROOT / "deploy" / "bot").resolve()
 WORK = pathlib.Path(sys.argv[1]).resolve()
+
+# These production modules use ordinary sibling imports (not a Python
+# package).  Mirror their installed /opt/pdg-bot layout with one exact,
+# highest-priority repository path before executing any of them by filename.
+bot_path = str(BOT_DIR)
+if not sys.path or sys.path[0] != bot_path:
+    sys.path.insert(0, bot_path)
 
 
 def load(name: str, path: pathlib.Path):
@@ -29,6 +37,10 @@ def load(name: str, path: pathlib.Path):
 cio = load("pdgconfigio_runtime", ROOT / "deploy/web/pdgconfigio.py")
 sb2 = load("sb2mihomo_runtime", ROOT / "deploy/bot/sb2mihomo.py")
 tx = None if os.name == "nt" else load("pdgtx_runtime", ROOT / "deploy/bot/pdgtx.py")
+shared_model = sys.modules.get("pdgmodel")
+if (shared_model is None
+        or pathlib.Path(shared_model.__file__).resolve().parent != BOT_DIR):
+    raise RuntimeError("shared pdgmodel was not loaded from the repository Bot directory")
 
 stage = WORK / "stage"
 providers = WORK / "providers"
