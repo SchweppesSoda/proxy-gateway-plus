@@ -3,7 +3,19 @@
 import copy
 import json
 import importlib.util
+import sys
+import types
 from pathlib import Path
+
+try:  # Production is Linux; permit the pure mutation regression on Windows.
+    import fcntl  # noqa: F401
+except ImportError:  # pragma: no cover - Windows developer workstation only
+    fcntl_stub = types.ModuleType("fcntl")
+    fcntl_stub.LOCK_EX = 2
+    fcntl_stub.LOCK_NB = 4
+    fcntl_stub.LOCK_UN = 8
+    fcntl_stub.flock = lambda *_args, **_kwargs: None
+    sys.modules["fcntl"] = fcntl_stub
 
 ROOT = Path(__file__).resolve().parents[1]
 BOT = ROOT / "deploy/bot/pdg-bot.py"
@@ -34,6 +46,7 @@ cfg = {
 }
 
 bot.load = lambda: copy.deepcopy(cfg)
+bot._model_snapshot = lambda: (copy.deepcopy(cfg), "a" * 64)
 
 # 5.1: rename_exit 的 model 改动与 rulesets.json 级联现在是同一笔事务。按新契约打桩:
 # model_mod 作用到内存里的 cfg, files 里的 rs_meta 直接落到 meta —— 断言的仍是级联是否完整。
@@ -100,5 +113,81 @@ ok, msg = bot.rename_exit("tw", "tw9")
 assert not ok and msg == "boom"
 assert meta["rs_11111111"]["outbound"] == "hk2"
 assert cfg == snap
+
+# ── Bot 旧 delx 路径: 删除代理后递归清空组，并在同一 CAS/pdgtx 内级联 rulesets ──
+delete_cfg = bot.pdgmodel.migrate({
+    "outbounds": [
+        {"type": "direct", "tag": "KFC_JP"},
+        {"type": "shadowsocks", "tag": "hk", "server": "203.0.113.20",
+         "server_port": 443},
+        {"type": "shadowsocks", "tag": "tw", "server": "203.0.113.21",
+         "server_port": 443},
+    ],
+    "route": {
+        "rules": [
+            {"action": "reject", "ip_cidr": ["198.51.100.1/32"]},
+            {"domain_suffix": ["leaf.example"], "outbound": "leaf"},
+        ],
+        "final": "hk",
+    },
+    "_pdg": {
+        "schema": 3,
+        "policy-groups": [
+            {"name": "leaf", "type": "select", "proxies": ["hk"], "use": []},
+            {"name": "root", "type": "select",
+             "proxies": ["leaf", "KFC_JP"], "use": []},
+        ],
+        "mihomo": {"proxy-providers": {}, "rule-providers": {},
+                   "advanced": {}, "managed-files": {}},
+    },
+})
+delete_meta = {
+    "rs_22222222": {"url": "https://example.com/leaf.list",
+                     "outbound": "leaf", "label": "leaf"},
+    "rs_33333333": {"url": "https://example.com/direct.list",
+                     "outbound": "direct", "label": "direct"},
+}
+bot._model_snapshot = lambda: (copy.deepcopy(delete_cfg), "c" * 64)
+bot._rs_meta_snapshot = lambda: (copy.deepcopy(delete_meta), "d" * 64)
+delete_calls = []
+
+def fake_delete_tx(op, model_mod=None, files=None, **kwargs):
+    record = {"op": op, "files": dict(files or {}), **kwargs}
+    candidate = copy.deepcopy(delete_cfg)
+    model_mod(candidate)
+    bot.pdgmodel.validate(candidate)
+    delete_cfg.clear(); delete_cfg.update(candidate)
+    if "rs_meta" in record["files"]:
+        delete_meta.clear()
+        delete_meta.update(json.loads(record["files"]["rs_meta"].decode()))
+    delete_calls.append(record)
+    return True, ""
+
+bot.tx_apply = fake_delete_tx
+ok, msg = bot.delete_exit("hk")
+assert ok, msg
+assert [item["tag"] for item in delete_cfg["outbounds"]] == ["KFC_JP", "tw"]
+groups = delete_cfg["_pdg"]["policy-groups"]
+assert [item["name"] for item in groups] == ["root"]
+assert groups[0]["proxies"] == ["KFC_JP"]
+assert delete_cfg["route"]["final"] == "KFC_JP"
+assert delete_cfg["route"]["rules"][0] == {
+    "action": "reject", "ip_cidr": ["198.51.100.1/32"]}
+assert delete_cfg["route"]["rules"][1]["outbound"] == "KFC_JP"
+assert delete_meta["rs_22222222"]["outbound"] == "KFC_JP"
+assert delete_meta["rs_33333333"]["outbound"] == "direct"
+assert len(delete_calls) == 1
+assert delete_calls[0]["op"] == "exit_delete"
+assert delete_calls[0]["model_expect"] == "c" * 64
+assert delete_calls[0]["file_expects"] == {"rs_meta": "d" * 64}
+
+# Failed transaction must leave both authoritative files untouched.
+delete_before = copy.deepcopy(delete_cfg)
+meta_before = copy.deepcopy(delete_meta)
+bot._model_snapshot = lambda: (copy.deepcopy(delete_cfg), "e" * 64)
+bot.tx_apply = lambda *_args, **_kwargs: (False, "PRECONDITION_FAILED")
+ok, msg = bot.delete_exit("tw")
+assert not ok and msg == "PRECONDITION_FAILED"
+assert delete_cfg == delete_before and delete_meta == meta_before
 
 print("exit-rename regression OK")

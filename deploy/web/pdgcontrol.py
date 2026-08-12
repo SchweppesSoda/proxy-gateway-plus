@@ -32,6 +32,10 @@ _DOMAIN_RE = re.compile(
 )
 _SAFE_TYPE_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,32}$")
 _SAFE_VERSION_RE = re.compile(r"^[A-Za-z0-9_.+:/ -]{1,96}$")
+_MIHOMO_RESERVED = frozenset({
+    "DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE",
+    "GLOBAL",
+})
 _JOB_ID_RE = re.compile(r"^[0-9]{8}t[0-9]{6}z-[a-f0-9]{12}$")
 _SNAPSHOT_ID_RE = re.compile(
     r"^[0-9]{8}-[0-9]{6}(?:-[a-f0-9]{8})?$")
@@ -302,6 +306,70 @@ class PDGControl:
             raise UnavailableError()
         return model
 
+    def _routable_tags_unchecked(self, model: dict[str, Any]) -> list[str]:
+        """Ordered targets during a delete, before dangling refs are cascaded."""
+        helper = getattr(getattr(self.bot, "pdgmodel", None),
+                         "routable_tags_unchecked", None)
+        if callable(helper):
+            return helper(model)
+        # Test doubles and an older colocated Bot may not expose the helper.
+        # Derive from the same public type inventory without validating the
+        # temporary mid-mutation route closure.
+        allowed = set(getattr(self.bot, "PROXY_TYPES", ())) | {"direct", "block"}
+        values = [item.get("tag") for item in model.get("outbounds", [])
+                  if isinstance(item, dict) and item.get("type") in allowed]
+        values += [item.get("name") for item in (
+            (model.get("_pdg") or {}).get("policy-groups") or [])
+                   if isinstance(item, dict)]
+        return [value for value in values if isinstance(value, str)]
+
+    def _model_snapshot(self) -> tuple[dict[str, Any], str]:
+        """Return one exact model image and the CAS revision of its raw bytes."""
+        snapshot = getattr(self.bot, "_model_snapshot", None)
+        if not callable(snapshot):
+            raise UnavailableError()
+        try:
+            model, revision = snapshot()
+        except Exception as exc:
+            raise UnavailableError() from exc
+        if (not isinstance(model, dict) or not isinstance(revision, str)
+                or re.fullmatch(r"[a-f0-9]{64}", revision) is None):
+            raise UnavailableError()
+        return model, revision
+
+    def _policy_cas_body(
+            self, body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str]:
+        if not isinstance(body, dict):
+            raise ValidationError()
+        candidate = copy.deepcopy(body)
+        revision = candidate.pop("revision", None)
+        if not isinstance(revision, str) or re.fullmatch(r"[a-f0-9]{64}", revision) is None:
+            raise ValidationError("revision is invalid.")
+        model, current = self._model_snapshot()
+        if revision != current:
+            raise ConflictError()
+        return candidate, model, revision
+
+    def _legacy_group_cas_body(
+            self, body: dict[str, Any] | None
+    ) -> tuple[dict[str, Any], dict[str, Any], str, bool]:
+        """Pin a legacy group write to the exact snapshot it validated."""
+        if body is None:
+            candidate: dict[str, Any] = {}
+        elif isinstance(body, dict):
+            candidate = copy.deepcopy(body)
+        else:
+            raise ValidationError()
+        supplied = "revision" in candidate
+        requested = candidate.pop("revision", None)
+        if supplied and (not isinstance(requested, str)
+                         or re.fullmatch(r"[a-f0-9]{64}", requested) is None):
+            raise ValidationError("revision is invalid.")
+        model, current = self._model_snapshot()
+        if supplied and requested != current:
+            raise ConflictError()
+        return candidate, model, current, not supplied
+
     def _meta(self) -> dict[str, dict[str, Any]]:
         try:
             meta = self.bot._rs_meta()
@@ -324,6 +392,8 @@ class PDGControl:
             return
         if self._busy(message):
             raise BusyError()
+        if isinstance(message, str) and "PRECONDITION_FAILED" in message:
+            raise ConflictError()
         raise ControlError()
 
     def _tx(self, op: str, **kwargs: Any) -> None:
@@ -491,13 +561,113 @@ class PDGControl:
 
     def _group_items(
             self, model: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        return [
-            {"tag": item["tag"], "members": item.get("members", [])}
-            for item in self._exit_items(model) if item["kind"] == "group"
-        ]
+        model = self._load() if model is None else model
+        meta = model.get("_pdg") if isinstance(model, dict) else None
+        groups = meta.get("policy-groups") if isinstance(meta, dict) else None
+        if not isinstance(groups, list):
+            groups = []
+        if not groups:
+            # Read compatibility for a not-yet-migrated in-memory test/backup;
+            # all writes still canonicalize through tx_apply before staging.
+            return [
+                {"name": item["tag"], "tag": item["tag"], "type": (
+                    "select" if item.get("type") == "selector" else "url-test"),
+                 "proxies": copy.deepcopy(item.get("members", [])),
+                 "members": copy.deepcopy(item.get("members", [])), "use": []}
+                for item in self._exit_items(model) if item["kind"] == "group"
+            ]
+        direct = next((item.get("tag") for item in model.get("outbounds", [])
+                       if isinstance(item, dict) and item.get("type") == "direct"), None)
+        blocks = {item.get("tag") for item in model.get("outbounds", [])
+                  if isinstance(item, dict) and item.get("type") == "block"
+                  and isinstance(item.get("tag"), str)}
+        out = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("name"), str):
+                continue
+            view = {
+                "name": group["name"], "tag": group["name"],
+                "type": group.get("type", "unknown"),
+                "proxies": copy.deepcopy(group.get("proxies") or []),
+                "members": copy.deepcopy(group.get("proxies") or []),
+                "use": copy.deepcopy(group.get("use") or []),
+            }
+            for key in ("url", "interval", "tolerance", "strategy", "lazy",
+                        "disable-udp", "hidden"):
+                if key in group:
+                    view[key] = copy.deepcopy(group[key])
+            if group.get("type") == "select":
+                view["runtimeCandidates"] = []
+                try:
+                    runtime = self.bot.clash_get(
+                        "/proxies/" + urllib.parse.quote(group["name"], safe=""))
+                    selected = runtime.get("now") if isinstance(runtime, dict) else None
+                    actual_to_public = self._runtime_member_map(
+                        runtime, group, direct=direct, blocks=blocks)
+                    candidates = list(dict.fromkeys(actual_to_public.values()))
+                    # Provider content is outside the canonical model and can
+                    # collide with a mapped machine tag.  Refuse an ambiguous
+                    # runtime picker instead of selecting the wrong proxy.
+                    if len(candidates) != len(actual_to_public):
+                        raise ValueError("ambiguous runtime candidates")
+                    view["runtimeCandidates"] = candidates
+                    public_selected = actual_to_public.get(selected)
+                    if public_selected in candidates:
+                        view["runtimeSelected"] = public_selected
+                except Exception:
+                    view["runtimeSelected"] = None
+            out.append(view)
+        return out
+
+    @staticmethod
+    def _runtime_member_map(runtime: Any, group: dict[str, Any], *, direct, blocks):
+        """Map Clash's actual candidates to unambiguous PDG-facing names."""
+        actual = runtime.get("all") if isinstance(runtime, dict) else None
+        if (not isinstance(actual, list) or len(actual) > 512
+                or any(not isinstance(item, str) or not 1 <= len(item) <= 256
+                       or "\x00" in item or "\r" in item or "\n" in item
+                       for item in actual)):
+            raise ValueError("invalid Clash candidate list")
+        configured = group.get("proxies") or []
+        if not isinstance(configured, list):
+            raise ValueError("invalid configured candidates")
+        mapping = {}
+        for item in actual:
+            public = item
+            if item == "DIRECT" and direct in configured:
+                public = direct
+            elif item == "REJECT":
+                # Literal REJECT is a first-class explicit member.  A machine
+                # block tag is only a display alias when that exact tag is in
+                # this group; never infer it from the mere existence of block.
+                if "REJECT" in configured:
+                    public = "REJECT"
+                else:
+                    aliases = [value for value in configured if value in blocks]
+                    if len(aliases) == 1:
+                        public = aliases[0]
+            mapping[item] = public
+        return mapping
 
     def groups(self) -> dict[str, Any]:
-        return {"items": self._group_items()}
+        return {"items": [
+            {"tag": item["name"], "members": copy.deepcopy(item["proxies"])}
+            for item in self._group_items()
+        ]}
+
+    def policy_groups(self) -> dict[str, Any]:
+        model, revision = self._model_snapshot()
+        metadata = ((model.get("_pdg") or {}).get("mihomo") or {})
+        providers = sorted(
+            name for name in (metadata.get("proxy-providers") or {})
+            if isinstance(name, str) and _TAG_RE.fullmatch(name))
+        return {
+            "items": self._group_items(model),
+            "targets": [value for value in self.bot.exit_tags(model)
+                        if isinstance(value, str) and _TAG_RE.fullmatch(value)],
+            "providers": providers,
+            "revision": revision,
+        }
 
     def _rule_items(self) -> list[dict[str, Any]]:
         model = self._load()
@@ -1155,9 +1325,13 @@ class PDGControl:
         )
         return self._public_exit_item(item)
 
-    def _delete_outbound(self, tag: str, *, group_only: bool = False) -> None:
+    def _delete_outbound(
+            self, tag: str, *, group_only: bool = False,
+            model: dict[str, Any] | None = None,
+            model_expect: str | None = None) -> None:
         tag = _tag(tag)
-        before = next((item for item in self._exit_items() if item["tag"] == tag), None)
+        before = next((item for item in self._exit_items(model)
+                       if item["tag"] == tag), None)
         if before is None or not before["deletable"]:
             raise NotFoundError()
         if group_only and before["kind"] != "group":
@@ -1203,10 +1377,7 @@ class PDGControl:
                 after_tags = {item.get("tag") for item in model["outbounds"]
                               if isinstance(item, dict)}
                 sync_delete(model, before_tags - after_tags)
-            live = {
-                item.get("tag") for item in model["outbounds"]
-                if isinstance(item, dict) and isinstance(item.get("tag"), str)
-            }
+            live = set(self._routable_tags_unchecked(model))
             # ``direct`` is a MosDNS/mobile pseudo-target, not an outbound tag.
             # It remains valid regardless of which concrete proxy is deleted.
             routable = live | {"direct"}
@@ -1215,7 +1386,7 @@ class PDGControl:
                 final = next((
                     item.get("tag") for item in model["outbounds"]
                     if item.get("type") in set(getattr(self.bot, "PROXY_TYPES", ())) | {
-                        "urltest", "selector", "direct"}
+                        "direct"}
                 ), None)
                 if final is None:
                     raise ValueError("no fallback")
@@ -1235,12 +1406,13 @@ class PDGControl:
                     meta_snapshot, ensure_ascii=False, indent=2).encode("utf-8")
                 file_expects["rs_meta"] = meta_sha
 
-        self._tx(
-            "web_outbound_delete",
-            model_mod=modify,
-            files=files,
-            file_expects=file_expects,
-        )
+        tx_args = {
+            "model_mod": modify, "files": files,
+            "file_expects": file_expects,
+        }
+        if model_expect is not None:
+            tx_args["model_expect"] = model_expect
+        self._tx("web_outbound_delete", **tx_args)
 
     def delete_exit(self, tag: str) -> dict[str, Any]:
         self._delete_outbound(tag)
@@ -1273,16 +1445,63 @@ class PDGControl:
         self._tx("web_default_exit", model_mod=modify)
         return {"tag": tag}
 
-    def add_group(self, body: dict[str, Any]) -> dict[str, Any]:
-        _dict_keys(body, allowed={"name", "members"}, required={"name", "members"})
-        tag = _tag(body["name"])
-        members = self._members(body["members"])
-        fn = getattr(self.bot, "add_group", None)
-        if not callable(fn):
-            raise UnavailableError()
-        self._result(fn(tag, members))
-        return next((item for item in self._group_items() if item["tag"] == tag),
-                    {"tag": tag, "members": members})
+    def add_policy_group(self, body: dict[str, Any]) -> dict[str, Any]:
+        candidate, model, revision = self._policy_cas_body(body)
+        return self.add_group(candidate, _model=model, _model_expect=revision)
+
+    def add_group(
+            self, body: dict[str, Any], *, _model=None,
+            _model_expect: str | None = None) -> dict[str, Any]:
+        deprecated = False
+        if _model is None:
+            body, current_model, _model_expect, deprecated = (
+                self._legacy_group_cas_body(body))
+        else:
+            current_model = _model
+        # Backward-compatible legacy Web payload creates a url-test group.
+        legacy_payload = isinstance(body, dict) and set(body) == {"name", "members"}
+        if legacy_payload and (current_model.get("_pdg") or {}).get("schema") != 3:
+            tag = _tag(body["name"])
+            members = self._members(body["members"])
+            fn = getattr(self.bot, "add_group", None)
+            if not callable(fn):
+                raise UnavailableError()
+            self._result(fn(tag, members, model_expect=_model_expect))
+            result = next((item for item in self._group_items() if item["tag"] == tag),
+                          {"tag": tag, "members": members})
+            if deprecated:
+                result["deprecated"] = True
+            return result
+        if legacy_payload:
+            body = {
+                "name": body["name"], "type": "url-test",
+                "proxies": body["members"], "use": [],
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": 180, "tolerance": 50,
+            }
+        group = self._policy_group_body(body, require_name=True)
+        name = group["name"]
+
+        def modify(model):
+            meta = model.setdefault("_pdg", {})
+            groups = meta.setdefault("policy-groups", [])
+            occupied = {item.get("tag") for item in model.get("outbounds", [])}
+            occupied |= {item.get("name") for item in groups if isinstance(item, dict)}
+            mihomo = meta.get("mihomo") or {}
+            occupied |= set(mihomo.get("proxy-providers") or {})
+            occupied |= set(mihomo.get("rule-providers") or {})
+            if name in occupied or name in _MIHOMO_RESERVED:
+                raise ValueError("name conflict")
+            groups.append(copy.deepcopy(group))
+
+        tx_args = {"model_mod": modify}
+        if _model_expect is not None:
+            tx_args["model_expect"] = _model_expect
+        self._tx("web_policy_group_add", **tx_args)
+        result = next(item for item in self._group_items() if item["name"] == name)
+        if deprecated:
+            result["deprecated"] = True
+        return result
 
     def _members(self, value: Any) -> list[str]:
         if not isinstance(value, list) or not 2 <= len(value) <= 64:
@@ -1292,23 +1511,297 @@ class PDGControl:
             raise ValidationError("members is invalid.")
         return members
 
-    def patch_group(self, old: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _policy_group_body(
+            self, body: dict[str, Any], *, require_name: bool) -> dict[str, Any]:
+        allowed = {
+            "name", "type", "proxies", "use", "url", "interval", "tolerance",
+            "strategy", "lazy", "disable-udp", "hidden",
+        }
+        _dict_keys(body, allowed=allowed,
+                   required={"name", "type"} if require_name else {"type"})
+        typ = body.get("type")
+        if typ not in {"select", "url-test", "fallback", "load-balance"}:
+            raise ValidationError("group type is invalid.")
+        group: dict[str, Any] = {"type": typ}
+        if require_name or "name" in body:
+            group["name"] = _tag(body["name"], field="name")
+        for key in ("proxies", "use"):
+            value = body.get(key, [])
+            if (not isinstance(value, list) or len(value) > 128
+                    or any(not isinstance(item, str) for item in value)):
+                raise ValidationError(key + " is invalid.")
+            items = []
+            for item in value:
+                if key == "proxies" and item == "REJECT":
+                    items.append(item)
+                else:
+                    items.append(_tag(item, field=key))
+            if len(items) != len(set(items)):
+                raise ValidationError(key + " is invalid.")
+            group[key] = items
+        if not group["proxies"] and not group["use"]:
+            raise ValidationError("group needs a member or provider.")
+        option_fields = {
+            "select": {"lazy", "disable-udp", "hidden"},
+            "url-test": {"url", "interval", "tolerance", "lazy", "disable-udp", "hidden"},
+            "fallback": {"url", "interval", "lazy", "disable-udp", "hidden"},
+            "load-balance": {"url", "interval", "strategy", "lazy", "disable-udp", "hidden"},
+        }[typ]
+        if set(body) - ({"name", "type", "proxies", "use"} | option_fields):
+            raise ValidationError("group options do not match its type.")
+        for key in ("lazy", "disable-udp", "hidden"):
+            if key in body:
+                group[key] = _bool(body[key], field=key)
+        if "url" in option_fields:
+            url = body.get("url", "https://www.gstatic.com/generate_204")
+            if (not isinstance(url, str) or len(url) > 8192
+                    or not re.fullmatch(r"https?://[^\s\x00]+", url, re.I)):
+                raise ValidationError("url is invalid.")
+            group["url"] = url
+            interval = body.get("interval", 180)
+            if type(interval) is not int or not 1 <= interval <= 604800:
+                raise ValidationError("interval is invalid.")
+            group["interval"] = interval
+        if "tolerance" in option_fields:
+            tolerance = body.get("tolerance", 50)
+            if type(tolerance) is not int or not 0 <= tolerance <= 65535:
+                raise ValidationError("tolerance is invalid.")
+            group["tolerance"] = tolerance
+        if "strategy" in option_fields:
+            strategy = body.get("strategy", "consistent-hashing")
+            if strategy not in {"consistent-hashing", "round-robin", "sticky-sessions"}:
+                raise ValidationError("strategy is invalid.")
+            group["strategy"] = strategy
+        return group
+
+    def patch_policy_group(self, old: str, body: dict[str, Any]) -> dict[str, Any]:
+        candidate, model, revision = self._policy_cas_body(body)
+        return self.patch_group(
+            old, candidate, _model=model, _model_expect=revision)
+
+    def patch_group(
+            self, old: str, body: dict[str, Any], *, _model=None,
+            _model_expect: str | None = None) -> dict[str, Any]:
         old = _tag(old)
-        _dict_keys(body, allowed={"members"}, required={"members"})
-        members = self._members(body["members"])
-        current = next((item for item in self._group_items() if item["tag"] == old), None)
+        deprecated = False
+        if _model is None:
+            body, model_snapshot, _model_expect, deprecated = (
+                self._legacy_group_cas_body(body))
+        else:
+            model_snapshot = _model
+        current = next((item for item in self._group_items(model_snapshot)
+                        if item["name"] == old), None)
         if current is None:
             raise NotFoundError()
-        fn = getattr(self.bot, "add_group", None)
+        if (isinstance(body, dict) and set(body) == {"members"}
+                and (model_snapshot.get("_pdg") or {}).get("schema") != 3):
+            members = self._members(body["members"])
+            fn = getattr(self.bot, "add_group", None)
+            if not callable(fn):
+                raise UnavailableError()
+            self._result(fn(old, members, model_expect=_model_expect))
+            result = next((item for item in self._group_items() if item["tag"] == old),
+                          {"tag": old, "members": members})
+            if deprecated:
+                result["deprecated"] = True
+            return result
+        if isinstance(body, dict) and set(body) == {"members"}:
+            legacy_members = copy.deepcopy(body["members"])
+            body = {key: copy.deepcopy(value) for key, value in current.items()
+                    if key in {"name", "type", "use", "url", "interval", "tolerance",
+                               "strategy", "lazy", "disable-udp", "hidden"}}
+            body["proxies"] = legacy_members
+        # Correct the compatibility transformation without retaining public-only fields.
+        if "members" in body:
+            body["proxies"] = body.pop("members")
+        candidate = self._policy_group_body(body, require_name=True)
+        new = candidate["name"]
+        files: dict[str, bytes] = {}
+        file_expects: dict[str, str | None] = {}
+        try:
+            rsm, meta_sha = self.bot._rs_meta_snapshot()
+        except Exception as exc:
+            raise UnavailableError() from exc
+        if old != new:
+            dirty = False
+            for item in rsm.values():
+                if isinstance(item, dict) and item.get("outbound") == old:
+                    item["outbound"] = new
+                    dirty = True
+            if dirty:
+                files["rs_meta"] = json.dumps(
+                    rsm, ensure_ascii=False, indent=2).encode("utf-8")
+                file_expects["rs_meta"] = meta_sha
+
+        def modify(model):
+            groups = (model.get("_pdg") or {}).get("policy-groups") or []
+            matches = [index for index, item in enumerate(groups)
+                       if isinstance(item, dict) and item.get("name") == old]
+            if len(matches) != 1:
+                raise ValueError("group changed")
+            if old != new:
+                occupied = {item.get("tag") for item in model.get("outbounds", [])}
+                occupied |= {item.get("name") for item in groups
+                             if isinstance(item, dict) and item.get("name") != old}
+                mihomo = (model.get("_pdg") or {}).get("mihomo") or {}
+                occupied |= set(mihomo.get("proxy-providers") or {})
+                occupied |= set(mihomo.get("rule-providers") or {})
+                if new in occupied or new in _MIHOMO_RESERVED:
+                    raise ValueError("name conflict")
+                self.bot.pdgmodel.rename_references(
+                    model, old, new, rename_group=True)
+                groups = model["_pdg"]["policy-groups"]
+                matches = [index for index, item in enumerate(groups)
+                           if item.get("name") == new]
+            groups[matches[0]] = copy.deepcopy(candidate)
+
+        tx_args = {
+            "model_mod": modify, "files": files,
+            "file_expects": file_expects,
+        }
+        if _model_expect is not None:
+            tx_args["model_expect"] = _model_expect
+        self._tx("web_policy_group_patch", **tx_args)
+        result = next(item for item in self._group_items() if item["name"] == new)
+        if deprecated:
+            result["deprecated"] = True
+        return result
+
+    def delete_policy_group(self, tag: str, body: dict[str, Any]) -> dict[str, Any]:
+        candidate, model, revision = self._policy_cas_body(body)
+        if candidate:
+            raise ValidationError()
+        return self.delete_group(tag, _model=model, _model_expect=revision)
+
+    def delete_group(
+            self, tag: str, body: dict[str, Any] | None = None, *, _model=None,
+            _model_expect: str | None = None) -> dict[str, Any]:
+        tag = _tag(tag)
+        deprecated = False
+        if _model is None:
+            candidate, current, _model_expect, deprecated = (
+                self._legacy_group_cas_body(body))
+            if candidate:
+                raise ValidationError()
+        else:
+            current = _model
+        if (current.get("_pdg") or {}).get("schema") != 3:
+            self._delete_outbound(
+                tag, group_only=True, model=current,
+                model_expect=_model_expect)
+            result = {"deleted": True}
+            if deprecated:
+                result["deprecated"] = True
+            return result
+        if not any(group.get("name") == tag for group in (
+                (current.get("_pdg") or {}).get("policy-groups") or [])):
+            raise NotFoundError()
+        preview = copy.deepcopy(current)
+        before_group_names = {item.get("name") for item in (
+            (preview.get("_pdg") or {}).get("policy-groups") or [])}
+        self.bot._mihomo_group_delete(preview, {tag})
+        after_group_names = {item.get("name") for item in (
+            (preview.get("_pdg") or {}).get("policy-groups") or [])}
+        removed_names = before_group_names - after_group_names
+        fallback = next((value for value in self.bot.exit_tags(current)
+                         if value not in removed_names), None)
+        if fallback is None:
+            raise ConflictError()
+        try:
+            rsm, meta_sha = self.bot._rs_meta_snapshot()
+        except Exception as exc:
+            raise UnavailableError() from exc
+        dirty = False
+        for item in rsm.values():
+            if isinstance(item, dict) and item.get("outbound") in removed_names:
+                item["outbound"] = fallback
+                dirty = True
+        files = ({"rs_meta": json.dumps(
+            rsm, ensure_ascii=False, indent=2).encode("utf-8")} if dirty else {})
+        expects = ({"rs_meta": meta_sha} if dirty else {})
+
+        def modify(model):
+            groups = model["_pdg"]["policy-groups"]
+            if not any(item.get("name") == tag for item in groups):
+                raise ValueError("group changed")
+            self.bot._mihomo_group_delete(model, {tag})
+            live = set(self._routable_tags_unchecked(model))
+            if fallback not in live:
+                raise ValueError("fallback changed")
+            route = model.get("route", {})
+            if route.get("final") not in live:
+                route["final"] = fallback
+            for rule in route.get("rules", []):
+                if (isinstance(rule, dict) and rule.get("outbound") is not None
+                        and rule.get("outbound") not in live):
+                    rule["outbound"] = fallback
+
+        tx_args = {"model_mod": modify, "files": files, "file_expects": expects}
+        if _model_expect is not None:
+            tx_args["model_expect"] = _model_expect
+        self._tx("web_policy_group_delete", **tx_args)
+        result = {"deleted": True}
+        if deprecated:
+            result["deprecated"] = True
+        return result
+
+    def select_group_runtime(self, tag: str, body: dict[str, Any]) -> dict[str, Any]:
+        tag = _tag(tag)
+        _dict_keys(body, allowed={"member"}, required={"member"})
+        member = body["member"]
+        if (not isinstance(member, str) or not 1 <= len(member) <= 256
+                or "\x00" in member or "\r" in member or "\n" in member):
+            raise ValidationError("member is invalid.")
+        model = self._load()
+        group = next((item for item in (
+            (model.get("_pdg") or {}).get("policy-groups") or [])
+                      if item.get("name") == tag), None)
+        if group is None or group.get("type") != "select":
+            raise NotFoundError()
+        direct = next((item.get("tag") for item in model.get("outbounds", [])
+                       if item.get("type") == "direct"), None)
+        blocks = {item.get("tag") for item in model.get("outbounds", [])
+                  if item.get("type") == "block"
+                  and isinstance(item.get("tag"), str)}
+        try:
+            runtime = self.bot.clash_get(
+                "/proxies/" + urllib.parse.quote(group["name"], safe=""))
+            actual_to_public = self._runtime_member_map(
+                runtime, group, direct=direct, blocks=blocks)
+        except Exception as exc:
+            raise UnavailableError() from exc
+        public_to_actual = {}
+        for actual, public in actual_to_public.items():
+            if public in public_to_actual and public_to_actual[public] != actual:
+                raise ConflictError()
+            public_to_actual[public] = actual
+        runtime_member = public_to_actual.get(member)
+        if runtime_member is None:
+            raise ValidationError("member is not an active candidate in this select group.")
+        fn = getattr(self.bot, "clash_select", None)
         if not callable(fn):
             raise UnavailableError()
-        self._result(fn(old, members))
-        return next((item for item in self._group_items() if item["tag"] == old),
-                    {"tag": old, "members": members})
+        try:
+            fn(tag, runtime_member)
+        except Exception as exc:
+            raise UnavailableError() from exc
+        return {"name": tag, "runtimeSelected": member, "persistent": False}
 
-    def delete_group(self, tag: str) -> dict[str, Any]:
-        self._delete_outbound(tag, group_only=True)
-        return {"deleted": True}
+    def set_direct_tag(self, body: dict[str, Any]) -> dict[str, Any]:
+        _dict_keys(body, allowed={"tag"}, required={"tag"})
+        tag = _tag(body["tag"])
+        validator = getattr(getattr(self.bot, "pdgmodel", None),
+                            "validate_direct_tag_setting", None)
+        if callable(validator):
+            try:
+                tag = validator(tag)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("direct tag is reserved.") from exc
+        fn = getattr(self.bot, "set_direct_tag", None)
+        if not callable(fn):
+            raise UnavailableError()
+        self._result(fn(tag))
+        return {"tag": tag}
 
     # ---- rules ----------------------------------------------------------
     def add_rule(self, body: dict[str, Any]) -> dict[str, Any]:

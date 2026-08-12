@@ -170,11 +170,11 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     model = json.load(stream)
 assert model["_pdg"] == {
-    "schema": 2,
+    "schema": 3,
+    "policy-groups": [],
     "mihomo": {
         "proxy-providers": {},
         "rule-providers": {},
-        "proxy-groups": [],
         "advanced": {},
         "managed-files": {},
     },
@@ -211,8 +211,8 @@ for placeholder in __SERVER_IP__ __INTERNAL_CIDR__ __CERT_DIR__ \
   grep -qF "$placeholder" "$mosdns_template" || template_contract_ok=0
 done
 [[ "$template_contract_ok" == 1 ]] \
-  && ok "模型 v2 与 Mihomo/MosDNS 导入模板结构完整" \
-  || bad "模型 v2 或导入模板结构不完整"
+  && ok "模型 v3 与 Mihomo/MosDNS 导入模板结构完整" \
+  || bad "模型 v3 或导入模板结构不完整"
 
 aggregate_inventory_ok=1
 for exact in \
@@ -361,10 +361,11 @@ if [[ -n "$migration_source" ]] \
    && grep -qF 'apt-get install -y -qq python3-yaml' <<<"$migration_source" \
    && grep -qF "python3 -c 'import yaml'" <<<"$migration_source" \
    && grep -qF '/var/lib/privdns-gateway/web-imports /etc/mihomo/providers' <<<"$migration_source" \
+   && grep -qF '/opt/pdg-bot/pdgmodel.py' <<<"$migration_source" \
    && grep -qF '/opt/pdg-web/pdgconfigio.py' <<<"$migration_source" \
    && grep -qF 'mihomo-import.example.yaml' <<<"$migration_source" \
    && grep -qF 'mosdns-import.example.yaml' <<<"$migration_source" \
-   && grep -qF 'python3 -m py_compile /opt/pdg-web/pdgconfigio.py || return 1' <<<"$migration_source" \
+   && grep -qF 'python3 -m py_compile /opt/pdg-bot/pdgmodel.py /opt/pdg-web/pdgconfigio.py || return 1' <<<"$migration_source" \
    && grep -qF 'migrate_web_config_io || rc=1' <<<"$run_migrations_source" \
    && ! grep -Eq 'migrate_web_config_io[[:space:]]*\|\|[[:space:]]*true' <<<"$run_migrations_source"; then
   ok "pre-v1.9 旧 updater（含 v1.6.4）经新版 __migrate 硬安装并校验 ConfigIO/PyYAML/模板"

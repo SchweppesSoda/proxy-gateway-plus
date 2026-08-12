@@ -820,6 +820,7 @@ install -m755 "$REPO_DIR"/deploy/bot/nftmerge.py         /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/doctor.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/pdgmodel.py         /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/pdgprofile.py        /opt/pdg-bot/
 # 可选 Web 管理面只铺设代码与 unit，默认不配置、不启用，也不修改任何 input/firewall。
 install -m755 "$REPO_DIR"/deploy/web/pdg-web.py           /opt/pdg-web/

@@ -42,6 +42,7 @@ printf 'android\n' > /etc/privdns-gateway/platform
 
 mkdir -p /opt/pdg-web /etc/mihomo/providers \
   /var/lib/privdns-gateway/web-imports /var/lib/privdns-gateway/web-jobs
+install -m755 "$E2E_ROOT/deploy/bot/pdgmodel.py" /opt/pdg-bot/pdgmodel.py
 install -m755 "$E2E_ROOT/deploy/web/pdgconfigio.py" /opt/pdg-web/pdgconfigio.py
 install -m755 "$E2E_ROOT/deploy/web/pdg-web-job.py" /opt/pdg-web/pdg-web-job.py
 chmod 700 /etc/mihomo/providers /var/lib/privdns-gateway/web-imports \
@@ -105,7 +106,7 @@ export PDG_CONFIG_IO_RUNNER=/opt/pdg-web/pdgconfigio.py
 export PDG_E2E_STOCK_MOSDNS_ABI_ONLY=1
 
 if python3 "$E2E_ROOT/tests/e2e-config-import.py"; then
-  ok "普通/归档/PDG v2/MosDNS 导入均经过真实事务，CAS/回滚/JobStore 恢复清理均通过"
+  ok "普通/归档/PDG v3/MosDNS 导入均经过真实事务，CAS/回滚/JobStore 恢复清理均通过"
 else
   bad "配置导入真实 apply E2E 失败"
 fi

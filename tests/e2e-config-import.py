@@ -326,23 +326,23 @@ def main() -> int:
           "merge retains existing proxy and adds provider metadata")
 
     # Export the generation containing both imports.  Replacing it with a
-    # plain config must delete its provider; re-importing the v2 export must
+    # plain config must delete its provider; re-importing the v3 export must
     # restore the exact managed provider closure.
     bot = manager._load_bot()
     exported_components = install_nonmodel_generation(bot, "bundle-a", "plain-node")
     exported_model = copy.deepcopy(current)
     live_mosdns_at_export = MOSDNS.read_bytes()
     bundle, filename, media_type = manager.export("pdg")
-    check(filename == "pdg-config-v2.tar.gz" and media_type == "application/gzip",
-          "PDG v2 export returns the stable archive contract")
+    check(filename == "pdg-config-v3.tar.gz" and media_type == "application/gzip",
+          "PDG v3 export returns the stable archive contract")
     with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive_file:
         names = set(archive_file.getnames())
         archived_mosdns_file = archive_file.extractfile("etc/mosdns/config.yaml")
         check(archived_mosdns_file is not None,
-              "PDG v2 export contains the managed MosDNS configuration")
+              "PDG v3 export contains the managed MosDNS configuration")
         archived_mosdns_bytes = archived_mosdns_file.read()
     check(archived_mosdns_bytes == live_mosdns_at_export,
-          "PDG v2 export captures the exact live MosDNS bytes")
+          "PDG v3 export captures the exact live MosDNS bytes")
     exported_mosdns = yaml.safe_load(archived_mosdns_bytes)
     exported_internal_sequence = next(
         item["args"] for item in exported_mosdns["plugins"]
@@ -352,7 +352,7 @@ def main() -> int:
         for item in exported_internal_sequence),
         "PDG E2E archive contains the managed all-mode MosDNS shape")
     check("manifest.json" in names and "etc/mihomo/providers/" + leaf in names,
-          "PDG v2 manifest archive covers the local provider")
+          "PDG v3 manifest archive covers the local provider")
     check({
         "etc/mosdns/rules/custom_direct.txt",
         "etc/mosdns/rules/custom_hijack.txt",
@@ -360,7 +360,7 @@ def main() -> int:
         "etc/mosdns/rules/ruleset_hijack.txt",
         "opt/pdg-bot/rulesets.json",
         *{"etc/sing-box/rs/" + item for item in exported_components["leaves"]},
-    } <= names, "PDG v2 export contains MosDNS rules and managed ruleset closure")
+    } <= names, "PDG v3 export contains MosDNS rules and managed ruleset closure")
 
     # Install a distinct non-model generation before replacing the model.  The
     # replacement job derives Mihomo against this generation, so the live state
@@ -391,20 +391,15 @@ def main() -> int:
     replacement = model()
     replacement_proxies = {
         item["tag"] for item in replacement["outbounds"]
-        if isinstance(item, dict) and item.get("type") not in {
-            "direct", "selector", "urltest"
-        }
+        if isinstance(item, dict) and item.get("type") != "direct"
     }
     replacement_groups = {
-        item["tag"] for item in replacement["outbounds"]
-        if isinstance(item, dict) and item.get("type") in {"selector", "urltest"}
+        item["name"] for item in replacement["_pdg"]["policy-groups"]
     }
     replacement_meta = replacement["_pdg"]["mihomo"]
     check(replacement_proxies == {"replacement-node"},
           "Mihomo replace leaves the exact canonical proxy set")
-    check(replacement_groups == {"E2E-replacement-node"} and {
-        item["name"] for item in replacement_meta["proxy-groups"]
-    } == {"E2E-replacement-node"},
+    check(replacement_groups == {"E2E-replacement-node"},
           "Mihomo replace leaves the exact canonical group set")
     check(replacement_meta["proxy-providers"] == {} and
           replacement_meta["rule-providers"] == {} and
@@ -416,21 +411,21 @@ def main() -> int:
     apply_job(preview, "replace", "incoming")
     restored = model()
     check(cio.normalize_model(restored) == cio.normalize_model(exported_model),
-          "PDG v2 export-preview-apply roundtrip restores canonical model")
+          "PDG v3 export-preview-apply roundtrip restores canonical model")
     check((PROVIDERS / leaf).read_bytes() == provider,
-          "PDG v2 roundtrip restores provider payload")
+          "PDG v3 roundtrip restores provider payload")
     restored_mosdns = yaml.safe_load(MOSDNS.read_bytes())
     restored_internal_sequence = next(
         item["args"] for item in restored_mosdns["plugins"]
         if item.get("tag") == "internal_sequence")
     check(restored_internal_sequence == exported_internal_sequence,
-          "PDG v2 roundtrip preserves the live managed MosDNS hijack mode")
+          "PDG v3 roundtrip preserves the live managed MosDNS hijack mode")
     for path, expected in exported_components["files"].items():
         check(path.read_bytes() == expected,
-              "PDG v2 roundtrip restores non-model bytes: " + str(path))
+              "PDG v3 roundtrip restores non-model bytes: " + str(path))
     for replaced_leaf in replaced_components["leaves"]:
         check(not (RS_DIR / replaced_leaf).exists(),
-              "PDG v2 roundtrip deletes later managed ruleset: " + replaced_leaf)
+              "PDG v3 roundtrip deletes later managed ruleset: " + replaced_leaf)
 
     # Exercise native PDG's default mode rather than merely passing the word
     # "merge" explicitly.  First create a coherent live-only model generation,
@@ -484,9 +479,9 @@ def main() -> int:
         if isinstance(item, dict) and isinstance(item.get("tag"), str)
     }
     merged_groups = {
-        item["name"] for item in merged["_pdg"]["mihomo"]["proxy-groups"]
+        item["name"] for item in merged["_pdg"]["policy-groups"]
     }
-    check({"live-only-node", "Live-Only-Group"} <= merged_tags and
+    check("live-only-node" in merged_tags and
           "Live-Only-Group" in merged_groups,
           "PDG default merge preserves live-only proxy and group")
     merged_plain = next(

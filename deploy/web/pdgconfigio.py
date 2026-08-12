@@ -71,6 +71,10 @@ _HEX64_RE = re.compile(r"^[a-f0-9]{64}$")
 _PROVIDER_EXT_RE = re.compile(r"\.(?:ya?ml|json|txt|mrs)$", re.I)
 
 
+def _reserved_targets() -> frozenset[str]:
+    return frozenset(_pdgmodel().RESERVED_TARGETS)
+
+
 def _archive_member_limit(name: str) -> int:
     return MAX_MODEL_FILE if name in {
         "model.json", "config.json", "etc/sing-box/config.json",
@@ -127,6 +131,33 @@ class ImportExpired(ConfigIOError):
 
 class ImportConflict(ConfigIOError):
     pass
+
+
+_PDG_MODEL_MODULE = None
+
+
+def _pdgmodel():
+    """Load the one shared schema-v3 validator from the managed Bot bundle."""
+    global _PDG_MODEL_MODULE
+    if _PDG_MODEL_MODULE is None:
+        candidates = [
+            "/opt/pdg-bot/pdgmodel.py",
+            os.path.abspath(os.path.join(
+                os.path.dirname(__file__), "..", "bot", "pdgmodel.py")),
+        ]
+        path = next((item for item in candidates
+                     if os.path.isfile(item) and not os.path.islink(item)), None)
+        if path is None:
+            raise ImportInvalid("PDG schema validator is unavailable")
+        spec = importlib.util.spec_from_file_location("_pdg_model_v3", path)
+        if spec is None or spec.loader is None:
+            raise ImportInvalid("PDG schema validator is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not callable(getattr(module, "migrate", None)):
+            raise ImportInvalid("PDG schema validator is unavailable")
+        _PDG_MODEL_MODULE = module
+    return _PDG_MODEL_MODULE
 
 
 def _sha(data: bytes) -> str:
@@ -601,11 +632,10 @@ def _validate_runtime_advanced(value: dict[str, Any], *, proxy: bool) -> None:
 
 
 def normalize_model(model: Any) -> dict[str, Any]:
-    if not isinstance(model, dict):
-        raise ImportInvalid("PDG model root must be an object")
-    if not isinstance(model.get("outbounds"), list) or not isinstance(model.get("route"), dict):
-        raise ImportInvalid("PDG model is missing outbounds or route")
-    result = copy.deepcopy(model)
+    try:
+        result = _pdgmodel().migrate(model)
+    except (TypeError, ValueError) as exc:
+        raise ImportInvalid("PDG schema v3 validation failed: " + str(exc)) from exc
     for outbound in result["outbounds"]:
         if not isinstance(outbound, dict):
             continue
@@ -623,26 +653,24 @@ def normalize_model(model: Any) -> dict[str, Any]:
     meta = result.get("_pdg")
     if meta is None:
         meta = {}
-    if not isinstance(meta, dict) or set(meta) - {"schema", "mihomo"}:
+    if not isinstance(meta, dict) or set(meta) != {
+            "schema", "policy-groups", "mihomo"}:
         raise ImportInvalid("PDG metadata is invalid")
-    schema = meta.get("schema", 1)
-    if schema not in {1, 2}:
+    schema = meta.get("schema")
+    if schema != 3:
         raise ImportInvalid("PDG model schema is not supported")
     mihomo = meta.get("mihomo") or {}
-    if not isinstance(mihomo, dict) or set(mihomo) - {
-            "proxy-providers", "rule-providers", "proxy-groups",
-            "advanced", "managed-files"}:
+    if not isinstance(mihomo, dict) or set(mihomo) != {
+            "proxy-providers", "rule-providers", "advanced", "managed-files"}:
         raise ImportInvalid("PDG Mihomo metadata is invalid")
     normalized = {
         "proxy-providers": copy.deepcopy(mihomo.get("proxy-providers") or {}),
         "rule-providers": copy.deepcopy(mihomo.get("rule-providers") or {}),
-        "proxy-groups": copy.deepcopy(mihomo.get("proxy-groups") or []),
         "advanced": copy.deepcopy(mihomo.get("advanced") or {}),
         "managed-files": copy.deepcopy(mihomo.get("managed-files") or {}),
     }
     if not isinstance(normalized["proxy-providers"], dict) or not isinstance(
             normalized["rule-providers"], dict) or not isinstance(
-            normalized["proxy-groups"], list) or not isinstance(
             normalized["advanced"], dict) or not isinstance(
             normalized["managed-files"], dict):
         raise ImportInvalid("PDG Mihomo metadata has the wrong shape")
@@ -663,7 +691,11 @@ def normalize_model(model: Any) -> dict[str, Any]:
             raise ImportInvalid("managed provider file integrity check failed")
         managed_raw_total += len(raw)
     _validate_native_mihomo_metadata(result, normalized)
-    result["_pdg"] = {"schema": 2, "mihomo": normalized}
+    result["_pdg"] = {
+        "schema": 3,
+        "policy-groups": copy.deepcopy(meta["policy-groups"]),
+        "mihomo": normalized,
+    }
     encoded_model_size = len(_model_bytes(result))
     if (encoded_model_size > MAX_MODEL_FILE
             or encoded_model_size + managed_raw_total > MAX_ARCHIVE_TOTAL):
@@ -672,7 +704,7 @@ def normalize_model(model: Any) -> dict[str, Any]:
 
 
 def _validate_native_mihomo_metadata(model: dict[str, Any], metadata: dict[str, Any]) -> None:
-    """Validate native PDG v2 metadata as strictly as the Mihomo importer.
+    """Validate native PDG v3 metadata as strictly as the Mihomo importer.
 
     A native bundle is not a privileged raw takeover channel: provider paths,
     group references and embedded managed-file closure remain PDG-owned.
@@ -683,7 +715,7 @@ def _validate_native_mihomo_metadata(model: dict[str, Any], metadata: dict[str, 
         if isinstance(item, dict) and item.get("type") == "direct"
         and isinstance(item.get("tag"), str)
     }
-    if direct_tags & {"DIRECT", "REJECT"}:
+    if direct_tags & _reserved_targets():
         raise ImportInvalid("direct tag collides with a reserved Mihomo target")
     providers = metadata["proxy-providers"]
     rule_providers = metadata["rule-providers"]
@@ -724,7 +756,7 @@ def _validate_native_mihomo_metadata(model: dict[str, Any], metadata: dict[str, 
     if local_leaves != set(metadata["managed-files"]):
         raise ImportInvalid("managed provider files are not an exact reference closure")
 
-    groups = metadata["proxy-groups"]
+    groups = (model.get("_pdg") or {}).get("policy-groups") or []
     group_names: set[str] = set()
     for group in groups:
         if (not isinstance(group, dict) or not _validate_safe_value(group)
@@ -744,38 +776,8 @@ def _validate_native_mihomo_metadata(model: dict[str, Any], metadata: dict[str, 
                   and item.get("type") not in {"direct", "selector", "urltest"}}
     if group_names & proxy_tags:
         raise ImportInvalid("proxy and group names collide")
-    if group_names & ({"DIRECT", "REJECT"} | direct_tags):
+    if group_names & (_reserved_targets() | direct_tags):
         raise ImportInvalid("proxy group name collides with a reserved target")
-    canonical_groups = {item.get("tag"): item for item in model.get("outbounds", [])
-                        if isinstance(item, dict) and item.get("type") in {"selector", "urltest"}}
-    for group in groups:
-        canonical = canonical_groups.get(group["name"])
-        representable = not group.get("use") and "REJECT" not in group.get("proxies", [])
-        if canonical is None:
-            if group["type"] in {"select", "url-test"} and representable:
-                raise ImportInvalid("editable Mihomo group is missing its canonical outbound")
-            continue
-        expected_type = "select" if canonical.get("type") == "selector" else "url-test"
-        if group["type"] != expected_type or not representable:
-            raise ImportInvalid("canonical and Mihomo group representations disagree")
-        direct_tag = next(iter(direct_tags), None)
-        metadata_members = [direct_tag if item == "DIRECT" else item
-                            for item in group.get("proxies", [])]
-        if metadata_members != canonical.get("outbounds", []):
-            raise ImportInvalid("canonical and Mihomo group memberships disagree")
-        if expected_type == "url-test":
-            raw_interval = group.get("interval", 180)
-            if type(raw_interval) is not int:
-                raise ImportInvalid("Mihomo group probe interval is invalid")
-            canonical_interval = str(canonical.get("interval", "180s"))
-            match = re.fullmatch(r"(\d+)([smh]?)", canonical_interval)
-            scale = {"": 1, "s": 1, "m": 60, "h": 3600}
-            seconds = int(match.group(1)) * scale[match.group(2)] if match else -1
-            if (group.get("url", "https://www.gstatic.com/generate_204")
-                    != canonical.get("url", "https://www.gstatic.com/generate_204")
-                    or raw_interval != seconds
-                    or group.get("tolerance", 50) != canonical.get("tolerance", 50)):
-                raise ImportInvalid("canonical and Mihomo group probes disagree")
     known = outbound_tags | group_names | {"DIRECT", "REJECT"}
     graph: dict[str, set[str]] = {}
     for group in groups:
@@ -916,15 +918,20 @@ def _proxy_to_model(item: Any) -> dict[str, Any]:
     return out
 
 
-def _safe_target(value: str, direct_tag: str, known: set[str]) -> str:
+def _safe_target(
+        value: str, direct_tag: str, known: set[str], block_tag: str | None = None) -> str:
     if value == "DIRECT":
         return direct_tag
+    if value == "REJECT" and block_tag:
+        return block_tag
     if value not in known:
         raise ImportInvalid("rule references an undefined policy target")
     return value
 
 
-def _rules_to_model(rules: Any, direct_tag: str, known: set[str]) -> dict[str, Any]:
+def _rules_to_model(
+        rules: Any, direct_tag: str, known: set[str], block_tag: str | None = None
+        ) -> dict[str, Any]:
     if not isinstance(rules, list) or not rules:
         raise ImportInvalid("Mihomo rules must be a non-empty list")
     out = []
@@ -939,14 +946,14 @@ def _rules_to_model(rules: Any, direct_tag: str, known: set[str]) -> dict[str, A
             if len(parts) != 2 or match_seen or index != len(rules) - 1:
                 raise ImportInvalid("MATCH rule is invalid")
             match_seen = True
-            final = _safe_target(parts[1], direct_tag, known)
+            final = _safe_target(parts[1], direct_tag, known, block_tag)
             continue
         # Suffix parameters such as `no-resolve` have target-specific runtime
         # semantics.  PDG does not currently model them, so accepting and
         # dropping a fourth field would silently change routing behavior.
         if kind not in _SUPPORTED_RULES or len(parts) != 3:
             raise ImportInvalid("Mihomo rule type is not supported")
-        value, target = parts[1], _safe_target(parts[2], direct_tag, known)
+        value, target = parts[1], _safe_target(parts[2], direct_tag, known, block_tag)
         if not value or len(value) > 2048:
             raise ImportInvalid("Mihomo rule value is invalid")
         key = _SUPPORTED_RULES[kind]
@@ -1012,7 +1019,7 @@ def mihomo_to_model(
                    if isinstance(item, dict) and item.get("type") == "direct"), None)
     direct = copy.deepcopy(direct or {"type": "direct", "tag": "direct"})
     direct_tag = direct.get("tag", "direct")
-    if direct_tag in {"DIRECT", "REJECT"}:
+    if direct_tag in _reserved_targets():
         raise ImportInvalid("current direct tag collides with a reserved Mihomo target")
 
     managed_files: dict[str, str] = {}
@@ -1054,9 +1061,28 @@ def mihomo_to_model(
         managed_groups.append(copy.deepcopy(group))
     if names & group_names:
         raise ImportInvalid("proxy and group names must not collide")
-    if (names | group_names) & {direct_tag, "DIRECT", "REJECT"}:
+    if (names | group_names) & ({direct_tag} | _reserved_targets()):
         raise ImportInvalid("proxy or group name collides with a reserved target")
+    current_blocks = [copy.deepcopy(item) for item in current.get("outbounds", [])
+                      if isinstance(item, dict) and item.get("type") == "block"]
+    if len(current_blocks) > 1:
+        raise ImportInvalid("current model contains ambiguous block outbounds")
+    block = current_blocks[0] if current_blocks else None
+    block_tag = block.get("tag") if block else None
+    reject_referenced = any(
+        isinstance(group, dict) and "REJECT" in (group.get("proxies") or [])
+        for group in managed_groups)
+    reject_referenced = reject_referenced or any(
+        isinstance(rule, str) and re.search(r",\s*REJECT(?:\s*,|\s*$)", rule, re.I)
+        for rule in (doc.get("rules") or []))
+    if reject_referenced and block is None:
+        block_tag = "block"
+        if block_tag in names | group_names | {direct_tag}:
+            raise ImportInvalid("REJECT requires a block outbound but its canonical tag collides")
+        block = {"type": "block", "tag": block_tag}
     known = names | group_names | {direct_tag, "REJECT"}
+    if block_tag:
+        known.add(block_tag)
     for group in managed_groups:
         members = group.get("proxies") or []
         uses = group.get("use") or []
@@ -1088,7 +1114,7 @@ def mihomo_to_model(
     for name in graph:
         visit(name)
     known |= {"DIRECT"}
-    route = _rules_to_model(doc.get("rules"), direct_tag, known)
+    route = _rules_to_model(doc.get("rules"), direct_tag, known, block_tag)
     for rule in route["rules"]:
         if "rule_set" in rule and rule["rule_set"] not in rule_providers:
             raise ImportInvalid("rule references an undefined rule provider")
@@ -1105,29 +1131,15 @@ def mihomo_to_model(
         if key in (_PDG_OWNED_MIHOMO - _MIHOMO_IMPORTED_SECTIONS))
     if ignored:
         warnings.append("PDG-managed runtime fields will be rebound: " + ", ".join(ignored))
-    canonical_groups = []
     for group in managed_groups:
-        if (group["type"] not in {"select", "url-test"} or group.get("use")
-                or "REJECT" in (group.get("proxies") or [])):
-            continue
-        canonical_groups.append({
-            "type": "selector" if group["type"] == "select" else "urltest",
-            "tag": group["name"],
-            "outbounds": [direct_tag if member == "DIRECT" else member
-                          for member in group.get("proxies") or []
-                          if member != "REJECT"],
-            **({"url": group.get("url", "https://www.gstatic.com/generate_204"),
-                "interval": str(group.get("interval", 180)) + "s",
-                "tolerance": group.get("tolerance", 50)}
-               if group["type"] == "url-test" else {}),
-        })
+        group["proxies"] = [direct_tag if member == "DIRECT" else member
+                            for member in group.get("proxies") or []]
     model = {
-        "outbounds": [direct] + converted + canonical_groups,
+        "outbounds": [direct] + ([block] if block else []) + converted,
         "route": route,
-        "_pdg": {"schema": 2, "mihomo": {
+        "_pdg": {"schema": 3, "policy-groups": managed_groups, "mihomo": {
             "proxy-providers": providers,
             "rule-providers": rule_providers,
-            "proxy-groups": managed_groups,
             "advanced": advanced,
             "managed-files": managed_files,
         }},
@@ -1456,7 +1468,13 @@ def _ruleset_names(data: bytes, *, source: str) -> set[str]:
     if not isinstance(doc, dict) or any(
             not isinstance(name, str) or not _TAG_RE.fullmatch(name) for name in doc):
         raise ImportInvalid(source + " PDG ruleset metadata is invalid")
-    return set(doc)
+    names = set(doc)
+    reserved = sorted(names & _reserved_targets())
+    if reserved:
+        raise ImportInvalid(
+            source + " PDG ruleset metadata uses a reserved Mihomo target: "
+            + ", ".join(reserved))
+    return names
 
 
 def _current_ruleset_names() -> set[str]:
@@ -1482,6 +1500,19 @@ def _restore_bundle(
         files = {}
     files = dict(files)
     source_v2 = "manifest.json" in files
+    incoming_direct_tag = None
+    for name, data in files.items():
+        if name in {"model.json", "config.json", "etc/sing-box/config.json"} \
+                or name.endswith("/etc/sing-box/config.json"):
+            try:
+                incoming_direct_tag = _single_direct(
+                    normalize_model(_strict_json(data)), "incoming")[1]
+            except Exception:
+                # The preview path already validated the selected model.  If a
+                # legacy archive has several candidate names, only the chosen
+                # valid one contributes a direct identity.
+                continue
+            break
     files.pop("manifest.json", None)
     files.pop("model.json", None)
     files.pop("config.json", None)
@@ -1501,6 +1532,22 @@ def _restore_bundle(
     if mosdns_override is not None and (mode == "replace" or resolutions.get(
             "component:mosdns", "existing") == "incoming"):
         files["etc/mosdns/config.yaml"] = mosdns_override
+    final_direct_tag = _single_direct(model, "result")[1]
+    ruleset_meta_name = "opt/pdg-bot/rulesets.json"
+    if (ruleset_meta_name in files and incoming_direct_tag
+            and incoming_direct_tag != final_direct_tag):
+        try:
+            ruleset_meta = _strict_json(files[ruleset_meta_name])
+            if not isinstance(ruleset_meta, dict):
+                raise ValueError("not an object")
+            for item in ruleset_meta.values():
+                if isinstance(item, dict) and item.get("outbound") == incoming_direct_tag:
+                    item["outbound"] = final_direct_tag
+            files[ruleset_meta_name] = json.dumps(
+                ruleset_meta, ensure_ascii=False, indent=2).encode("utf-8")
+        except Exception as exc:
+            raise ImportInvalid(
+                "ruleset metadata cannot be rebound to the current direct tag") from exc
     for leaf, encoded in model["_pdg"]["mihomo"]["managed-files"].items():
         files["etc/mihomo/providers/" + leaf] = base64.b64decode(
             encoded, validate=True)
@@ -1559,28 +1606,10 @@ def _rebind_incoming_direct(
            and item.get("tag") == current_tag for item in incoming["outbounds"]):
         raise ImportInvalid("incoming model collides with the current direct tag")
 
-    result = copy.deepcopy(incoming)
-    rebound_direct, _unused = _single_direct(result, "incoming")
-    rebound_direct["tag"] = current_tag
-    for outbound in result["outbounds"]:
-        if (isinstance(outbound, dict)
-                and outbound.get("type") in {"selector", "urltest"}
-                and isinstance(outbound.get("outbounds"), list)):
-            outbound["outbounds"] = [
-                current_tag if member == incoming_tag else member
-                for member in outbound["outbounds"]]
-    route = result["route"]
-    if route.get("final") == incoming_tag:
-        route["final"] = current_tag
-    for rule in route.get("rules") or []:
-        if isinstance(rule, dict) and rule.get("outbound") == incoming_tag:
-            rule["outbound"] = current_tag
-    metadata = ((result.get("_pdg") or {}).get("mihomo") or {})
-    for group in metadata.get("proxy-groups") or []:
-        if isinstance(group, dict) and isinstance(group.get("proxies"), list):
-            group["proxies"] = [
-                current_tag if member == incoming_tag else member
-                for member in group["proxies"]]
+    try:
+        result = _pdgmodel().rebind_direct(incoming, current_tag)
+    except (TypeError, ValueError) as exc:
+        raise ImportInvalid("incoming direct tag cannot be rebound: " + str(exc)) from exc
     return normalize_model(result)
 
 
@@ -1590,9 +1619,9 @@ def _model_name_occupancy(model: dict[str, Any]) -> set[str]:
         if isinstance(item, dict) and item.get("type") != "direct"
         and isinstance(item.get("tag"), str)
     }
-    metadata = ((model.get("_pdg") or {}).get("mihomo") or {})
+    metadata = model.get("_pdg") or {}
     names.update(
-        group.get("name") for group in metadata.get("proxy-groups") or []
+        group.get("name") for group in metadata.get("policy-groups") or []
         if isinstance(group, dict) and isinstance(group.get("name"), str))
     return names
 
@@ -1606,8 +1635,8 @@ def _ordered_model_names(model: dict[str, Any]) -> list[str]:
                 and isinstance(name, str) and name not in seen:
             seen.add(name)
             ordered.append(name)
-    metadata = ((model.get("_pdg") or {}).get("mihomo") or {})
-    for group in metadata.get("proxy-groups") or []:
+    metadata = model.get("_pdg") or {}
+    for group in metadata.get("policy-groups") or []:
         name = group.get("name") if isinstance(group, dict) else None
         if isinstance(name, str) and name not in seen:
             seen.add(name)
@@ -1628,6 +1657,8 @@ def _merge_model(
             copy.deepcopy(item) for item in incoming["outbounds"]
             if isinstance(item, dict) and item.get("type") != "direct"]
         result["route"] = copy.deepcopy(incoming["route"])
+        result["_pdg"]["policy-groups"] = copy.deepcopy(
+            incoming["_pdg"]["policy-groups"])
         result["_pdg"]["mihomo"] = copy.deepcopy(incoming["_pdg"]["mihomo"])
         return _prune_managed_files(result)
     result = copy.deepcopy(current)
@@ -1640,7 +1671,7 @@ def _merge_model(
     }
     incoming_groups = {
         group.get("name"): group
-        for group in incoming["_pdg"]["mihomo"]["proxy-groups"]
+        for group in incoming["_pdg"]["policy-groups"]
         if isinstance(group, dict) and isinstance(group.get("name"), str)
     }
     cur_ext = result["_pdg"]["mihomo"]
@@ -1655,13 +1686,14 @@ def _merge_model(
             item for item in result["outbounds"]
             if not (isinstance(item, dict) and item.get("type") != "direct"
                     and item.get("tag") == name)]
-        cur_ext["proxy-groups"] = [
-            group for group in cur_ext["proxy-groups"]
+        result["_pdg"]["policy-groups"] = [
+            group for group in result["_pdg"]["policy-groups"]
             if not (isinstance(group, dict) and group.get("name") == name)]
         if name in incoming_outbounds:
             result["outbounds"].append(copy.deepcopy(incoming_outbounds[name]))
         if name in incoming_groups:
-            cur_ext["proxy-groups"].append(copy.deepcopy(incoming_groups[name]))
+            result["_pdg"]["policy-groups"].append(
+                copy.deepcopy(incoming_groups[name]))
     result["route"]["rules"] = copy.deepcopy(incoming["route"].get("rules") or []) + copy.deepcopy(
         result["route"].get("rules") or [])
     if incoming["route"].get("final"):
@@ -2170,6 +2202,13 @@ class ConfigIO:
             if incoming_ruleset_meta is not None:
                 incoming_ruleset_names = _ruleset_names(
                     incoming_ruleset_meta, source="imported")
+                try:
+                    _pdgmodel().validate_ruleset_namespace(
+                        incoming, incoming_ruleset_names)
+                except (TypeError, ValueError) as exc:
+                    raise ImportInvalid(
+                        "imported PDG ruleset namespace is invalid: "
+                        + str(exc)) from exc
             conflicts = [
                 {"name": item, "kind": "name", "default": "incoming"}
                 for item in sorted(
@@ -2195,10 +2234,13 @@ class ConfigIO:
             # prepare_apply reject the selected unsafe state before a durable
             # job can start.  This permits a safe merge that keeps live
             # rulesets even when an unused incoming metadata file collides.
+            existing_ruleset_names = _current_ruleset_names()
             candidate["rulesetCollisions"] = {
                 "incomingPresent": incoming_ruleset_meta is not None,
                 "incoming": sorted(rule_provider_names & incoming_ruleset_names),
-                "existing": sorted(rule_provider_names & _current_ruleset_names()),
+                "existing": sorted(rule_provider_names & existing_ruleset_names),
+                "incomingNames": sorted(incoming_ruleset_names),
+                "existingNames": sorted(existing_ruleset_names),
             }
             incoming_mosdns = files.get("etc/mosdns/config.yaml")
             if incoming_mosdns is not None:
@@ -2237,7 +2279,7 @@ class ConfigIO:
                     if isinstance(item, dict) and item.get("type") not in {
                         "direct", "selector", "urltest"}),
                 "proxyProviders": len(incoming["_pdg"]["mihomo"]["proxy-providers"]),
-                "proxyGroups": len(incoming["_pdg"]["mihomo"]["proxy-groups"]),
+                "proxyGroups": len(incoming["_pdg"]["policy-groups"]),
                 "ruleProviders": len(incoming["_pdg"]["mihomo"]["rule-providers"]),
                 "rules": len(incoming["route"].get("rules") or []),
             }
@@ -2252,12 +2294,13 @@ class ConfigIO:
             warnings.append("MosDNS plugin graphs are replace-only; local identity will be rebound.")
 
         if kind == "mihomo":
-            collision = set(candidate["model"]["_pdg"]["mihomo"]["rule-providers"]) & (
-                _current_ruleset_names())
-            if collision:
+            try:
+                _pdgmodel().validate_ruleset_namespace(
+                    candidate["model"], _current_ruleset_names())
+            except (TypeError, ValueError) as exc:
                 raise ImportInvalid(
-                    "imported rule-provider collides with a PDG ruleset: "
-                    + ", ".join(sorted(collision)))
+                    "imported model collides with a PDG ruleset: "
+                    + str(exc)) from exc
 
         # The Web UI renders and submits the complete conflict set.  Reject
         # oversized previews before persisting either record or upload so the
@@ -2371,7 +2414,8 @@ class ConfigIO:
                     "rulesetCollisions")
                 if (not isinstance(collision_state, dict)
                         or set(collision_state) != {
-                            "incomingPresent", "incoming", "existing"}
+                            "incomingPresent", "incoming", "existing",
+                            "incomingNames", "existingNames"}
                         or type(collision_state["incomingPresent"]) is not bool
                         or any(not isinstance(values, list)
                                or any(not isinstance(name, str)
@@ -2379,7 +2423,9 @@ class ConfigIO:
                                       for name in values)
                                for values in (
                                    collision_state["incoming"],
-                                   collision_state["existing"]))):
+                                   collision_state["existing"],
+                                   collision_state["incomingNames"],
+                                   collision_state["existingNames"]))):
                     raise ImportInvalid("ruleset collision state is invalid")
                 ruleset_choice = "existing"
                 ruleset_conflict = next((
@@ -2397,6 +2443,23 @@ class ConfigIO:
                     raise ImportInvalid(
                         "imported rule-provider collides with the selected PDG ruleset state: "
                         + ", ".join(sorted(selected_collisions)))
+                choices = resolutions
+                semantic_resolutions = {
+                    item["kind"] + ":" + item["name"]:
+                    choices[item["conflictId"]]
+                    for item in record.get("conflicts") or []
+                }
+                current = self._current_model()
+                incoming = normalize_model(record["candidate"]["model"])
+                final = _merge_model(
+                    current, incoming, mode, semantic_resolutions)
+                try:
+                    _pdgmodel().validate_ruleset_namespace(
+                        final, collision_state[ruleset_choice + "Names"])
+                except (TypeError, ValueError) as exc:
+                    raise ImportInvalid(
+                        "selected PDG ruleset namespace is invalid: "
+                        + str(exc)) from exc
             record["apply"] = {
                 "mode": mode, "conflicts": resolutions, "confirmed": True,
                 "claimed": True, "claimedAt": int(time.time())}
@@ -2525,7 +2588,7 @@ class ConfigIO:
             data = fn()
             if not isinstance(data, bytes) or not 0 < len(data) <= MAX_UPLOAD:
                 raise ConfigIOError("PDG backup is unavailable")
-            return data, "pdg-config-v2.tar.gz", "application/gzip"
+            return data, "pdg-config-v3.tar.gz", "application/gzip"
         path = MIHOMO_PATH if kind == "mihomo" else MOSDNS_PATH if kind == "mosdns" else ""
         if not path:
             raise ImportInvalid("export kind is invalid")

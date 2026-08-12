@@ -95,6 +95,7 @@ managed_paths=(
   etc/systemd/system/pdg-quic-routing.service
   usr/local/libexec/pdg-quic-routing.sh
   opt/pdg-bot/pdgprofile.py
+  opt/pdg-bot/pdgmodel.py
   opt/pdg-bot/bot.py
   etc/mihomo/config.yaml
   etc/systemd/system/mihomo.service
@@ -112,6 +113,7 @@ reset_current(){
   printf 'CURRENT-QUIC-UNIT\n' >"$BOX/etc/systemd/system/pdg-quic-routing.service"
   cp "$WORK/quic-helper" "$BOX/usr/local/libexec/pdg-quic-routing.sh"
   printf '# parser\n' >"$BOX/opt/pdg-bot/pdgprofile.py"
+  printf 'CURRENT-MODEL\n' >"$BOX/opt/pdg-bot/pdgmodel.py"
   printf 'CURRENT-BOT\n' >"$BOX/opt/pdg-bot/bot.py"
   printf 'CURRENT-MIHOMO\n' >"$BOX/etc/mihomo/config.yaml"
   printf 'CURRENT-MIHOMO-UNIT\n' >"$BOX/etc/systemd/system/mihomo.service"
@@ -155,6 +157,7 @@ inject_phase_failure(){
       rm -f "$BOX/etc/systemd/system/pdg-quic-routing.service" \
         "$BOX/usr/local/libexec/pdg-quic-routing.sh" \
         "$BOX/opt/pdg-bot/pdgprofile.py"
+      rm -f "$BOX/opt/pdg-bot/pdgmodel.py"
       systemctl disable --now pdg-quic-routing >/dev/null;&
     legacy-cleanup)
       rm -f "$BOX/etc/mihomo/config.yaml" \
@@ -172,6 +175,7 @@ assert_current_exact(){
   [[ "$(cat "$BOX/etc/privdns-gateway/profile.env")" == CURRENT-PROFILE \
      && "$(cat "$BOX/etc/privdns-gateway/backend")" == mihomo \
      && "$(cat "$BOX/opt/pdg-bot/bot.py")" == CURRENT-BOT \
+     && "$(cat "$BOX/opt/pdg-bot/pdgmodel.py")" == CURRENT-MODEL \
      && "$(cat "$BOX/etc/mihomo/config.yaml")" == CURRENT-MIHOMO \
      && "$(cat "$BOX/etc/systemd/system/mihomo.service")" == CURRENT-MIHOMO-UNIT \
      && "$(cat "$BOX/etc/nftables.conf")" == CURRENT-NFT \

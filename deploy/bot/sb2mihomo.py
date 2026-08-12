@@ -7,7 +7,7 @@ sing-box 出站 dict 与 route.rules 结构,这里只做"翻译成 mihomo"这一
 关键映射:
   入站:  sing-box direct(sniff+override)  → mihomo redir-port(靠 nft REDIRECT 送入) + sniffer.override-destination
   出站:  sing-box outbounds[proxy]         → mihomo proxies[]
-         sing-box outbounds[urltest]       → mihomo proxy-groups[url-test]
+         PDG _pdg.policy-groups           → mihomo proxy-groups
          sing-box outbounds[direct] "JP"   → mihomo 内建 DIRECT
   路由:  route.rules[{ip_cidr,reject}]     → IP-CIDR,...,REJECT,no-resolve(反自环)
          route.rules[{domain_suffix,out}]  → DOMAIN-SUFFIX,...,<target>
@@ -23,6 +23,8 @@ from __future__ import annotations
 import copy
 import json
 import re
+
+import pdgmodel
 
 
 _TOP_RUNTIME_ADVANCED = {"tcp-concurrent", "unified-delay"}
@@ -311,14 +313,20 @@ def _direct_tags(sb):
     return {o["tag"] for o in sb.get("outbounds", []) if o.get("type") == "direct"}
 
 
-def _map_target(tag, direct_tags):
+def _block_tags(sb):
+    return {o["tag"] for o in sb.get("outbounds", []) if o.get("type") == "block"}
+
+
+def _map_target(tag, direct_tags, block_tags=()):
     """出口 tag → mihomo 策略名(direct 出口 → 内建 DIRECT)。"""
     if tag in direct_tags:
         return "DIRECT"
+    if tag in block_tags:
+        return "REJECT"
     return tag
 
 
-def _rules_from_route(sb, direct_tags, rulesets):
+def _rules_from_route(sb, direct_tags, rulesets, block_tags=()):
     rules = []
     dropped = []
     for r in sb.get("route", {}).get("rules", []):
@@ -331,7 +339,7 @@ def _rules_from_route(sb, direct_tags, rulesets):
         if not out:
             dropped.append(r)
             continue
-        target = _map_target(out, direct_tags)
+        target = _map_target(out, direct_tags, block_tags)
         if r.get("rule_set"):
             name = r["rule_set"]
             if rulesets is not None and name in rulesets:
@@ -346,11 +354,11 @@ def _rules_from_route(sb, direct_tags, rulesets):
         for kw in r.get("domain_keyword", []):
             rules.append(f"DOMAIN-KEYWORD,{kw},{target}")
     final = sb.get("route", {}).get("final")
-    rules.append(f"MATCH,{_map_target(final, direct_tags) if final else 'DIRECT'}")
+    rules.append(f"MATCH,{_map_target(final, direct_tags, block_tags) if final else 'DIRECT'}")
     return rules, dropped
 
 
-def _mixed_listeners(sb, direct_tags):
+def _mixed_listeners(sb, direct_tags, block_tags=()):
     """sing-box 的 mixed 入站(如 tg-proxy :8445)→ mihomo listeners + IN-NAME 路由规则。
     direct 入站(80/443/5228-5230)不在此列——它们靠 nft REDIRECT→redir-port 覆盖。
     每个 mixed 入站按 route 里 `inbound:[tag]→出口` 定 pin(没有则跟 route.final)。
@@ -366,7 +374,8 @@ def _mixed_listeners(sb, direct_tags):
                           "port": i["listen_port"], "listen": i.get("listen", "0.0.0.0")})
         exit_tag = next((r["outbound"] for r in route.get("rules", [])
                          if tag in (r.get("inbound") or []) and r.get("outbound")), None) or final
-        in_rules.append(f"IN-NAME,{tag},{_map_target(exit_tag, direct_tags) if exit_tag else 'DIRECT'}")
+        in_rules.append(
+            f"IN-NAME,{tag},{_map_target(exit_tag, direct_tags, block_tags) if exit_tag else 'DIRECT'}")
     return listeners, in_rules
 
 
@@ -381,7 +390,9 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
               未提供的 rule_set 规则会被丢弃并记入返回的 dropped(原型阶段先只保证域名规则)。
     返回 (mihomo_config_dict, meta) —— meta.dropped 列出没能翻译的规则(供调用方告警)。
     """
+    sb = pdgmodel.migrate(sb)
     direct_tags = _direct_tags(sb)
+    block_tags = _block_tags(sb)
     pdg_meta = sb.get("_pdg") if isinstance(sb.get("_pdg"), dict) else {}
     mihomo_meta = pdg_meta.get("mihomo") if isinstance(pdg_meta.get("mihomo"), dict) else {}
     imported_proxy_providers = {
@@ -392,7 +403,7 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
         name: _runtime_provider(provider, rule=True)
         for name, provider in (mihomo_meta.get("rule-providers") or {}).items()
         if isinstance(name, str) and isinstance(provider, dict)}
-    imported_groups = copy.deepcopy(mihomo_meta.get("proxy-groups") or [])
+    imported_groups = copy.deepcopy(pdgmodel.policy_groups(sb))
     advanced = copy.deepcopy(mihomo_meta.get("advanced") or {})
     proxies, unknown = [], []
     # TCP Fast Open: sing-box tcp_fast_open → mihomo tfo, 仅 TCP 类协议(QUIC 的 hy2/tuic 无意义)
@@ -421,53 +432,25 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                     p.update(_runtime_proxy_advanced(advanced_proxy))
                 proxies.append(p)
 
+    # Schema v3 policy groups are the sole authoritative representation.
     groups = []
-    for o in sb.get("outbounds", []):
-        if o.get("type") == "urltest":
-            groups.append({
-                "name": o["tag"], "type": "url-test",
-                "proxies": [_map_target(m, direct_tags) for m in o.get("outbounds", [])],
-                "url": o.get("url", "https://www.gstatic.com/generate_204"),
-                "interval": _dur_secs(o.get("interval", "3m")),
-                "tolerance": o.get("tolerance", 50),
-            })
-        elif o.get("type") == "selector":
-            groups.append({
-                "name": o["tag"], "type": "select",
-                "proxies": [_map_target(m, direct_tags) for m in o.get("outbounds", [])],
-            })
-
-    # Advanced imported group types remain canonical metadata rather than raw
-    # takeover.  Canonical groups win duplicate names and PDG always controls
-    # listeners/DNS/TUN/controller elsewhere in this renderer.
-    group_by_name = {item.get("name"): item for item in groups if isinstance(item, dict)}
-    group_names = set(group_by_name)
     for raw_group in imported_groups:
         group = _runtime_group(raw_group)
         if not group:
             continue
-        if group.get("name") in group_names:
-            # Canonical fields come from the editable PDG outbound.  Preserve
-            # only explicitly safe group options from read-only metadata.
-            blocked = {"name", "type", "proxies", "use", "url", "interval", "tolerance"}
-            group_by_name[group.get("name")].update({
-                key: copy.deepcopy(value) for key, value in group.items() if key not in blocked
-            })
-            continue
         clone = copy.deepcopy(group)
         if isinstance(clone.get("proxies"), list):
-            clone["proxies"] = [_map_target(member, direct_tags)
+            clone["proxies"] = [_map_target(member, direct_tags, block_tags)
                                 for member in clone["proxies"]]
         groups.append(clone)
-        group_by_name[clone.get("name")] = clone
-        group_names.add(clone.get("name"))
 
     available_rule_providers = dict(imported_rule_providers)
     available_rule_providers.update(rulesets or {})
-    rules, dropped = _rules_from_route(sb, direct_tags, available_rule_providers)
+    rules, dropped = _rules_from_route(
+        sb, direct_tags, available_rule_providers, block_tags)
 
     # mixed 入站(TG 代理 :8445 等)→ mihomo listeners + IN-NAME 路由(pin 到其出口/final)。
-    listeners, in_rules = _mixed_listeners(sb, direct_tags)
+    listeners, in_rules = _mixed_listeners(sb, direct_tags, block_tags)
 
     # 规则插入点: 开头的 IP-CIDR REJECT(反自环)之后; 顺序 = reject → IN-NAME(入站 pin) → MITM → 其余。
     i = 0

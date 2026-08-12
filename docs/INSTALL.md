@@ -77,13 +77,15 @@ Web 支持修改已有规则集 target，以及在保留 tag、顺序和全部�
 回滚和软件更新使用持久异步任务，浏览器断连后可重连查看状态。软件更新任务实际执行时调用
 `pdg update` 并跟随届时最新发布版，不锁定提交任务时预检到的 tag。
 
-v1.9.0 起，Web 还可导出或导入 PDG 配置包、Mihomo YAML 和 MosDNS YAML，并提供两种
+v1.10.0 的独立“策略组”页完整管理 select、url-test、fallback、load-balance、嵌套成员和
+provider。策略组配置变更走 CAS/pdgtx；select 的临时运行态选择只调用 Clash API，不写权威
+模型，Mihomo 重启后可能恢复。v1.9.0 起，Web 还可导出或导入 PDG 配置包、Mihomo YAML 和 MosDNS YAML，并提供两种
 YAML 示例模板。PDG 与 Mihomo 导入支持预览后合并或替换；MosDNS 只允许替换完整受管插件
 图。本机身份、监听、证书与规则路径会重新绑定，Mihomo 内容会转换到
 `/etc/sing-box/config.json` 权威模型后再派生运行配置。预览不修改生产配置，可主动取消；
 确认应用后才创建配置事务任务。上传在 root-only 目录暂存并于 30 分钟后失效，每次导出都
 需要重新验证 Web 管理员密码。完整安全边界与格式说明见
-[README 的配置导入、导出与模板](../README.md#配置导入导出与模板v190)。
+[README 的配置导入、导出与模板](../README.md#配置导入导出与模板v1100)。
 
 推荐保持 loopback 监听并使用 SSH 隧道，例如：
 
@@ -178,7 +180,9 @@ MosDNS 在劫持模式下会把代理域名 A 记录改写为网关 IP。遇到�
    `DOMAIN-KEYWORD`→`keyword:`，在同一 `pdgtx` 事务中派生到独立
    `/etc/mosdns/rules/ruleset_direct.txt`。这表示 MosDNS 返回真实地址、手机本地直连且不经
    VPS；含任何 `IP-CIDR/IP-CIDR6` 或 `.mrs/.srs` 的规则集会明确拒绝。默认 direct-type
-   出口 `JP` 则是流量已到 VPS 后由 VPS 本机直出，两者不要混淆。显式单域名代理规则比宽泛
+   出口 `JP` 则是流量已到 VPS 后由 VPS 本机直出，两者不要混淆。管理员可用
+   `sudo pdg direct-tag set <TAG>` 事务化自定义这个本机锚点；新装默认仍为 `JP`，旧 `jp`
+   兼容迁移不覆盖自定义名称。显式单域名代理规则比宽泛
    direct 规则集优先。
    指向非 literal-direct 出口的可展开 source 规则集会把域名项聚合到
    `/etc/mosdns/rules/ruleset_hijack.txt`，由 MosDNS 在国内直连判断前强制劫持，避免目标

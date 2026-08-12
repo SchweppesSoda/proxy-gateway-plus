@@ -22,7 +22,7 @@ pdg_verify_sha256 "$PATCH" "${PDG_SHA256[mosdns-patch]}" "MosDNS patch" \
    && "$MOSDNS_BUILD_VERSION" == v5.3.4-pdg-notickets.1 ]] \
   && ok "官方 commit、Go 与 flavor marker 均精确 pin" || bad "provenance pin 漂移"
 
-EXPECTED_RELEASE_BASE="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.9.0"
+EXPECTED_RELEASE_BASE="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.10.0"
 AMD64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-amd64"
 ARM64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-arm64"
 [[ "$MOSDNS_PDG_ASSET_BASE_URL" == "$EXPECTED_RELEASE_BASE" \
@@ -30,7 +30,7 @@ ARM64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-arm64"
    && "$(pdg_mosdns_asset_name arm64)" == "$ARM64_ASSET" \
    && $(grep -Fc 'ASSET="mosdns-${MOSDNS_VER}-${MOSDNS_PATCH_REV}-linux-${ARCH}"' \
         "$ROOT/tools/build-mosdns-patched.sh") == 1 ]] \
-  && ok "v1.9.0 Release 目录、helper 与构建产物名精确一致" \
+  && ok "v1.10.0 Release 目录、helper 与构建产物名精确一致" \
   || bad "Release 目录或 MosDNS asset 命名漂移"
 
 cat >"$WORK/stock" <<'EOF'
@@ -116,6 +116,28 @@ pdg_prepare_mosdns_candidate arm64 "$WORK/release-arm64" \
    && $(grep -Fxc "$EXPECTED_RELEASE_BASE/$ARM64_ASSET" "$PDG_TEST_CURL_LOG") == 1 ]] \
   && ok "amd64/arm64 均只从精确 tag asset URL 下载并校验" \
   || bad "双架构 Release 下载 URL、命名或候选校验失败"
+
+# CI validates a commit before v1.10.0 assets can exist.  Its explicit guard
+# must stop release-channel I/O, while the same guard must not disable the
+# hash-pinned local artifact channel used by install E2E.
+rm -rf "$WORK/candidate"; mkdir "$WORK/candidate"
+: >"$PDG_TEST_CURL_LOG"
+export PDG_MOSDNS_RELEASE_FETCH_FORBIDDEN=1
+PDG_SHA256[mosdns-pdg-amd64]="$AMD64_FIXTURE_SHA"
+pdg_prepare_mosdns_candidate amd64 "$WORK/candidate" >/dev/null 2>&1 \
+  && bad "CI release-fetch guard 仍允许读取未发布 asset" \
+  || { [[ ! -s "$PDG_TEST_CURL_LOG" ]] \
+       && ok "PR/CI 禁止 Release 取件，不依赖尚未创建的 tag assets" \
+       || bad "CI release-fetch guard 失败后仍发起下载"; }
+rm -rf "$WORK/candidate"; mkdir "$WORK/candidate"
+export PDG_MOSDNS_ARTIFACT="$WORK/patched"
+export PDG_MOSDNS_ARTIFACT_SHA256="$AMD64_FIXTURE_SHA"
+pdg_prepare_mosdns_candidate amd64 "$WORK/candidate" \
+  && [[ "$PDG_MOSDNS_PREPARED_CHANNEL" == local ]] \
+  && ok "PR/CI guard 下显式本地 pin 通道仍可验证装机" \
+  || bad "PR/CI guard 误禁止显式本地 pin 通道"
+unset PDG_MOSDNS_ARTIFACT PDG_MOSDNS_ARTIFACT_SHA256 \
+  PDG_MOSDNS_RELEASE_FETCH_FORBIDDEN
 
 rm -rf "$WORK/candidate"; mkdir "$WORK/candidate"
 PDG_SHA256[mosdns-pdg-amd64]="0000000000000000000000000000000000000000000000000000000000000000"

@@ -10,6 +10,10 @@
     sessionExpiresAt: 0,
     exits: [],
     groups: [],
+    groupProviders: [],
+    groupRevision: "",
+    editingGroupRevision: "",
+    editingGroup: "",
     exitOrder: [],
     exitTargets: [],
     ruleTargets: [],
@@ -467,6 +471,7 @@
     try {
       if (name === "overview") await loadOverview();
       if (name === "exits") await loadExits();
+      if (name === "groups") await loadGroups();
       if (name === "rules") await loadRules();
       if (name === "dns") await loadDns();
       if (name === "runtime") await loadRuntime();
@@ -853,25 +858,73 @@
     const target = $("#group-list");
     empty(target);
     if (!state.groups.length) {
-      target.append(node("div", "empty-state", "暂无故障切换组"));
+      target.append(node("div", "empty-state", "暂无策略组"));
       return;
     }
     state.groups.forEach((group) => {
       const card = node("article", "list-card");
-      card.dataset.tag = group.tag;
+      card.dataset.tag = group.name;
       const main = node("div", "list-card-main");
       const title = node("div", "list-card-title");
-      title.append(node("b", "", group.tag));
-      title.append(node("span", "type-badge", "FAILOVER"));
+      title.append(node("b", "", group.name));
+      title.append(node("span", "type-badge", group.type.toUpperCase()));
       main.append(title);
       main.append(node("span", "list-card-detail",
-        (group.members || []).map(formatExitName).join(" › ") || "无成员"));
+        (group.proxies || []).map(formatExitName).join(" › ") || "仅 provider"));
+      if (group.use.length) {
+        main.append(node("span", "list-card-detail", `providers: ${group.use.join(", ")}`));
+      }
+      const options = [];
+      if (group.url) options.push(`url=${group.url}`);
+      if (group.interval) options.push(`interval=${group.interval}s`);
+      if (Number.isInteger(group.tolerance)) options.push(`tolerance=${group.tolerance}ms`);
+      if (group.strategy) options.push(`strategy=${group.strategy}`);
+      if (group.lazy) options.push("lazy=true");
+      if (group.disableUdp) options.push("disable-udp=true");
+      if (group.hidden) options.push("hidden=true");
+      if (options.length) main.append(node("span", "list-card-detail", options.join(" · ")));
+      if (group.type === "select") {
+        main.append(node("span", "list-card-detail",
+          `临时运行态: ${group.runtimeSelected ? formatExitName(group.runtimeSelected) : "不可用"}`));
+      }
       const actions = node("div", "list-actions");
-      actions.append(makeActionButton("改成员", "edit-group"));
+      actions.append(makeActionButton("编辑配置", "edit-group"));
+      if (group.type === "select") actions.append(makeActionButton("临时切换", "select-runtime"));
       actions.append(makeActionButton("删除", "delete-group", "danger"));
       card.append(main, actions);
       target.append(card);
     });
+  }
+
+  function normalizeGroups(items) {
+    return Array.isArray(items) ? items.map((item) => ({
+      name: safeString(item.name || item.tag, 80),
+      tag: safeString(item.name || item.tag, 80),
+      type: safeString(item.type, 32),
+      proxies: Array.isArray(item.proxies || item.members)
+        ? (item.proxies || item.members).map((value) => safeString(value, 80)) : [],
+      use: Array.isArray(item.use) ? item.use.map((value) => safeString(value, 80)) : [],
+      url: item.url ? safeString(item.url, 8192) : "",
+      interval: Number(item.interval) || 0,
+      tolerance: Number.isInteger(item.tolerance) ? item.tolerance : undefined,
+      strategy: item.strategy ? safeString(item.strategy, 40) : "",
+      lazy: item.lazy === true,
+      disableUdp: item["disable-udp"] === true,
+      hidden: item.hidden === true,
+      runtimeSelected: item.runtimeSelected ? safeString(item.runtimeSelected, 256) : "",
+      runtimeCandidates: Array.isArray(item.runtimeCandidates)
+        ? item.runtimeCandidates.map((value) => safeString(value, 256)).filter(Boolean) : []
+    })) : [];
+  }
+
+  async function loadGroups() {
+    const { data } = await api("/policy-groups");
+    state.groups = normalizeGroups(data?.items);
+    state.groupRevision = typeof data?.revision === "string" ? data.revision : "";
+    state.groupProviders = Array.isArray(data?.providers) ? data.providers.map(String) : [];
+    state.exitTargets = Array.isArray(data?.targets) ? data.targets.map(String) : state.exitTargets;
+    renderGroups();
+    $("#group-count").textContent = `${state.groups.length} 个策略组`;
   }
 
   function normalizeExitItems(items) {
@@ -893,10 +946,11 @@
     state.exits = normalizeExitItems(
       Array.isArray(exitData.items) ? exitData.items : []
     );
-    state.groups = Array.isArray(groupData.items) ? groupData.items.map((item) => ({
-      tag: safeString(item.tag, 80),
-      members: Array.isArray(item.members) ? item.members.map((member) => safeString(member, 80)) : []
-    })) : [];
+    // Legacy compact endpoint remains a compatibility read; the independent
+    // policy-groups page always reloads the full schema from /policy-groups.
+    if (!state.groups.length && Array.isArray(groupData.items)) {
+      state.groups = normalizeGroups(groupData.items);
+    }
     state.exitTargets = Array.isArray(exitData.targets) ? exitData.targets.map(String) : state.exits.map((item) => item.tag);
     const currentTags = new Set(state.exits.map((item) => item.tag));
     Array.from(state.exitDiagnostics.keys()).forEach((tag) => {
@@ -905,7 +959,6 @@
     state.exitOrder = normalizeExitOrder(exitData.order);
     renderExitList();
     renderExitOrder();
-    renderGroups();
     populateSelect($("#default-exit"), state.exitTargets, String(exitData.default || ""));
     $("#save-order").disabled = true;
   }
@@ -1145,18 +1198,36 @@
     event.preventDefault();
     const form = event.currentTarget;
     const name = $("#group-name").value.trim();
-    const members = $("#group-members").value.trim().split(/[\s,，]+/).filter(Boolean);
-    if (members.length < 2 || new Set(members).size !== members.length) {
-      toast("故障切换组至少需要两个不重复的成员", "bad");
+    const type = $("#group-type").value;
+    const proxies = $("#group-members").value.trim().split(/[\s,，]+/).filter(Boolean);
+    const use = $("#group-providers").value.trim().split(/[\s,，]+/).filter(Boolean);
+    if ((!proxies.length && !use.length) || new Set(proxies).size !== proxies.length || new Set(use).size !== use.length) {
+      toast("策略组至少需要一个成员或 provider，且不能重复", "bad");
       return;
     }
+    const body = {
+      revision: state.editingGroup ? state.editingGroupRevision : state.groupRevision,
+      name, type, proxies, use
+    };
+    body.lazy = $("#group-lazy").checked;
+    body["disable-udp"] = $("#group-disable-udp").checked;
+    body.hidden = $("#group-hidden").checked;
+    if (["url-test", "fallback", "load-balance"].includes(type)) {
+      body.url = $("#group-url").value.trim();
+      body.interval = Number($("#group-interval").value);
+    }
+    if (type === "url-test") body.tolerance = Number($("#group-tolerance").value);
+    if (type === "load-balance") body.strategy = $("#group-strategy").value;
     const button = $("button[type='submit']", form);
-    setButtonBusy(button, true, "创建中…");
+    setButtonBusy(button, true, state.editingGroup ? "保存中…" : "创建中…");
     try {
-      const result = await api("/groups", { method: "POST", body: { name, members } });
-      form.reset();
-      toast(result.message || `故障组 ${name} 已创建`, "good");
-      await loadExits();
+      const editing = state.editingGroup;
+      const result = await api(editing ? `/policy-groups/${encodeURIComponent(editing)}` : "/policy-groups", {
+        method: editing ? "PATCH" : "POST", body
+      });
+      resetGroupEditor();
+      toast(result.message || `策略组 ${name} 已${editing ? "保存" : "创建"}`, "good");
+      await loadGroups();
     } catch (error) {
       toast(errorMessage(error), "bad");
     } finally {
@@ -1164,41 +1235,93 @@
     }
   }
 
+  function updateGroupOptions() {
+    const type = $("#group-type").value;
+    $("#group-probe-options").hidden = type === "select";
+    $("#group-tolerance-wrap").hidden = type !== "url-test";
+    $("#group-strategy-wrap").hidden = type !== "load-balance";
+  }
+
+  function resetGroupEditor() {
+    state.editingGroup = "";
+    state.editingGroupRevision = "";
+    $("#group-form").reset();
+    $("#group-url").value = "https://www.gstatic.com/generate_204";
+    $("#group-interval").value = "180";
+    $("#group-tolerance").value = "50";
+    $("#group-lazy").checked = false;
+    $("#group-disable-udp").checked = false;
+    $("#group-hidden").checked = false;
+    $("#group-editor-title").textContent = "创建策略组";
+    $("#group-submit").textContent = "创建策略组";
+    $("#group-cancel-edit").hidden = true;
+    updateGroupOptions();
+  }
+
+  function editGroup(group) {
+    state.editingGroup = group.name;
+    state.editingGroupRevision = state.groupRevision;
+    $("#group-name").value = group.name;
+    $("#group-type").value = group.type;
+    $("#group-members").value = group.proxies.join(" ");
+    $("#group-providers").value = group.use.join(" ");
+    $("#group-url").value = group.url || "https://www.gstatic.com/generate_204";
+    $("#group-interval").value = String(group.interval || 180);
+    $("#group-tolerance").value = String(group.tolerance ?? 50);
+    $("#group-strategy").value = group.strategy || "consistent-hashing";
+    $("#group-lazy").checked = group.lazy;
+    $("#group-disable-udp").checked = group.disableUdp;
+    $("#group-hidden").checked = group.hidden;
+    $("#group-editor-title").textContent = `编辑策略组 ${group.name}`;
+    $("#group-submit").textContent = "保存配置变更";
+    $("#group-cancel-edit").hidden = false;
+    updateGroupOptions();
+    $("#group-name").focus();
+  }
+
   async function handleGroupAction(event) {
     const button = event.target.closest("button[data-action]");
     if (!button) return;
     const tag = button.closest("[data-tag]")?.dataset.tag;
-    const group = state.groups.find((item) => item.tag === tag);
+    const group = state.groups.find((item) => item.name === tag);
     if (!tag || !group) return;
     if (button.dataset.action === "edit-group") {
-      const value = window.prompt(`编辑“${tag}”成员（用空格分隔）：`, group.members.join(" "));
+      editGroup(group);
+    }
+    if (button.dataset.action === "select-runtime") {
+      const value = window.prompt(
+        `临时切换“${tag}”当前成员（不写入配置，重启后可能恢复）：\n${group.runtimeCandidates.join(" / ")}`,
+        group.runtimeSelected || group.runtimeCandidates[0] || "");
       if (!value) return;
-      const members = value.trim().split(/[\s,，]+/).filter(Boolean);
-      if (members.length < 2 || new Set(members).size !== members.length) {
-        toast("故障切换组至少需要两个不重复的成员", "bad");
+      const member = value.trim();
+      if (!group.runtimeCandidates.includes(member)) {
+        toast("只能选择 Mihomo 当前实际提供的候选成员", "bad");
         return;
       }
       try {
-        const result = await api(`/groups/${encodeURIComponent(tag)}`, {
-          method: "PATCH", body: { members }
+        const result = await api(`/policy-groups/${encodeURIComponent(tag)}/runtime`, {
+          method: "PUT", body: { member }
         });
-        toast(result.message || `故障组 ${tag} 已更新`, "good");
-        await loadExits();
+        toast(result.message || `已临时切换到 ${member}（未写入配置）`, "good");
+        await loadGroups();
       } catch (error) {
         toast(errorMessage(error), "bad");
       }
     }
     if (button.dataset.action === "delete-group") {
       const confirmed = await confirmAction(
-        "删除故障切换组",
-        `确认删除“${tag}”？使用该组的默认出口或分流规则需要重新选择。`,
+        "删除策略组",
+        `确认删除“${tag}”？嵌套引用会安全级联，路由目标会切换到可用回退项。`,
         "删除组"
       );
       if (!confirmed) return;
       try {
-        const result = await api(`/groups/${encodeURIComponent(tag)}`, { method: "DELETE" });
-        toast(result.message || `已删除故障组 ${tag}`, "good");
-        await loadExits();
+        const result = await api(`/policy-groups/${encodeURIComponent(tag)}`, {
+          method: "DELETE", body: { revision: state.groupRevision }
+        });
+        toast(result.message || `已删除策略组 ${tag}`, "good");
+        resetGroupEditor();
+        await loadGroups();
       } catch (error) {
         toast(errorMessage(error), "bad");
       }
@@ -2498,6 +2621,8 @@
     $("#default-exit-form").addEventListener("submit", saveDefaultExit);
     $("#group-form").addEventListener("submit", addGroup);
     $("#group-list").addEventListener("click", handleGroupAction);
+    $("#group-type").addEventListener("change", updateGroupOptions);
+    $("#group-cancel-edit").addEventListener("click", resetGroupEditor);
     $("#rule-form").addEventListener("submit", addRule);
     $("#rule-list").addEventListener("click", handleRuleAction);
     $("#ruleset-form").addEventListener("submit", addRuleset);
@@ -2551,5 +2676,6 @@
   }
 
   bindEvents();
+  updateGroupOptions();
   loadSession();
 })();
