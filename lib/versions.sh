@@ -8,8 +8,8 @@
 #   2) MosDNS 按 tools/build-mosdns-patched.sh 从钉死 commit 可复现构建;
 #      mihomo 下载官方 release 重算 SHA256;
 #   3) 把哈希同步到 PDG_SHA256(amd64 + arm64)。
-# MosDNS 修补 raw hash 已由 KFC 交叉构建钉死；长期 release URL 发布前故意留空并
-# fail closed，可用显式本地产物通道部署。
+# MosDNS 修补 raw hash 已由 KFC 交叉构建钉死；长期下载只允许使用与项目发布 tag
+# 绑定的不可变 Release 目录。显式本地产物通道仍用于发版前验证与离线部署。
 # ─────────────────────────────────────────────────────────────────────────────
 MOSDNS_VER="v5.3.4"
 MOSDNS_UPSTREAM_REPO="https://github.com/IrineSistiana/mosdns.git"
@@ -18,9 +18,8 @@ MOSDNS_GO_VERSION="1.24.9"
 MOSDNS_PATCH_REV="pdg-notickets.1"
 MOSDNS_BUILD_VERSION="${MOSDNS_VER}-${MOSDNS_PATCH_REV}"
 MOSDNS_PATCH_FILE="patches/mosdns/v5.3.4-session-tickets-disabled.patch"
-# 自有 GitHub Release 产物上线时填写不带末尾 / 的目录。
-# 当前没有 release asset；空值使 installer/update 拒绝回退到存在会话恢复的官方二进制。
-MOSDNS_PDG_ASSET_BASE_URL=""
+# 自有 GitHub Release 产物目录，不带末尾 /；必须与包含这些 pin 的项目 tag 一致。
+MOSDNS_PDG_ASSET_BASE_URL="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.9.0"
 MIHOMO_VER="v1.19.29"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
 ZASHBOARD_VER="v3.15.0"       # 观测面板(纯静态前端, 由 external_ui 托管; dist-no-fonts 最小、不依赖 CDN; mihomo 原生 clash 核也可托管)
 

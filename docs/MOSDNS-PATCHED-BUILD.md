@@ -52,13 +52,13 @@ arm64 将两处 `amd64` 改为 `arm64`。脚本会重新克隆指定 source，�
 amd64 / arm64 各构建两次并用 `diff` 要求逐字节一致，再上传 14 天 release-candidate
 artifact。Actions artifact 不是长期安装源，不能把临时下载 URL 写进 installer。
 
-## 安全部署当前 KFC 产物
+## 发版前或离线部署 KFC 产物
 
 先通过可信通道把对应架构的 raw binary 传到目标机，例如
 `/root/pdg-artifacts/mosdns-v5.3.4-pdg-notickets.1-linux-amd64`。从构建机的 `.sha256`
 独立复制哈希，不在目标机下载后“现算现信”。
 
-全新正式安装（标准入口会自动切换到最新 `v*` Release）：
+发版前全新安装验证（标准入口会自动切换到最新 `v*` Release）：
 
 ```bash
 sudo env \
@@ -67,7 +67,7 @@ sudo env \
   ./install.sh
 ```
 
-已有部署升级到包含本修复的正式项目 tag：
+已有部署在离线环境升级到包含本修复的正式项目 tag：
 
 ```bash
 sudo env \
@@ -96,13 +96,15 @@ sudo pdg doctor --deep
 
 ## 发布自有 asset
 
-当前 raw hash 已钉死，但 `MOSDNS_PDG_ASSET_BASE_URL` 故意留空，所以未提供本地产物时
-安装会 fail closed。正式发布前：
+v1.9.0 的长期目录已精确钉死为
+`https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.9.0`。正式发布前：
 
 1. 用 KFC 和 Actions 分别运行仓库构建脚本，确认同架构 raw SHA256 一致。
-2. 把 raw binary 以脚本定义的文件名上传到长期 GitHub Release。
-3. 在同一个项目发布提交中填写 asset base URL，以及 amd64 / arm64 的 raw SHA256。
-4. 运行供应链测试和安装/更新故障回滚测试后再打项目 `v*` tag。
+2. 把两个 raw binary 以脚本定义的精确文件名上传到 v1.9.0 GitHub Release；同时附上各自
+   的 `.sha256` 和 `.provenance.json`（`.env` 只是离线部署便利文件，不是信任锚）。
+3. 确认 base URL 与项目 tag 一致，amd64 / arm64 raw SHA256 与 `lib/versions.sh` 完全一致。
+4. 从 Release URL 实际下载两架构 raw asset 并复核 SHA256，再运行供应链测试和安装/更新
+   故障回滚测试，最后才允许生产部署消费该 tag。
 
 不要发布一个 hash 尚未写入 `lib/versions.sh` 的默认下载通道，也不要在下载失败时回退到
 上游 stock asset。

@@ -76,14 +76,11 @@ VPS 用的是 **kfchost** — 官网:<https://kfchost.com/center/> · 邀请注�
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
 cd proxy-gateway-plus
-sudo env \
-  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
-  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  ./install.sh
+sudo ./install.sh
 ```
 
-> MosDNS 修补产物必须先按 [构建与部署说明](MOSDNS-PATCHED-BUILD.md) 在可信构建机准备并
-> 校验，正式安装不得使用 `PDG_TAG_BOOTSTRAPPED=1` 绕过发布 tag。
+> v1.9.0 起，MosDNS 修补产物从同 tag 的 GitHub Release 下载并由仓库架构 SHA256 pin
+> 校验；正式安装不得使用 `PDG_TAG_BOOTSTRAPPED=1` 绕过发布 tag。
 
 过程中它会:**①** 自动检测公网 IP、SSH 端口、内网卡来源段(抓包识别,期间用手机走这张 SIM 访问一次本机);**②** 让你填 bot token / 你的 user id / DoT 域名(token 可留空,装完再设);**③** 确认 A 记录生效后自动签 Let's Encrypt 证书,起服务、应用防火墙。
 

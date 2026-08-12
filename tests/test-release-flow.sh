@@ -10,16 +10,26 @@ grep -q 'pdg_checkout_latest_tag' "$ROOT/install.sh" \
   || fail "install.sh bootstrap must checkout the latest v* tag"
 ! grep -q 'git clone -q --depth 1 "$REPO_URL"' "$ROOT/install.sh" \
   || fail "install.sh must not seed /opt/privdns-gateway as a shallow main clone"
-grep -q 'git -C "$dir" checkout -q "$tag"' "$ROOT/install.sh" \
+grep -q 'pdg_origin_release_select "$dir"' "$ROOT/install.sh" \
+  || fail "install.sh must select only origin-advertised release tags"
+grep -q 'checkout -q --detach "$target"' "$ROOT/install.sh" \
   || fail "install.sh must checkout the selected release tag before re-exec"
 
 grep -q 'pdg_fetch_release_tags' "$ROOT/deploy/bot/pdg.sh" \
   || fail "pdg update must share a release-tag fetch helper"
-grep -q 'fetch -q --unshallow --tags origin main' "$ROOT/deploy/bot/pdg.sh" \
-  || fail "pdg update must unshallow old installs before comparing tags"
+grep -q 'pdg_origin_release_select "$dir" "$requested"' "$ROOT/deploy/bot/pdg.sh" \
+  || fail "pdg update must use the origin-only release selector"
+grep -q -- '--target)' "$ROOT/deploy/bot/pdg.sh" \
+  || fail "pdg update must accept an exact release target"
+! grep -q "tag -l 'v\*'" "$ROOT/deploy/bot/pdg.sh" \
+  || fail "pdg update must not enumerate untrusted local tags"
 
-grep -q '_fetch_release_tags' "$ROOT/deploy/bot/pdg-bot.py" \
-  || fail "bot update check must fetch release tags through a helper"
+grep -q '_select_origin_release' "$ROOT/deploy/bot/pdg-bot.py" \
+  || fail "bot update check must call the origin-only selector"
+grep -q '"--target", target' "$ROOT/deploy/bot/pdg-bot.py" \
+  || fail "bot apply must bind the confirmed exact target"
+! grep -q '"tag", "-l", "v\*"' "$ROOT/deploy/bot/pdg-bot.py" \
+  || fail "bot must not enumerate untrusted local tags"
 grep -q 'mb.returncode == 0' "$ROOT/deploy/bot/pdg-bot.py" \
   || fail "bot update check must distinguish merge-base success"
 grep -q 'mb.returncode == 1' "$ROOT/deploy/bot/pdg-bot.py" \

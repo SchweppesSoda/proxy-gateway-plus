@@ -7,6 +7,7 @@
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -50,13 +51,27 @@ def _isolate_bot_runtime(bot, box):
     )
     box.put("/etc/privdns-gateway/backend", b"mihomo\n", 0o644)
     box.put("/etc/privdns-gateway/platform", b"android\n", 0o644)
-    box.put(
-        "/etc/mosdns/config.yaml",
-        (ROOT / "deploy" / "mosdns" / "config.yaml").read_bytes(),
-        0o644,
-    )
+    mosdns = (ROOT / "deploy" / "mosdns" / "config.yaml").read_text(encoding="utf-8")
+    replacements = {
+        "__SERVER_IP__": "203.0.113.10",
+        "__INTERNAL_CIDR__": "10.0.0.0/24",
+        "__CERT_DIR__": "/etc/mosdns/certs",
+        "__HIJACK_SET_FILE__": "geosite_geolocation-!cn.txt",
+        "__MOSDNS_CACHE__": "8192",
+    }
+    placeholder = re.compile(r"__[A-Z0-9_]+__")
+    assert set(placeholder.findall(mosdns)) == set(replacements), \
+        "MosDNS 模板占位符契约漂移"
+    for old, new in replacements.items():
+        mosdns = mosdns.replace(old, new)
+    assert not placeholder.search(mosdns), "MosDNS fixture 写入前仍有占位符"
+    box.put("/etc/mosdns/config.yaml", mosdns.encode("utf-8"), 0o644)
+    assert not placeholder.search(
+        box.read("/etc/mosdns/config.yaml").decode("utf-8")
+    ), "MosDNS fixture 写入后仍有占位符"
     bot.PROFILE_ENV = profile
     bot.BACKEND_MARKER = box.path("/etc/privdns-gateway/backend")
+    bot.MOSDNS_CONF = box.path("/etc/mosdns/config.yaml")
     # _platform currently has no path constant, so replace that read seam directly.
     bot._platform = lambda: "android"
     assert Path(bot.PROFILE_ENV).resolve() == Path(profile).resolve()
@@ -637,8 +652,6 @@ def main():
         return (3, False)
 
     b3._build_source = _build_normal_provider
-    b3._render_mihomo_bytes = lambda model, rs_meta=None: (
-        json.dumps({"proxies": [], "rules": [], "rule-providers": rs_meta or {}}).encode(), {})
     bt3 = b3._pdgtx()
     bt3.svc_stable = lambda unit, **k: (True, "")
     bt3.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}

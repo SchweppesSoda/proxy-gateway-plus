@@ -61,6 +61,7 @@ rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-web,mosdns,mihomo,pdg-mitm,pd
       /etc/systemd/system/pdg-rules-update.timer /etc/systemd/system/pdg-health.timer \
       /etc/systemd/journald.conf.d/50-pdg.conf /etc/systemd/system/journald.conf.d/50-pdg.conf   # 正确路径 + 历史错路径都删
 rm -rf /opt/pdg-web
+rm -rf /var/lib/privdns-gateway/web-imports
 rm -f /usr/local/bin/pdg-webctl
 if [[ "$QUIC_CLEAN" == 1 ]]; then
   rm -f /etc/systemd/system/pdg-quic-routing.service \

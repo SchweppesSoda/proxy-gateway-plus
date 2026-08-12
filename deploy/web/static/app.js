@@ -21,7 +21,9 @@
     maintenanceJobs: [],
     trackedMaintenanceJobs: new Set(),
     maintenancePollTimer: 0,
-    maintenancePollDisconnected: false
+    maintenancePollDisconnected: false,
+    importPreview: null,
+    exportKind: ""
   };
 
   class ApiError extends Error {
@@ -239,6 +241,37 @@
 
     if (envelope.data && typeof envelope.data.csrf === "string") {
       state.csrf = envelope.data.csrf;
+    }
+    return { data: envelope.data, message: envelope.message || "" };
+  }
+
+  async function binaryApi(path, bytes, contentType) {
+    const headers = new Headers({
+      Accept: "application/json",
+      "Content-Type": contentType || "application/octet-stream",
+      "X-CSRF-Token": state.csrf
+    });
+    if (!state.csrf) throw new ApiError(403, "csrf_missing", "安全令牌缺失，请重新登录");
+    let response;
+    try {
+      response = await fetch(`${API_BASE}${normalizePath(path)}`, {
+        method: "POST", headers, credentials: "same-origin", cache: "no-store", body: bytes
+      });
+    } catch (_error) {
+      throw new ApiError(0, "network_error", "无法连接网关，请检查当前网络");
+    }
+    let envelope = null;
+    try { envelope = await response.json(); } catch (_error) { envelope = null; }
+    if (response.status === 401) {
+      showAuthenticated(false, "登录已过期，请重新登录");
+      window.setTimeout(loadSession, 0);
+      throw new ApiError(401, envelope?.error?.code, "登录已过期，请重新登录");
+    }
+    if (!response.ok || envelope?.ok !== true) {
+      throw new ApiError(
+        response.status, envelope?.error?.code,
+        envelope?.error?.message || defaultErrorMessage(response.status)
+      );
     }
     return { data: envelope.data, message: envelope.message || "" };
   }
@@ -1801,7 +1834,8 @@
       rollback: "回滚快照",
       "software-update": "软件升级",
       update: "软件升级",
-      snapshot: "创建快照"
+      snapshot: "创建快照",
+      "config-import": "导入受管配置"
     };
     return labels[operation] || "维护操作";
   }
@@ -1824,7 +1858,7 @@
 
   function setMaintenanceControls() {
     const unavailable = state.maintenancePollDisconnected || hasActiveMaintenanceJob();
-    $$("[data-operation], [data-maintenance-control]").forEach((control) => {
+    $$("[data-operation], [data-maintenance-control], [data-config-maintenance-control]").forEach((control) => {
       control.disabled = unavailable;
       if (unavailable) {
         control.title = state.maintenancePollDisconnected
@@ -2033,6 +2067,233 @@
       toast(result.message || `TCP Fast Open 已${enabled ? "开启" : "关闭"}`, "good");
       await loadSettings();
     } catch (error) {
+      toast(errorMessage(error), "bad");
+    } finally {
+      setButtonBusy(button, false);
+    }
+  }
+
+  function resetImportPreview(message = "") {
+    state.importPreview = null;
+    const target = $("#config-import-result");
+    target.hidden = !message;
+    empty(target);
+    if (message) target.append(node("div", "empty-state", message));
+  }
+
+  function renderImportPreview(preview) {
+    const target = $("#config-import-result");
+    empty(target);
+    target.hidden = false;
+    target.append(node("h3", "", "预览已完成，生产配置尚未修改"));
+    const summary = node("div", "kv-list import-summary");
+    renderKeyValues(summary, preview.summary || {}, "没有可显示的变更摘要");
+    target.append(summary);
+    const warnings = Array.isArray(preview.warnings) ? preview.warnings.slice(0, 20) : [];
+    if (warnings.length) {
+      const box = node("div", "import-warnings");
+      box.append(node("strong", "", "导入提醒"));
+      const list = node("ul");
+      warnings.forEach((warning) => list.append(node("li", "", safeString(warning, 300))));
+      box.append(list);
+      target.append(box);
+    }
+    const controls = node("div", "import-apply-controls");
+    const modeWrap = node("div", "grow");
+    const modeLabel = node("label", "", "应用方式");
+    modeLabel.htmlFor = "config-import-mode";
+    const mode = node("select");
+    mode.id = "config-import-mode";
+    (Array.isArray(preview.modes) ? preview.modes : ["merge"]).forEach((value) => {
+      const option = node("option", "", value === "replace" ? "替换受管配置" : "合并（推荐）");
+      option.value = value;
+      mode.append(option);
+    });
+    modeWrap.append(modeLabel, mode);
+    controls.append(modeWrap);
+    target.append(controls);
+    const conflicts = Array.isArray(preview.conflicts) ? preview.conflicts.slice(0, 200) : [];
+    if (conflicts.length) {
+      const conflictBox = node("div", "import-conflicts");
+      conflictBox.append(node("strong", "", "同名项目处理"));
+      conflicts.forEach((conflict) => {
+        const row = node("label", "import-conflict-row");
+        row.append(node("span", "", `${safeString(conflict.kind, 30)} · ${safeString(conflict.name, 80)}`));
+        const select = node("select");
+        select.dataset.importConflict = safeString(conflict.conflictId, 64);
+        const incoming = node("option", "", "使用导入内容");
+        incoming.value = "incoming";
+        const existing = node("option", "", "保留现有内容");
+        existing.value = "existing";
+        if (conflict.default === "existing") existing.selected = true;
+        select.append(incoming, existing);
+        row.append(select);
+        conflictBox.append(row);
+      });
+      target.append(conflictBox);
+      const syncConflictMode = () => {
+        const replace = mode.value === "replace";
+        $$('[data-import-conflict]', conflictBox).forEach((select) => {
+          if (replace) select.value = "incoming";
+          select.disabled = replace;
+        });
+      };
+      mode.addEventListener("change", syncConflictMode);
+      syncConflictMode();
+    }
+    const apply = node("button", "button warning", "确认并创建导入任务");
+    apply.type = "button";
+    apply.id = "config-import-apply";
+    apply.dataset.configMaintenanceControl = "";
+    const cancel = node("button", "button ghost", "取消预览并清理暂存");
+    cancel.type = "button";
+    cancel.id = "config-import-cancel";
+    cancel.dataset.configMaintenanceControl = "";
+    target.append(apply, cancel);
+    setMaintenanceControls();
+  }
+
+  function importContentType(file, kind) {
+    const name = String(file.name || "").toLowerCase();
+    if (name.endsWith(".zip")) return "application/zip";
+    if (name.endsWith(".gz") || name.endsWith(".tgz")) return "application/gzip";
+    if (kind === "pdg" && name.endsWith(".json")) return "application/json";
+    return "application/yaml";
+  }
+
+  async function previewConfigImport(event) {
+    event.preventDefault();
+    const kind = $("#config-import-kind").value;
+    const input = $("#config-import-file");
+    let file = input.files?.[0];
+    const maximumMiB = kind === "pdg" ? 68 : 36;
+    if (!file || file.size <= 0 || file.size > maximumMiB * 1024 * 1024) {
+      toast(`请选择不超过 ${maximumMiB} MiB 的非空配置文件`, "bad");
+      return;
+    }
+    const button = $("#config-import-preview");
+    setButtonBusy(button, true, "正在安全解析…");
+    resetImportPreview("正在上传并验证；此阶段不会修改生产配置…");
+    try {
+      const contentType = importContentType(file, kind);
+      const bytes = await file.arrayBuffer();
+      // Release the File object/input immediately after the bounded copy; the
+      // upload and parser may take time and must not retain the local handle.
+      input.value = "";
+      file = null;
+      const result = await binaryApi(
+        `/imports/${encodeURIComponent(kind)}/preview`, bytes, contentType
+      );
+      state.importPreview = result.data || null;
+      if (!state.importPreview?.importId) throw new ApiError(500, "invalid_preview", "预览结果无效");
+      renderImportPreview(state.importPreview);
+      toast("导入预览已完成，尚未修改生产配置", "good");
+    } catch (error) {
+      resetImportPreview(errorMessage(error));
+      toast(errorMessage(error), "bad");
+    } finally {
+      input.value = "";
+      file = null;
+      setButtonBusy(button, false);
+      setMaintenanceControls();
+    }
+  }
+
+  async function applyConfigImport() {
+    const preview = state.importPreview;
+    if (!preview?.importId) return;
+    const confirmed = await confirmAction(
+      "应用受管配置导入",
+      "服务器会再次核对暂存文件和预览基线，然后通过 PDG 配置事务校验、提交并观察服务；失败会自动回滚。",
+      "确认应用", "warning"
+    );
+    if (!confirmed) return;
+    const conflicts = {};
+    $$('[data-import-conflict]', $("#config-import-result")).forEach((select) => {
+      conflicts[select.dataset.importConflict] = select.value;
+    });
+    const button = $("#config-import-apply");
+    setButtonBusy(button, true, "正在创建任务…");
+    try {
+      const result = await api(`/imports/${encodeURIComponent(preview.importId)}/apply`, {
+        method: "POST",
+        body: { confirm: true, mode: $("#config-import-mode").value, conflicts }
+      });
+      const job = registerMaintenanceJob(result.data?.job, "config-import");
+      resetImportPreview(job ? "导入任务已提交，请在最近维护任务中查看结果。" : "导入请求已接受。");
+      $("#config-import-file").value = "";
+      toast("配置导入任务已提交，尚未确认完成", "good");
+    } catch (error) {
+      toast(errorMessage(error), "bad");
+    } finally {
+      setButtonBusy(button, false);
+      setMaintenanceControls();
+    }
+  }
+
+  async function cancelConfigImport() {
+    const preview = state.importPreview;
+    if (!preview?.importId) return;
+    const button = $("#config-import-cancel");
+    setButtonBusy(button, true, "正在清理…");
+    try {
+      await api(`/imports/${encodeURIComponent(preview.importId)}`, { method: "DELETE" });
+      resetImportPreview("预览已取消，暂存上传已立即清理；生产配置未修改。");
+      toast("导入预览已取消", "good");
+    } catch (error) {
+      toast(errorMessage(error), "bad");
+    } finally {
+      setButtonBusy(button, false);
+      setMaintenanceControls();
+    }
+  }
+
+  function openConfigExport(kind) {
+    state.exportKind = kind;
+    const dialog = $("#export-config-dialog");
+    $("#export-config-password").value = "";
+    dialog.returnValue = "cancel";
+    dialog.showModal();
+    window.setTimeout(() => $("#export-config-password").focus(), 0);
+  }
+
+  async function submitConfigExport(event) {
+    event.preventDefault();
+    const kind = state.exportKind;
+    const input = $("#export-config-password");
+    let password = input.value;
+    input.value = "";
+    const button = $("#export-config-submit");
+    setButtonBusy(button, true, "正在验证…");
+    try {
+      const response = await fetch(`${API_BASE}/exports/${encodeURIComponent(kind)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf },
+        credentials: "same-origin", cache: "no-store", body: JSON.stringify({ password })
+      });
+      password = "";
+      if (!response.ok) {
+        let envelope = null;
+        try { envelope = await response.json(); } catch (_error) { envelope = null; }
+        throw new ApiError(
+          response.status, envelope?.error?.code,
+          response.status === 401 ? "管理密码不正确" : envelope?.error?.message
+        );
+      }
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = /filename="([A-Za-z0-9_.-]{1,64})"/.exec(disposition);
+      if (!match) throw new ApiError(500, "invalid_attachment", "导出附件无效");
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = match[1];
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      $("#export-config-dialog").close("complete");
+      toast("配置已导出到本机下载目录", "good");
+    } catch (error) {
+      password = "";
       toast(errorMessage(error), "bad");
     } finally {
       setButtonBusy(button, false);
@@ -2254,6 +2515,30 @@
     });
     $("#rollback-form").addEventListener("submit", rollback);
     $("#software-update").addEventListener("click", softwareUpdate);
+    $("#config-import-form").addEventListener("submit", previewConfigImport);
+    const discardSupersededPreview = () => {
+      if (state.importPreview?.importId) cancelConfigImport();
+      else resetImportPreview();
+    };
+    $("#config-import-kind").addEventListener("change", discardSupersededPreview);
+    $("#config-import-file").addEventListener("change", discardSupersededPreview);
+    $("#config-import-result").addEventListener("click", (event) => {
+      if (event.target.closest("#config-import-apply")) applyConfigImport();
+      if (event.target.closest("#config-import-cancel")) cancelConfigImport();
+    });
+    $$("[data-export-kind]").forEach((button) => {
+      button.addEventListener("click", () => openConfigExport(button.dataset.exportKind));
+    });
+    $("#export-config-form").addEventListener("submit", submitConfigExport);
+    $("[data-export-cancel]").addEventListener("click", () => {
+      $("#export-config-password").value = "";
+      state.exportKind = "";
+      $("#export-config-dialog").close("cancel");
+    });
+    $("#export-config-dialog").addEventListener("close", () => {
+      $("#export-config-password").value = "";
+      state.exportKind = "";
+    });
 
     document.addEventListener("visibilitychange", () => {
       if (!document.hidden && state.activeTab === "runtime") loadRuntime();

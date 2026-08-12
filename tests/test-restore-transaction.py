@@ -54,34 +54,25 @@ AFTER_SB["outbounds"][0]["password"] = "BACKUP-PASSWORD-2"
 AFTER_SB["route"]["rules"][0]["ip_cidr"] = ["198.51.100.7/32"]     # 备份来自另一台机器
 AFTER_SB["route"]["final"] = "new-tw"
 
-def mos_shape(level, cidr, cert):
-    return """\
-log: {level: %s}
-identity: {ips: [ "%s" ], cert: "%s"}
-plugins:
-  - tag: geosite_cn
-    type: domain_set
-    args: { files: ["/etc/mosdns/rules/ruleset_direct.txt"] }
-  - tag: explicit_hijack
-    type: domain_set
-    args: { files: ["/etc/mosdns/rules/custom_hijack.txt","/etc/mosdns/rules/ruleset_hijack.txt"] }
-  - tag: force_hijack_seq
-    type: sequence
-    args:
-      - matches: qtype 1
-        exec: black_hole 203.0.113.10
-  - tag: internal_sequence
-    type: sequence
-    args:
-      - matches: qname $explicit_hijack
-        exec: goto force_hijack_seq
-      - matches: qname $geosite_cn
-        exec: $local_upstream
-""" % (level, cidr, cert)
+def mos_shape(level, cidr, cert, server):
+    # Restore now applies the production ConfigIO graph contract before any
+    # target is staged.  Keep this fault-injection matrix on the real managed
+    # graph so failures below exercise transactions, not an obsolete toy YAML.
+    return (
+        (ROOT / "deploy/mosdns/config.yaml").read_text(encoding="utf-8")
+        .replace("  level: warn", "  level: " + level, 1)
+        .replace("__SERVER_IP__", server)
+        .replace("__INTERNAL_CIDR__", cidr)
+        .replace("__CERT_DIR__", os.path.dirname(cert))
+        .replace("__HIJACK_SET_FILE__", "geosite_geolocation-!cn.txt")
+        .replace("__MOSDNS_CACHE__", "8192")
+    )
 
 
-CUR_MOS = mos_shape("info", "172.22.0.0/16", "/etc/mosdns/certs/fullchain.pem")
-BAK_MOS = mos_shape("debug", "10.9.0.0/16", "/etc/other/certs/fullchain.pem")
+CUR_MOS = mos_shape(
+    "info", "172.22.0.0/16", "/etc/mosdns/certs/fullchain.pem", "203.0.113.9")
+BAK_MOS = mos_shape(
+    "debug", "10.9.0.0/16", "/etc/other/certs/fullchain.pem", "198.51.100.7")
 
 
 def make_box():

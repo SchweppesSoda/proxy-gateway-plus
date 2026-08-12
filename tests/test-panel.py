@@ -2,6 +2,7 @@
 """Regression: 观测面板 (zashboard) 开关 + clash_api secret 适配。"""
 import importlib.util
 import copy
+import hashlib
 import io
 import json
 import os
@@ -371,7 +372,23 @@ with tempfile.TemporaryDirectory() as td:
     bot.SB = sb; bot.BACKUP_FILES = [sb]; bot.RS_DIR = os.path.join(td, "missing-rs")
     blob = bot.backup_blob()
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
-        backed = json.load(tar.extractfile(sb.lstrip("/")))
+        canonical = "etc/sing-box/config.json"
+        names = tar.getnames()
+        assert set(names) == {canonical, "manifest.json"}
+        assert sb.lstrip("/") not in names, "物理临时路径不得泄漏进备份成员名"
+        model_stream = tar.extractfile(canonical)
+        manifest_stream = tar.extractfile("manifest.json")
+        assert model_stream is not None and manifest_stream is not None
+        model_data = model_stream.read()
+        manifest = json.load(manifest_stream)
+        assert set(manifest) == {"version", "createdAt", "files"}
+        assert manifest["version"] == 2
+        assert manifest["files"] == [{
+            "path": canonical,
+            "size": len(model_data),
+            "sha256": hashlib.sha256(model_data).hexdigest(),
+        }]
+        backed = json.loads(model_data)
     assert backed["experimental"]["clash_api"] == {"external_controller": "127.0.0.1:9090"}
 
 with tempfile.TemporaryDirectory() as td:

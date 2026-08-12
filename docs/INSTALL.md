@@ -24,17 +24,14 @@
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
 cd proxy-gateway-plus
-sudo env \
-  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
-  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  ./install.sh
+sudo ./install.sh
 ```
 
 正式安装不得用 `PDG_TAG_BOOTSTRAPPED=1` 绕过发布 tag 校验。
 
-> MosDNS 使用 v5.3.4 no-session-ticket 修补 flavor。当前没有自有长期 release asset，
-> 所以还须先在本机/KFC 构建并通过 `PDG_MOSDNS_ARTIFACT` 与显式 SHA256 交给安装器；
-> 不会回退安装官方 stock v5.3.4，也不在 VPS 临时安装 Go。见
+> MosDNS 使用 v5.3.4 no-session-ticket 修补 flavor。v1.9.0 起从同 tag 的 GitHub Release
+> 下载 raw binary，并用仓库独立钉死的架构 SHA256 与 build marker 校验；不会回退安装
+> 官方 stock v5.3.4，也不在 VPS 临时安装 Go。离线/发版前本地产物通道见
 > [MosDNS 修补版构建与部署](MOSDNS-PATCHED-BUILD.md)。
 
 过程中:
@@ -79,6 +76,14 @@ Web 支持修改已有规则集 target，以及在保留 tag、顺序和全部�
 推演，网关出口推演不等同于真实数据包出口验证。回滚按带随机后缀的稳定快照 ID 精确选择，
 回滚和软件更新使用持久异步任务，浏览器断连后可重连查看状态。软件更新任务实际执行时调用
 `pdg update` 并跟随届时最新发布版，不锁定提交任务时预检到的 tag。
+
+v1.9.0 起，Web 还可导出或导入 PDG 配置包、Mihomo YAML 和 MosDNS YAML，并提供两种
+YAML 示例模板。PDG 与 Mihomo 导入支持预览后合并或替换；MosDNS 只允许替换完整受管插件
+图。本机身份、监听、证书与规则路径会重新绑定，Mihomo 内容会转换到
+`/etc/sing-box/config.json` 权威模型后再派生运行配置。预览不修改生产配置，可主动取消；
+确认应用后才创建配置事务任务。上传在 root-only 目录暂存并于 30 分钟后失效，每次导出都
+需要重新验证 Web 管理员密码。完整安全边界与格式说明见
+[README 的配置导入、导出与模板](../README.md#配置导入导出与模板v190)。
 
 推荐保持 loopback 监听并使用 SSH 隧道，例如：
 

@@ -31,7 +31,13 @@ sleep(){ :; }
 _pdg_platform(){ echo "${PLATFORM:-android}"; }
 _pdg_core(){ echo singbox; }
 _pdg_bot_cred(){ echo unset; }
-pdg_fetch_release_tags(){ return 0; }
+pdg_fetch_release_tags(){
+  PDG_RELEASE_TAG="${2:-v9.9.9}"
+  PDG_RELEASE_COMMIT=1111111111111111111111111111111111111111
+  PDG_RELEASE_OBJECT=2222222222222222222222222222222222222222
+  return 0
+}
+pdg_origin_release_materialize(){ return 0; }
 # 全桩 git: 只控制 reset 成败, 其余给出稳定输出
 git(){
   local a=("$@"); [[ "${a[0]:-}" == "-C" ]] && a=("${a[@]:2}")
@@ -46,6 +52,7 @@ git(){
 }
 # 必需文件安装: FAIL_INSTALL 命中目标子串则失败
 install(){ local last="${*: -1}"; [[ -n "${FAIL_INSTALL:-}" && "$*" == *"${FAIL_INSTALL}"* ]] && return 1; return 0; }
+apt-get(){ [[ -n "${FAIL_APT:-}" ]] && return 1; return 0; }
 # __migrate 经 `bash /usr/local/bin/pdg __migrate` 调用 → 拦 bash 函数
 bash(){ [[ "$*" == *__migrate* ]] && return "${MIGRATE_RC:-0}"; command bash "$@"; }
 _update_core_binary(){ [[ -n "${FAIL_CORE:-}" ]] && return 1; return 0; }
@@ -59,6 +66,7 @@ systemctl(){
 }
 python3(){
   case "$*" in
+    *"import yaml"*) return 0;;
     *py_compile*) return 0;;
     *doctor.py*)
       [[ -n "${DOCTOR_RC:-}" ]] && return "$DOCTOR_RC"
@@ -120,6 +128,7 @@ assert_fail_rollback(){ # 故障路径: rc非0 + 有 ROLLBACK + 无"✅ 已更�
 
 assert_success ""
 assert_fail_rollback "git reset 失败"        "FAIL_RESET=1"
+assert_fail_rollback "PyYAML 自愈失败"         "FAIL_APT=1"
 assert_fail_rollback "必需文件(bot.py)安装失败" "FAIL_INSTALL=/opt/pdg-bot/bot.py"
 assert_fail_rollback "必需文件(report.py)安装失败" "FAIL_INSTALL=report.py"
 assert_fail_rollback "必需文件(pdg 主脚本)安装失败" "FAIL_INSTALL=/usr/local/bin/pdg"

@@ -16,7 +16,9 @@ proxy-gateway-plus 基于 PrivDNS Gateway，是一个使用系统私密 DNS（Do
 - 国内域名返回真实 IP，手机直连。
 - 需要走代理的域名，网关把 A 记录改写成网关自己的 IP，流量因此回到网关；网关嗅探 SNI/Host，再按域名把连接交给对应出口，或从本机直出。
 
-手机上只有一条私密 DNS 设置，没有客户端，也没有 tun。出口、分流规则、故障组、DoT 域名等都在 Telegram Bot 或 `pdg` 命令里管理。
+手机上只有一条私密 DNS 设置，没有客户端，也没有 tun。出口、分流规则和故障组可在
+Telegram Bot、可选 PDG Web 或 `pdg` 命令中管理；DoT 证书、安装和主机生命周期仍由
+对应的受管入口处理。
 
 ## 2. 工作原理
 
@@ -66,27 +68,24 @@ Debian 12+ / Ubuntu 22+，需要 root。仓库已有兼容的 `v*` Release；标
 ```bash
 git clone https://github.com/SchweppesSoda/proxy-gateway-plus.git
 cd proxy-gateway-plus
-sudo env \
-  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
-  PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  ./install.sh
+sudo ./install.sh
 ```
 
 `PDG_TAG_BOOTSTRAPPED=1` 只保留给首次派生发布前的隔离开发验证，正式安装不得使用。
 
 MosDNS 使用本项目的 v5.3.4 no-session-ticket 修补 flavor，stock v5.3.4 不会被接受。
-当前尚未发布自有长期 release asset；开发部署须先在可信构建机上可复现构建 raw binary，
-通过可信通道把 binary 与预先取得的仓库 pin 交给安装器。不能在目标机下载后再“现算现信”，
-VPS 也不安装 Go。完整步骤见
+从 v1.9.0 起，安装器按架构从同一个项目 tag 的 GitHub Release 下载 raw binary，并用
+`lib/versions.sh` 中的独立 SHA256 pin 和 build marker 校验；不会信任下载点提供的哈希，
+也不会在 VPS 安装 Go。完整供应链与离线部署步骤见
 [MosDNS 修补版构建与部署](docs/MOSDNS-PATCHED-BUILD.md)。
 
-已经安装 stock MosDNS 或其他非项目 flavor 的机器在执行更新时，同样须显式提供产物：
+发版前验证或离线部署仍可显式提供本地 raw binary：
 
 ```bash
 sudo env \
-  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1 \
+  PDG_MOSDNS_ARTIFACT=/absolute/path/mosdns-v5.3.4-pdg-notickets.1-linux-amd64 \
   PDG_MOSDNS_ARTIFACT_SHA256=<lib/versions.sh 中当前架构的 mosdns-pdg pin> \
-  pdg update
+  ./install.sh
 ```
 
 路径必须是普通文件而不是符号链接。产物 SHA256 必须与 `lib/versions.sh` 中对应架构的
@@ -221,6 +220,42 @@ Web 可直接修改已有规则集的 target；这里的 literal `direct` 仍表
 Mihomo Clash API 探测；域名诊断分别呈现 DNS 实测证据与配置规则推演，网关出口推演不冒充
 真实数据包的出口验证。
 
+#### 配置导入、导出与模板（v1.9.0）
+
+Web 的「配置导入与导出」提供三个受管入口：
+
+- **PDG 配置包**：可下载并重新导入 PDG 受管配置包，适合迁移或离线保管。PDG 包和 Mihomo
+  配置均可在预览后选择合并或替换；合并时可逐项处理同名出口、策略组和 provider 冲突。
+- **Mihomo YAML**：支持普通 YAML，以及包含本地 proxy/rule provider 文件的安全归档。
+  导入器主要转换受支持的 `proxies`、`proxy-providers`、`proxy-groups`、`rule-providers` 和
+  `rules`。未建模的顶层和单节点高级字段可作为只读 opaque 元数据保存，但只有显式安全白名单
+  （目前顶层 `tcp-concurrent` / `unified-delay`，单节点 `udp` / `packet-encoding`）会进入派生运行
+  配置；其余字段会在预览中提醒但不会激活。策略组和 provider 使用更小的显式字段 schema，
+  `interface-name`、`routing-mark`、`dialer-proxy`、本地证书/私钥/状态路径等机器级控制不会进入
+  Mihomo。端口、LAN、DNS、TUN、controller 和 sniffer 等运行时字段始终由 PDG 按本机 profile
+  重新生成，不存在绕开 PDG 的 raw takeover。
+- **MosDNS YAML**：只允许替换符合当前 PDG 插件图契约的配置，不对插件流水线做模糊合并；
+  本机 IP、内网来源段、证书、规则文件路径和缓存参数会绑定回当前机器。不完整插件图、错误
+  顺序、未解析引用或其他不受支持内容会在预览阶段被拒绝。
+
+页面可直接下载 Mihomo 和 MosDNS 示例模板。PDG 不另设手写模板：由 Web 导出的 PDG 配置包
+本身就是可再次导入的标准包。`/etc/sing-box/config.json` 即使不再由 sing-box 运行，仍是出口、
+策略组和分流规则的**唯一权威数据模型**；`/etc/mihomo/config.yaml` 是从该模型派生并经真实
+Mihomo 校验的运行文件，不能反过来成为第二份事实来源。
+
+导入固定分成「安全预览 → 确认应用」两步。预览会显示摘要、提醒和冲突，但不会修改生产
+配置；用户可取消并立即清理上传，也可确认后创建持久化 `config-import` 维护任务。应用前会
+再次核对上传摘要和预览基线，再通过统一配置事务校验、提交、观察服务并在失败时回滚。同一
+时间仍只运行一个维护任务。
+
+上传暂存在 root-only 的 `/var/lib/privdns-gateway/web-imports`，使用不可猜测 ID 和 SHA-256
+复核，预览默认 30 分钟失效并自动清理；Mihomo/MosDNS 与 v2 包的上传上限为 36 MiB，
+旧 PDG 包为保持兼容可上传至 68 MiB、解压至 64 MiB。新 v2 归档最多 512 个成员，
+普通单成员不超过 8 MiB（模型成员不超过 24 MiB）、解压总量不超过 32 MiB，并检查路径、重复文件以及链接/设备类型。每次
+导出即使已有登录会话，也必须重新输入管理员
+密码；下载可能包含节点密码、UUID、provider URL 等敏感信息，只应保存到受信任设备并按
+凭据文件保护。
+
 Web 的本机快照使用带随机后缀的稳定 ID 精确选择，不会因新快照插入而改变回滚目标。回滚和
 软件更新由持久化异步任务执行，浏览器断连或重新打开后仍可按任务记录继续查看状态；同一时间
 只运行一个维护任务。软件更新任务在实际执行时调用 `pdg update` 并跟随届时最新发布版，提交
@@ -257,7 +292,8 @@ nftables、云安全组或整机 input policy。非 loopback 入口只在
 sudo pdg            # 进管理菜单
 sudo pdg status     # 状态
 sudo pdg doctor     # 自检（只读）；--deep 含 DoT chain/SAN 与两次握手会话恢复检查
-sudo pdg update     # 更新（更新前自动快照，失败自动回滚；--dry-run 查看待更新）
+sudo pdg update     # 更新到 origin 最新可信发布（更新前快照，失败回滚；--dry-run 查看）
+sudo pdg update --target vX.Y.Z  # 精确更新到 origin/main 已公布的指定发布
 sudo pdg snapshot   # 手动留一份配置快照
 sudo pdg rollback   # 回滚到最近快照
 sudo pdg token      # 设置 / 更换 Bot token
@@ -272,7 +308,7 @@ sudo pdg hijack-mode <all|gfw>          # 切换劫持模式
 sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 ```
 
-`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）主要用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置可在 Telegram Bot 或可选 PDG Web 中管理。首版 Web 覆盖出口与默认出口、故障组、单域名规则、规则集、DNS 上游、TFO、状态/日志/流量查看、服务重启、规则库更新、本机配置快照与回滚，以及软件更新；概览页自检按失败、警告和正常项分组展示，不再把全部结果挤成一段文本。Web 的本机快照不是可下载的完整配置备份包；DoT 域名和证书签发、配置包备份/恢复、iOS 描述文件、WLOC、平台切换、安装/卸载和 Bot token 管理仍仅通过 SSH 下的 `pdg` 或 Telegram Bot 完成。
+`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）主要用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置可在 Telegram Bot 或可选 PDG Web 中管理。Web 覆盖出口与默认出口、故障组、单域名规则、规则集、DNS 上游、TFO、状态/日志/流量查看、服务重启、规则库更新、本机配置快照与回滚、软件更新，以及 PDG/Mihomo/MosDNS 配置导入导出；概览页自检按失败、警告和正常项分组展示。Web 的本机快照仍是服务端恢复点，不是下载文件；需要离线保存或跨机迁移时，应使用 Web 的「PDG 配置包」导出。DoT 域名和证书签发、iOS 描述文件、WLOC、平台切换、安装/卸载和 Bot token 管理仍通过 SSH 下的 `pdg` 或 Telegram Bot 完成。
 
 ## 10. iOS 位置改写（WLOC，可选）
 
@@ -309,7 +345,7 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 |---|---|---|
 | DNS | mosdns v5.3.4 no-ticket 修补版 | 关闭 DoT session ticket/恢复；国内直连；代理域名 A 记录劫持到本机、AAAA / HTTPS 置空；按来源 IP 分支；ECS 处理；缓存；DoT（853）；可选 GFWList 劫持模式 |
 | 流量 | mihomo（clash.meta） | 单进程；TCP source-scoped REDIRECT → `:7893`，UDP/443 默认 TPROXY → `:7895`；按域名规则支持多出口与故障组；提供 clash_api（观测面板） |
-| 管理 | Telegram Bot + 可选 Web 管理面（Python 标准库） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；Web 默认禁用并使用独立 root-only 认证配置；事务管理的变更先校验候选并支持失败回滚 |
+| 管理 | Telegram Bot + 可选 Web 管理面（Python + PyYAML） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；Web 另支持 PDG/Mihomo/MosDNS 受管配置导入导出与模板下载，默认禁用并使用独立 root-only 认证配置；事务管理的变更先校验候选并支持失败回滚 |
 | 位置改写 | pdg-mitm（可选，iOS） | 自签 CA + 终止 TLS + 转发并替换 `gs-loc` 响应坐标 |
 | 证书 | certbot standalone | Let's Encrypt，自动续期 |
 | 防火墙 | nftables | `managed` 维护 source-aware input policy；`external` 不创建 input hook。两种模式的数据面均只按内网卡来源段透明接管 |

@@ -34,12 +34,15 @@ SNAPSHOT_DIR = os.environ.get(
     "PDG_SNAPSHOT_DIR", "/var/lib/privdns-gateway/backups")
 PDG_CLI = os.environ.get("PDG_CLI", "/usr/local/bin/pdg")
 RUNNER = os.environ.get("PDG_WEB_JOB_RUNNER", "/opt/pdg-web/pdg-web-job.py")
+CONFIG_IO_RUNNER = os.environ.get(
+    "PDG_CONFIG_IO_RUNNER", "/opt/pdg-web/pdgconfigio.py")
 SYSTEMD_RUN = os.environ.get("PDG_SYSTEMD_RUN", "/usr/bin/systemd-run")
 PYTHON = os.environ.get("PDG_PYTHON", "/usr/bin/python3")
 
 _JOB_ID_RE = re.compile(r"^[0-9]{8}t[0-9]{6}z-[a-f0-9]{12}$")
 _SNAPSHOT_ID_RE = re.compile(
     r"^[0-9]{8}-[0-9]{6}(?:-[a-f0-9]{8})?$")
+_IMPORT_ID_RE = re.compile(r"^imp-[a-f0-9]{32}$")
 _UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 _ACTIVE = {"queued", "running"}
 _TERMINAL = {"succeeded", "failed", "interrupted"}
@@ -92,6 +95,7 @@ class JobStore:
     def __init__(
             self, *, state_dir: str = STATE_DIR, snapshot_dir: str = SNAPSHOT_DIR,
             cli: str = PDG_CLI, runner: str = RUNNER,
+            config_io_runner: str = CONFIG_IO_RUNNER,
             systemd_run: str = SYSTEMD_RUN, python: str = PYTHON,
             run_command: Callable[..., Any] = subprocess.run,
             enforce_root_owner: bool = True):
@@ -99,6 +103,7 @@ class JobStore:
         self.snapshot_dir = os.path.abspath(snapshot_dir)
         self.cli = os.path.abspath(cli)
         self.runner = os.path.abspath(runner)
+        self.config_io_runner = os.path.abspath(config_io_runner)
         self.systemd_run = os.path.abspath(systemd_run)
         self.python = os.path.abspath(python)
         self._run_command = run_command
@@ -193,7 +198,7 @@ class JobStore:
                 or not isinstance(record, dict)
                 or set(record) - {
                 "id", "kind", "status", "createdAt", "bootId", "unit",
-                "snapshotId", "startedAt", "finishedAt", "result"}):
+                "snapshotId", "importId", "startedAt", "finishedAt", "result"}):
             raise JobInvalid("invalid job record")
         required = {"id", "kind", "status", "createdAt", "bootId", "unit"}
         if not required <= set(record) or record.get("id") != job_id:
@@ -204,7 +209,7 @@ class JobStore:
             raise JobInvalid("invalid job record")
         kind = record.get("kind")
         status = record.get("status")
-        if kind not in {"rollback", "software-update"}:
+        if kind not in {"rollback", "software-update", "config-import"}:
             raise JobInvalid("invalid job record")
         if status not in _ACTIVE | _TERMINAL:
             raise JobInvalid("invalid job record")
@@ -242,6 +247,12 @@ class JobStore:
                     _SNAPSHOT_ID_RE.fullmatch(record["snapshotId"])):
                 raise JobInvalid("invalid job record")
         elif "snapshotId" in record:
+            raise JobInvalid("invalid job record")
+        if kind == "config-import":
+            if not isinstance(record.get("importId"), str) or not (
+                    _IMPORT_ID_RE.fullmatch(record["importId"])):
+                raise JobInvalid("invalid job record")
+        elif "importId" in record:
             raise JobInvalid("invalid job record")
         if status == "queued" and set(record) & {
                 "startedAt", "finishedAt", "result"}:
@@ -363,7 +374,27 @@ class JobStore:
             "active", "activating", "deactivating", "inactive", "failed"
         } else "unknown"
 
-    def _reconcile(self, record: dict[str, Any]) -> dict[str, Any]:
+    def _unit_load_state(self, unit: str) -> str:
+        """Return whether systemd knows the transient unit, without guessing.
+
+        ``is-active`` may briefly report inactive after ``systemd-run`` has
+        accepted a unit but before its runner changes the durable record to
+        running.  LoadState is the only useful discriminator in that window;
+        command or parsing failures remain ambiguous and must fail closed.
+        """
+        try:
+            result = self._run_command(
+                ["systemctl", "show", "--property=LoadState", "--value", unit],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=5, check=False)
+            value = str(getattr(result, "stdout", "")).strip()
+        except Exception:
+            return "unknown"
+        return value if value in {"loaded", "not-found"} else "unknown"
+
+    def _reconcile(
+            self, record: dict[str, Any],
+            cleanups: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         if record.get("status") not in _ACTIVE:
             return record
         interrupted = record.get("bootId") != _boot_id()
@@ -394,7 +425,7 @@ class JobStore:
                 else:
                     maximum = (
                         50 * 60 if record.get("kind") == "software-update"
-                        else 20 * 60)
+                        else 25 * 60)
                     interrupted = age >= maximum
         if interrupted:
             record = dict(record)
@@ -402,22 +433,40 @@ class JobStore:
             record["finishedAt"] = _utc_now()
             record["result"] = "runner_interrupted"
             self._write_record(record)
+            if cleanups is not None:
+                cleanups.append(dict(record))
         return record
 
-    def _assert_idle_locked(self) -> None:
+    def _cleanup_import(self, record: dict[str, Any]) -> None:
+        if record.get("kind") != "config-import":
+            return
+        import_id = record.get("importId")
+        if not isinstance(import_id, str) or not _IMPORT_ID_RE.fullmatch(import_id):
+            return
+        try:
+            self._run_command(
+                [self.python, self.config_io_runner, "discard", "--import-id", import_id],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=30, check=False)
+        except Exception:
+            pass
+
+    def _assert_idle_locked(
+            self, cleanups: list[dict[str, Any]] | None = None) -> None:
         records: list[dict[str, Any]] = []
         for job_id in self._record_ids():
-            record = self._reconcile(self._read_record(job_id))
+            record = self._reconcile(self._read_record(job_id), cleanups)
             records.append(record)
             if record.get("status") in _ACTIVE:
                 raise JobBusy("maintenance job already active")
         self._prune_terminal_locked(records)
 
     def _prune_terminal_locked(
-            self, records: list[dict[str, Any]] | None = None) -> None:
+            self, records: list[dict[str, Any]] | None = None,
+            cleanups: list[dict[str, Any]] | None = None) -> None:
         if records is None:
             records = [
-                self._reconcile(self._read_record(job_id))
+                self._reconcile(self._read_record(job_id), cleanups)
                 for job_id in self._record_ids()
             ]
         terminal = [
@@ -441,10 +490,16 @@ class JobStore:
     @contextlib.contextmanager
     def maintenance_guard(self) -> Iterator[None]:
         """Exclude job submission while a synchronous maintenance action runs."""
-
-        with self._locked():
-            self._assert_idle_locked()
-            yield
+        cleanups: list[dict[str, Any]] = []
+        try:
+            with self._locked():
+                self._assert_idle_locked(cleanups)
+                yield
+        finally:
+            # Discard can involve a separate Python process.  Never execute it
+            # while holding the global job-state lock used by all API reads.
+            for record in cleanups:
+                self._cleanup_import(record)
 
     def list_snapshots(self) -> list[dict[str, Any]]:
         root = Path(self.snapshot_dir)
@@ -534,32 +589,49 @@ class JobStore:
                 return job_id
         raise JobStartError("cannot allocate job id")
 
-    def start(self, kind: str, *, snapshot_id: str | None = None) -> dict[str, Any]:
-        if kind not in {"rollback", "software-update"}:
+    def start(
+            self, kind: str, *, snapshot_id: str | None = None,
+            import_id: str | None = None) -> dict[str, Any]:
+        if kind not in {"rollback", "software-update", "config-import"}:
             raise JobInvalid("invalid job kind")
         if kind != "rollback" and snapshot_id is not None:
             raise JobInvalid("unexpected snapshot id")
-        with self._locked():
-            self._assert_idle_locked()
-            if kind == "rollback":
-                # Exact snapshot resolution belongs to the same state-lock
-                # critical section as the idle gate.  A concurrent Web snapshot
-                # maintenance guard therefore cannot prune the accepted ID
-                # between validation and job publication.
-                snapshot_id = self.resolve_snapshot_id(snapshot_id or "")
-            job_id = self._new_job_id()
-            unit = "pdg-web-job-" + job_id.lower() + ".service"
-            record: dict[str, Any] = {
-                "id": job_id,
-                "kind": kind,
-                "status": "queued",
-                "createdAt": _utc_now(),
-                "bootId": _boot_id(),
-                "unit": unit,
-            }
-            if snapshot_id is not None:
-                record["snapshotId"] = snapshot_id
-            self._write_record(record)
+        if kind == "config-import":
+            if not isinstance(import_id, str) or not _IMPORT_ID_RE.fullmatch(import_id):
+                raise JobInvalid("invalid import id")
+        elif import_id is not None:
+            raise JobInvalid("unexpected import id")
+        cleanups: list[dict[str, Any]] = []
+        try:
+            with self._locked():
+                self._assert_idle_locked(cleanups)
+                if kind == "rollback":
+                    # Exact snapshot resolution belongs to the same state-lock
+                    # critical section as the idle gate.  A concurrent Web snapshot
+                    # maintenance guard therefore cannot prune the accepted ID
+                    # between validation and job publication.
+                    snapshot_id = self.resolve_snapshot_id(snapshot_id or "")
+                job_id = self._new_job_id()
+                unit = "pdg-web-job-" + job_id.lower() + ".service"
+                record: dict[str, Any] = {
+                    "id": job_id,
+                    "kind": kind,
+                    "status": "queued",
+                    "createdAt": _utc_now(),
+                    "bootId": _boot_id(),
+                    "unit": unit,
+                }
+                if snapshot_id is not None:
+                    record["snapshotId"] = snapshot_id
+                if import_id is not None:
+                    record["importId"] = import_id
+                self._write_record(record)
+        finally:
+            # Reconcile may have terminalized an older import before a later
+            # busy/corrupt record aborts this start.  Cleanup must still happen,
+            # and only after releasing the state lock.
+            for cleanup in cleanups:
+                self._cleanup_import(cleanup)
         # Release the state lock before systemd can start the runner.  With
         # --no-block the child may execute immediately; launching while holding
         # our nonblocking flock would make that child fail with JobBusy.
@@ -577,41 +649,85 @@ class JobStore:
             job_id,
         ]
         launch_error: Exception | None = None
+        launch_returned = False
         try:
             result = self._run_command(
                 argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=30, check=False)
+            launch_returned = True
             if getattr(result, "returncode", 1) != 0:
                 launch_error = JobStartError("cannot launch job")
         except Exception as exc:
             launch_error = exc
         if launch_error is not None:
+            cleanup_record = None
+            load_state = self._unit_load_state(unit)
             with self._locked():
                 latest = self._read_record(job_id)
-                if latest.get("status") == "queued":
+                # A non-zero systemd-run result plus LoadState=not-found is
+                # positive evidence that the transient unit was not accepted.
+                # Exceptions are ambiguous: the client can raise after systemd
+                # accepted the unit, while the runner is still durably queued.
+                # Preserve that claim and let normal reconciliation apply the
+                # queued-job launch grace instead of risking a double apply.
+                if (latest.get("status") == "queued"
+                        and launch_returned
+                        and load_state == "not-found"):
                     latest["status"] = "failed"
                     latest["finishedAt"] = _utc_now()
                     latest["result"] = "launcher_failed"
                     self._write_record(latest)
-            raise JobStartError("cannot launch job") from launch_error
+                    cleanup_record = dict(latest)
+            if cleanup_record is not None:
+                self._cleanup_import(cleanup_record)
+                raise JobStartError("cannot launch job") from launch_error
+            # systemd may have accepted the transient unit and then the client
+            # hook/transport raised.  The durable record is now the authority;
+            # report the queued/running job instead of releasing its import
+            # claim and permitting a second apply.
+            return dict(latest)
         return dict(record)
 
+    def can_release_import(self, import_id: str) -> bool:
+        """Prove no durable job can still apply this import id."""
+        if not isinstance(import_id, str) or not _IMPORT_ID_RE.fullmatch(import_id):
+            return False
+        try:
+            with self._locked():
+                for job_id in self._record_ids():
+                    record = self._read_record(job_id)
+                    if record.get("importId") == import_id:
+                        return False
+        except Exception:
+            return False
+        return True
+
     def get(self, job_id: str) -> dict[str, Any]:
-        with self._locked():
-            return dict(self._reconcile(self._read_record(job_id)))
+        cleanups: list[dict[str, Any]] = []
+        try:
+            with self._locked():
+                return dict(self._reconcile(self._read_record(job_id), cleanups))
+        finally:
+            for cleanup in cleanups:
+                self._cleanup_import(cleanup)
 
     def list(self) -> list[dict[str, Any]]:
-        with self._locked():
-            records = [
-                dict(self._reconcile(self._read_record(job_id)))
-                for job_id in self._record_ids()[:_MAX_RECORDS]
-            ]
-        return records
+        cleanups: list[dict[str, Any]] = []
+        try:
+            with self._locked():
+                return [
+                    dict(self._reconcile(self._read_record(job_id), cleanups))
+                    for job_id in self._record_ids()[:_MAX_RECORDS]
+                ]
+        finally:
+            for cleanup in cleanups:
+                self._cleanup_import(cleanup)
 
     def run(self, job_id: str) -> int:
         # A read request can briefly hold the state lock just as systemd starts
         # us.  The dedicated runner waits for that finite critical section
         # instead of losing the job; Web request paths remain nonblocking.
+        boot_cleanup = None
         with self._locked(blocking=True):
             record = self._read_record(job_id)
             if record.get("status") != "queued":
@@ -621,10 +737,14 @@ class JobStore:
                 record["finishedAt"] = _utc_now()
                 record["result"] = "boot_changed"
                 self._write_record(record)
-                return 1
-            record["status"] = "running"
-            record["startedAt"] = _utc_now()
-            self._write_record(record)
+                boot_cleanup = dict(record)
+            else:
+                record["status"] = "running"
+                record["startedAt"] = _utc_now()
+                self._write_record(record)
+        if boot_cleanup is not None:
+            self._cleanup_import(boot_cleanup)
+            return 1
         status = "failed"
         result_code = "operation_failed"
         try:
@@ -640,6 +760,15 @@ class JobStore:
             elif kind == "software-update":
                 argv = [self.cli, "update"]
                 timeout = 45 * 60
+            elif kind == "config-import":
+                import_id = record.get("importId", "")
+                if not isinstance(import_id, str) or not _IMPORT_ID_RE.fullmatch(import_id):
+                    raise JobInvalid("invalid import id")
+                argv = [
+                    self.python, self.config_io_runner, "apply",
+                    "--import-id", import_id,
+                ]
+                timeout = 20 * 60
             else:
                 raise JobInvalid("invalid job operation")
             if not argv:
@@ -655,6 +784,7 @@ class JobStore:
         except Exception:
             result_code = "operation_failed"
         finally:
+            cleanup_record = None
             with self._locked(blocking=True):
                 latest = self._read_record(job_id)
                 if latest.get("status") in _ACTIVE:
@@ -662,7 +792,57 @@ class JobStore:
                     latest["finishedAt"] = _utc_now()
                     latest["result"] = result_code
                     self._write_record(latest)
+                    cleanup_record = dict(latest)
+            if cleanup_record is not None:
+                self._cleanup_import(cleanup_record)
         return 0 if status == "succeeded" else 1
+
+    def cleanup_config_import_for_legacy(self) -> None:
+        """Remove only v1.9 import records before starting an older Web UI.
+
+        The caller has already stopped pdg-web.  Transient runners are separate
+        systemd units, so each must be stopped and proven inactive before its
+        strictly validated durable record is removed.  Rollback/update records
+        remain readable by the older JobStore.
+        """
+        with self._locked(blocking=True):
+            records = [self._read_record(job_id) for job_id in self._record_ids()]
+            imports = [record for record in records
+                       if record.get("kind") == "config-import"]
+        for record in imports:
+            unit = record["unit"]
+            load_state = self._unit_load_state(unit)
+            if load_state == "unknown":
+                raise JobInvalid("cannot prove config-import unit load state")
+            if load_state != "not-found":
+                try:
+                    stopped = self._run_command(
+                        ["systemctl", "stop", unit], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=15, check=False)
+                except Exception as exc:
+                    raise JobInvalid("cannot stop config-import unit") from exc
+                if getattr(stopped, "returncode", 1) != 0:
+                    raise JobInvalid("cannot stop config-import unit")
+            if (load_state != "not-found"
+                    and self._unit_state(unit) not in {"inactive", "failed"}):
+                raise JobInvalid("config-import unit is still active")
+
+        expected = {record["id"]: record for record in imports}
+        with self._locked(blocking=True):
+            latest = [self._read_record(job_id) for job_id in self._record_ids()]
+            latest_imports = {record["id"]: record for record in latest
+                              if record.get("kind") == "config-import"}
+            if latest_imports != expected:
+                raise JobInvalid("config-import records changed during cleanup")
+            for job_id in sorted(expected):
+                os.unlink(self._record_path(job_id))
+            if expected and os.name != "nt":
+                directory_fd = os.open(
+                    self.state_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
 
 
 def _arguments(argv=None):
@@ -670,6 +850,7 @@ def _arguments(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run")
     run.add_argument("--job-id", required=True)
+    sub.add_parser("legacy-cleanup-config-import")
     return parser.parse_args(argv)
 
 
@@ -679,6 +860,9 @@ def main(argv=None) -> int:
         store = JobStore()
         if args.command == "run":
             return store.run(args.job_id)
+        if args.command == "legacy-cleanup-config-import":
+            store.cleanup_config_import_for_legacy()
+            return 0
     except JobError:
         return 1
     return 1

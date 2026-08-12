@@ -26,7 +26,43 @@ e2e_skip(){ echo "[SKIP] $1"; echo "──────────────�
 # safe.directory 属"受保护配置": 经 -c / GIT_CONFIG_* 环境变量设置会被 git 故意忽略,
 # 只认 system/global。所以写沙盒里的 /etc/gitconfig —— 本地是 overlay, CI 是一次性容器,
 # 两边都碰不到开发机的真实配置。
-_e2e_git_safe(){ grep -q 'directory = \*' /etc/gitconfig 2>/dev/null || printf '[safe]\n\tdirectory = *\n' >> /etc/gitconfig 2>/dev/null || true; }
+_e2e_git_safe(){
+  grep -q 'directory = \*' /etc/gitconfig 2>/dev/null \
+    || printf '[safe]\n\tdirectory = *\n' >> /etc/gitconfig
+}
+
+_e2e_overlay_root_valid(){
+  local root="${E2E_TMP_ROOT:-}" overlay="${E2E_OVL:-}" resolved resolved_root
+  [[ -n "$root" && -n "$overlay" && -d "$root" && -d "$overlay" \
+     && ! -L "$overlay" ]] || return 1
+  resolved_root="$(cd "$root" 2>/dev/null && pwd -P)" || return 1
+  [[ "$resolved_root" == "$root" ]] || return 1
+  case "$overlay" in
+    "$root"/pdg-e2e-overlay.*) ;;
+    *) return 1 ;;
+  esac
+  resolved="$(cd "$overlay" 2>/dev/null && pwd -P)" || return 1
+  [[ "$resolved" == "$overlay" ]]
+}
+
+_e2e_cleanup_overlay_root(){
+  _e2e_overlay_root_valid || {
+    echo "[FAIL] 拒绝清理不可信的 E2E overlay 路径" >&2
+    return 1
+  }
+  local target="$E2E_OVL" root="$E2E_TMP_ROOT"
+  if unshare -rm bash -c '
+      set -u
+      target=$1; root=$2
+      case "$target" in "$root"/pdg-e2e-overlay.*) ;; *) exit 64;; esac
+      [[ -n "$target" && -d "$target" && ! -L "$target" ]] || exit 65
+      rm -rf -- "$target"
+    ' _ "$target" "$root" 2>/dev/null; then
+    return 0
+  fi
+  _e2e_overlay_root_valid || return 1
+  rm -rf -- "$E2E_OVL"
+}
 
 # 把机器清回"什么都没装过"的状态。namespace 模式下 overlay 本来就干净, 这里主要给容器模式
 # (CI 里多个脚本共用一个容器)用: 二进制、unit、归属/后端标记、快照、仓库副本、服务桩一个不留。
@@ -86,30 +122,50 @@ e2e_enter(){
     return 0
   fi
   if [[ "${PDG_E2E_INNER:-}" == 1 ]]; then
+    _e2e_overlay_root_valid \
+      || { echo "[FAIL] E2E overlay 临时根不可信" >&2; exit 1; }
     mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew" /etc \
-      || { echo "[SKIP] overlay /etc 挂不上"; exit 0; }
-    mount -t overlay overlay -o "lowerdir=/usr/local,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local
-    mount -t overlay overlay -o "lowerdir=/opt,upperdir=$E2E_OVL/ou,workdir=$E2E_OVL/ow" /opt
-    mount -t tmpfs tmpfs /run 2>/dev/null || true            # pdg 的 flock 落在 /run(宿主归真 root)
+      || { echo "[FAIL] E2E overlay /etc 挂载失败" >&2; exit 1; }
+    mount -t overlay overlay -o "lowerdir=/usr/local,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local \
+      || { echo "[FAIL] E2E overlay /usr/local 挂载失败" >&2; exit 1; }
+    mount -t overlay overlay -o "lowerdir=/opt,upperdir=$E2E_OVL/ou,workdir=$E2E_OVL/ow" /opt \
+      || { echo "[FAIL] E2E overlay /opt 挂载失败" >&2; exit 1; }
+    # pdg 的 flock 落在 /run；不隔离就绝不能继续执行绝对路径事务。
+    mount -t tmpfs tmpfs /run \
+      || { echo "[FAIL] E2E tmpfs /run 挂载失败" >&2; exit 1; }
     # 快照目录在 /var/lib/privdns-gateway; 宿主 /var/lib 归真 root, 不覆盖就建不了快照,
     # 而"快照失败即中止更新"是有意设计 → 不覆盖的话整条 update 路径根本走不到。
     mount -t overlay overlay -o "lowerdir=/var/lib,upperdir=$E2E_OVL/vu,workdir=$E2E_OVL/vw" /var/lib \
-      2>/dev/null || mount -t tmpfs tmpfs /var/lib 2>/dev/null || true
-    mkdir -p /var/lib/privdns-gateway 2>/dev/null || true
-    _e2e_git_safe
+      || { echo "[FAIL] E2E overlay /var/lib 挂载失败" >&2; exit 1; }
+    mkdir -p /var/lib/privdns-gateway \
+      || { echo "[FAIL] E2E 无法建立隔离状态目录" >&2; exit 1; }
+    _e2e_git_safe \
+      || { echo "[FAIL] E2E 无法写入隔离 gitconfig" >&2; exit 1; }
     return 0
   fi
   unshare -rm true 2>/dev/null || e2e_skip "本环境不支持 unshare -rm(需用户+挂载命名空间)"
-  E2E_OVL="$(mktemp -d)"
+  E2E_TMP_ROOT="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" \
+    || { echo "[FAIL] 无法解析 E2E 临时根" >&2; exit 1; }
+  [[ -n "$E2E_TMP_ROOT" && -d "$E2E_TMP_ROOT" ]] \
+    || { echo "[FAIL] E2E 临时根不可信" >&2; exit 1; }
+  E2E_OVL="$(mktemp -d "$E2E_TMP_ROOT/pdg-e2e-overlay.XXXXXX")" \
+    || { echo "[FAIL] 无法建立 E2E overlay 临时目录" >&2; exit 1; }
+  _e2e_overlay_root_valid || {
+    echo "[FAIL] E2E overlay 临时目录验证失败" >&2
+    exit 1
+  }
   # 宿主 /etc 里归真 root 的路径在 userns 里映射成 nobody, 改不动 → 先在 upperdir 里建好(归本人)
-  mkdir -p "$E2E_OVL"/{eu,ew,bu,bw,ou,ow,vu,vw}
-  mkdir -p "$E2E_OVL"/eu/{mosdns/rules,sing-box,mihomo,privdns-gateway,systemd/system,systemd/journald.conf.d}
-  : > "$E2E_OVL"/eu/nftables.conf
+  mkdir -p "$E2E_OVL"/{eu,ew,bu,bw,ou,ow,vu,vw} \
+    || { echo "[FAIL] 无法建立 E2E overlay 层" >&2; _e2e_cleanup_overlay_root; exit 1; }
+  mkdir -p "$E2E_OVL"/eu/{mosdns/rules,sing-box,mihomo,privdns-gateway,systemd/system,systemd/journald.conf.d} \
+    || { echo "[FAIL] 无法预置 E2E /etc upperdir" >&2; _e2e_cleanup_overlay_root; exit 1; }
+  : > "$E2E_OVL"/eu/nftables.conf \
+    || { echo "[FAIL] 无法预置隔离 nftables 配置" >&2; _e2e_cleanup_overlay_root; exit 1; }
   local rc=0
-  PDG_E2E_INNER=1 E2E_OVL="$E2E_OVL" E2E_ROOT="$E2E_ROOT" \
+  PDG_E2E_INNER=1 E2E_OVL="$E2E_OVL" E2E_TMP_ROOT="$E2E_TMP_ROOT" E2E_ROOT="$E2E_ROOT" \
     unshare -rm bash "$0" "$@" || rc=$?
   # overlay 的 workdir 归 namespace 内的 root, 外层删不掉 → 再进一次 namespace 清理
-  unshare -rm bash -c 'rm -rf "$1"' _ "$E2E_OVL" 2>/dev/null || rm -rf "$E2E_OVL" 2>/dev/null
+  _e2e_cleanup_overlay_root || rc=1
   exit "$rc"
 }
 

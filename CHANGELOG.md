@@ -2,7 +2,23 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
-## Unreleased
+## 2026-08-11 — v1.9.0
+
+- PDG Web 新增受管配置迁移中心：PDG v2 完整包、Mihomo YAML/安全归档及 MosDNS
+  完整插件图均可先做零写入预览，再经冲突选择、二次确认和持久化维护任务应用；Mihomo
+  会转换为唯一 canonical model，MosDNS 只允许契约化 replace，不提供 raw takeover。
+- 增加三类重新验证密码的附件导出，以及 Mihomo/MosDNS 可下载模板。PDG 包与 Bot 备份
+  共用 manifest、成员白名单、大小和 SHA-256 判据，并覆盖规则集、本地 provider 与 MosDNS
+  规则；旧无 manifest 备份仍可按严格白名单导入。
+- 导入暂存采用 root-only 目录、排他随机 ID、流式限额、SHA/CAS、30 分钟 TTL 和不可重放
+  claim；取消预览会立即删除暂存。model、MosDNS 与 provider 基线均在 pdgtx 全局锁内复核，
+  事务失败继续沿用候选校验、服务观察和完整回滚。
+- 模型升级为向后兼容 schema v2，以 `_pdg.mihomo` 保存 provider、组、规则和只读高级字段；
+  v1 仅内存迁移，成功事务才持久化。原生 v2 包与普通 Mihomo 导入执行同等级路径、引用、
+  闭包、复杂度及 PDG-owned 字段校验。
+- 首装、pre-v1.9 旧 updater（含 v1.6.4）调用新版 `__migrate` 的自举路径、update/snapshot/rollback/purge、
+  CI/E2E 均补齐 PyYAML、ConfigIO 模块和模板清单；真实模板测试串联 preview、生产渲染器、
+  `mihomo -t` 与 MosDNS 隔离启动。
 
 - 新增维护者侧 `tools/deploy-release.sh`：只通过本机私有 SSH alias 定位线上 PDG，先验证
   远端 PDG 身份和预期 GitHub 仓库 origin，再固定执行更新预检、事务化更新、精确发布 tag、

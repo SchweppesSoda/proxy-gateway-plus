@@ -519,12 +519,11 @@ migrate_lowmem(){
 }
 
 pdg_fetch_release_tags(){
-  local dir="${1:-$REPO_DIR}" requested="${2:-}" helper
-  helper="$dir/lib/release-tags.sh"
-  [[ -f "$helper" ]] || { echo "缺发布标签校验器: $helper" >&2; return 1; }
-  # shellcheck source=lib/release-tags.sh
-  source "$helper" || return 1
-  pdg_origin_release_select "$dir" "$requested"
+  local dir="${1:-$REPO_DIR}"
+  git -C "$dir" fetch -q --tags origin main || return 1
+  if [[ "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+    git -C "$dir" fetch -q --unshallow --tags origin main || return 1
+  fi
 }
 
 cmd_status(){
@@ -881,45 +880,6 @@ _pdg_mktemp_dir(){
   d="$(mktemp -d)" || return 1
   [[ -n "$d" && -d "$d" ]] || return 1
   printf '%s\n' "$d"
-}
-
-# A snapshot older than ConfigIO has no janitor.  Once pdg-web is stopped,
-# remove only the exact root-managed staging directory so uploaded credentials
-# cannot survive indefinitely after a cross-version rollback.
-_pdg_clear_web_import_staging(){
-  local pfx="${PDG_ROOT_PREFIX:-}" staging parent item
-  pfx="${pfx%/}"
-  [[ -z "$pfx" || ( "$pfx" == /* && "$pfx" != *".."* ) ]] || return 1
-  staging="$pfx/var/lib/privdns-gateway/web-imports"
-  [[ "$staging" == "$pfx/var/lib/privdns-gateway/web-imports" ]] || return 1
-  [[ -e "$staging" || -L "$staging" ]] || return 0
-  for parent in "$pfx/var" "$pfx/var/lib" "$pfx/var/lib/privdns-gateway" "$staging"; do
-    [[ -d "$parent" && ! -L "$parent" ]] || return 1
-  done
-  [[ "$(readlink -f -- "$staging" 2>/dev/null)" == "$staging" ]] || return 1
-  if [[ -z "$pfx" ]]; then
-    [[ "$(stat -c '%u:%a' "$staging" 2>/dev/null)" == 0:700 ]] || return 1
-  fi
-  (
-    shopt -s nullglob dotglob
-    for item in "$staging"/*; do
-      [[ -f "$item" || -L "$item" ]] || exit 1
-      rm -f -- "$item" || exit 1
-    done
-  ) || return 1
-  rmdir -- "$staging" || return 1
-}
-
-_pdg_clear_legacy_config_import_jobs(){
-  local pfx="${PDG_ROOT_PREFIX:-}" jobs module
-  pfx="${pfx%/}"
-  [[ -z "$pfx" || ( "$pfx" == /* && "$pfx" != *".."* ) ]] || return 1
-  jobs="$pfx/var/lib/privdns-gateway/web-jobs"
-  module="$REPO_DIR/deploy/web/pdg-web-job.py"
-  [[ -e "$jobs" || -L "$jobs" ]] || return 0
-  [[ -d "$jobs" && ! -L "$jobs" && -f "$module" && ! -L "$module" ]] || return 1
-  PDG_WEB_JOB_STATE_DIR="$jobs" python3 "$module" \
-    legacy-cleanup-config-import
 }
 
 # 按原归档成员清单把已验证临时树落到目标根；不递归顶层隐式父目录，避免误改 /etc、/opt 元数据。
@@ -1937,7 +1897,6 @@ cmd_rollback(){
     opt/pdg-web/pdg-web.py
     opt/pdg-web/pdg-web-job.py
     opt/pdg-web/pdgcontrol.py
-    opt/pdg-web/pdgconfigio.py
     opt/pdg-web/pdg-web-setup.py
     opt/pdg-web/pdgwebconfig.py
     opt/pdg-web/static/index.html
@@ -1945,8 +1904,6 @@ cmd_rollback(){
     opt/pdg-web/static/style.css
     opt/pdg-web/static/manifest.webmanifest
     opt/pdg-web/static/icon.svg
-    opt/pdg-web/static/templates/mihomo-import.example.yaml
-    opt/pdg-web/static/templates/mosdns-import.example.yaml
     usr/local/bin/pdg-webctl
     etc/systemd/system/pdg-web.service
     etc/privdns-gateway/web.json
@@ -2086,27 +2043,6 @@ cmd_rollback(){
       return $?
     fi
   fi
-  if [[ ! -e "$tree/opt/pdg-web/pdgconfigio.py" ]]; then
-    if systemctl is-active pdg-web >/dev/null 2>&1 \
-       && ! systemctl stop pdg-web >/dev/null 2>&1; then
-      _pdg_snapshot_abort "$tmp" "$q_current_before" \
-        "$captured_helper" "$captured_tool" "$txn_nftexe" \
-        "$current_had_live" "无法停止旧快照不支持的 ConfigIO Web service"
-      return $?
-    fi
-    if ! _pdg_clear_legacy_config_import_jobs; then
-      _pdg_snapshot_abort "$tmp" "$q_current_before" \
-        "$captured_helper" "$captured_tool" "$txn_nftexe" \
-        "$current_had_live" "无法停止或清理旧 Web 不认识的 config-import jobs"
-      return $?
-    fi
-    if ! _pdg_clear_web_import_staging; then
-      _pdg_snapshot_abort "$tmp" "$q_current_before" \
-        "$captured_helper" "$captured_tool" "$txn_nftexe" \
-        "$current_had_live" "无法安全清理旧快照不再管理的 Web import staging"
-      return $?
-    fi
-  fi
   local managed_optional=(
     etc/mosdns/rules/ruleset_direct.txt
     etc/mosdns/rules/ruleset_hijack.txt
@@ -2120,7 +2056,6 @@ cmd_rollback(){
     opt/pdg-web/pdg-web.py
     opt/pdg-web/pdg-web-job.py
     opt/pdg-web/pdgcontrol.py
-    opt/pdg-web/pdgconfigio.py
     opt/pdg-web/pdg-web-setup.py
     opt/pdg-web/pdgwebconfig.py
     opt/pdg-web/static/index.html
@@ -2128,8 +2063,6 @@ cmd_rollback(){
     opt/pdg-web/static/style.css
     opt/pdg-web/static/manifest.webmanifest
     opt/pdg-web/static/icon.svg
-    opt/pdg-web/static/templates/mihomo-import.example.yaml
-    opt/pdg-web/static/templates/mosdns-import.example.yaml
   ) mp
   for mp in "${managed_optional[@]}"; do
     if [[ ! -e "$tree/$mp" ]]; then
@@ -2149,7 +2082,7 @@ cmd_rollback(){
         }
     fi
   done
-  rmdir /opt/pdg-web/static/templates /opt/pdg-web/static /opt/pdg-web 2>/dev/null || true
+  rmdir /opt/pdg-web/static /opt/pdg-web 2>/dev/null || true
   if ! awk '$0 !~ /^etc[/]nftables[.]conf$/' "$members" >"$apply_members"; then
     _pdg_snapshot_abort "$tmp" "$q_current_before" \
       "$captured_helper" "$captured_tool" "$txn_nftexe" \
@@ -2589,34 +2522,24 @@ migrate_mosdns_patched_binary(){
 
 cmd_update(){
   need_root update
-  local dry_run=0 requested=""
-  while (($#)); do
-    case "$1" in
-      --dry-run) dry_run=1; shift;;
-      --target)
-        (($# >= 2)) || { c_y "❌ --target 缺版本号"; return 1; }
-        requested="$2"; shift 2;;
-      *) c_y "❌ update 未知参数: $1"; return 1;;
-    esac
-  done
   # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
   # 以前 fetch/describe/tag 全用 `2>/dev/null` 吞掉, 拿不到就打印"最新发布: (无 tag)"再 return 0,
   # 用户会当成"已经是最新版", 实际是网络不通或仓库读不了。
-  if [[ "$dry_run" == 1 ]]; then
+  if [[ "${1:-}" == "--dry-run" ]]; then
     command -v git >/dev/null 2>&1 || { c_y "❌ 没有 git, 无法查看更新(dry-run 不安装任何东西)"; return 1; }
     [[ -d "$REPO_DIR/.git" ]] || { c_y "❌ $REPO_DIR 不是 git 仓库, 无法查看更新"; return 1; }
-    local cur_desc tgt tgt_commit
-    if ! pdg_fetch_release_tags "$REPO_DIR" "$requested"; then
+    local cur_desc tgt
+    if ! pdg_fetch_release_tags "$REPO_DIR"; then
       c_y "❌ 拉取远端 tag 失败(网络不通 / 仓库地址无效 / 属主异常)→ 无法判断是否有新版"; return 1
     fi
     if ! cur_desc="$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)" || [[ -z "$cur_desc" ]]; then
       c_y "❌ 读不到当前版本(git describe 失败: 仓库损坏 / 无提交 / 属主异常)"; return 1
     fi
-    tgt="$PDG_RELEASE_TAG"; tgt_commit="$PDG_RELEASE_COMMIT"
+    tgt="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
+    [[ -n "$tgt" ]] || { c_y "❌ 仓库里没有任何发布 tag(v*)→ 无法确定目标版本"; return 1; }
     echo "当前: $cur_desc   最新发布: $tgt"
     echo "待更新提交(HEAD..$tgt):"
-    git -C "$REPO_DIR" log --oneline "HEAD..$tgt_commit" 2>/dev/null \
-      || echo "  (已是最新或无法比较)"
+    git -C "$REPO_DIR" log --oneline "HEAD..$tgt" 2>/dev/null || echo "  (已是最新或无法比较)"
     return 0
   fi
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
@@ -2632,29 +2555,20 @@ cmd_update(){
   systemctl is-active pdg-web >/dev/null 2>&1 && web_was_active=1
   c_g "拉取最新发布 tag…"
   [[ -d "$REPO_DIR/.git" ]] || { rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"; }
-  if ! pdg_fetch_release_tags "$REPO_DIR" "$requested"; then
+  if ! pdg_fetch_release_tags "$REPO_DIR"; then
     c_y "拉取发布 tag 失败, 中止更新。"; return 1
   fi
-  local tgt="$PDG_RELEASE_TAG" tgt_commit="$PDG_RELEASE_COMMIT" tgt_object="$PDG_RELEASE_OBJECT"
-  if ! pdg_origin_release_materialize "$REPO_DIR" "$tgt" "$tgt_object"; then
-    c_y "无法固定 origin 发布 tag $tgt, 中止更新。"; return 1
+  local tgt; tgt=$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname | head -1)
+  if [[ -z "$tgt" ]]; then
+    c_y "仓库没有发布 tag(v*), 中止更新。"; return 1
   fi
-  if ! git -C "$REPO_DIR" reset --hard -q "$tgt_commit"; then
+  if ! git -C "$REPO_DIR" reset --hard -q "$tgt"; then
     c_y "git reset 到 $tgt 失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
   c_g "→ 已切到发布 $tgt"
   c_g "刷新代码(配置/出口/token/证书均不动)…"
-  # Web 导入解析器依赖系统 PyYAML。旧安装可能没有；必须在替换 Web
-  # 代码前自愈并做真实 import 硬校验，不能把缺依赖的新版本重启进生产。
-  if ! apt-get update -qq \
-     || ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null \
-     || ! python3 -c 'import yaml' >/dev/null 2>&1; then
-    c_y "python3-yaml 自愈/校验失败, 回滚到更新前快照…"
-    cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
-  fi
   # 必需文件: 任一装失败即立即回滚(拒绝新旧混部)。`! A || ! B` 在首个失败处短路。
-  if   ! install -d -m755 /opt/pdg-web /opt/pdg-web/static /opt/pdg-web/static/templates \
-    || ! install -d -o root -g root -m700 /var/lib/privdns-gateway/web-imports /etc/mihomo/providers \
+  if   ! install -d -m755 /opt/pdg-web /opt/pdg-web/static \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py           /opt/pdg-bot/bot.py \
     || ! install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/ \
@@ -2676,7 +2590,6 @@ cmd_update(){
     || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web.py           /opt/pdg-web/ \
     || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web-job.py       /opt/pdg-web/ \
     || ! install -m755 "$REPO_DIR"/deploy/web/pdgcontrol.py        /opt/pdg-web/ \
-    || ! install -m755 "$REPO_DIR"/deploy/web/pdgconfigio.py       /opt/pdg-web/ \
     || ! install -m755 "$REPO_DIR"/deploy/web/pdg-web-setup.py     /opt/pdg-web/ \
     || ! install -m644 "$REPO_DIR"/deploy/web/pdgwebconfig.py      /opt/pdg-web/ \
     || ! install -m644 "$REPO_DIR"/deploy/web/static/index.html    /opt/pdg-web/static/ \
@@ -2684,8 +2597,6 @@ cmd_update(){
     || ! install -m644 "$REPO_DIR"/deploy/web/static/style.css     /opt/pdg-web/static/ \
     || ! install -m644 "$REPO_DIR"/deploy/web/static/manifest.webmanifest /opt/pdg-web/static/ \
     || ! install -m644 "$REPO_DIR"/deploy/web/static/icon.svg      /opt/pdg-web/static/ \
-    || ! install -m644 "$REPO_DIR"/deploy/web/static/templates/mihomo-import.example.yaml /opt/pdg-web/static/templates/ \
-    || ! install -m644 "$REPO_DIR"/deploy/web/static/templates/mosdns-import.example.yaml /opt/pdg-web/static/templates/ \
     || ! install -m755 "$REPO_DIR"/deploy/web/pdg-webctl.sh        /usr/local/bin/pdg-webctl \
     || ! install -m644 "$REPO_DIR"/deploy/web/pdg-web.service      /etc/systemd/system/pdg-web.service \
     || ! install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh \
@@ -2722,8 +2633,7 @@ cmd_update(){
 
   # ── 更新后校验门: 任一硬校验失败即回滚到更新前快照 ──
   c_g "校验新版本…"
-  if ! python3 -c 'import yaml' >/dev/null 2>&1 \
-     || ! python3 -m py_compile /opt/pdg-bot/*.py /opt/pdg-web/*.py 2>/dev/null; then
+  if ! python3 -m py_compile /opt/pdg-bot/*.py /opt/pdg-web/*.py 2>/dev/null; then
     c_y "Python 语法错误, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
   if [[ ( -e /etc/privdns-gateway/web.json \
@@ -4417,49 +4327,6 @@ migrate_dataplane_profile(){
      && "$(systemctl is-active mihomo 2>/dev/null)" == active ]] || return 1
 }
 
-# v1.9.0: this migration is intentionally self-contained.  During an update from
-# a pre-v1.9 release (including v1.6.4), the *old* updater copies the new repository and pdg script, then invokes
-# the new `pdg __migrate`; it cannot know about newly-added Web modules or Python
-# dependencies.  Any failure must escape __migrate so the old updater restores
-# its pre-update snapshot instead of restarting a half-installed pdg-web.
-migrate_web_config_io(){
-  local web_src="$REPO_DIR/deploy/web" static_src="$REPO_DIR/deploy/web/static"
-  [[ -f "$web_src/pdgconfigio.py" \
-     && -f "$static_src/templates/mihomo-import.example.yaml" \
-     && -f "$static_src/templates/mosdns-import.example.yaml" ]] || return 1
-  if python3 -c 'import yaml' >/dev/null 2>&1 \
-     && [[ "$(stat -c '%U:%G:%a' /var/lib/privdns-gateway/web-imports 2>/dev/null)" == root:root:700 \
-        && "$(stat -c '%U:%G:%a' /etc/mihomo/providers 2>/dev/null)" == root:root:700 ]] \
-     && cmp -s "$web_src/pdgconfigio.py" /opt/pdg-web/pdgconfigio.py \
-     && cmp -s "$static_src/templates/mihomo-import.example.yaml" \
-          /opt/pdg-web/static/templates/mihomo-import.example.yaml \
-     && cmp -s "$static_src/templates/mosdns-import.example.yaml" \
-          /opt/pdg-web/static/templates/mosdns-import.example.yaml; then
-    return 0
-  fi
-  apt-get update -qq || return 1
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-yaml >/dev/null || return 1
-  python3 -c 'import yaml' >/dev/null 2>&1 || return 1
-  install -d -o root -g root -m700 \
-    /var/lib/privdns-gateway/web-imports /etc/mihomo/providers || return 1
-  install -d -o root -g root -m755 \
-    /opt/pdg-web /opt/pdg-web/static /opt/pdg-web/static/templates || return 1
-  install -o root -g root -m755 "$web_src/pdgconfigio.py" /opt/pdg-web/pdgconfigio.py \
-    || return 1
-  install -o root -g root -m644 \
-    "$static_src/templates/mihomo-import.example.yaml" \
-    /opt/pdg-web/static/templates/mihomo-import.example.yaml || return 1
-  install -o root -g root -m644 \
-    "$static_src/templates/mosdns-import.example.yaml" \
-    /opt/pdg-web/static/templates/mosdns-import.example.yaml || return 1
-  python3 -m py_compile /opt/pdg-web/pdgconfigio.py || return 1
-  [[ "$(stat -c '%U:%G:%a' /var/lib/privdns-gateway/web-imports)" == root:root:700 \
-     && "$(stat -c '%U:%G:%a' /etc/mihomo/providers)" == root:root:700 \
-     && -s /opt/pdg-web/pdgconfigio.py \
-     && -s /opt/pdg-web/static/templates/mihomo-import.example.yaml \
-     && -s /opt/pdg-web/static/templates/mosdns-import.example.yaml ]] || return 1
-}
-
 run_all_migrations(){
   local rc=0 tool preflight_mode
   # Hard gate before even platform/backend marker migrations: a conflict,
@@ -4473,9 +4340,6 @@ run_all_migrations(){
   # 数据面前置迁移负责在任何写入前完成 mode-aware nft 冲突扫描；失败后继续跑
   # best-effort 迁移会破坏其“冲突现场零改动”保证，因此这里立即返回。
   migrate_dataplane_profile || return 1
-  # Required even for pre-v1.9 -> v1.9.0, whose in-memory updater cannot install
-  # these new files/dependencies itself.  Never downgrade this to best-effort.
-  migrate_web_config_io || rc=1
   migrate_default_direct_tag || return 1
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
@@ -5283,7 +5147,7 @@ case "${1:-menu}" in
   tx)            shift || true; cmd_tx "$@";;
   status|st)     cmd_status;;
   doctor|dr)     shift || true; cmd_doctor "${1:-}";;
-  update|up)     shift || true; cmd_update "$@";;
+  update|up)     shift || true; cmd_update "${1:-}";;
   migrate-fw)    need_root migrate-fw; migrate_firewall_to_pdg;;
   snapshot|snap) cmd_snapshot;;
   rollback)
@@ -5301,5 +5165,5 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run] [--target vX.Y.Z]|snapshot|rollback [n]|web <setup|enable|disable|status|password>|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|web <setup|enable|disable|status|password>|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
 esac

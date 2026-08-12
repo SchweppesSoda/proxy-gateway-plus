@@ -58,6 +58,24 @@ def addfile(t, name, data=b"x"):
     t.addfile(i, io.BytesIO(data))
 
 
+def addfilled(t, name, size):
+    """Add a compressible member without allocating ``size`` bytes in RAM."""
+    class Fill:
+        def __init__(self, remaining):
+            self.remaining = remaining
+
+        def read(self, amount=-1):
+            if self.remaining <= 0:
+                return b""
+            amount = self.remaining if amount < 0 else min(amount, self.remaining)
+            self.remaining -= amount
+            return b"A" * amount
+
+    i = tarfile.TarInfo(name)
+    i.size = size
+    t.addfile(i, Fill(size))
+
+
 def extract(data, dest):
     """跑被测的安全解包; 返回 (是否抛错, 错误文本)。"""
     tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
@@ -198,20 +216,52 @@ def main():
     # ── 体积 / 数量上限(压缩炸弹) ──
     base = tempfile.mkdtemp(prefix="pdgsafe")
     try:
-        d1 = os.path.join(base, "r1")
-        os.makedirs(d1)
-        big = b"A" * (bot.RESTORE_MAX_FILE_BYTES + 1024)
-        raised, _ = extract(mktar(lambda t: addfile(t, "etc/sing-box/config.json", big)), d1)
-        if not raised:
-            bad("超大单文件未被拒")
-        ok(f"单文件体积上限生效({bot.RESTORE_MAX_FILE_BYTES} 字节)")
+        ordinary = "etc/sing-box/rs/size-boundary.json"
+        d1 = os.path.join(base, "r1"); os.makedirs(d1)
+        raised, err = extract(
+            mktar(lambda t: addfilled(t, ordinary, bot.RESTORE_MAX_FILE_BYTES)), d1)
+        if raised:
+            bad(f"普通成员等于单文件上限却被拒: {err}")
+        ordinary_target = os.path.join(d1, *ordinary.split("/"))
+        if (not os.path.isfile(ordinary_target)
+                or os.path.getsize(ordinary_target) != bot.RESTORE_MAX_FILE_BYTES):
+            bad("普通成员精确边界未按声明大小完整落地")
+        ok(f"普通成员精确边界可解出({bot.RESTORE_MAX_FILE_BYTES} 字节)")
+
+        d1_over = os.path.join(base, "r1-over"); os.makedirs(d1_over)
+        raised, err = extract(mktar(
+            lambda t: addfilled(t, ordinary, bot.RESTORE_MAX_FILE_BYTES + 1)), d1_over)
+        if not raised or "备份内文件过大" not in err:
+            bad(f"普通成员 +1 未被单文件体积门拒绝: {err}")
+        ok(f"普通成员 +1 字节被拒({bot.RESTORE_MAX_FILE_BYTES} 字节上限)")
+
+        if bot.RESTORE_MAX_FILE_BYTES >= bot.RESTORE_MAX_MODEL_BYTES:
+            bad("测试契约要求 model 上限严格高于普通成员上限")
+        model = "etc/sing-box/config.json"
+        d_model = os.path.join(base, "model"); os.makedirs(d_model)
+        raised, err = extract(mktar(lambda t: addfilled(
+            t, model, bot.RESTORE_MAX_MODEL_BYTES)), d_model)
+        if raised:
+            bad(f"model 等于专属上限却被拒: {err}")
+        model_target = os.path.join(d_model, *model.split("/"))
+        if (not os.path.isfile(model_target)
+                or os.path.getsize(model_target) != bot.RESTORE_MAX_MODEL_BYTES):
+            bad("model 精确边界未按声明大小完整落地")
+        ok("model 精确 24 MiB 边界可解出(纯解包测试，不声称内容是合法 JSON)")
+
+        d_model_over = os.path.join(base, "model-over"); os.makedirs(d_model_over)
+        raised, err = extract(mktar(lambda t: addfilled(
+            t, model, bot.RESTORE_MAX_MODEL_BYTES + 1)), d_model_over)
+        if not raised or "备份内文件过大" not in err:
+            bad(f"model +1 未被专属体积门拒绝: {err}")
+        ok(f"model +1 字节被拒({bot.RESTORE_MAX_MODEL_BYTES} 字节上限)")
 
         d2 = os.path.join(base, "r2")
         os.makedirs(d2)
 
         def many(t):
             for i in range(bot.RESTORE_MAX_MEMBERS + 5):
-                addfile(t, f"etc/sing-box/rs/r{i}.list", b"x")
+                addfile(t, f"etc/sing-box/rs/r{i}.json", b"x")
         raised, _ = extract(mktar(many), d2)
         if not raised:
             bad("成员数量上限未生效")
@@ -230,7 +280,7 @@ def main():
 
         def liar(t):
             for i in range(min(n_needed, bot.RESTORE_MAX_MEMBERS - 1)):
-                addfile(t, f"etc/sing-box/rs/big{i}.list", chunk)
+                addfile(t, f"etc/sing-box/rs/big{i}.json", chunk)
         raised, _ = extract(mktar(liar), dest)
         if not raised:
             bad("累计解出量超限却没被拒(只卡声明值挡不住解压炸弹)")
@@ -249,13 +299,13 @@ def main():
             addfile(t, "etc/mosdns/rules/custom_direct.txt", b"a.com\n")
             addfile(t, "etc/mosdns/rules/custom_hijack.txt", b"b.com\n")
             addfile(t, "opt/pdg-bot/rulesets.json", b"{}")
-            addfile(t, "etc/sing-box/rs/my.list", b"DOMAIN,x.com\n")
+            addfile(t, "etc/sing-box/rs/my.json", b"DOMAIN,x.com\n")
         raised, err = extract(mktar(good), dest)
         if raised:
             bad(f"合法备份被误拒: {err}")
         for rel in ("etc/sing-box/config.json", "etc/mosdns/config.yaml",
                     "etc/mosdns/rules/custom_direct.txt", "etc/mosdns/rules/custom_hijack.txt",
-                    "opt/pdg-bot/rulesets.json", "etc/sing-box/rs/my.list"):
+                    "opt/pdg-bot/rulesets.json", "etc/sing-box/rs/my.json"):
             if not os.path.exists(os.path.join(dest, rel)):
                 bad(f"合法成员未解出: {rel}")
         ok("合法备份(含 rs/ 规则集)完整解出, 保护没误伤正常恢复")
@@ -282,7 +332,7 @@ def main():
         for p in (bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK):
             open(p, "w").write("x\n")
         json.dump({}, open(bot.RS_META, "w"))
-        open(os.path.join(bot.RS_DIR, "a.list"), "w").write("DOMAIN,a.com\n")
+        open(os.path.join(bot.RS_DIR, "a.json"), "w").write("DOMAIN,a.com\n")
         blob = bot.backup_blob()
         tar = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz")
         missed = []

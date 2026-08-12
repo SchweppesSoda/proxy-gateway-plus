@@ -408,6 +408,42 @@
                     data-maintenance-control>检查并开始升级</button>
           </section>
         </div>
+        <section class="surface config-io-surface">
+          <div class="section-heading">
+            <div><p class="eyebrow">MANAGED CONFIG I/O</p><h2>配置导入与导出</h2></div>
+            <span class="chip subtle">始终转换为 PDG 受管模型</span>
+          </div>
+          <div class="config-io-grid">
+            <div class="config-io-column">
+              <h3>导出当前配置</h3>
+              <p class="field-help">每次导出都要重新输入管理密码。导出不会进入维护任务或日志。</p>
+              <div class="config-export-actions">
+                <button class="button secondary" type="button" data-export-kind="pdg">PDG 配置包</button>
+                <button class="button secondary" type="button" data-export-kind="mihomo">Mihomo YAML</button>
+                <button class="button secondary" type="button" data-export-kind="mosdns">MosDNS YAML</button>
+              </div>
+            </div>
+            <form id="config-import-form" class="config-io-column">
+              <h3>导入外部配置</h3>
+              <label for="config-import-kind">配置类型</label>
+              <select id="config-import-kind" required>
+                <option value="mihomo">Mihomo YAML / 安全归档</option>
+                <option value="mosdns">MosDNS YAML</option>
+                <option value="pdg">PDG 配置包 / 旧版模型</option>
+              </select>
+              <label for="config-import-file">选择文件</label>
+              <input id="config-import-file" type="file" required
+                     accept=".yaml,.yml,.json,.zip,.gz,.tgz,application/yaml,application/json,application/zip">
+              <div class="template-links">
+                <a href="/templates/mihomo-import.example.yaml" download>Mihomo 导入模板</a>
+                <a href="/templates/mosdns-import.example.yaml" download>MosDNS 导入模板</a>
+              </div>
+              <button id="config-import-preview" class="button secondary" type="submit"
+                      data-config-maintenance-control>安全预览</button>
+            </form>
+          </div>
+          <div id="config-import-result" class="import-preview" aria-live="polite" hidden></div>
+        </section>
         <div id="operation-result" class="operation-result" aria-live="polite"></div>
         <section class="surface jobs-surface">
           <div class="section-heading">
@@ -432,6 +468,22 @@
       <div class="dialog-actions">
         <button id="confirm-cancel" class="button ghost" value="cancel">取消</button>
         <button id="confirm-accept" class="button danger" value="confirm">确认</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="export-config-dialog" class="confirm-dialog secure-entry-dialog"
+          aria-labelledby="export-config-title">
+    <form id="export-config-form" method="dialog" autocomplete="off">
+      <p class="eyebrow">PASSWORD RE-AUTHENTICATION</p>
+      <h2 id="export-config-title">导出受管配置</h2>
+      <p class="muted">请输入当前管理密码。密码只用于本次校验，不会写入任务或日志。</p>
+      <label for="export-config-password">管理密码</label>
+      <input id="export-config-password" type="password" required maxlength="1024"
+             autocomplete="current-password">
+      <div class="dialog-actions">
+        <button class="button ghost" value="cancel" type="button" data-export-cancel>取消</button>
+        <button id="export-config-submit" class="button warning" type="submit">验证并下载</button>
       </div>
     </form>
   </dialog>

@@ -115,6 +115,42 @@ for selector in (
 ):
     assert selector in STYLE_SOURCE
 
+# Configuration migration keeps credentials/files out of long-lived DOM state,
+# exposes only same-origin templates, and participates in the maintenance gate.
+for template in (
+    "/templates/mihomo-import.example.yaml",
+    "/templates/mosdns-import.example.yaml",
+):
+    assert template in INDEX_SOURCE
+for element_id in (
+    "config-import-file", "config-import-preview", "config-import-result",
+    "export-config-dialog", "export-config-password", "export-config-submit",
+):
+    assert element_id in parser.elements
+preview_import = function_source("previewConfigImport")
+assert "await file.arrayBuffer()" in preview_import
+read_at = preview_import.index("await file.arrayBuffer()")
+clear_at = preview_import.index('input.value = "";', read_at)
+upload_at = preview_import.index("await binaryApi(", read_at)
+release_at = preview_import.index("file = null;", read_at)
+assert read_at < clear_at < release_at < upload_at
+assert 'kind === "pdg" ? 68 : 36' in preview_import
+assert "maximumMiB * 1024 * 1024" in preview_import
+render_preview = function_source("renderImportPreview")
+assert 'mode.value === "replace"' in render_preview
+assert 'select.value = "incoming"' in render_preview
+assert "select.disabled = replace" in render_preview
+cancel_import = function_source("cancelConfigImport")
+assert 'method: "DELETE"' in cancel_import
+assert "暂存上传已立即清理" in cancel_import
+submit_export = function_source("submitConfigExport")
+assert 'input.value = "";' in submit_export
+assert 'password = "";' in submit_export
+assert "URL.revokeObjectURL(url)" in submit_export
+maintenance_controls = function_source("setMaintenanceControls")
+assert "data-config-maintenance-control" in maintenance_controls
+assert "data-config-maintenance-control" in parser.elements["config-import-preview"][1]
+
 # Canonical models now use JP; the formatter also normalizes legacy jp payloads
 # so an older backup/server response is never shown with inconsistent casing.
 format_exit_name = function_source("formatExitName")

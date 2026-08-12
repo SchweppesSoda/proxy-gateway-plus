@@ -18,13 +18,15 @@
   · 锁拿不到就退出, 锁不可用就**拒绝写**(fail-closed), 绝不退化成"没锁也写";
   · 元数据 / 差异 / 审计 / 日志一律脱敏, token、密码、UUID、节点链接、secret 不落盘。
 
-不引入数据库、消息队列、常驻进程或任何第三方依赖 —— 纯标准库。
+不引入数据库、消息队列或额外常驻进程；provider 严格解析复用已安装的 PyYAML。
 """
 
+import base64
 import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -36,6 +38,9 @@ import time
 import uuid
 
 SCHEMA_VERSION = 1
+MAX_MANAGED_FILE = 8 * 1024 * 1024
+MAX_MODEL_FILE = 24 * 1024 * 1024
+MAX_MANAGED_BUNDLE = 32 * 1024 * 1024
 
 # 测试用的根前缀: 白名单结构不变, 只是整棵树挂到沙箱里。调用方**不能**用它逃出白名单 ——
 # 它只在进程环境里生效, 且对所有目标一视同仁。
@@ -123,6 +128,8 @@ _STATIC = {
 _MOSDNS_RULE_RE = re.compile(r"^[A-Za-z0-9_!.-]+\.txt$")
 _RULESET_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
+_MIHOMO_PROVIDER_RE = re.compile(r"^[a-f0-9]{64}\.(yaml|yml|json|txt|mrs)$")
+_PDG_RULESET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 # 目标 → 该目标牵动哪个服务(决定基线范围、观察范围)
 _TARGET_SVC = {
@@ -209,6 +216,18 @@ def resolve_target(name):
     if name in _STATIC:
         rel, mode, secret, val = _STATIC[name]
         return FSROOT + rel, mode, secret, val
+    if name.startswith("mihomo_provider:"):
+        leaf = name[len("mihomo_provider:"):]
+        if not _MIHOMO_PROVIDER_RE.fullmatch(leaf) or "/" in leaf or leaf.startswith("."):
+            raise TxError("目标名不合法: %s" % name)
+        if leaf.endswith((".yaml", ".yml", ".json")):
+            validators = ("yaml_safe",)
+        elif leaf.endswith(".mrs"):
+            validators = ("ruleset_format",)
+        else:
+            validators = ("nonempty",)
+        # Provider payloads contain proxy credentials just like model/config.yaml.
+        return FSROOT + "/etc/mihomo/providers/" + leaf, 0o600, True, validators
     for pfx, rex, base, mode, val in (
             ("mosdns_rule:", _MOSDNS_RULE_RE, "/etc/mosdns/rules/", 0o644, ("mosdns_lines",)),
             ("ruleset:", _RULESET_RE, "/etc/sing-box/rs/", 0o644, ("ruleset_format",)),
@@ -227,6 +246,8 @@ def target_service(name):
     if name.startswith("mosdns_rule:"):
         return "mosdns"
     if name.startswith("ruleset:"):
+        return "mihomo"
+    if name.startswith("mihomo_provider:"):
         return "mihomo"
     return None
 
@@ -464,14 +485,436 @@ def _v_json_any(path, data, ctx):
     return True, ""
 
 
+def _candidate_ruleset_meta(ctx):
+    """Load the transaction's effective rulesets.json with a fixed read cap.
+
+    A staged ``rs_meta`` target is authoritative, including an explicit
+    deletion.  Falling back to the live file while that candidate exists can
+    validate the model against a different provider namespace than the one
+    committed by the transaction.  The shared loader also keeps model and
+    Mihomo derivation on the same bounded parsing path.
+    """
+    targets = getattr(ctx, "targets", {}) if ctx else {}
+    if not isinstance(targets, dict):
+        targets = {}
+    candidate = "rs_meta" in targets
+    try:
+        if candidate:
+            target = targets.get("rs_meta")
+            if not isinstance(target, dict):
+                return False, {}, "候选 rulesets.json 目标不合法"
+            raw = target.get("data")
+            if raw is None:
+                meta = {}
+            else:
+                if (not isinstance(raw, bytes) or not raw
+                        or len(raw) > MAX_MANAGED_FILE):
+                    return False, {}, "候选 rulesets.json 为空或过大"
+                meta = json.loads(raw.decode("utf-8"))
+        else:
+            try:
+                with open(FSROOT + "/opt/pdg-bot/rulesets.json", "rb") as stream:
+                    raw = stream.read(MAX_MANAGED_FILE + 1)
+            except FileNotFoundError:
+                return True, {}, ""
+            if len(raw) > MAX_MANAGED_FILE:
+                return False, {}, "现网 rulesets.json 超过受管上限"
+            meta = json.loads(raw.decode("utf-8"))
+    except (AttributeError, UnicodeError, ValueError, TypeError,
+            OSError, RecursionError):
+        label = "候选" if candidate else "现网"
+        return False, {}, "%s rulesets.json 无法安全解析" % label
+    if not isinstance(meta, dict):
+        label = "候选" if candidate else "现网"
+        return False, {}, "%s rulesets.json 不是映射" % label
+    return True, meta, ""
+
+
 def _v_json_model(path, data, ctx):
+    if not data or len(data) > MAX_MODEL_FILE:
+        return False, "config.json 为空或超过受管模型上限"
     ok, err = _v_json_any(path, data, ctx)
     if not ok:
         return ok, err
     doc = json.loads(data.decode("utf-8"))
     if not isinstance(doc, dict) or "outbounds" not in doc or "route" not in doc:
         return False, "config.json 缺 outbounds/route, 不像本项目的数据模型"
+    blocked_advanced = {
+        "name", "type", "server", "port", "password", "username", "uuid",
+        "cipher", "alterId", "flow", "auth", "auth-str", "up", "down",
+        "congestion-controller", "udp-relay-mode", "tls", "servername", "sni",
+        "skip-cert-verify", "alpn", "reality-opts", "client-fingerprint",
+        "network", "ws-opts", "grpc-opts", "tfo",
+    }
+
+    def safe_advanced(value, depth=0, budget=None):
+        budget = [0] if budget is None else budget
+        if depth > 12:
+            return False
+        budget[0] += 1
+        if budget[0] > 4096:
+            return False
+        if value is None or isinstance(value, (bool, int)):
+            return True
+        if isinstance(value, float):
+            return math.isfinite(value)
+        if isinstance(value, str):
+            return len(value) <= 16384 and "\x00" not in value
+        if isinstance(value, list):
+            return all(safe_advanced(item, depth + 1, budget) for item in value)
+        if isinstance(value, dict):
+            return all(isinstance(key, str) and key and len(key) <= 128
+                       and "\x00" not in key
+                       and safe_advanced(item, depth + 1, budget)
+                       for key, item in value.items())
+        return False
+
+    provider_common = {"type", "url", "path", "interval", "size-limit"}
+    proxy_provider_fields = provider_common | {
+        "health-check", "filter", "exclude-filter", "override"}
+    rule_provider_fields = provider_common | {"format", "behavior"}
+    health_fields = {"enable", "url", "interval", "lazy"}
+    override_fields = {"additional-prefix", "additional-suffix", "udp", "tfo"}
+    group_common = {"name", "type", "proxies", "use"}
+    group_fields = {
+        "select": group_common | {"lazy", "disable-udp", "hidden"},
+        "url-test": group_common | {
+            "url", "interval", "tolerance", "lazy", "disable-udp", "hidden"},
+        "fallback": group_common | {
+            "url", "interval", "lazy", "disable-udp", "hidden"},
+        "load-balance": group_common | {
+            "url", "interval", "lazy", "disable-udp", "hidden", "strategy"},
+    }
+
+    def http_url(value):
+        return (isinstance(value, str) and len(value) <= 8192
+                and re.fullmatch(r"https?://[^\s\x00]+", value, re.I) is not None)
+
+    def provider_schema(kind, provider):
+        fields = proxy_provider_fields if kind == "proxy-provider" else rule_provider_fields
+        if set(provider) - fields:
+            return False
+        interval = provider.get("interval")
+        if interval is not None and (type(interval) is not int or not 1 <= interval <= 604800):
+            return False
+        size_limit = provider.get("size-limit")
+        if size_limit is not None and (
+                type(size_limit) is not int or not 1 <= size_limit <= 1024 * 1024 * 1024):
+            return False
+        for key in ("filter", "exclude-filter"):
+            value = provider.get(key)
+            if value is not None and (
+                    not isinstance(value, str) or len(value) > 4096 or "\x00" in value):
+                return False
+        health = provider.get("health-check")
+        if health is not None and (
+                not isinstance(health, dict) or set(health) - health_fields
+                or type(health.get("enable", True)) is not bool
+                or not http_url(health.get("url"))
+                or type(health.get("interval")) is not int
+                or not 1 <= health["interval"] <= 604800
+                or ("lazy" in health and type(health["lazy"]) is not bool)):
+            return False
+        override = provider.get("override")
+        if override is not None:
+            if not isinstance(override, dict) or set(override) - override_fields:
+                return False
+            for key in ("additional-prefix", "additional-suffix"):
+                value = override.get(key)
+                if value is not None and (
+                        not isinstance(value, str) or len(value) > 128 or "\x00" in value):
+                    return False
+            if any(key in override and type(override[key]) is not bool
+                   for key in ("udp", "tfo")):
+                return False
+        if "format" in provider:
+            allowed = {"yaml"} if kind == "proxy-provider" else {"yaml", "text", "mrs"}
+            if provider["format"] not in allowed:
+                return False
+        return ("behavior" not in provider
+                or provider["behavior"] in {"domain", "ipcidr", "classical"})
+
+    def group_schema(group):
+        allowed = group_fields.get(group.get("type"))
+        if allowed is None or set(group) - allowed:
+            return False
+        if any(key in group and type(group[key]) is not bool
+               for key in ("lazy", "disable-udp", "hidden")):
+            return False
+        if "url" in group and not http_url(group["url"]):
+            return False
+        if "interval" in group and (
+                type(group["interval"]) is not int or not 1 <= group["interval"] <= 604800):
+            return False
+        if "tolerance" in group and (
+                type(group["tolerance"]) is not int or not 0 <= group["tolerance"] <= 65535):
+            return False
+        return ("strategy" not in group or group["strategy"] in {
+            "consistent-hashing", "round-robin", "sticky-sessions"})
+
+    for outbound in doc.get("outbounds", []):
+        if not isinstance(outbound, dict) or "_pdg_mihomo" not in outbound:
+            continue
+        proxy_meta = outbound["_pdg_mihomo"]
+        if (not isinstance(proxy_meta, dict) or set(proxy_meta) != {"advanced"}
+                or not isinstance(proxy_meta.get("advanced"), dict)
+                or set(proxy_meta["advanced"]) & blocked_advanced
+                or not safe_advanced(proxy_meta["advanced"])
+                or ("udp" in proxy_meta["advanced"]
+                    and type(proxy_meta["advanced"]["udp"]) is not bool)
+                or ("packet-encoding" in proxy_meta["advanced"]
+                    and proxy_meta["advanced"]["packet-encoding"] not in {
+                        "packetaddr", "xudp"})):
+            return False, "config.json 的 per-proxy Mihomo 扩展字段不安全"
+    meta = doc.get("_pdg")
+    if meta is not None:
+        if not isinstance(meta, dict) or set(meta) - {"schema", "mihomo"}:
+            return False, "config.json 的 _pdg 元数据不合法"
+        if meta.get("schema") != 2 or not isinstance(meta.get("mihomo"), dict):
+            return False, "config.json 的 _pdg schema 不是受支持的 v2"
+        mihomo = meta["mihomo"]
+        expected = {"proxy-providers", "rule-providers", "proxy-groups",
+                    "advanced", "managed-files"}
+        if set(mihomo) != expected:
+            return False, "config.json 的 Mihomo 扩展字段不完整"
+        if not all(isinstance(mihomo[key], typ) for key, typ in (
+                ("proxy-providers", dict), ("rule-providers", dict),
+                ("proxy-groups", list), ("advanced", dict),
+                ("managed-files", dict))):
+            return False, "config.json 的 Mihomo 扩展字段类型不合法"
+        pdg_owned = {
+            "allow-lan", "bind-address", "dns", "external-controller",
+            "external-ui", "external-ui-url", "listeners", "mixed-port", "port",
+            "redir-port", "secret", "sniffer", "socks-port", "tproxy-port", "tun",
+            "proxies", "proxy-providers", "proxy-groups", "rule-providers", "rules",
+            "mode", "log-level",
+        }
+        if (set(mihomo["advanced"]) & pdg_owned
+                or not safe_advanced(mihomo["advanced"])
+                or any(key in mihomo["advanced"]
+                       and type(mihomo["advanced"][key]) is not bool
+                       for key in ("tcp-concurrent", "unified-delay"))):
+            return False, "config.json 的 Mihomo advanced 覆盖受管字段或内容不安全"
+        managed = mihomo["managed-files"]
+        managed_raw = {}
+        managed_raw_total = 0
+        for leaf, encoded in managed.items():
+            if (not isinstance(leaf, str) or not re.fullmatch(
+                    r"[a-f0-9]{64}\.(?:ya?ml|json|txt|mrs)", leaf, re.I)
+                    or not isinstance(encoded, str)):
+                return False, "config.json 的 managed provider 文件不合法"
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except Exception:  # noqa: BLE001
+                return False, "config.json 的 managed provider 内容不合法"
+            # Keep the transaction validator aligned with the backup/import
+            # member ceiling: a model accepted here must remain restorable.
+            if (not raw or len(raw) > MAX_MANAGED_FILE
+                    or hashlib.sha256(raw).hexdigest() != leaf.split(".", 1)[0]):
+                return False, "config.json 的 managed provider 哈希不匹配"
+            managed_raw[leaf] = raw
+            managed_raw_total += len(raw)
+        if len(data) + managed_raw_total > MAX_MANAGED_BUNDLE:
+            return False, "config.json 与 managed provider 超过可恢复总量"
+        local_leaves = set()
+        for kind, field in (("proxy-provider", "proxy-providers"),
+                            ("rule-provider", "rule-providers")):
+            for name, provider in mihomo[field].items():
+                if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name)
+                        or not isinstance(provider, dict) or not safe_advanced(provider)
+                        or not provider_schema(kind, provider)):
+                    return False, "config.json 的 %s 元数据不合法" % kind
+                typ = provider.get("type", "http")
+                path = provider.get("path")
+                match = re.fullmatch(
+                    r"/etc/mihomo/providers/([a-f0-9]{64}\.(?:ya?ml|json|txt|mrs))",
+                    path or "", re.I)
+                if typ not in ("http", "file") or not match:
+                    return False, "config.json 的 %s 路径不受管" % kind
+                leaf = match.group(1)
+                if typ == "file":
+                    if leaf not in managed or "url" in provider:
+                        return False, "config.json 的本地 %s 文件未内嵌" % kind
+                    local_leaves.add(leaf)
+                else:
+                    url = provider.get("url")
+                    expected_leaf = hashlib.sha256(
+                        (kind + ":" + name).encode("utf-8")).hexdigest()
+                    if (not isinstance(url, str) or len(url) > 8192 or not re.fullmatch(
+                            r"https?://[^\s\x00]+", url, re.I)
+                            or leaf.split(".", 1)[0].lower() != expected_leaf
+                            or leaf in managed):
+                        return False, "config.json 的远程 %s URL/path 不合法" % kind
+        if local_leaves != set(managed):
+            return False, "config.json 的 managed provider 引用闭包不完整"
+        groups = mihomo["proxy-groups"]
+        group_names = set()
+        for group in groups:
+            if (not isinstance(group, dict) or not safe_advanced(group)
+                    or not isinstance(group.get("name"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", group["name"])
+                    or group["name"] in group_names
+                    or group.get("type") not in ("select", "url-test", "fallback", "load-balance")
+                    or not isinstance(group.get("proxies", []), list)
+                    or not isinstance(group.get("use", []), list)
+                    or not group_schema(group)):
+                return False, "config.json 的 proxy-group 元数据不合法"
+            group_names.add(group["name"])
+        tags = {item.get("tag") for item in doc.get("outbounds", [])
+                if isinstance(item, dict) and isinstance(item.get("tag"), str)}
+        direct_tags = {item.get("tag") for item in doc.get("outbounds", [])
+                       if isinstance(item, dict) and item.get("type") == "direct"
+                       and isinstance(item.get("tag"), str)}
+        if direct_tags & {"DIRECT", "REJECT"}:
+            return False, "config.json 的 direct tag 与 Mihomo 保留目标冲突"
+        proxy_tags = {item.get("tag") for item in doc.get("outbounds", [])
+                      if isinstance(item, dict) and isinstance(item.get("tag"), str)
+                      and item.get("type") not in ("direct", "selector", "urltest")}
+        if group_names & proxy_tags:
+            return False, "config.json 的 proxy 与 proxy-group 名称冲突"
+        if group_names & (direct_tags | {"DIRECT", "REJECT"}):
+            return False, "config.json 的 proxy-group 名称与保留目标冲突"
+        canonical_groups = {
+            item.get("tag"): item for item in doc.get("outbounds", [])
+            if isinstance(item, dict) and item.get("type") in ("selector", "urltest")
+        }
+        for group in groups:
+            canonical = canonical_groups.get(group["name"])
+            representable = not group.get("use") and "REJECT" not in group.get("proxies", [])
+            if canonical is None:
+                if group["type"] in ("select", "url-test") and representable:
+                    return False, "config.json 的可编辑 Mihomo group 缺 canonical outbound"
+                continue
+            expected_type = "select" if canonical.get("type") == "selector" else "url-test"
+            if group["type"] != expected_type or not representable:
+                return False, "config.json 的 canonical 与 Mihomo proxy-group 表示不一致"
+            direct_tag = next(iter(direct_tags), None)
+            metadata_members = [direct_tag if item == "DIRECT" else item
+                                for item in group.get("proxies", [])]
+            if metadata_members != canonical.get("outbounds", []):
+                return False, "config.json 的 canonical 与 Mihomo group 成员不一致"
+            if expected_type == "url-test":
+                interval = group.get("interval", 180)
+                canonical_interval = str(canonical.get("interval", "180s"))
+                match = re.fullmatch(r"(\d+)([smh]?)", canonical_interval)
+                scale = {"": 1, "s": 1, "m": 60, "h": 3600}
+                seconds = int(match.group(1)) * scale[match.group(2)] if match else -1
+                if (type(interval) is not int or interval != seconds
+                        or group.get("url", "https://www.gstatic.com/generate_204")
+                        != canonical.get("url", "https://www.gstatic.com/generate_204")
+                        or group.get("tolerance", 50) != canonical.get("tolerance", 50)):
+                    return False, "config.json 的 canonical 与 Mihomo group 探针不一致"
+        known = tags | group_names | {"DIRECT", "REJECT"}
+        graph = {}
+        for group in groups:
+            members = group.get("proxies", [])
+            uses = group.get("use", [])
+            if (any(not isinstance(item, str) or item not in known for item in members)
+                    or any(not isinstance(item, str) or item not in mihomo["proxy-providers"]
+                           for item in uses)):
+                return False, "config.json 的 proxy-group 引用未定义对象"
+            graph[group["name"]] = {item for item in members if item in group_names}
+        visiting, visited = set(), set()
+        def visit_group(name):
+            if name in visiting:
+                return False
+            if name in visited:
+                return True
+            visiting.add(name)
+            if not all(visit_group(child) for child in graph.get(name, ())):
+                return False
+            visiting.remove(name); visited.add(name)
+            return True
+        if not all(visit_group(name) for name in graph):
+            return False, "config.json 的 proxy-group 存在循环引用"
+        ruleset_ok, rule_meta, ruleset_error = _candidate_ruleset_meta(ctx)
+        if not ruleset_ok:
+            return False, ruleset_error
+        # Use every PDG metadata key, not only providers rendered at runtime.
+        # ``direct`` and legacy ``.srs`` entries still occupy the PDG-owned
+        # namespace and could otherwise become latent imported providers after
+        # a later metadata edit.
+        if set(mihomo["rule-providers"]) & set(rule_meta):
+            return False, "导入 rule-provider 与 PDG 规则集同名"
     return True, ""
+
+
+def _pdg_mihomo_rule_providers(ctx):
+    """Return the exact PDG-owned HTTP rule-providers for this candidate.
+
+    Imported providers remain content-addressed under /etc/mihomo/providers.
+    PDG's own rulesets have a separate stable cache ABI under ./ruleset; only
+    entries derived exactly from candidate/live rulesets.json are allowed into
+    that namespace.
+    """
+    targets = getattr(ctx, "targets", {}) if ctx else {}
+    if not isinstance(targets, dict):
+        targets = {}
+    meta_ok, meta, meta_error = _candidate_ruleset_meta(ctx)
+    if not meta_ok:
+        return False, {}, {}, meta_error
+
+    expected = {}
+    probe_sources = {}
+    extensions = {"text": "txt", "yaml": "yaml", "mrs": "mrs"}
+    for name, info in meta.items():
+        if not isinstance(name, str) or not isinstance(info, dict):
+            return False, {}, {}, "候选 rulesets.json 条目不合法"
+        if not _PDG_RULESET_NAME_RE.fullmatch(name):
+            return False, {}, {}, "候选 PDG rule-provider 名称不是安全叶"
+        url = info.get("url", "")
+        if (not isinstance(url, str) or len(url) > 8192
+                or not re.fullmatch(r"https?://[^\s\x00]+", url, re.I)):
+            return False, {}, {}, "候选 ruleset URL 不合法"
+        if info.get("outbound") == "direct":
+            continue
+        low = url.lower().split("?", 1)[0]
+        recorded_format = str(info.get("format", ""))
+        if low.endswith(".srs") or recorded_format == "binary":
+            continue
+        if low.endswith((".yaml", ".yml")):
+            behavior, provider_format = "classical", "yaml"
+        elif low.endswith(".mrs") or recorded_format == "mrs":
+            behavior = str(info.get("behavior", ""))
+            source_path = info.get("path", "")
+            if not isinstance(source_path, str):
+                return False, {}, {}, "候选 MRS 源路径不合法"
+            leaf = os.path.basename(source_path)
+            canonical = "/etc/sing-box/rs/" + leaf
+            if (not _RULESET_RE.fullmatch(leaf) or not leaf.endswith(".mrs")
+                    or source_path != canonical):
+                return False, {}, {}, "候选 MRS 源路径不受管"
+            source_target = targets.get("ruleset:" + leaf)
+            try:
+                if source_target is not None:
+                    source_data = source_target.get("data")
+                else:
+                    with open(FSROOT + canonical, "rb") as stream:
+                        source_data = stream.read(MAX_MANAGED_FILE + 1)
+            except (AttributeError, OSError):
+                return False, {}, {}, "候选 MRS 源文件不可读"
+            if (not isinstance(source_data, bytes) or not source_data
+                    or len(source_data) > MAX_MANAGED_FILE):
+                return False, {}, {}, "候选 MRS 源文件为空或过大"
+            head, mrs_error = _mrs_validation_head(source_data)
+            if mrs_error or len(head) < 5 or head[:4] != b"MRS\x01":
+                return False, {}, {}, "候选 MRS 源文件无法严格识别"
+            sniffed = {0: "domain", 1: "ipcidr"}.get(head[4])
+            if behavior not in ("domain", "ipcidr"):
+                behavior = sniffed or ""
+            if behavior not in ("domain", "ipcidr") or behavior != sniffed:
+                return False, {}, {}, "候选 MRS behavior 与源文件不一致"
+            provider_format = "mrs"
+            probe_sources[name] = source_data
+        else:
+            behavior, provider_format = "classical", "text"
+        expected[name] = {
+            "type": "http", "url": url, "behavior": behavior,
+            "format": provider_format,
+            "path": "./ruleset/%s.%s" % (name, extensions[provider_format]),
+            "interval": 86400,
+        }
+    return True, expected, probe_sources, ""
 
 
 def _v_mihomo_check(path, data, ctx):
@@ -482,11 +925,161 @@ def _v_mihomo_check(path, data, ctx):
     d = tempfile.mkdtemp(prefix="pdgtx-mihomo.")
     try:
         cand = os.path.join(d, "config.yaml")
-        atomic_write(cand, data, 0o600)
-        rc, out = _run([exe, "-t", "-d", FSROOT + "/etc/mihomo", "-f", cand], timeout=60)
+        # Imported local providers are transaction targets too.  Validate the
+        # complete candidate set, never candidate config + live provider files.
+        # sb2mihomo renders JSON (valid YAML), so paths can be rebound without a
+        # second YAML dependency in the transaction engine.
+        try:
+            document = json.loads(data.decode("utf-8"))
+        except (UnicodeError, ValueError, TypeError, RecursionError):
+            return False, "候选 Mihomo 配置不是合法 UTF-8 JSON"
+        if not isinstance(document, dict):
+            return False, "候选 Mihomo 配置不是映射"
+        try:
+            probe_dir = os.path.join(d, "providers")
+            os.makedirs(probe_dir, mode=0o700, exist_ok=True)
+            targets = getattr(ctx, "targets", {}) if ctx else {}
+            ok, pdg_rule_providers, pdg_probe_sources, error = _pdg_mihomo_rule_providers(ctx)
+            if not ok:
+                return False, error
+            managed = {}
+            model_target = targets.get("model") if isinstance(targets, dict) else None
+            try:
+                candidate_model = json.loads((model_target or {}).get("data", b"").decode("utf-8"))
+                managed = (((candidate_model.get("_pdg") or {}).get("mihomo") or {})
+                           .get("managed-files") or {})
+                if not isinstance(managed, dict):
+                    managed = {}
+            except Exception:  # noqa: BLE001
+                managed = {}
+            for section in ("proxy-providers", "rule-providers"):
+                providers = document.get(section) or {}
+                if not isinstance(providers, dict):
+                    return False, "候选 provider 集合不是映射"
+                if (section == "rule-providers"
+                        and not set(pdg_rule_providers).issubset(providers)):
+                    return False, "候选配置缺少 rulesets.json 派生的 PDG rule-provider"
+                for name, provider in providers.items():
+                    if not isinstance(provider, dict):
+                        return False, "候选 provider 条目不合法"
+                    if section == "rule-providers" and name in pdg_rule_providers:
+                        expected = pdg_rule_providers[name]
+                        if provider != expected:
+                            return False, "候选 PDG rule-provider 与 rulesets.json 不一致"
+                        extension = expected["format"]
+                        provider_data = ({
+                            "text": b"DOMAIN,example.invalid\n",
+                            "yaml": b"payload:\n  - DOMAIN,example.invalid\n",
+                            "mrs": pdg_probe_sources.get(name),
+                        }[extension])
+                        if provider_data is None:
+                            return False, "候选 PDG rule-provider 缺少隔离 probe 数据"
+                        destination = os.path.join(
+                            probe_dir, os.path.basename(expected["path"]))
+                        atomic_write(destination, provider_data, 0o600)
+                        provider["path"] = destination
+                        continue
+                    source = provider.get("path")
+                    if not isinstance(source, str):
+                        return False, "候选 provider 缺少受管路径"
+                    leaf = os.path.basename(source)
+                    if not _MIHOMO_PROVIDER_RE.fullmatch(leaf):
+                        return False, "候选 provider 路径不受管"
+                    target = targets.get("mihomo_provider:" + leaf)
+                    provider_data = None
+                    if provider.get("type", "http") == "file":
+                        if target is not None:
+                            provider_data = target.get("data")
+                        if provider_data is None and leaf in managed:
+                            try:
+                                provider_data = base64.b64decode(
+                                    managed[leaf], validate=True)
+                            except Exception:  # noqa: BLE001
+                                provider_data = None
+                        if provider_data is None:
+                            return False, "候选本地 provider 未包含在 model/事务目标中"
+                    else:
+                        # HTTP providers are validated without network and
+                        # without consulting a live cache.  A minimal local
+                        # cache proves the candidate config's provider shape.
+                        provider_data = (b"proxies: []\n" if section == "proxy-providers"
+                                         else b"payload: []\n")
+                    destination = os.path.join(probe_dir, leaf)
+                    atomic_write(destination, provider_data, 0o600)
+                    provider["path"] = destination
+                    if provider["path"].startswith("/etc/mihomo/providers/"):
+                        return False, "候选 provider 未与生产目录隔离"
+            probe_data = json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8")
+        except (UnicodeError, ValueError, TypeError, RecursionError):
+            return False, "候选 Mihomo 配置无法安全处理"
+        atomic_write(cand, probe_data, 0o600)
+        rc, out = _run([exe, "-t", "-d", d, "-f", cand], timeout=60)
         return (rc == 0), ("" if rc == 0 else redact(out[-400:]))
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _v_nonempty(path, data, ctx):
+    if not data or len(data) > MAX_MANAGED_FILE:
+        return False, "provider 文件为空或过大"
+    return True, ""
+
+
+def _v_yaml_safe(path, data, ctx):
+    if not data or len(data) > MAX_MANAGED_FILE or b"\x00" in data:
+        return False, "provider YAML/JSON 为空、过大或含 NUL"
+    try:
+        import yaml
+        text = data.decode("utf-8")
+        count = 0
+        documents = 0
+        for token in yaml.scan(text):
+            count += 1
+            if count > 200000:
+                return False, "provider YAML/JSON 过于复杂"
+            if isinstance(token, yaml.tokens.DocumentStartToken):
+                documents += 1
+                if documents > 1:
+                    return False, "provider 不接受多文档 YAML"
+            if isinstance(token, (yaml.tokens.AnchorToken, yaml.tokens.AliasToken,
+                                  yaml.tokens.TagToken)):
+                return False, "provider 不接受 YAML anchor/alias/tag"
+
+        class StrictLoader(yaml.SafeLoader):
+            pass
+
+        def mapping(loader, node, deep=False):
+            if not isinstance(node, yaml.nodes.MappingNode):
+                raise ValueError("mapping")
+            out = {}
+            for key_node, value_node in node.value:
+                if not isinstance(key_node, yaml.nodes.ScalarNode):
+                    raise ValueError("complex key")
+                key = loader.construct_object(key_node, deep=False)
+                if not isinstance(key, str) or key in out:
+                    raise ValueError("duplicate/non-string key")
+                out[key] = loader.construct_object(value_node, deep=deep)
+            return out
+
+        StrictLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+        value = yaml.load(text, Loader=StrictLoader)
+    except Exception as e:  # noqa: BLE001
+        return False, "provider YAML/JSON 无法安全解析: %s" % type(e).__name__
+    if not isinstance(value, (dict, list)):
+        return False, "provider YAML/JSON 顶层必须是 mapping/list"
+    stack = [(value, 0)]
+    seen = 0
+    while stack:
+        item, depth = stack.pop()
+        seen += 1
+        if seen > 100000 or depth > 64:
+            return False, "provider YAML/JSON 嵌套或规模过大"
+        if isinstance(item, dict):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+    return True, ""
 
 
 def _v_nft_check(path, data, ctx):
@@ -792,6 +1385,7 @@ VALIDATORS = {
     "nft_check": _v_nft_check, "mosdns_lines": _v_mosdns_lines, "mosdns_probe": _v_mosdns_probe,
     "ruleset_format": _v_ruleset_format, "kv_env": _v_kv_env, "hostname_line": _v_hostname_line,
     "pem_cert": _v_pem_cert, "pem_key": _v_pem_key, "systemd_unit": _v_systemd_unit,
+    "nonempty": _v_nonempty, "yaml_safe": _v_yaml_safe,
 }
 # 只做行级格式校验的目标: 报告里要标出来, 不能说成完整配置强校验
 LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line")
@@ -1289,7 +1883,9 @@ class Tx:
         self.targets[target] = {
             "path": path, "mode": mode, "secret": secret, "validators": list(validators),
             "data": data, "candidate": cpath,
-            "expect": _sha(cur) if cur is not None else None, "existed": cur is not None,
+            "expect": self._read_sha.get(
+                target, _sha(cur) if cur is not None else None),
+            "existed": cur is not None,
         }
 
     # ---- before-image ----

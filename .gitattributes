@@ -19,3 +19,4 @@
 *.yaml text eol=lf
 *.yml text eol=lf
 *.ps1 text eol=crlf
+/tests/fixtures/pdg-v1.6.4.fixture text eol=lf

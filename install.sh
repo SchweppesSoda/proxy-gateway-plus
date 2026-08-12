@@ -41,18 +41,23 @@ ask(){
 }
 
 pdg_checkout_latest_tag(){
-  local dir="$1" tag cur target
-  git -C "$dir" fetch -q --tags origin main
-  if [[ "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
-    git -C "$dir" fetch -q --unshallow --tags origin main
-  fi
-  tag=$(git -C "$dir" tag -l 'v*' --sort=-v:refname | head -1)
-  [[ -n "$tag" ]] || die "仓库没有发布 tag(v*), 中止安装。"
+  local dir="$1" tag cur target helper
+  helper="$dir/lib/release-tags.sh"
+  [[ -f "$helper" ]] || die "发布标签校验器缺失: $helper"
+  # shellcheck source=lib/release-tags.sh
+  source "$helper"
+  pdg_origin_release_select "$dir" \
+    || die "无法从 origin 选择可信 release tag, 中止安装。"
+  tag="$PDG_RELEASE_TAG"; target="$PDG_RELEASE_COMMIT"
+  pdg_origin_release_materialize "$dir" "$tag" "$PDG_RELEASE_OBJECT" \
+    || die "无法固定 origin release tag $tag"
   cur=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
-  target=$(git -C "$dir" rev-parse "$tag^{commit}" 2>/dev/null || true)
   if [[ "$cur" != "$target" ]]; then
-    git -C "$dir" checkout -q "$tag"
+    git -C "$dir" checkout -q --detach "$target" \
+      || die "无法 checkout 已验证的 origin release $tag"
   fi
+  [[ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" == "$target" ]] \
+    || die "checkout 后 HEAD 与 origin release $tag 不一致"
   echo "$tag"
 }
 
@@ -585,7 +590,9 @@ apt-get update -qq
 # zstd: 读 mihomo .mrs 规则集的头部(判 domain/ipcidr), 没它大文件就只能让用户手填类型
 # iproute2: install.sh 用 ss 探 SSH 端口, pdg status/report/doctor 也靠它看监听 —— 极简
 # Debian 12 默认不带, 缺了它"监听端口"整块是空的, 而装机不会报任何错。
-apt-get install -y -qq curl tar unzip zstd nftables iproute2 python3 openssl certbot dnsutils tcpdump jq ca-certificates vnstat >/dev/null
+apt-get install -y -qq curl tar unzip zstd nftables iproute2 python3 python3-yaml openssl certbot dnsutils tcpdump jq ca-certificates vnstat >/dev/null
+python3 -c 'import yaml' >/dev/null 2>&1 \
+  || die "python3-yaml 安装后仍无法 import yaml，拒绝安装会在启动后失效的配置导入功能。"
 systemctl enable --now vnstat >/dev/null 2>&1 || true   # 网卡流量统计(轻量, ~3MB)
 
 # ── 2. mosdns ──
@@ -784,12 +791,14 @@ else
     /var/lib/privdns-gateway /opt/privdns-gateway \
     || die "目录备份失败, 未改动任何文件。"
 fi
-install -d /etc/mosdns/rules /etc/sing-box/rs /opt/pdg-bot /opt/pdg-web/static "$CERT_DIR" \
+install -d /etc/mosdns/rules /etc/sing-box/rs /opt/pdg-bot /opt/pdg-web/static/templates "$CERT_DIR" \
   /etc/letsencrypt/renewal-hooks/deploy /etc/systemd/journald.conf.d \
   /usr/local/libexec
 # Persistent Web maintenance records are command authority.  Pre-create their
 # final directory root:root/0700 instead of relying on a later chmod-only fixup.
 install -d -o root -g root -m700 /var/lib/privdns-gateway/web-jobs
+install -d -o root -g root -m700 /var/lib/privdns-gateway/web-imports
+install -d -o root -g root -m700 /etc/mihomo/providers
 if [[ "$MOSDNS_INSTALLED" == 1 ]]; then
   pdg_write_mosdns_attestation "$PDG_MOSDNS_ATTESTATION" "$MARCH" \
     "$MOSDNS_PREPARED_ARTIFACT_SHA" "$MOSDNS_PREPARED_BINARY_SHA" \
@@ -816,6 +825,7 @@ install -m755 "$REPO_DIR"/deploy/bot/pdgprofile.py        /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/web/pdg-web.py           /opt/pdg-web/
 install -m755 "$REPO_DIR"/deploy/web/pdg-web-job.py       /opt/pdg-web/
 install -m755 "$REPO_DIR"/deploy/web/pdgcontrol.py        /opt/pdg-web/
+install -m755 "$REPO_DIR"/deploy/web/pdgconfigio.py       /opt/pdg-web/
 install -m755 "$REPO_DIR"/deploy/web/pdg-web-setup.py     /opt/pdg-web/
 install -m644 "$REPO_DIR"/deploy/web/pdgwebconfig.py      /opt/pdg-web/
 install -m644 "$REPO_DIR"/deploy/web/static/index.html    /opt/pdg-web/static/
@@ -823,6 +833,8 @@ install -m644 "$REPO_DIR"/deploy/web/static/app.js        /opt/pdg-web/static/
 install -m644 "$REPO_DIR"/deploy/web/static/style.css     /opt/pdg-web/static/
 install -m644 "$REPO_DIR"/deploy/web/static/manifest.webmanifest /opt/pdg-web/static/
 install -m644 "$REPO_DIR"/deploy/web/static/icon.svg      /opt/pdg-web/static/
+install -m644 "$REPO_DIR"/deploy/web/static/templates/mihomo-import.example.yaml /opt/pdg-web/static/templates/
+install -m644 "$REPO_DIR"/deploy/web/static/templates/mosdns-import.example.yaml /opt/pdg-web/static/templates/
 # iOS 专属组件(MITM 模块 / :81 探测 / 描述文件模板)只在 iOS 平台安装; Android 不装。
 if [[ "$PLATFORM" == ios ]]; then
   install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/
@@ -1142,6 +1154,8 @@ fi
 _write_resolv "nameserver 1.1.1.1"
 systemctl daemon-reload
 if [[ "$WEB_WAS_ENABLED" == 1 || "$WEB_WAS_ACTIVE" == 1 ]]; then
+  python3 -c 'import yaml' >/dev/null 2>&1 \
+    || die "pdg-web 的 YAML 解析依赖不可用；拒绝重启并回滚覆盖重装。"
   [[ -f /etc/privdns-gateway/web.json \
      && ! -L /etc/privdns-gateway/web.json ]] \
     || die "pdg-web 原为 enabled/active，但 root-only 配置缺失或不是普通文件。"

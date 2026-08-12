@@ -13,6 +13,7 @@ required=(
   deploy/web/pdg-web.py
   deploy/web/pdg-web-job.py
   deploy/web/pdgcontrol.py
+  deploy/web/pdgconfigio.py
   deploy/web/pdg-web-setup.py
   deploy/web/pdgwebconfig.py
   deploy/web/pdg-webctl.sh
@@ -22,6 +23,8 @@ required=(
   deploy/web/static/style.css
   deploy/web/static/manifest.webmanifest
   deploy/web/static/icon.svg
+  deploy/web/static/templates/mihomo-import.example.yaml
+  deploy/web/static/templates/mosdns-import.example.yaml
 )
 missing=()
 for path in "${required[@]}"; do
@@ -39,11 +42,14 @@ done
 [[ "$syntax_ok" == 1 ]] && ok "相关 shell 脚本通过 bash -n" || bad "shell 语法错误"
 
 install_ok=1
-for path in pdg-web.py pdg-web-job.py pdgcontrol.py pdg-web-setup.py pdgwebconfig.py index.html app.js style.css \
+for path in pdg-web.py pdg-web-job.py pdgcontrol.py pdgconfigio.py pdg-web-setup.py pdgwebconfig.py index.html app.js style.css \
             manifest.webmanifest icon.svg pdg-webctl.sh pdg-web.service; do
   grep -qF "deploy/web/${path}" "$ROOT/install.sh" \
     || grep -qF "deploy/web/static/${path}" "$ROOT/install.sh" \
     || install_ok=0
+done
+for template in mihomo-import.example.yaml mosdns-import.example.yaml; do
+  grep -qF "deploy/web/static/templates/${template}" "$ROOT/install.sh" || install_ok=0
 done
 has install.sh "_dir_txn_record /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /opt/pdg-web" \
   || install_ok=0
@@ -118,16 +124,95 @@ fi
 inventory_ok=1
 for exact in \
   "opt/pdg-web/pdg-web.py" "opt/pdg-web/pdg-web-job.py" "opt/pdg-web/pdgcontrol.py" \
+  "opt/pdg-web/pdgconfigio.py" \
   "opt/pdg-web/pdg-web-setup.py" "opt/pdg-web/pdgwebconfig.py" \
   "opt/pdg-web/static/manifest.webmanifest" \
+  "opt/pdg-web/static/templates/mihomo-import.example.yaml" \
+  "opt/pdg-web/static/templates/mosdns-import.example.yaml" \
   "usr/local/bin/pdg-webctl" "etc/systemd/system/pdg-web.service"; do
   grep -qF "$exact" "$ROOT/deploy/bot/pdg.sh" || inventory_ok=0
 done
+for exact in \
+  "opt/pdg-web/static/templates/mihomo-import.example.yaml" \
+  "opt/pdg-web/static/templates/mosdns-import.example.yaml"; do
+  [[ "$(grep -cF "$exact" "$ROOT/deploy/bot/pdg.sh")" -ge 2 ]] \
+    || inventory_ok=0
+done
+for template in mihomo-import.example.yaml mosdns-import.example.yaml; do
+  grep -qF "deploy/web/static/templates/${template}" \
+    "$ROOT/deploy/bot/pdg.sh" || inventory_ok=0
+done
+grep -qF "rmdir /opt/pdg-web/static/templates /opt/pdg-web/static /opt/pdg-web" \
+  "$ROOT/deploy/bot/pdg.sh" || inventory_ok=0
 grep -qF "python3 /opt/pdg-web/pdg-web-setup.py --validate-only" \
   "$ROOT/deploy/bot/pdg.sh" || inventory_ok=0
+grep -qF "apt-get install -y -qq python3-yaml" "$ROOT/deploy/bot/pdg.sh" \
+  || inventory_ok=0
+grep -qF "python3 -c 'import yaml'" "$ROOT/deploy/bot/pdg.sh" \
+  || inventory_ok=0
+grep -qF "python3-yaml" "$ROOT/install.sh" || inventory_ok=0
+grep -qF "/var/lib/privdns-gateway/web-imports" "$ROOT/uninstall.sh" \
+  || inventory_ok=0
 [[ "$inventory_ok" == 1 ]] \
   && ok "update/snapshot/rollback 清单跟踪 Web 且更新时校验配置" \
   || bad "update/snapshot/rollback Web 清单不完整"
+
+template_contract_ok=1
+template_python="$(command -v python3 || command -v python || true)"
+if [[ -n "$template_python" ]]; then
+  "$template_python" - "$ROOT/deploy/singbox/config.json.tmpl" \
+    "$ROOT/deploy/mosdns/config.yaml" \
+    "$ROOT/deploy/web/static/templates/mosdns-import.example.yaml" <<'PY' \
+    || template_contract_ok=0
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    model = json.load(stream)
+assert model["_pdg"] == {
+    "schema": 2,
+    "mihomo": {
+        "proxy-providers": {},
+        "rule-providers": {},
+        "proxy-groups": [],
+        "advanced": {},
+        "managed-files": {},
+    },
+}
+assert model["outbounds"] == [{"type": "direct", "tag": "JP"}]
+assert model["route"]["final"] == "JP"
+with open(sys.argv[2], encoding="utf-8") as stream:
+    managed_mosdns = stream.read()
+with open(sys.argv[3], encoding="utf-8") as stream:
+    import_example = stream.read()
+assert import_example[import_example.index("log:\n"):] == managed_mosdns
+PY
+else
+  template_contract_ok=0
+fi
+mihomo_template="$ROOT/deploy/web/static/templates/mihomo-import.example.yaml"
+for marker in proxies: proxy-providers: proxy-groups: rule-providers: rules: \
+              dns: tun: sniffer:; do
+  grep -qxF "$marker" "$mihomo_template" || template_contract_ok=0
+done
+grep -qE '^mixed-port:[[:space:]]+[0-9]+' "$mihomo_template" \
+  || template_contract_ok=0
+grep -qF "They are ignored" "$mihomo_template" || template_contract_ok=0
+mosdns_template="$ROOT/deploy/web/static/templates/mosdns-import.example.yaml"
+for marker in remote_upstream local_upstream unlock_upstream geosite_unlock \
+              geosite_cn npn_clients hijack_set explicit_hijack force_hijack \
+              ecs_china ecs_neutral has_resp client_limiter lazy_cache \
+              force_hijack_seq internal_sequence main_sequence \
+              udp_server tcp_server dot_server; do
+  grep -qF -- "- tag: $marker" "$mosdns_template" || template_contract_ok=0
+done
+for placeholder in __SERVER_IP__ __INTERNAL_CIDR__ __CERT_DIR__ \
+                   __HIJACK_SET_FILE__ __MOSDNS_CACHE__; do
+  grep -qF "$placeholder" "$mosdns_template" || template_contract_ok=0
+done
+[[ "$template_contract_ok" == 1 ]] \
+  && ok "模型 v2 与 Mihomo/MosDNS 导入模板结构完整" \
+  || bad "模型 v2 或导入模板结构不完整"
 
 aggregate_inventory_ok=1
 for exact in \
@@ -257,6 +342,80 @@ if grep -qF '[[ -f /etc/privdns-gateway/web.json && ! -L /etc/privdns-gateway/we
   ok "证书 hook 只重启已配置且 active 的 pdg-web"
 else
   bad "证书 hook 的 pdg-web 条件重载契约缺失"
+fi
+
+# A pre-v1.9 updater (including v1.6.4) runs from its already-loaded old shell, but invokes the newly
+# installed `pdg __migrate`.  Therefore the new migration itself must install
+# every dependency/file unknown to v1.8 and must propagate failure.
+migration_source="$(awk '
+  /^migrate_web_config_io\(\)\{/ { active=1 }
+  active { print }
+  active && /^}$/ { exit }
+' "$ROOT/deploy/bot/pdg.sh")"
+run_migrations_source="$(awk '
+  /^run_all_migrations\(\)\{/ { active=1 }
+  active { print }
+  active && /^}$/ { exit }
+' "$ROOT/deploy/bot/pdg.sh")"
+if [[ -n "$migration_source" ]] \
+   && grep -qF 'apt-get install -y -qq python3-yaml' <<<"$migration_source" \
+   && grep -qF "python3 -c 'import yaml'" <<<"$migration_source" \
+   && grep -qF '/var/lib/privdns-gateway/web-imports /etc/mihomo/providers' <<<"$migration_source" \
+   && grep -qF '/opt/pdg-web/pdgconfigio.py' <<<"$migration_source" \
+   && grep -qF 'mihomo-import.example.yaml' <<<"$migration_source" \
+   && grep -qF 'mosdns-import.example.yaml' <<<"$migration_source" \
+   && grep -qF 'python3 -m py_compile /opt/pdg-web/pdgconfigio.py || return 1' <<<"$migration_source" \
+   && grep -qF 'migrate_web_config_io || rc=1' <<<"$run_migrations_source" \
+   && ! grep -Eq 'migrate_web_config_io[[:space:]]*\|\|[[:space:]]*true' <<<"$run_migrations_source"; then
+  ok "pre-v1.9 旧 updater（含 v1.6.4）经新版 __migrate 硬安装并校验 ConfigIO/PyYAML/模板"
+else
+  bad "pre-v1.9→v1.9 ConfigIO 自举迁移不完整或错误吞掉失败"
+fi
+
+cleanup_source="$(awk '
+  /^_pdg_clear_web_import_staging\(\)\{/ { active=1 }
+  active { print }
+  active && /^}$/ { exit }
+' "$ROOT/deploy/bot/pdg.sh")"
+cleanup_root="$(mktemp -d)"
+cleanup_ok=1
+if [[ -z "$cleanup_source" ]]; then
+  cleanup_ok=0
+else
+  eval "$cleanup_source"
+  mkdir -p "$cleanup_root/root/var/lib/privdns-gateway/web-imports"
+  printf 'secret\n' >"$cleanup_root/root/var/lib/privdns-gateway/web-imports/imp-test.upload"
+  printf 'keep\n' >"$cleanup_root/root/var/lib/privdns-gateway/keep"
+  PDG_ROOT_PREFIX="$cleanup_root/root" _pdg_clear_web_import_staging \
+    || cleanup_ok=0
+  [[ ! -e "$cleanup_root/root/var/lib/privdns-gateway/web-imports" \
+     && "$(cat "$cleanup_root/root/var/lib/privdns-gateway/keep" 2>/dev/null)" == keep ]] \
+    || cleanup_ok=0
+
+  mkdir -p "$cleanup_root/root/var/lib/privdns-gateway/elsewhere"
+  printf 'do-not-follow\n' >"$cleanup_root/root/var/lib/privdns-gateway/elsewhere/secret"
+  if ln -s "$cleanup_root/root/var/lib/privdns-gateway/elsewhere" \
+      "$cleanup_root/root/var/lib/privdns-gateway/web-imports" 2>/dev/null \
+      && [[ -L "$cleanup_root/root/var/lib/privdns-gateway/web-imports" ]]; then
+    if PDG_ROOT_PREFIX="$cleanup_root/root" _pdg_clear_web_import_staging; then
+      cleanup_ok=0
+    fi
+  elif ! grep -qF '[[ -d "$parent" && ! -L "$parent" ]]' <<<"$cleanup_source" \
+       || ! grep -qF 'readlink -f -- "$staging"' <<<"$cleanup_source"; then
+    # Windows Git Bash may not grant symlink creation; keep the executable
+    # boundary check on POSIX and require both no-follow guards statically.
+    cleanup_ok=0
+  fi
+  [[ "$(cat "$cleanup_root/root/var/lib/privdns-gateway/elsewhere/secret" 2>/dev/null)" \
+      == do-not-follow ]] || cleanup_ok=0
+fi
+rm -rf -- "$cleanup_root"
+if [[ "$cleanup_ok" == 1 ]] \
+   && grep -qF 'if [[ ! -e "$tree/opt/pdg-web/pdgconfigio.py" ]]' \
+      "$ROOT/deploy/bot/pdg.sh"; then
+  ok "回滚到旧 Web 快照会在停服后清空精确 root-only import staging，拒绝 symlink"
+else
+  bad "旧快照回滚未安全清理 ConfigIO staging"
 fi
 
 echo "────────────────────────────────────────"

@@ -45,6 +45,12 @@ PDG_NONINTERACTIVE=1 PDG_SERVER_IP=<公网IP> PDG_INTERNAL_CIDR=172.22.0.0/16 \
 - [ ] **防火墙模式一致**:`managed` 的 owned `inet pdg` 有 input hook 和 `policy drop`;
   `external` 无 input hook / input policy,但仍保留 source-scoped REDIRECT,并在 `tproxy`
   模式保留 source-scoped QUIC TPROXY。
+- [ ] **PDG Web 配置 I/O**：保持默认 disabled/inactive；完成 loopback setup/enable 后，
+  Mihomo/MosDNS 模板可下载。错误管理密码不能导出，重新验证正确密码后 PDG/Mihomo/MosDNS
+  三类附件均可下载。分别上传两份示例模板执行预览，确认生产模型/config SHA 未变化；取消后
+  暂存立即删除。再在 throwaway 机确认 Mihomo 的 merge/replace 与 MosDNS replace-only
+  各完成一次，维护任务成功、`pdg-web`/`mihomo`/`mosdns` 稳定、`pdg-bot` 符合其凭据配置
+  状态，且 `pdg doctor --deep` 通过。
 
 ## ② 从上一个发布版升级(最容易翻车)
 
@@ -97,8 +103,33 @@ bash uninstall.sh --purge
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin HEAD:main
 git push origin vX.Y.Z
-gh release create vX.Y.Z --latest --title "vX.Y.Z" --notes ""
+
+source lib/versions.sh
+source lib/mosdns-artifact.sh
+release_assets="$PWD/dist/release-assets"
+[[ ! -e "$release_assets" ]] || { echo "refuse pre-existing $release_assets" >&2; exit 1; }
+mkdir -p "$release_assets"
+bash tools/build-mosdns-patched.sh --arch amd64 --out "$release_assets"
+bash tools/build-mosdns-patched.sh --arch arm64 --out "$release_assets"
+amd64_asset="$(pdg_mosdns_asset_name amd64)"
+arm64_asset="$(pdg_mosdns_asset_name arm64)"
+
+gh release create vX.Y.Z --verify-tag \
+  "$release_assets/$amd64_asset" \
+  "$release_assets/$amd64_asset.sha256" \
+  "$release_assets/$amd64_asset.provenance.json" \
+  "$release_assets/$arm64_asset" \
+  "$release_assets/$arm64_asset.sha256" \
+  "$release_assets/$arm64_asset.provenance.json" \
+  --latest --title "vX.Y.Z" --notes ""
 ```
+
+发布目录必须在 clean checkout 中不存在；命令拒绝复用旧目录，并只显式上传列出的六个文件，
+不会用通配符夹带其他内容。amd64 / arm64 各附 raw binary、`.sha256`、`.provenance.json`；
+构建生成的 `.env` 仅供离线部署复制变量，不上传且不是信任锚。发布前后均须
+确认 raw 文件名与 `pdg_mosdns_asset_name` 完全一致，base URL 是当前项目 tag 的精确
+`releases/download/vX.Y.Z` 目录，并从该 URL 回下载两架构 raw binary 复核仓库 pin。
+GitHub Actions 的 14 天 artifact 不能代替 Release asset。
 
 Release 发布成功后，从维护者本机使用私有 SSH alias 部署。当前 fork 的默认线上 alias 为
 `kfc-pdg`；真实 IP、端口和 IdentityFile 只写在 `~/.ssh/config`，绝不进入仓库：

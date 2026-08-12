@@ -1,0 +1,91 @@
+# PDG Mihomo import template
+#
+# Importable sections:
+#   proxies, proxy-providers, proxy-groups, rule-providers and rules.
+# Common proxy fields are converted into PDG's canonical model. Extra supported
+# top-level fields are retained as read-only advanced Mihomo metadata.
+#
+# PDG-owned runtime sections are intentionally shown below. They are ignored on
+# import and rebound from this gateway's managed settings; do not rely on their
+# values for ports, LAN access, DNS, TUN, controller or traffic sniffing.
+mixed-port: 7890
+redir-port: 7892
+tproxy-port: 7893
+allow-lan: true
+bind-address: "*"
+external-controller: 127.0.0.1:9090
+secret: example-only
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+tun:
+  enable: true
+sniffer:
+  enable: true
+
+# An ordinary proxy. Replace every example value before importing.
+proxies:
+  - name: example-vless
+    type: vless
+    server: proxy.example.com
+    port: 443
+    uuid: 00000000-0000-4000-8000-000000000000
+    tls: true
+    servername: proxy.example.com
+    client-fingerprint: chrome
+    network: ws
+    ws-opts:
+      path: /example
+      headers:
+        Host: proxy.example.com
+
+# HTTP providers are downloaded by Mihomo after PDG accepts the configuration.
+# For a local provider, upload an archive containing this YAML plus the referenced
+# relative provider file and set type: file / path: ./providers/name.yaml.
+proxy-providers:
+  example-subscription:
+    type: http
+    url: https://example.invalid/subscription.yaml
+    path: ./providers/example-subscription.yaml
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - example-vless
+      - DIRECT
+    use:
+      - example-subscription
+  - name: Auto
+    type: url-test
+    use:
+      - example-subscription
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+
+rule-providers:
+  example-direct:
+    type: http
+    behavior: domain
+    format: yaml
+    url: https://example.invalid/example-direct.yaml
+    path: ./rules/example-direct.yaml
+    interval: 86400
+
+rules:
+  - DOMAIN-SUFFIX,example.org,DIRECT
+  - RULE-SET,example-direct,DIRECT
+  - MATCH,Proxy
+
+# Allowlisted runtime option: PDG retains and activates this safe setting.
+tcp-concurrent: true
+
+# Opaque advanced option: PDG retains this for round-trip visibility but does
+# not activate it in the managed runtime configuration.
+profile:
+  store-selected: true

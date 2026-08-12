@@ -8,6 +8,7 @@ import copy
 import hashlib
 import http.client
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -307,7 +308,7 @@ class FakeBot:
             return False, "unknown member"
         for item in self.model["outbounds"]:
             if item.get("tag") == tag:
-                if item.get("type") != "urltest":
+                if item.get("type") not in {"urltest", "selector"}:
                     return False, "tag conflict"
                 item["outbounds"] = list(members)
                 return True, "updated"
@@ -608,8 +609,8 @@ class FakeJobStore:
             raise type("JobNotFound", (RuntimeError,), {})()
         return self.SNAPSHOT_ID
 
-    def start(self, kind, snapshot_id=None):
-        self.calls.append(("start", kind, snapshot_id))
+    def start(self, kind, snapshot_id=None, import_id=None):
+        self.calls.append(("start", kind, import_id if import_id is not None else snapshot_id))
         record = {
             "id": self.JOB_ID,
             "kind": kind,
@@ -618,6 +619,8 @@ class FakeJobStore:
         }
         if snapshot_id is not None:
             record["snapshotId"] = snapshot_id
+        if import_id is not None:
+            record["importId"] = import_id
         self.records = [record]
         return copy.deepcopy(record)
 
@@ -628,6 +631,159 @@ class FakeJobStore:
         if job_id != self.JOB_ID or not self.records:
             raise type("JobNotFound", (RuntimeError,), {})()
         return copy.deepcopy(self.records[0])
+
+
+class FakeConfigIO:
+    IMPORT_ID = "imp-" + "b" * 32
+
+    def __init__(self):
+        self.calls = []
+
+    def export(self, kind):
+        self.calls.append(("export", kind))
+        return b"managed-config\n", f"{kind}-config.yaml", "application/yaml; charset=utf-8"
+
+    def preview_stream(self, kind, stream, size, content_type):
+        payload = stream.read(size)
+        self.calls.append(("preview", kind, payload, content_type))
+        return {
+            "importId": self.IMPORT_ID, "kind": kind, "expiresIn": 1800,
+            "summary": {"bytes": len(payload)}, "warnings": [],
+            "conflicts": [], "modes": ["merge", "replace"],
+        }
+
+    def prepare_apply(self, import_id, body):
+        self.calls.append(("prepare", import_id, copy.deepcopy(body)))
+        return {"importId": import_id, "kind": "mihomo", "mode": body.get("mode")}
+
+    def release_claim(self, import_id):
+        self.calls.append(("release", import_id))
+
+    def cancel(self, import_id):
+        self.calls.append(("cancel", import_id))
+
+
+class LazyServiceInitializationTestCase(unittest.TestCase):
+    def test_concurrent_first_config_io_call_publishes_one_manager_and_slot(self):
+        workers = 12
+        start = threading.Barrier(workers)
+        counter_lock = threading.Lock()
+        created = []
+        closed = []
+        preview_entered = threading.Event()
+        release_preview = threading.Event()
+
+        class CountingConfigIO:
+            def __init__(self, *, bot):
+                self.bot = bot
+                self.slot = threading.BoundedSemaphore(1)
+                with counter_lock:
+                    created.append(self)
+                # Widen the historical race without relying on the scheduler.
+                time.sleep(0.01)
+
+            def close(self):
+                with counter_lock:
+                    closed.append(self)
+
+            def preview_stream(self, kind, stream, size, content_type):
+                if not self.slot.acquire(blocking=False):
+                    raise pdgcontrol.BusyError()
+                try:
+                    preview_entered.set()
+                    if not release_preview.wait(timeout=2):
+                        raise AssertionError("preview release timed out")
+                    payload = stream.read(size)
+                    return {"kind": kind, "summary": {"bytes": len(payload)}}
+                finally:
+                    self.slot.release()
+
+        control = pdgcontrol.PDGControl(
+            FakeBot(), job_store=FakeJobStore())
+        module = types.SimpleNamespace(ConfigIO=CountingConfigIO)
+        managers = []
+        errors = []
+
+        def resolve_manager():
+            try:
+                start.wait(timeout=2)
+                managers.append(control._config_io())
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with mock.patch.object(
+                pdgcontrol, "load_config_io_module", return_value=module):
+            threads = [threading.Thread(target=resolve_manager)
+                       for _ in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+            self.assertFalse(errors)
+            self.assertEqual(len(managers), workers)
+            self.assertEqual(len(created), 1)
+            self.assertFalse(closed)
+            self.assertTrue(all(item is created[0] for item in managers))
+
+            results = []
+
+            def first_preview():
+                try:
+                    results.append(control.preview_import_stream(
+                        "mihomo", io.BytesIO(b"first"), 5,
+                        "application/yaml"))
+                except Exception as exc:  # pragma: no cover - asserted below
+                    results.append(exc)
+
+            first = threading.Thread(target=first_preview)
+            first.start()
+            self.assertTrue(preview_entered.wait(timeout=2))
+            with self.assertRaises(pdgcontrol.BusyError):
+                control.preview_import_stream(
+                    "mihomo", io.BytesIO(b"second"), 6,
+                    "application/yaml")
+            release_preview.set()
+            first.join(timeout=2)
+            self.assertEqual(results, [
+                {"kind": "mihomo", "summary": {"bytes": 5}}
+            ])
+
+    def test_concurrent_first_job_store_call_publishes_one_store(self):
+        workers = 12
+        start = threading.Barrier(workers)
+        created = []
+
+        class CountingJobStore:
+            def __init__(self):
+                created.append(self)
+                time.sleep(0.01)
+
+        control = pdgcontrol.PDGControl(FakeBot())
+        module = types.SimpleNamespace(JobStore=CountingJobStore)
+        stores = []
+        errors = []
+
+        def resolve_store():
+            try:
+                start.wait(timeout=2)
+                stores.append(control._job_store())
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with mock.patch.object(
+                pdgcontrol, "load_job_module", return_value=module):
+            threads = [threading.Thread(target=resolve_store)
+                       for _ in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertFalse(errors)
+        self.assertEqual(len(stores), workers)
+        self.assertEqual(len(created), 1)
+        self.assertTrue(all(item is created[0] for item in stores))
 
 
 class WebAPITestCase(unittest.TestCase):
@@ -683,8 +839,9 @@ class WebAPITestCase(unittest.TestCase):
         self.config = web.load_config(str(self.config_path), testing=True)
         self.fake = FakeBot()
         self.jobs = FakeJobStore()
+        self.config_io = FakeConfigIO()
         self.control = pdgcontrol.PDGControl(
-            self.fake, job_store=self.jobs)
+            self.fake, job_store=self.jobs, config_io=self.config_io)
         self._old_http_env = os.environ.get("PDG_WEB_TEST_ALLOW_HTTP")
         os.environ["PDG_WEB_TEST_ALLOW_HTTP"] = "1"
         self.server = web.make_server(
@@ -1214,6 +1371,28 @@ class WebAPITestCase(unittest.TestCase):
             deleted_normal_ruleset["text"],
         )
 
+    def test_imported_selector_is_an_editable_group_across_web_paths(self):
+        self.fake.model["outbounds"].append({
+            "type": "selector", "tag": "choice", "outbounds": ["hk", "tw"],
+        })
+        self.login()
+        groups = self.request("GET", "/api/v1/groups")
+        self.assertEqual(groups["status"], 200, groups["text"])
+        choice = next(item for item in groups["json"]["data"]["items"]
+                      if item["tag"] == "choice")
+        self.assertEqual(choice["members"], ["hk", "tw"])
+        patched = self.request(
+            "PATCH", "/api/v1/groups/choice", {"members": ["tw", "hk"]})
+        self.assertEqual(patched["status"], 200, patched["text"])
+        canonical = next(item for item in self.fake.model["outbounds"]
+                         if item.get("tag") == "choice")
+        self.assertEqual(canonical["type"], "selector")
+        self.assertEqual(canonical["outbounds"], ["tw", "hk"])
+        deleted = self.request("DELETE", "/api/v1/groups/choice")
+        self.assertEqual(deleted["status"], 200, deleted["text"])
+        self.assertFalse(any(item.get("tag") == "choice"
+                             for item in self.fake.model["outbounds"]))
+
     def test_diagnostics_are_structured_and_drop_internal_fields(self):
         self.login()
         exits = self.request(
@@ -1621,6 +1800,44 @@ class WebAPITestCase(unittest.TestCase):
         self.assertEqual(len(self.fake.transactions), before_transactions)
         self.assertEqual(len(self.fake.sh_calls), before_shell)
 
+    def test_active_maintenance_rejects_preview_before_stream_read_or_staging(self):
+        self.login()
+        JobBusy = type("JobBusy", (RuntimeError,), {})
+
+        class ActiveJobStore:
+            @staticmethod
+            @contextlib.contextmanager
+            def maintenance_guard():
+                raise JobBusy("maintenance active")
+                yield  # pragma: no cover
+
+        class CountingStream(io.BytesIO):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.reads = 0
+
+            def read(self, *args, **kwargs):
+                self.reads += 1
+                return super().read(*args, **kwargs)
+
+        self.control._job_store_instance = ActiveJobStore()
+        before = list(self.config_io.calls)
+        stream = CountingStream(b"rules:\n  - MATCH,DIRECT\n")
+        with self.assertRaises(pdgcontrol.BusyError):
+            self.control.preview_import_stream(
+                "mihomo", stream, len(stream.getvalue()), "application/yaml")
+        self.assertEqual(stream.reads, 0)
+        with self.assertRaises(pdgcontrol.BusyError):
+            self.control.preview_import(
+                "mihomo", stream.getvalue(), "application/yaml")
+        self.assertEqual(self.config_io.calls, before)
+
+        response = self.request(
+            "POST", "/api/v1/imports/mihomo/preview",
+            b"rules:\n  - MATCH,DIRECT\n", content_type="application/yaml")
+        self.assert_error(response, 409)
+        self.assertEqual(self.config_io.calls, before)
+
     def test_software_update_preflight_is_fail_closed_and_sanitized(self):
         self.login()
         sensitive = f"internal ss://{PLAIN_SECRET}@secret.example"
@@ -1783,6 +2000,59 @@ class WebAPITestCase(unittest.TestCase):
                 web.load_config("/etc/privdns-gateway/web.json", testing=False)
 
 
+    def test_config_export_import_http_security_and_attachment_channel(self):
+        self.login()
+        denied = self.request(
+            "POST", "/api/v1/exports/mihomo", {"password": "wrong"})
+        self.assert_error(denied, 401)
+        self.assertEqual(self.config_io.calls, [])
+
+        for kind in ("pdg", "mihomo", "mosdns"):
+            exported = self.request(
+                "POST", f"/api/v1/exports/{kind}", {"password": self.password})
+            self.assertEqual(exported["status"], 200, exported["text"])
+            self.assertEqual(exported["raw"], b"managed-config\n")
+            self.assertEqual(
+                exported["headers"]["Content-Disposition"],
+                f'attachment; filename="{kind}-config.yaml"')
+            self.assertEqual(exported["headers"]["Cache-Control"], "no-store, max-age=0")
+            self.assertEqual(exported["headers"]["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(self.jobs.records, [])
+
+        missing_csrf = self.request(
+            "POST", "/api/v1/imports/mihomo/preview", b"rules:\n  - MATCH,DIRECT\n",
+            csrf=None, content_type="application/yaml")
+        self.assert_error(missing_csrf, 403)
+        unsupported = self.request(
+            "POST", "/api/v1/imports/mihomo/preview", b"x",
+            content_type="text/plain")
+        self.assert_error(unsupported, 415)
+        preview = self.request(
+            "POST", "/api/v1/imports/mihomo/preview",
+            b"rules:\n  - MATCH,DIRECT\n", content_type="application/yaml")
+        self.assertEqual(preview["status"], 201, preview["text"])
+        self.assertEqual(
+            preview["json"]["data"]["importId"], FakeConfigIO.IMPORT_ID)
+        denied_cancel = self.request(
+            "DELETE", f"/api/v1/imports/{FakeConfigIO.IMPORT_ID}", csrf=None)
+        self.assert_error(denied_cancel, 403)
+        cancelled = self.request(
+            "DELETE", f"/api/v1/imports/{FakeConfigIO.IMPORT_ID}")
+        self.assertEqual(cancelled["status"], 200, cancelled["text"])
+        self.assertIn(("cancel", FakeConfigIO.IMPORT_ID), self.config_io.calls)
+        preview = self.request(
+            "POST", "/api/v1/imports/mihomo/preview",
+            b"rules:\n  - MATCH,DIRECT\n", content_type="application/yaml")
+        self.assertEqual(preview["status"], 201, preview["text"])
+        applied = self.request(
+            "POST", f"/api/v1/imports/{FakeConfigIO.IMPORT_ID}/apply",
+            {"confirm": True, "mode": "merge", "conflicts": {}})
+        self.assertEqual(applied["status"], 202, applied["text"])
+        self.assertEqual(applied["json"]["data"]["action"], "config-import")
+        self.assertIn(
+            ("start", "config-import", FakeConfigIO.IMPORT_ID), self.jobs.calls)
+
+
 class PersistentJobStoreTestCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pdg-job-test.")
@@ -1795,6 +2065,7 @@ class PersistentJobStoreTestCase(unittest.TestCase):
         archive.write_bytes(b"snapshot")
         self.calls = []
         self.launch_lock_was_free = False
+        self.cleanup_lock_was_free = False
         self.module = pdgcontrol.load_job_module()
 
         def fake_run(argv, **_kwargs):
@@ -1804,6 +2075,9 @@ class PersistentJobStoreTestCase(unittest.TestCase):
             if argv and argv[0] == str(self.root / "systemd-run"):
                 with self.store._locked():
                     self.launch_lock_was_free = True
+            if "discard" in argv:
+                with self.store._locked():
+                    self.cleanup_lock_was_free = True
             return FakeResult(returncode=0)
 
         self.store = self.module.JobStore(
@@ -1811,6 +2085,7 @@ class PersistentJobStoreTestCase(unittest.TestCase):
             snapshot_dir=str(self.snapshots),
             cli=str(self.root / "pdg"),
             runner=str(self.root / "pdg-web-job.py"),
+            config_io_runner=str(self.root / "pdgconfigio.py"),
             systemd_run=str(self.root / "systemd-run"),
             python=str(self.root / "python3"),
             run_command=fake_run,
@@ -1864,9 +2139,9 @@ class PersistentJobStoreTestCase(unittest.TestCase):
         original_idle = self.store._assert_idle_locked
         original_resolve = self.store.resolve_snapshot_id
 
-        def marked_idle():
+        def marked_idle(cleanups=None):
             order.append("idle")
-            return original_idle()
+            return original_idle(cleanups)
 
         def marked_resolve(snapshot_id):
             order.append("resolve")
@@ -1877,6 +2152,112 @@ class PersistentJobStoreTestCase(unittest.TestCase):
         self.store.resolve_snapshot_id = marked_resolve
         self.store.start("rollback", snapshot_id=self.snapshot_id)
         self.assertEqual(order[:2], ["idle", "resolve"])
+
+    def test_config_import_fixed_argv_and_terminal_cleanup_outside_lock(self):
+        import_id = "imp-" + "a" * 32
+        record = self.store.start("config-import", import_id=import_id)
+        self.assertEqual(self.store.run(record["id"]), 0)
+        apply_argv = [
+            str(self.root / "python3"), str(self.root / "pdgconfigio.py"),
+            "apply", "--import-id", import_id,
+        ]
+        discard_argv = [
+            str(self.root / "python3"), str(self.root / "pdgconfigio.py"),
+            "discard", "--import-id", import_id,
+        ]
+        self.assertIn(apply_argv, self.calls)
+        self.assertIn(discard_argv, self.calls)
+        self.assertTrue(self.cleanup_lock_was_free)
+        final = self.store.get(record["id"])
+        self.assertEqual(final["status"], "succeeded")
+
+    def test_launcher_exception_after_runner_started_keeps_durable_import_claim(self):
+        import_id = "imp-" + "c" * 32
+        original_run = self.store._run_command
+
+        def accepted_then_raised(argv, **kwargs):
+            if argv and argv[0] == str(self.root / "systemd-run"):
+                job_id = argv[-1]
+                with self.store._locked(blocking=True):
+                    record = self.store._read_record(job_id)
+                    record["status"] = "running"
+                    record["startedAt"] = self.module._utc_now()
+                    self.store._write_record(record)
+                raise RuntimeError("client hook failed after systemd accepted unit")
+            if argv[:2] == ["systemctl", "is-active"]:
+                return FakeResult(returncode=0, stdout="active\n")
+            return original_run(argv, **kwargs)
+
+        self.store._run_command = accepted_then_raised
+        record = self.store.start("config-import", import_id=import_id)
+        self.assertEqual(record["status"], "running")
+        self.assertFalse(self.store.can_release_import(import_id))
+        self.assertFalse(any("discard" in call for call in self.calls))
+
+    def test_launcher_exception_after_unit_accept_before_runner_keeps_claim(self):
+        import_id = "imp-" + "d" * 32
+        original_run = self.store._run_command
+
+        def accepted_queued_then_raised(argv, **kwargs):
+            if argv and argv[0] == str(self.root / "systemd-run"):
+                raise RuntimeError(
+                    "client hook failed after unit acceptance but before runner start")
+            if argv[:2] == ["systemctl", "show"]:
+                return FakeResult(returncode=0, stdout="loaded\n")
+            if argv[:2] == ["systemctl", "is-active"]:
+                return FakeResult(returncode=3, stdout="inactive\n")
+            return original_run(argv, **kwargs)
+
+        self.store._run_command = accepted_queued_then_raised
+        record = self.store.start("config-import", import_id=import_id)
+        self.assertEqual(record["status"], "queued")
+        self.assertFalse(self.store.can_release_import(import_id))
+        self.assertFalse(any("discard" in call for call in self.calls))
+
+    def test_definitive_launcher_rejection_terminalizes_and_cleans_import(self):
+        import_id = "imp-" + "e" * 32
+        original_run = self.store._run_command
+
+        def rejected(argv, **kwargs):
+            if argv and argv[0] == str(self.root / "systemd-run"):
+                return FakeResult(returncode=1)
+            if argv[:2] == ["systemctl", "show"]:
+                return FakeResult(returncode=0, stdout="not-found\n")
+            return original_run(argv, **kwargs)
+
+        self.store._run_command = rejected
+        with self.assertRaises(self.module.JobStartError):
+            self.store.start("config-import", import_id=import_id)
+        jobs = self.store.list()
+        self.assertEqual(jobs[0]["status"], "failed")
+        self.assertEqual(jobs[0]["result"], "launcher_failed")
+        self.assertTrue(any("discard" in call for call in self.calls))
+
+    def test_start_failure_still_cleans_reconciled_import_outside_lock(self):
+        interrupted_id = "20260729t010203z-ffffffffffff"
+        active_id = "20260729t010203z-000000000001"
+        import_id = "imp-" + "b" * 32
+        with self.store._locked():
+            self.store._write_record({
+                "id": interrupted_id, "kind": "config-import",
+                "importId": import_id, "status": "queued",
+                "createdAt": "2026-07-29T01:02:03Z",
+                "bootId": "00000000-0000-0000-0000-000000000000",
+                "unit": "pdg-web-job-" + interrupted_id + ".service",
+            })
+            self.store._write_record({
+                "id": active_id, "kind": "software-update", "status": "queued",
+                "createdAt": self.module._utc_now(),
+                "bootId": self.module._boot_id(),
+                "unit": "pdg-web-job-" + active_id + ".service",
+            })
+        with self.assertRaises(self.module.JobBusy):
+            self.store.start("software-update")
+        self.assertIn([
+            str(self.root / "python3"), str(self.root / "pdgconfigio.py"),
+            "discard", "--import-id", import_id,
+        ], self.calls)
+        self.assertTrue(self.cleanup_lock_was_free)
 
     def test_terminal_job_pruning_is_bounded_and_never_removes_active(self):
         active = self.store.start("software-update")
@@ -1949,6 +2330,64 @@ class PersistentJobStoreTestCase(unittest.TestCase):
             ]),
             launches,
         )
+
+    def test_legacy_cleanup_stops_import_units_and_preserves_older_job_records(self):
+        stamp = "2026-07-29T01:02:03Z"
+        import_id = "imp-" + "a" * 32
+        import_job = "20260729t010203z-abcdef123456"
+        old_job = "20260729t010204z-abcdef123457"
+        self.store._write_record({
+            "id": import_job, "kind": "config-import", "status": "succeeded",
+            "createdAt": stamp, "startedAt": stamp, "finishedAt": stamp,
+            "bootId": "unknown", "result": "completed", "importId": import_id,
+            "unit": "pdg-web-job-" + import_job + ".service",
+        })
+        self.store._write_record({
+            "id": old_job, "kind": "software-update", "status": "failed",
+            "createdAt": stamp, "finishedAt": stamp, "bootId": "unknown",
+            "result": "launcher_failed",
+            "unit": "pdg-web-job-" + old_job + ".service",
+        })
+        original_run = self.store._run_command
+
+        def loaded_then_stopped(argv, **kwargs):
+            self.calls.append(list(argv))
+            if argv[:2] == ["systemctl", "show"]:
+                return FakeResult(returncode=0, stdout="loaded\n")
+            if argv[:2] == ["systemctl", "stop"]:
+                return FakeResult(returncode=0)
+            if argv[:2] == ["systemctl", "is-active"]:
+                return FakeResult(returncode=3, stdout="inactive\n")
+            return original_run(argv, **kwargs)
+
+        self.store._run_command = loaded_then_stopped
+        self.store.cleanup_config_import_for_legacy()
+        self.assertFalse(pathlib.Path(self.store._record_path(import_job)).exists())
+        self.assertEqual(self.store._read_record(old_job)["kind"], "software-update")
+        self.assertIn(["systemctl", "stop",
+                       "pdg-web-job-" + import_job + ".service"], self.calls)
+
+    def test_legacy_cleanup_keeps_import_record_if_unit_cannot_be_stopped(self):
+        stamp = "2026-07-29T01:02:03Z"
+        job_id = "20260729t010203z-abcdef123456"
+        self.store._write_record({
+            "id": job_id, "kind": "config-import", "status": "running",
+            "createdAt": stamp, "startedAt": stamp, "bootId": "unknown",
+            "importId": "imp-" + "b" * 32,
+            "unit": "pdg-web-job-" + job_id + ".service",
+        })
+
+        def cannot_stop(argv, **_kwargs):
+            if argv[:2] == ["systemctl", "show"]:
+                return FakeResult(returncode=0, stdout="loaded\n")
+            if argv[:2] == ["systemctl", "stop"]:
+                return FakeResult(returncode=1)
+            return FakeResult(returncode=0, stdout="active\n")
+
+        self.store._run_command = cannot_stop
+        with self.assertRaises(self.module.JobInvalid):
+            self.store.cleanup_config_import_for_legacy()
+        self.assertTrue(pathlib.Path(self.store._record_path(job_id)).exists())
 
     def test_record_started_timestamp_result_combinations(self):
         job_id = "20260729t010203z-abcdef123456"

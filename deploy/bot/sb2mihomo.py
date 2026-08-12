@@ -20,8 +20,82 @@ mihomo 只吃 YAML;但 YAML 1.2 是 JSON 超集,合法 JSON 即合法 YAML,故�
 不引入额外 YAML 依赖(已在 .200 用 `mihomo -t` 实测确认可解析)。
 """
 from __future__ import annotations
+import copy
 import json
 import re
+
+
+_TOP_RUNTIME_ADVANCED = {"tcp-concurrent", "unified-delay"}
+_PROXY_RUNTIME_ADVANCED = {"udp", "packet-encoding"}
+_PROVIDER_HEALTH_FIELDS = {"enable", "url", "interval", "lazy"}
+_PROVIDER_OVERRIDE_FIELDS = {"additional-prefix", "additional-suffix", "udp", "tfo"}
+_PROXY_PROVIDER_FIELDS = {
+    "type", "url", "path", "interval", "size-limit", "health-check",
+    "filter", "exclude-filter", "override"}
+_RULE_PROVIDER_FIELDS = {
+    "type", "url", "path", "interval", "size-limit", "format", "behavior"}
+_GROUP_RUNTIME_FIELDS = {
+    "name", "type", "proxies", "use", "url", "interval", "tolerance",
+    "lazy", "disable-udp", "hidden", "strategy"}
+
+
+def _runtime_top_advanced(value):
+    if not isinstance(value, dict):
+        return {}
+    return {key: copy.deepcopy(item) for key, item in value.items()
+            if key in _TOP_RUNTIME_ADVANCED and type(item) is bool}
+
+
+def _runtime_proxy_advanced(value):
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    if type(value.get("udp")) is bool:
+        out["udp"] = value["udp"]
+    if value.get("packet-encoding") in {"packetaddr", "xudp"}:
+        out["packet-encoding"] = value["packet-encoding"]
+    return out
+
+
+def _runtime_provider(value, *, rule=False):
+    """Defense-in-depth filter for metadata already validated by pdgtx."""
+    if not isinstance(value, dict):
+        return {}
+    if (value.get("type", "http") not in {"http", "file"}
+            or not isinstance(value.get("path"), str)
+            or re.fullmatch(
+                r"/etc/mihomo/providers/[a-f0-9]{64}\.(?:ya?ml|json|txt|mrs)",
+                value["path"], re.I) is None):
+        return {}
+    if value.get("type", "http") == "http" and (
+            not isinstance(value.get("url"), str)
+            or re.fullmatch(r"https?://[^\s\x00]+", value["url"], re.I) is None):
+        return {}
+    allowed = _RULE_PROVIDER_FIELDS if rule else _PROXY_PROVIDER_FIELDS
+    out = {key: copy.deepcopy(item) for key, item in value.items() if key in allowed}
+    health = out.get("health-check")
+    if isinstance(health, dict):
+        out["health-check"] = {key: copy.deepcopy(item) for key, item in health.items()
+                               if key in _PROVIDER_HEALTH_FIELDS}
+    override = out.get("override")
+    if isinstance(override, dict):
+        out["override"] = {key: copy.deepcopy(item) for key, item in override.items()
+                           if key in _PROVIDER_OVERRIDE_FIELDS}
+    return out
+
+
+def _runtime_group(value):
+    if not isinstance(value, dict):
+        return {}
+    out = {key: copy.deepcopy(item) for key, item in value.items()
+           if key in _GROUP_RUNTIME_FIELDS}
+    if out.get("type") not in {"select", "url-test", "fallback", "load-balance"}:
+        return {}
+    if "url" in out and (
+            not isinstance(out["url"], str)
+            or re.fullmatch(r"https?://[^\s\x00]+", out["url"], re.I) is None):
+        out.pop("url", None)
+    return out
 
 # 可作出口的代理协议(与 pdg-bot.py 的 PROXY_TYPES 对齐)
 PROXY_TYPES = ("shadowsocks", "vmess", "trojan", "vless", "hysteria", "hysteria2",
@@ -308,6 +382,18 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
     返回 (mihomo_config_dict, meta) —— meta.dropped 列出没能翻译的规则(供调用方告警)。
     """
     direct_tags = _direct_tags(sb)
+    pdg_meta = sb.get("_pdg") if isinstance(sb.get("_pdg"), dict) else {}
+    mihomo_meta = pdg_meta.get("mihomo") if isinstance(pdg_meta.get("mihomo"), dict) else {}
+    imported_proxy_providers = {
+        name: _runtime_provider(provider)
+        for name, provider in (mihomo_meta.get("proxy-providers") or {}).items()
+        if isinstance(name, str) and isinstance(provider, dict)}
+    imported_rule_providers = {
+        name: _runtime_provider(provider, rule=True)
+        for name, provider in (mihomo_meta.get("rule-providers") or {}).items()
+        if isinstance(name, str) and isinstance(provider, dict)}
+    imported_groups = copy.deepcopy(mihomo_meta.get("proxy-groups") or [])
+    advanced = copy.deepcopy(mihomo_meta.get("advanced") or {})
     proxies, unknown = [], []
     # TCP Fast Open: sing-box tcp_fast_open → mihomo tfo, 仅 TCP 类协议(QUIC 的 hy2/tuic 无意义)
     tfo_types = {"ss", "vmess", "trojan", "vless", "http", "socks5", "anytls"}
@@ -327,6 +413,12 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
             else:
                 if o.get("tcp_fast_open") and p.get("type") in tfo_types:
                     p["tfo"] = True
+                metadata = o.get("_pdg_mihomo")
+                advanced_proxy = metadata.get("advanced") if isinstance(metadata, dict) else None
+                if isinstance(advanced_proxy, dict):
+                    # Opaque metadata is preserved in the PDG model, but only
+                    # this small schema is activated in the running config.
+                    p.update(_runtime_proxy_advanced(advanced_proxy))
                 proxies.append(p)
 
     groups = []
@@ -339,8 +431,40 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                 "interval": _dur_secs(o.get("interval", "3m")),
                 "tolerance": o.get("tolerance", 50),
             })
+        elif o.get("type") == "selector":
+            groups.append({
+                "name": o["tag"], "type": "select",
+                "proxies": [_map_target(m, direct_tags) for m in o.get("outbounds", [])],
+            })
 
-    rules, dropped = _rules_from_route(sb, direct_tags, rulesets)
+    # Advanced imported group types remain canonical metadata rather than raw
+    # takeover.  Canonical groups win duplicate names and PDG always controls
+    # listeners/DNS/TUN/controller elsewhere in this renderer.
+    group_by_name = {item.get("name"): item for item in groups if isinstance(item, dict)}
+    group_names = set(group_by_name)
+    for raw_group in imported_groups:
+        group = _runtime_group(raw_group)
+        if not group:
+            continue
+        if group.get("name") in group_names:
+            # Canonical fields come from the editable PDG outbound.  Preserve
+            # only explicitly safe group options from read-only metadata.
+            blocked = {"name", "type", "proxies", "use", "url", "interval", "tolerance"}
+            group_by_name[group.get("name")].update({
+                key: copy.deepcopy(value) for key, value in group.items() if key not in blocked
+            })
+            continue
+        clone = copy.deepcopy(group)
+        if isinstance(clone.get("proxies"), list):
+            clone["proxies"] = [_map_target(member, direct_tags)
+                                for member in clone["proxies"]]
+        groups.append(clone)
+        group_by_name[clone.get("name")] = clone
+        group_names.add(clone.get("name"))
+
+    available_rule_providers = dict(imported_rule_providers)
+    available_rule_providers.update(rulesets or {})
+    rules, dropped = _rules_from_route(sb, direct_tags, available_rule_providers)
 
     # mixed 入站(TG 代理 :8445 等)→ mihomo listeners + IN-NAME 路由(pin 到其出口/final)。
     listeners, in_rules = _mixed_listeners(sb, direct_tags)
@@ -371,7 +495,8 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
         tproxy_port = parse_port_list([tproxy_port], name="tproxy port")[0]
         sniff["QUIC"] = {"ports": [443]}
 
-    cfg = {
+    cfg = _runtime_top_advanced(advanced)
+    cfg.update({
         "redir-port": redir_port,
         "bind-address": "*",
         "allow-lan": True,
@@ -387,7 +512,7 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
         },
         "proxies": proxies,
         "proxy-groups": groups,
-    }
+    })
     if quic_mode == "tproxy":
         cfg["tproxy-port"] = tproxy_port
     if listeners:
@@ -398,9 +523,12 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
         cfg["external-ui"] = external_ui
     if external_ui_url:
         cfg["external-ui-url"] = external_ui_url
+    if imported_proxy_providers:
+        cfg["proxy-providers"] = imported_proxy_providers
+    combined_rule_providers = imported_rule_providers
     if rulesets:
         _ext = {"text": "txt", "yaml": "yaml", "mrs": "mrs"}
-        cfg["rule-providers"] = {
+        generated_rule_providers = {
             name: {"type": "http", "url": rs["url"],
                    "behavior": rs.get("behavior", "domain"),
                    "format": rs.get("format", "text"),
@@ -408,6 +536,9 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                    "interval": 86400}
             for name, rs in rulesets.items()
         }
+        combined_rule_providers.update(generated_rule_providers)
+    if combined_rule_providers:
+        cfg["rule-providers"] = combined_rule_providers
     cfg["rules"] = rules
 
     meta = {"dropped": dropped, "unknown_proxies": unknown}

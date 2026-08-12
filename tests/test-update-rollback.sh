@@ -51,9 +51,14 @@ HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
 mkdir -p "$REPO/deploy/bot"
 cp "$ROOT/deploy/bot/pdg-bot.py" "$REPO/deploy/bot/pdg-bot.py"
 cp "$ROOT/deploy/bot/pdgtx.py" "$REPO/deploy/bot/pdgtx.py"
+mkdir -p "$REPO/deploy/web"
+cp "$ROOT/deploy/web/pdg-web-job.py" "$REPO/deploy/web/pdg-web-job.py"
+cp "$ROOT/deploy/web/pdgconfigio.py" "$REPO/deploy/web/pdgconfigio.py"
 
 # ── 抽取 cmd_rollback + 打桩 ──────────────────────────────────────────────────
-for fn in _pdg_snapshot_rederive_ruleset_direct _pdg_rollback_restore_quic cmd_rollback; do
+for fn in _pdg_clear_web_import_staging _pdg_clear_legacy_config_import_jobs \
+          _pdg_snapshot_rederive_ruleset_direct _pdg_rollback_restore_quic \
+          cmd_rollback; do
   sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
 done | sed \
   -e 's#^\([[:space:]]*local cur_qhelper=\)/usr/local/libexec/pdg-quic-routing[.]sh#\1"$SB/usr/local/libexec/pdg-quic-routing.sh"#' \
@@ -64,8 +69,12 @@ done | sed \
   -e 's# /etc/sing-box/config\.json# "$SB/etc/sing-box/config.json"#g' \
   -e 's#install -d -m700 /etc/mihomo#install -d -m700 "$SB/etc/mihomo"#' \
   -e 's#rm -f -- "/$mp"#rm -f -- "$SB/$mp"#' \
-  -e 's#rmdir /opt/pdg-web/static /opt/pdg-web#rmdir "$SB/opt/pdg-web/static" "$SB/opt/pdg-web"#' \
+  -e 's#rmdir /opt/pdg-web/static/templates /opt/pdg-web/static /opt/pdg-web#rmdir "$SB/opt/pdg-web/static/templates" "$SB/opt/pdg-web/static" "$SB/opt/pdg-web"#' \
   > "$WORK/rollback.sh"
+if grep -Eq '(^|[[:space:]])rmdir[[:space:]]+/opt/' "$WORK/rollback.sh"; then
+  echo "[FAIL] rollback harness 残留真实 /opt rmdir" >&2
+  exit 1
+fi
 # 快照里不含 etc/sing-box/config.json 与 etc/nftables.conf → 内核/nft 校验分支被跳过,
 # 无需真 sing-box/mihomo/nft 二进制(也就不必打桩带连字符的函数名)。
 SB="$WORK/root"; mkdir -p "$SB/etc/privdns-gateway"
@@ -73,6 +82,7 @@ cat > "$WORK/harness.sh" <<EOF
 SNAP_DIR="$SNAP"
 REPO_DIR="$REPO"
 SB="$SB"
+PDG_ROOT_PREFIX="$SB"
 PROFILE_ENV="$SB/etc/privdns-gateway/profile.env"
 need_root(){ :; }; _lock(){ :; }
 c_g(){ echo "\$*"; }; c_y(){ echo "\$*"; }
@@ -100,6 +110,7 @@ systemctl(){
   return 0
 }
 nft(){ return 0; }
+command_not_found_handle(){ printf '%s\n' "\${1:-unknown}" > "$WORK/command-not-found.log"; return 127; }
 # 覆写落盘: 不碰真 /, 把被应用快照的判别标记抄到沙箱, 供断言"回滚到了哪份"
 APPLIED="$WORK/applied_snapid"
 _pdg_apply_snapshot_tree(){ cat "\$1/etc/privdns-gateway/snapid" > "\$APPLIED" 2>/dev/null; return 0; }
@@ -171,7 +182,8 @@ tar czf "$LEGACY/snap.tar.gz" -C "$LT" etc opt 2>/dev/null
 rm -rf "$LT"
 rm -f "$WORK/applied_snapid"
 out=$(run "--dir '$LEGACY'") || rc=$?
-[[ "${rc:-0}" == 0 && "$(cat "$WORK/applied_snapid" 2>/dev/null)" == LEGACY ]] \
+[[ "${rc:-0}" == 0 && "$(cat "$WORK/applied_snapid" 2>/dev/null)" == LEGACY \
+   && "$out" != *TxRefused* ]] \
   && ok "首次升级失败 → 新 CLI 可按旧 MosDNS 契约回滚旧规则集快照" \
   || bad "A3: rc=${rc:-0} applied=$(cat "$WORK/applied_snapid" 2>/dev/null) out=$out"
 unset rc
@@ -305,6 +317,13 @@ for p in 'usr/local/bin/pdg' 'usr/local/bin/pdg-set-token' 'etc/systemd/system/m
 done
 grep -q "etc/systemd/system/mihomo.service etc/systemd/system/sing-box.service" "$u" && ok "cmd_snapshot cand: 覆盖已装脚本 + 内核/mitm/probe/health 全部 unit + cert hook" || bad "D4 汇总"
 grep -q 'usr/local/bin)(/|$)' "$u" && ok "回滚越界守卫放行 usr/local/bin(否则装的脚本进不了快照)" || bad "D5: 守卫未放行 usr/local/bin"
+grep -q '^_pdg_clear_web_import_staging(){' "$WORK/rollback.sh" \
+  && grep -q '^_pdg_clear_legacy_config_import_jobs(){' "$WORK/rollback.sh" \
+  && ok "rollback harness 包含旧 snapshot 的 staging/job cleanup 依赖" \
+  || bad "D6: rollback helper 抽取不完整"
+[[ ! -e "$WORK/command-not-found.log" ]] \
+  && ok "rollback harness 无 command-not-found 假失败" \
+  || bad "D7: 未注入命令 $(cat "$WORK/command-not-found.log" 2>/dev/null)"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
