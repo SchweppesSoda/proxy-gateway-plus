@@ -653,7 +653,7 @@ E2E_CIDR=127.0.0.0/8
 
 # 装好 bot 模块 + 仓库 + pdg 脚本
 e2e_seed_install(){
-  mkdir -p /opt/pdg-bot /etc/mosdns/rules /etc/privdns-gateway \
+  mkdir -p /opt/pdg-bot /opt/pdg-web /etc/mosdns/rules /etc/privdns-gateway \
            /usr/local/libexec /etc/systemd/system \
            /etc/letsencrypt/renewal-hooks/deploy
   cp -a "$E2E_ROOT" /opt/privdns-gateway
@@ -664,6 +664,13 @@ e2e_seed_install(){
     /etc/systemd/system/pdg-quic-routing.service
   local f; for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
   install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
+  # tx_apply loads the shared ConfigIO validator from the same fixed path as a
+  # real installation.  Seed and smoke-test that dependency instead of
+  # weakening the product loader when an E2E fixture is incomplete.
+  install -m755 "$E2E_ROOT/deploy/web/pdgconfigio.py" /opt/pdg-web/pdgconfigio.py
+  test -f /opt/pdg-web/pdgconfigio.py
+  PYTHONPATH=/opt/pdg-bot:/opt/pdg-web python3 -c \
+    'import pathlib, pdgconfigio; assert pathlib.Path(pdgconfigio.__file__).resolve() == pathlib.Path("/opt/pdg-web/pdgconfigio.py")'
   printf 'PDG_BOT_TOKEN=x\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
   # Migration tests do not exercise MosDNS networking, but the real migration
   # now has a hard flavor/provenance gate. Preserve any downloaded real binary

@@ -542,8 +542,63 @@ class ArchiveTests(unittest.TestCase):
         finally:
             bot._pdgtx = original_pdgtx
 
+    def test_bot_restore_rejects_malformed_declared_v3_before_any_stage(self):
+        bot = load_bot_module()
+        current = cio._model_bytes(model())
+        malformed = model()
+        malformed["_pdg"]["mihomo"].pop("managed-files")
+
+        class Refused(RuntimeError):
+            pass
+
+        class FakeTransaction:
+            def __init__(self):
+                self.staged = []
+
+            def read_for_update(self, target):
+                data = current if target == "model" else b"{}"
+                return data, cio._sha(data)
+
+            def watch(self, _target, optional=False):
+                return b"{}"
+
+            def stage(self, *args, **kwargs):
+                self.staged.append((args, kwargs))
+
+            def abort_unstarted(self):
+                return None
+
+        transaction = FakeTransaction()
+        fake_tx = types.SimpleNamespace(
+            Tx=lambda **_kwargs: transaction,
+            TxBusy=type("Busy", (Exception,), {}), TxRefused=Refused,
+            TxError=type("TxError", (Exception,), {}), redact=str,
+            COMMITTED="COMMITTED", ROLLBACK_FAILED="ROLLBACK_FAILED")
+        original_pdgtx = bot._pdgtx
+        bot._pdgtx = lambda: fake_tx
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp, "etc", "sing-box", "config.json")
+                path.parent.mkdir(parents=True)
+                path.write_bytes(json.dumps(malformed).encode("utf-8"))
+                ok, message = bot._restore_commit(tmp)
+            self.assertFalse(ok)
+            self.assertIn("v3", message)
+            self.assertEqual(transaction.staged, [])
+        finally:
+            bot._pdgtx = original_pdgtx
+
 
 class ModelAndConversionTests(unittest.TestCase):
+    def test_declared_v3_malformed_shape_fails_in_bot_and_config_io(self):
+        bot_module = load_bot_module()
+        candidate = model()
+        candidate["_pdg"]["mihomo"].pop("managed-files")
+        with self.assertRaises(ValueError):
+            bot_module._model_schema_v3(copy.deepcopy(candidate))
+        with self.assertRaisesRegex(cio.ImportInvalid, "schema v3"):
+            cio.normalize_model(copy.deepcopy(candidate))
+
     def test_native_model_cannot_override_managed_or_proxy_identity(self):
         candidate = model({"type": "direct", "tag": "JP"})
         candidate["_pdg"]["mihomo"]["advanced"] = {"dns": {"enable": False}}
@@ -580,24 +635,22 @@ class ModelAndConversionTests(unittest.TestCase):
             {"type": "vless", "tag": "same", "server": "one.example",
              "server_port": 443, "uuid": "u"},
             {"type": "direct", "tag": "JP"})
-        candidate["_pdg"]["mihomo"]["proxy-groups"] = [{
-            "name": "same", "type": "select", "proxies": ["DIRECT"],
+        candidate["_pdg"]["policy-groups"] = [{
+            "name": "same", "type": "select", "proxies": ["JP"], "use": [],
         }]
         ok, error = pdgtx._v_json_model(
             "config.json", json.dumps(candidate).encode(), None)
         self.assertFalse(ok)
-        self.assertIn("名称冲突", error)
+        self.assertIn("share one namespace", error)
 
-        candidate = model(
-            {"type": "selector", "tag": "group", "outbounds": ["JP"]},
-            {"type": "direct", "tag": "JP"})
+        candidate = model({"type": "direct", "tag": "JP"})
         candidate["_pdg"]["mihomo"]["proxy-groups"] = [{
             "name": "group", "type": "fallback", "proxies": ["JP"],
         }]
         ok, error = pdgtx._v_json_model(
             "config.json", json.dumps(candidate).encode(), None)
         self.assertFalse(ok)
-        self.assertIn("不一致", error)
+        self.assertIn("扩展字段", error)
 
     @unittest.skipIf(pdgtx is None, "pdgtx requires POSIX fcntl")
     def test_transaction_validator_independently_enforces_runtime_metadata(self):
@@ -891,7 +944,7 @@ class ModelAndConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(cio.ImportInvalid, "not supported"):
             cio.mihomo_to_model(base, model(), archive=None, config_name="config.yaml")
 
-    def test_dual_group_survives_bot_edit_and_renderer_round_trip(self):
+    def test_first_class_group_survives_bot_edit_and_renderer_round_trip(self):
         document = {
             "proxies": [
                 {"name": "one", "type": "socks5", "server": "one.example", "port": 1080},
@@ -913,18 +966,18 @@ class ModelAndConversionTests(unittest.TestCase):
             bot.apply_sb = lambda modifier: (modifier(candidate) or True, "")
             ok, _message = bot.add_group("Auto", ["two", "one"])
             self.assertTrue(ok)
-            same_tag = [item for item in candidate["outbounds"]
-                        if item.get("tag") == "Auto"]
-            self.assertEqual(len(same_tag), 1)
-            self.assertEqual(same_tag[0]["type"], "selector")
-            self.assertEqual(same_tag[0]["outbounds"], ["two", "one"])
+            self.assertFalse(any(item.get("tag") == "Auto"
+                                 for item in candidate["outbounds"]))
+            group = next(item for item in candidate["_pdg"]["policy-groups"]
+                         if item.get("name") == "Auto")
+            self.assertEqual(group["type"], "select")
+            self.assertEqual(group["proxies"], ["two", "one"])
         finally:
             bot.load, bot.apply_sb = original_load, original_apply
-        canonical = next(item for item in candidate["outbounds"] if item.get("tag") == "Auto")
-        canonical["tag"] = "Fast"
-        canonical["outbounds"] = ["two", "JP"]
         bot._mihomo_group_rename(candidate, "Auto", "Fast")
-        bot._mihomo_group_update(candidate, "Fast")
+        group = next(item for item in candidate["_pdg"]["policy-groups"]
+                     if item.get("name") == "Fast")
+        group["proxies"] = ["two", "JP"]
         candidate = cio.normalize_model(candidate)
         rendered, _meta = sb2mihomo.singbox_to_mihomo(candidate)
         rendered_group = next(item for item in rendered["proxy-groups"]
@@ -932,8 +985,6 @@ class ModelAndConversionTests(unittest.TestCase):
         self.assertEqual(rendered_group["proxies"], ["two", "DIRECT"])
         self.assertTrue(rendered_group["lazy"])
         bot._mihomo_group_delete(candidate, {"two"})
-        canonical["outbounds"] = ["JP"]
-        bot._mihomo_group_update(candidate, "Fast")
         cio.normalize_model(candidate)
 
     def test_local_provider_archive_and_unresolved_references(self):
@@ -1128,6 +1179,16 @@ class StagingTests(unittest.TestCase):
         cio.MOSDNS_RULE_DIR = self.old_mosdns_rule_dir
         self.tmp.cleanup()
 
+    def test_malformed_declared_v3_import_is_rejected_before_staging(self):
+        candidate = model()
+        candidate["_pdg"]["policy-groups"] = {}
+        before = sorted(Path(self.tmp.name).iterdir())
+        with self.assertRaisesRegex(cio.ImportInvalid, "schema v3"):
+            self.manager.preview(
+                "pdg", json.dumps(candidate).encode("utf-8"),
+                "application/json")
+        self.assertEqual(sorted(Path(self.tmp.name).iterdir()), before)
+
     def test_mihomo_apply_passes_locked_model_cas_to_transaction(self):
         incoming = model(
             {"type": "vless", "tag": "new", "server": "new.example",
@@ -1181,33 +1242,15 @@ class StagingTests(unittest.TestCase):
                 for item in preview["conflicts"]
             }
 
-        # The imported metadata occupies "shared" even though this direct
-        # ruleset is not rendered as a Mihomo provider.  Incoming modes are
-        # unsafe, while merge-existing is safe and must remain usable.
+        # Every imported metadata key is a rule-provider name, even when the
+        # current representation would not render it.  Import rejects this
+        # ambiguous archive atomically before staging a preview.
         Path(cio.RULESET_META_PATH).write_text("{}\n", encoding="utf-8")
         payload = archive(provider_name, direct=True)
-        preview = self.manager.preview("pdg", payload, "application/gzip")
-        record = self.manager._record(preview["importId"])
-        self.assertEqual(record["candidate"]["rulesetCollisions"], {
-            "incomingPresent": True,
-            "incoming": [provider_name],
-            "existing": [],
-        })
-        with self.assertRaisesRegex(cio.ImportInvalid, "selected PDG ruleset"):
-            self.manager.prepare_apply(preview["importId"], {
-                "confirm": True, "mode": "replace",
-                "conflicts": choices(preview, "incoming")})
-        with self.assertRaisesRegex(cio.ImportInvalid, "selected PDG ruleset"):
-            self.manager.prepare_apply(preview["importId"], {
-                "confirm": True, "mode": "merge",
-                "conflicts": choices(preview, "incoming")})
-        self.manager.prepare_apply(preview["importId"], {
-            "confirm": True, "mode": "merge",
-            "conflicts": choices(preview, "existing")})
-        self.manager.apply(preview["importId"])
-        restored = cio._archive_files(self.manager.bot.calls[-1][0][0])
-        self.assertNotIn("opt/pdg-bot/rulesets.json", restored)
-        self.assertEqual(Path(cio.RULESET_META_PATH).read_text(encoding="utf-8"), "{}\n")
+        before = sorted(Path(self.tmp.name).iterdir())
+        with self.assertRaisesRegex(cio.ImportInvalid, "ruleset namespace"):
+            self.manager.preview("pdg", payload, "application/gzip")
+        self.assertEqual(sorted(Path(self.tmp.name).iterdir()), before)
 
         # Conversely, a live collision is unsafe only when merge keeps the
         # existing component.  Selecting the non-colliding incoming metadata
@@ -1222,22 +1265,10 @@ class StagingTests(unittest.TestCase):
         }), encoding="utf-8")
         payload = archive("incoming-only")
         preview = self.manager.preview("pdg", payload, "application/gzip")
-        record = self.manager._record(preview["importId"])
-        self.assertEqual(record["candidate"]["rulesetCollisions"], {
-            "incomingPresent": True,
-            "incoming": [],
-            "existing": [provider_name],
-        })
         with self.assertRaisesRegex(cio.ImportInvalid, "selected PDG ruleset"):
             self.manager.prepare_apply(preview["importId"], {
                 "confirm": True, "mode": "merge",
                 "conflicts": choices(preview, "existing")})
-        self.manager.prepare_apply(preview["importId"], {
-            "confirm": True, "mode": "merge",
-            "conflicts": choices(preview, "incoming")})
-        self.manager.apply(preview["importId"])
-        restored = cio._archive_files(self.manager.bot.calls[-1][0][0])
-        self.assertIn("opt/pdg-bot/rulesets.json", restored)
 
     def test_current_ruleset_names_reads_only_the_fixed_envelope(self):
         reads = []
@@ -1259,18 +1290,24 @@ class StagingTests(unittest.TestCase):
         self.assertEqual(reads, [cio.MAX_ARCHIVE_FILE + 1])
 
     def test_legacy_direct_tag_rebinds_for_json_and_manifestless_tar_apply(self):
-        incoming = model(
-            {"type": "vless", "tag": "p", "server": "proxy.example",
-             "server_port": 443, "uuid": "u"},
-            {"type": "selector", "tag": "G", "outbounds": ["jp", "p"]},
-            {"type": "direct", "tag": "jp"})
-        incoming["route"] = {
-            "rules": [{"domain_suffix": ["legacy.example"], "outbound": "jp"}],
-            "final": "jp",
+        incoming = {
+            "outbounds": [
+                {"type": "vless", "tag": "p", "server": "proxy.example",
+                 "server_port": 443, "uuid": "u"},
+                {"type": "selector", "tag": "G", "outbounds": ["jp", "p"]},
+                {"type": "direct", "tag": "jp"},
+            ],
+            "route": {
+                "rules": [{"domain_suffix": ["legacy.example"], "outbound": "jp"}],
+                "final": "jp",
+            },
+            "_pdg": {"schema": 2, "mihomo": {
+                "proxy-groups": [{"name": "G", "type": "select",
+                                  "proxies": ["jp", "p"]}],
+                "proxy-providers": {}, "rule-providers": {}, "advanced": {},
+                "managed-files": {},
+            }},
         }
-        incoming["_pdg"]["mihomo"]["proxy-groups"] = [{
-            "name": "G", "type": "select", "proxies": ["jp", "p"],
-        }]
         incoming = cio.normalize_model(incoming)
         raw_json = cio._model_bytes(incoming)
         payloads = {
@@ -1281,12 +1318,15 @@ class StagingTests(unittest.TestCase):
         for payload_name, payload in payloads.items():
             for mode in ("merge", "replace"):
                 with self.subTest(payload=payload_name, mode=mode):
-                    self.manager.bot.current = model({"type": "direct", "tag": "JP"})
+                    self.manager.bot.current = cio.normalize_model({
+                        "outbounds": [{"type": "direct", "tag": "KFC_JP"}],
+                        "route": {"rules": [], "final": "KFC_JP"},
+                    })
                     Path(cio.MODEL_PATH).write_bytes(
                         cio._model_bytes(self.manager.bot.current))
                     preview = self.manager.preview("pdg", payload)
                     staged = self.manager._record(preview["importId"])["candidate"]["model"]
-                    self.assertEqual(staged["route"]["final"], "JP")
+                    self.assertEqual(staged["route"]["final"], "KFC_JP")
                     choices = {item["conflictId"]: "incoming"
                                for item in preview["conflicts"]}
                     self.manager.prepare_apply(preview["importId"], {
@@ -1295,14 +1335,11 @@ class StagingTests(unittest.TestCase):
                     final = cio.normalize_model(self.manager.bot.current)
                     direct = [item for item in final["outbounds"]
                               if item.get("type") == "direct"]
-                    selector = next(item for item in final["outbounds"]
-                                    if item.get("tag") == "G")
-                    group = final["_pdg"]["mihomo"]["proxy-groups"][0]
-                    self.assertEqual([item["tag"] for item in direct], ["JP"])
-                    self.assertEqual(final["route"]["final"], "JP")
-                    self.assertEqual(final["route"]["rules"][0]["outbound"], "JP")
-                    self.assertEqual(selector["outbounds"], ["JP", "p"])
-                    self.assertEqual(group["proxies"], ["JP", "p"])
+                    group = final["_pdg"]["policy-groups"][0]
+                    self.assertEqual([item["tag"] for item in direct], ["KFC_JP"])
+                    self.assertEqual(final["route"]["final"], "KFC_JP")
+                    self.assertEqual(final["route"]["rules"][0]["outbound"], "KFC_JP")
+                    self.assertEqual(group["proxies"], ["KFC_JP", "p"])
                     rendered, _warnings = sb2mihomo.singbox_to_mihomo(final)
                     self.assertIn("G", {item["name"] for item in rendered["proxy-groups"]})
 
@@ -1352,12 +1389,10 @@ class StagingTests(unittest.TestCase):
                 {"type": "direct", "tag": "JP"})
 
         def editable_group_model():
-            candidate = model(
-                {"type": "selector", "tag": "X", "outbounds": ["JP"]},
-                {"type": "direct", "tag": "JP"})
-            candidate["_pdg"]["mihomo"]["proxy-groups"] = [{
-                "name": "X", "type": "select", "proxies": ["DIRECT"],
-                "hidden": True,
+            candidate = model({"type": "direct", "tag": "JP"})
+            candidate["_pdg"]["policy-groups"] = [{
+                "name": "X", "type": "select", "proxies": ["JP"],
+                "use": [], "hidden": True,
             }]
             return cio.normalize_model(candidate)
 
@@ -1371,7 +1406,7 @@ class StagingTests(unittest.TestCase):
                     "type": "http", "url": "https://provider.example/sub.yaml",
                     "path": "/etc/mihomo/providers/" + digest + ".yaml",
                 }}
-            candidate["_pdg"]["mihomo"]["proxy-groups"] = [{
+            candidate["_pdg"]["policy-groups"] = [{
                 "name": "X", "type": "select", "proxies": [],
                 "use": [provider_name], "hidden": True,
             }]
@@ -1380,11 +1415,11 @@ class StagingTests(unittest.TestCase):
         def shape(candidate):
             outbound = next((item for item in candidate["outbounds"]
                              if item.get("tag") == "X"), None)
-            group = next((item for item in candidate["_pdg"]["mihomo"]["proxy-groups"]
+            group = next((item for item in candidate["_pdg"]["policy-groups"]
                           if item.get("name") == "X"), None)
             if outbound and outbound.get("type") == "vless" and group is None:
                 return "proxy"
-            if outbound and outbound.get("type") == "selector" and group:
+            if outbound is None and group and not group.get("use"):
                 return "editable"
             if outbound is None and group and group.get("use") == ["remote"]:
                 return "metadata"

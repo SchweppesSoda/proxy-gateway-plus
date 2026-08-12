@@ -926,6 +926,7 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
             "/api/v1/overview": self.control.overview,
             "/api/v1/exits": self.control.exits,
             "/api/v1/groups": self.control.groups,
+            "/api/v1/policy-groups": self.control.policy_groups,
             "/api/v1/rules": self.control.rules,
             "/api/v1/rulesets": self.control.rulesets,
             "/api/v1/dns": self.control.dns,
@@ -961,8 +962,14 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/v1/default-exit" and self.command == "PUT":
             self._call_body(self.control.set_default_exit)
             return
+        if path == "/api/v1/direct-tag" and self.command == "PUT":
+            self._call_body(self.control.set_direct_tag)
+            return
         if path == "/api/v1/groups" and self.command == "POST":
             self._call_body(self.control.add_group, status=201)
+            return
+        if path == "/api/v1/policy-groups" and self.command == "POST":
+            self._call_body(self.control.add_policy_group, status=201)
             return
         if path == "/api/v1/rules" and self.command == "POST":
             self._call_body(self.control.add_rule, status=201)
@@ -991,12 +998,35 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
                 match.group(1), "tag",
                 operation, body=self.command in {"PATCH", "PUT"})
             return
-        match = re.fullmatch(r"/api/v1/groups/([^/]+)", path)
+        match = re.fullmatch(r"/api/v1/groups/([^/]+)/runtime", path)
+        if match and self.command == "PUT":
+            self._identifier_call(
+                match.group(1), "tag", self.control.select_group_runtime,
+                body=True)
+            return
+        match = re.fullmatch(r"/api/v1/policy-groups/([^/]+)/runtime", path)
+        if match and self.command == "PUT":
+            self._identifier_call(
+                match.group(1), "tag", self.control.select_group_runtime,
+                body=True)
+            return
+        match = re.fullmatch(r"/api/v1/policy-groups/([^/]+)", path)
         if match and self.command in {"PATCH", "DELETE"}:
             self._identifier_call(
                 match.group(1), "tag",
-                self.control.patch_group if self.command == "PATCH" else self.control.delete_group,
-                body=self.command == "PATCH")
+                self.control.patch_policy_group if self.command == "PATCH"
+                else self.control.delete_policy_group,
+                body=True)
+            return
+        match = re.fullmatch(r"/api/v1/groups/([^/]+)", path)
+        if match and self.command in {"PATCH", "DELETE"}:
+            if self.command == "DELETE":
+                self._identifier_optional_body(
+                    match.group(1), "tag", self.control.delete_group)
+            else:
+                self._identifier_call(
+                    match.group(1), "tag", self.control.patch_group,
+                    body=True)
             return
         match = re.fullmatch(r"/api/v1/rules/([^/]+)", path)
         if match and self.command in {"PATCH", "DELETE"}:
@@ -1199,6 +1229,26 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._call(lambda: fn(value, request_body))
         else:
             self._call(lambda: fn(value))
+
+    def _identifier_optional_body(self, raw: str, kind: str, fn):
+        try:
+            value = _strict_path_segment(raw, kind=kind)
+        except ValidationError as exc:
+            self._error(exc.status, exc.code, exc.public_message)
+            return
+        if self.headers.get_all("Transfer-Encoding"):
+            self._error(400, "invalid_request", "Request body is invalid.")
+            return
+        lengths = self.headers.get_all("Content-Length") or []
+        if not lengths or (len(lengths) == 1 and lengths[0] == "0"):
+            self._call(lambda: fn(value, None))
+            return
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,10}", lengths[0]):
+            self._error(411, "length_required", "A valid Content-Length is required.")
+            return
+        request_body = self._read_json()
+        if request_body is not None:
+            self._call(lambda: fn(value, request_body))
 
     def _static(self, path: str):
         if _PERCENT_BAD_RE.search(path) or len(path) > 1024:

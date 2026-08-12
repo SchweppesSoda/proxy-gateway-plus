@@ -75,7 +75,7 @@ BAK_MOS = mos_shape(
     "debug", "10.9.0.0/16", "/etc/other/certs/fullchain.pem", "198.51.100.7")
 
 
-def make_box():
+def make_box(current_direct="direct"):
     box = Box()
     load_tx(box.env)
     for m in list(sys.modules):
@@ -96,7 +96,11 @@ def make_box():
     bot.LOCKFILE = box.env["PDG_LOCKFILE"]
     bot._platform = lambda: "ios"
     bot._core_backend = lambda: "mihomo"
-    box.put("/etc/sing-box/config.json", json.dumps(BEFORE_SB).encode())
+    current_model = json.loads(json.dumps(BEFORE_SB))
+    if current_direct != "direct":
+        current_model = bot.pdgmodel.rebind_direct_preserve_schema(
+            current_model, current_direct)
+    box.put("/etc/sing-box/config.json", json.dumps(current_model).encode())
     box.put("/etc/mosdns/config.yaml", CUR_MOS.encode(), 0o644)
     box.put("/etc/mosdns/rules/custom_direct.txt", b"before-direct.com\n", 0o644)
     box.put("/etc/mosdns/rules/custom_hijack.txt", b"before-hijack.com\n", 0o644)
@@ -232,8 +236,8 @@ def main():
         bad("平台净化没生效: ok=%s tags=%s" % (okr, tags))
     box.clean()
 
-    # ── 1c. 旧备份 direct 锚点 jp → JP，model/meta/Mihomo 在同一恢复事务中一致 ──
-    box, bot = make_box()
+    # ── 1c. schema1 旧备份 direct 锚点 jp → JP，组/model/meta/Mihomo 同事务一致 ──
+    box, bot = make_box(current_direct="JP")
     legacy = json.loads(json.dumps(AFTER_SB))
     legacy["outbounds"][1]["tag"] = "jp"
     legacy["outbounds"].append(
@@ -260,14 +264,19 @@ def main():
     landed_meta = json.loads(box.read("/opt/pdg-bot/rulesets.json").decode())
     direct_tags = [
         item["tag"] for item in landed["outbounds"] if item.get("type") == "direct"]
-    auto = next(item for item in landed["outbounds"] if item.get("tag") == "auto")
+    auto = next(
+        item for item in landed["_pdg"]["policy-groups"]
+        if item.get("name") == "auto")
     legacy_rule = next(
         item for item in landed["route"]["rules"]
         if item.get("domain_suffix") == ["legacy-direct.example"])
     if (
         okr
         and direct_tags == ["JP"]
-        and auto["outbounds"] == ["new-tw", "JP"]
+        and auto["type"] == "url-test"
+        and auto["proxies"] == ["new-tw", "JP"]
+        and not any(item.get("type") in {"selector", "urltest"}
+                    for item in landed["outbounds"])
         and legacy_rule["outbound"] == "JP"
         and landed["route"]["final"] == "JP"
         and landed_meta["rs_legacy"]["outbound"] == "JP"

@@ -39,6 +39,7 @@ chmod +x "$REPO/deploy/firewall/pdg-quic-routing.sh"
 printf 'NEW-QUIC-UNIT\n' >"$REPO/deploy/firewall/pdg-quic-routing.service"
 printf '# strict parser fixture\n' >"$REPO/deploy/bot/pdgprofile.py"
 printf '# sibling fixture\n' >"$REPO/deploy/bot/sb2mihomo.py"
+printf '# model fixture\n' >"$REPO/deploy/bot/pdgmodel.py"
 printf '# equivalence source fixture\n' >"$REPO/deploy/bot/checks.py"
 printf '# nft ownership fixture\n' >"$REPO/deploy/bot/nftscan.py"
 cat >"$REPO/lib/units.sh" <<'EOF'
@@ -168,6 +169,7 @@ reset_legacy_target(){
   chmod +x "$BOX/usr/local/bin/sing-box"
   printf 'OLD-BOT\n' >"$BOX/opt/pdg-bot/bot.py"
   printf 'OLD-CONVERTER\n' >"$BOX/opt/pdg-bot/sb2mihomo.py"
+  printf 'OLD-MODEL\n' >"$BOX/opt/pdg-bot/pdgmodel.py"
   printf 'OLD-PROFILE-TOOL\n' >"$BOX/opt/pdg-bot/pdgprofile.py"
   printf 'table inet pdg { # legacy-live\n}\n' >"$BASE_LIVE"
   cp "$BASE_LIVE" "$NFT_LIVE"
@@ -181,6 +183,7 @@ migrate_dataplane_profile(){
   printf 'NEW-PROFILE\n' >"$pfx/etc/privdns-gateway/profile.env"
   printf 'NEW-BOT\n' >"$pfx/opt/pdg-bot/bot.py"
   printf 'NEW-CONVERTER\n' >"$pfx/opt/pdg-bot/sb2mihomo.py"
+  printf 'NEW-MODEL\n' >"$pfx/opt/pdg-bot/pdgmodel.py"
   printf 'NEW-PROFILE-TOOL\n' >"$pfx/opt/pdg-bot/pdgprofile.py"
   mkdir -p "$pfx/usr/local/libexec" "$pfx/etc/mihomo"
   cp "$REPO/deploy/firewall/pdg-quic-routing.sh" \
@@ -212,6 +215,7 @@ assert_legacy_recovered(){
   cmp -s "$BASE_LIVE" "$NFT_LIVE" || fail "$stage: live nft drift"
   [[ "$(cat "$BOX/opt/pdg-bot/bot.py")" == OLD-BOT \
      && "$(cat "$BOX/opt/pdg-bot/sb2mihomo.py")" == OLD-CONVERTER \
+     && "$(cat "$BOX/opt/pdg-bot/pdgmodel.py")" == OLD-MODEL \
      && "$(cat "$BOX/opt/pdg-bot/pdgprofile.py")" == OLD-PROFILE-TOOL ]] \
     || fail "$stage: coherent runtime bundle drift"
   [[ "$(cat "$BOX/etc/sing-box/config.json")" == '{"legacy":"model"}' \

@@ -100,7 +100,7 @@ _pdg_firewall_mode(){
 _pdg_render_mihomo_candidate(){
   local out="$1" bundle="${2:-/opt/pdg-bot}"
   ( cd "$bundle" && python3 - "$out" "$bundle" <<'PY'
-import importlib.util, os, sys
+import importlib.util, json, os, sys
 from pathlib import Path
 dst, root = sys.argv[1:]
 root = str(Path(root).resolve())
@@ -114,10 +114,35 @@ spec = importlib.util.spec_from_file_location("bot", str(source))
 bot = importlib.util.module_from_spec(spec)
 sys.modules["bot"] = bot
 spec.loader.exec_module(bot)
-model = bot.load()
-data, meta = bot._render_mihomo_bytes(model)
+model_path = os.environ.get("PDG_MODEL_PATH", "")
+if model_path:
+    with open(model_path, encoding="utf-8") as stream:
+        model = bot._model_schema_v3(json.load(stream))
+else:
+    model = bot.load()
+ruleset_path = os.environ.get("PDG_RULESET_META_PATH", "")
+rs_meta = {} if model_path else None
+if ruleset_path and os.path.isfile(ruleset_path):
+    with open(ruleset_path, encoding="utf-8") as stream:
+        rs_meta = json.load(stream)
+profile_path = os.environ.get("PDG_PROFILE_PATH", "")
+if profile_path:
+    bot.PROFILE_ENV = profile_path
+platform = os.environ.get("PDG_PLATFORM", "")
+if platform in {"ios", "android"}:
+    bot._platform = lambda: platform
+mitm_domains = []
+mitm_path = os.environ.get("PDG_MITM_DOMAINS_PATH", "")
+if platform == "ios" and mitm_path and os.path.isfile(mitm_path):
+    with open(mitm_path, encoding="utf-8") as stream:
+        mitm_domains = [line.strip().removeprefix("domain:")
+                        for line in stream if line.strip() and not line.startswith("#")]
+data, meta = bot._render_mihomo_bytes(
+    model, rs_meta=rs_meta, mitm_domains=mitm_domains if model_path else None)
 if meta.get("unknown_proxies"):
     raise SystemExit("unknown proxies: " + ",".join(meta["unknown_proxies"]))
+if meta.get("dropped"):
+    raise SystemExit("render dropped model rules")
 with open(dst, "wb") as fh:
     fh.write(data)
 os.chmod(dst, 0o600)
@@ -956,6 +981,84 @@ print("present" if present else "absent")
 PY
 }
 
+# Bind a restored model to this machine's current direct anchor without
+# upgrading the restored on-disk schema (the snapshot may also restore the Bot
+# version that owns that schema).  The trusted current pdgmodel validates both
+# the legacy source and the rewritten result; rulesets.json is rewritten in the
+# same candidate tree before any live file is touched.
+_pdg_snapshot_rebind_direct(){
+  local tree="$1" current="${2:-/etc/sing-box/config.json}"
+  local model="$tree/etc/sing-box/config.json"
+  local rulesets="$tree/opt/pdg-bot/rulesets.json"
+  local source="$REPO_DIR/deploy/bot/pdgmodel.py"
+  [[ -f "$current" && ! -L "$current" && -f "$model" && ! -L "$model" \
+     && -f "$source" ]] || return 1
+  python3 - "$source" "$current" "$model" "$rulesets" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+
+source, current_path, model_path, ruleset_path = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("pdgmodel_snapshot_rebind", source)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+def load(path):
+    with open(path, "rb") as stream:
+        raw = stream.read(8 * 1024 * 1024 + 1)
+    if not raw or len(raw) > 8 * 1024 * 1024:
+        raise ValueError("model size")
+    return json.loads(raw.decode("utf-8"))
+
+def replace(path, value, mode):
+    data = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    directory = os.path.dirname(path)
+    fd, temporary = tempfile.mkstemp(prefix=".pdg-direct-rebind.", dir=directory)
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as stream:
+            fd = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        temporary = ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+current = module.migrate(load(current_path))
+current_tag = module.direct_tag(current)
+snapshot = load(model_path)
+old_tag = module.direct_tag(snapshot)
+rebound = module.rebind_direct_preserve_schema(snapshot, current_tag)
+rulesets = {}
+if os.path.isfile(ruleset_path):
+    rulesets = load(ruleset_path)
+    if not isinstance(rulesets, dict):
+        raise ValueError("rulesets root")
+    for info in rulesets.values():
+        if not isinstance(info, dict):
+            raise ValueError("ruleset entry")
+        if info.get("outbound") == old_tag:
+            info["outbound"] = current_tag
+    routable = set(module.routable_tags(rebound))
+    for info in rulesets.values():
+        if info.get("outbound") != "direct" and info.get("outbound") not in routable:
+            raise ValueError("ruleset target closure")
+replace(model_path, rebound, 0o600)
+if os.path.isfile(ruleset_path):
+    replace(ruleset_path, rulesets, 0o644)
+PY
+}
+
 _pdg_ruleset_direct_interface_ready_file(){
   local config="$1" source="$REPO_DIR/deploy/bot/pdg-bot.py"
   [[ -f "$config" && ! -L "$config" && -f "$source" ]] || return 1
@@ -1464,6 +1567,7 @@ _pdg_legacy_migration_capture(){
     usr/local/libexec/pdg-quic-routing.sh
     opt/pdg-bot/bot.py
     opt/pdg-bot/sb2mihomo.py
+    opt/pdg-bot/pdgmodel.py
     opt/pdg-bot/pdgprofile.py
     etc/mihomo/config.yaml
     etc/systemd/system/mihomo.service
@@ -1483,6 +1587,8 @@ _pdg_legacy_migration_capture(){
       "$work/source/pdgprofile.py" \
     && cp -a "$REPO_DIR/deploy/bot/sb2mihomo.py" \
       "$work/source/sb2mihomo.py" \
+    && cp -a "$REPO_DIR/deploy/bot/pdgmodel.py" \
+      "$work/source/pdgmodel.py" \
     && cp -a "$REPO_DIR/lib/nfttxn.sh" "$work/source/nfttxn.sh" \
     && cmp -s "$REPO_DIR/deploy/firewall/pdg-quic-routing.sh" \
       "$work/source/pdg-quic-routing.sh" \
@@ -1490,6 +1596,8 @@ _pdg_legacy_migration_capture(){
       "$work/source/pdgprofile.py" \
     && cmp -s "$REPO_DIR/deploy/bot/sb2mihomo.py" \
       "$work/source/sb2mihomo.py" \
+    && cmp -s "$REPO_DIR/deploy/bot/pdgmodel.py" \
+      "$work/source/pdgmodel.py" \
     && cmp -s "$REPO_DIR/lib/nfttxn.sh" "$work/source/nfttxn.sh" \
     || return 1
   if [[ -f "$nft_target" ]]; then
@@ -1871,6 +1979,28 @@ cmd_rollback(){
     fi
     panel_sanitized=1
   fi
+  if ! _pdg_snapshot_rebind_direct "$tree" /etc/sing-box/config.json; then
+    echo "❌ 快照模型/规则集无法绑定当前机器 direct tag，中止"
+    rm -rf "$tmp"; return 1
+  fi
+  # Mihomo is derived state.  A direct-tag rebind invalidates the archived
+  # runtime file, so regenerate it from the rewritten candidate tree using the
+  # current trusted renderer before the ordinary ``mihomo -t`` gate.
+  if [[ -f "$tree/etc/mihomo/config.yaml" ]]; then
+    local snapshot_platform="android"
+    [[ "$(cat "$tree/etc/privdns-gateway/platform" 2>/dev/null)" == ios ]] \
+      && snapshot_platform="ios"
+    if ! PDG_MODEL_PATH="$tree/etc/sing-box/config.json" \
+         PDG_RULESET_META_PATH="$tree/opt/pdg-bot/rulesets.json" \
+         PDG_PROFILE_PATH="$tree/etc/privdns-gateway/profile.env" \
+         PDG_PLATFORM="$snapshot_platform" \
+         PDG_MITM_DOMAINS_PATH="$tree/etc/mosdns/rules/mitm_hijack.txt" \
+         _pdg_render_mihomo_candidate \
+           "$tree/etc/mihomo/config.yaml" "$REPO_DIR/deploy/bot"; then
+      echo "❌ 快照 direct tag 重绑后无法重新派生 Mihomo 候选，中止"
+      rm -rf "$tmp"; return 1
+    fi
+  fi
   local rsdirect_member="etc/mosdns/rules/ruleset_direct.txt"
   local rshijack_member="etc/mosdns/rules/ruleset_hijack.txt"
   local rsaggregate_members="$tmp/members-ruleset-aggregates"
@@ -1929,6 +2059,8 @@ cmd_rollback(){
     etc/mosdns/rules/ruleset_hijack.txt
     opt/pdg-bot/pdgprofile.py
     opt/pdg-bot/sb2mihomo.py
+    opt/pdg-bot/pdgmodel.py
+    opt/pdg-bot/rulesets.json
     opt/pdg-bot/bot.py
     opt/pdg-bot/checks.py
     opt/pdg-bot/report.py
@@ -1951,6 +2083,7 @@ cmd_rollback(){
     etc/systemd/system/pdg-web.service
     etc/privdns-gateway/web.json
     etc/mihomo/config.yaml
+    etc/sing-box/config.json
     etc/systemd/system/mihomo.service
   ) cp_path
   mkdir -p "$tmp/current-managed" || { rm -rf "$tmp"; return 1; }
@@ -2666,6 +2799,7 @@ cmd_update(){
     || ! install -m755 "$REPO_DIR"/deploy/bot/doctor.py            /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/pdgmodel.py         /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdgprofile.py       /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/nftscan.py          /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/nftmerge.py         /opt/pdg-bot/ \
@@ -3660,7 +3794,8 @@ PY
   return 0
 }
 
-# 把旧默认 direct-type 锚点 jp 精确迁移为 JP。与 iOS GMS 清理相同，这里已由 pdg.sh
+# 把权威模型事务化迁移到 schema v3，并把旧默认 direct-type 锚点 jp
+# 精确迁移为 JP。与 iOS GMS 清理相同，这里已由 pdg.sh
 # 持有整机写锁，不能再调用会抢同一把 flock 的 pdgtx；因此在锁内执行候选先行的三文件
 # 小事务：canonical model + rulesets 元数据（若存在）+ 派生 Mihomo 配置。任一步失败均按
 # before-image 原子恢复并重新启动内核；自定义 direct tag 不猜测、不改写。
@@ -4201,7 +4336,7 @@ _pdg_install_dataplane_bundle(){
   local source_root="$1" dst=/opt/pdg-bot wd name src target restore_name
   wd="$(mktemp -d)" || return 1
   mkdir -p "$dst" || { rm -rf "$wd"; return 1; }
-  for name in bot.py sb2mihomo.py pdgprofile.py; do
+  for name in bot.py sb2mihomo.py pdgmodel.py pdgprofile.py; do
     case "$name" in
       bot.py) src="$source_root/pdg-bot.py";;
       *) src="$source_root/$name";;
@@ -4214,11 +4349,11 @@ _pdg_install_dataplane_bundle(){
     fi
   done
   PYTHONPYCACHEPREFIX="$wd/pycache" python3 -m py_compile \
-    "$wd/bot.py" "$wd/sb2mihomo.py" "$wd/pdgprofile.py" \
+    "$wd/bot.py" "$wd/sb2mihomo.py" "$wd/pdgmodel.py" "$wd/pdgprofile.py" \
     || { rm -rf "$wd"; return 1; }
-  for name in bot.py sb2mihomo.py pdgprofile.py; do
+  for name in bot.py sb2mihomo.py pdgmodel.py pdgprofile.py; do
     if ! _pdg_atomic_install_file "$wd/$name" "$dst/$name" 755; then
-      for restore_name in bot.py sb2mihomo.py pdgprofile.py; do
+      for restore_name in bot.py sb2mihomo.py pdgmodel.py pdgprofile.py; do
         target="$dst/$restore_name"
         if [[ -e "$wd/$restore_name.existed" ]]; then
           _pdg_atomic_install_file \
@@ -4339,7 +4474,8 @@ migrate_dataplane_profile(){
   # before copying the new files.
   tool="$REPO_DIR/deploy/bot/pdgprofile.py"
   [[ -f "$tool" && -f "$REPO_DIR/deploy/bot/pdg-bot.py" \
-     && -f "$REPO_DIR/deploy/bot/sb2mihomo.py" ]] \
+     && -f "$REPO_DIR/deploy/bot/sb2mihomo.py" \
+     && -f "$REPO_DIR/deploy/bot/pdgmodel.py" ]] \
     || { echo "checked-out data-plane bundle 不完整"; return 1; }
 
   mode="$(_pdg_dataplane_mode_readonly "$tool")" || return 1
@@ -4424,13 +4560,16 @@ migrate_dataplane_profile(){
 # its pre-update snapshot instead of restarting a half-installed pdg-web.
 migrate_web_config_io(){
   local web_src="$REPO_DIR/deploy/web" static_src="$REPO_DIR/deploy/web/static"
+  local model_src="$REPO_DIR/deploy/bot/pdgmodel.py"
   [[ -f "$web_src/pdgconfigio.py" \
+     && -f "$model_src" \
      && -f "$static_src/templates/mihomo-import.example.yaml" \
      && -f "$static_src/templates/mosdns-import.example.yaml" ]] || return 1
   if python3 -c 'import yaml' >/dev/null 2>&1 \
      && [[ "$(stat -c '%U:%G:%a' /var/lib/privdns-gateway/web-imports 2>/dev/null)" == root:root:700 \
         && "$(stat -c '%U:%G:%a' /etc/mihomo/providers 2>/dev/null)" == root:root:700 ]] \
      && cmp -s "$web_src/pdgconfigio.py" /opt/pdg-web/pdgconfigio.py \
+     && cmp -s "$model_src" /opt/pdg-bot/pdgmodel.py \
      && cmp -s "$static_src/templates/mihomo-import.example.yaml" \
           /opt/pdg-web/static/templates/mihomo-import.example.yaml \
      && cmp -s "$static_src/templates/mosdns-import.example.yaml" \
@@ -4443,7 +4582,8 @@ migrate_web_config_io(){
   install -d -o root -g root -m700 \
     /var/lib/privdns-gateway/web-imports /etc/mihomo/providers || return 1
   install -d -o root -g root -m755 \
-    /opt/pdg-web /opt/pdg-web/static /opt/pdg-web/static/templates || return 1
+    /opt/pdg-bot /opt/pdg-web /opt/pdg-web/static /opt/pdg-web/static/templates || return 1
+  install -o root -g root -m755 "$model_src" /opt/pdg-bot/pdgmodel.py || return 1
   install -o root -g root -m755 "$web_src/pdgconfigio.py" /opt/pdg-web/pdgconfigio.py \
     || return 1
   install -o root -g root -m644 \
@@ -4452,10 +4592,11 @@ migrate_web_config_io(){
   install -o root -g root -m644 \
     "$static_src/templates/mosdns-import.example.yaml" \
     /opt/pdg-web/static/templates/mosdns-import.example.yaml || return 1
-  python3 -m py_compile /opt/pdg-web/pdgconfigio.py || return 1
+  python3 -m py_compile /opt/pdg-bot/pdgmodel.py /opt/pdg-web/pdgconfigio.py || return 1
   [[ "$(stat -c '%U:%G:%a' /var/lib/privdns-gateway/web-imports)" == root:root:700 \
      && "$(stat -c '%U:%G:%a' /etc/mihomo/providers)" == root:root:700 \
      && -s /opt/pdg-web/pdgconfigio.py \
+     && -s /opt/pdg-bot/pdgmodel.py \
      && -s /opt/pdg-web/static/templates/mihomo-import.example.yaml \
      && -s /opt/pdg-web/static/templates/mosdns-import.example.yaml ]] || return 1
 }
@@ -5268,6 +5409,30 @@ cmd_tx(){
   echo "❌ 找不到 pdgtx.py(事务核心缺失)"; return 1
 }
 
+cmd_direct_tag(){
+  need_root direct-tag
+  local action="${1:-}" new="${2:-}"
+  if [[ "$action" != set || -z "$new" || $# -ne 2 ]]; then
+    echo "用法: pdg direct-tag set <TAG>"
+    return 1
+  fi
+  python3 - "$new" <<'DIRECTTAGPY'
+import importlib.util
+import sys
+
+path = "/opt/pdg-bot/bot.py"
+spec = importlib.util.spec_from_file_location("pdg_bot_direct_tag", path)
+if spec is None or spec.loader is None:
+    print("❌ 找不到 PDG 配置事务后端")
+    raise SystemExit(1)
+bot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bot)
+ok, message = bot.set_direct_tag(sys.argv[1])
+print(message)
+raise SystemExit(0 if ok else 1)
+DIRECTTAGPY
+}
+
 # 5.1: **取消命令分派前的隐藏迁移**。
 # 以前这里对所有管理类命令(含 update)先跑一遍 run_all_migrations —— 那发生在 _lock 之前、
 # 也在 cmd_update 打快照之前: 迁移会改 unit / nft / mosdns, 于是"更新失败回滚"只能回到
@@ -5281,6 +5446,7 @@ case "${1:-menu}" in
   __migrate)     need_root __migrate; run_all_migrations;;   # 内部: cmd_update 装好新脚本后据此跑"新版"迁移
   migrate)       cmd_migrate;;
   tx)            shift || true; cmd_tx "$@";;
+  direct-tag)    shift || true; cmd_direct_tag "$@";;
   status|st)     cmd_status;;
   doctor|dr)     shift || true; cmd_doctor "${1:-}";;
   update|up)     shift || true; cmd_update "$@";;
@@ -5301,5 +5467,5 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run] [--target vX.Y.Z]|snapshot|rollback [n]|web <setup|enable|disable|status|password>|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run] [--target vX.Y.Z]|snapshot|rollback [n]|direct-tag set <TAG>|web <setup|enable|disable|status|password>|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
 esac

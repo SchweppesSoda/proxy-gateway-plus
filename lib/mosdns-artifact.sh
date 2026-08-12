@@ -141,6 +141,14 @@ pdg_prepare_mosdns_candidate(){
       echo "[x] lib/versions.sh 中 MosDNS 修补产物哈希格式非法" >&2
       return 1
     }
+    # Pull requests are validated before their release tag/assets exist.  CI
+    # sets this guard so every successful install path must use the explicit,
+    # hash-pinned local artifact channel; an accidental release fetch fails
+    # clearly instead of creating a merge-before-release dependency cycle.
+    if [[ "${PDG_MOSDNS_RELEASE_FETCH_FORBIDDEN:-0}" == 1 ]]; then
+      echo "[x] 当前环境禁止 MosDNS Release 下载；请使用显式本地产物通道。" >&2
+      return 1
+    fi
     curl -fsSL "$MOSDNS_PDG_ASSET_BASE_URL/$asset" -o "$candidate" || return 1
     channel="release"
   fi

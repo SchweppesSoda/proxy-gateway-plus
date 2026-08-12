@@ -195,6 +195,7 @@ jobs:
       - name: "原生 Web API/安全/前端回归"
         run: |
           python3 tests/test-config-io.py
+          python3 tests/test-policy-groups-v3.py
           python3 tests/test-web-api.py
           python3 tests/test-web-adversarial.py
           python3 tests/test-web-security-static.py
@@ -374,6 +375,9 @@ jobs:
       - name: "Phase3: 当前快照五阶段故障必须精确恢复"
         run: bash tests/test-snapshot-rollback-transaction.sh
 
+      - name: "Phase3: 快照恢复保持本机自定义 direct tag"
+        run: bash tests/test-snapshot-direct-rebind.sh
+
       - name: "Phase3: 旧 sing-box 快照清理 Mihomo 残留并重建 QUIC 前置"
         run: bash tests/test-legacy-snapshot-rollback.sh
 
@@ -459,6 +463,10 @@ jobs:
   functional:
     # 真功能测试: 下载并校验钉死版本的 Mihomo / MosDNS, 真起一遍验证两层核心链路。
     runs-on: ubuntu-latest
+    env:
+      # Functional CI precedes the release; project-owned MosDNS assets may
+      # only enter via an explicit local pin until the tag has been published.
+      PDG_MOSDNS_RELEASE_FETCH_FORBIDDEN: "1"
     steps:
       - uses: actions/checkout@v5
       - name: 安装真模板导入测试依赖
@@ -536,7 +544,11 @@ jobs:
             bash curl ca-certificates python3 python3-yaml tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
           python3 -c 'import yaml'
       - name: "跑 ${{ matrix.script }}"
-        env: { PDG_E2E_ISOLATED: "1" }
+        env:
+          PDG_E2E_ISOLATED: "1"
+          # PR 先于 Release 创建；所有装机成功路径必须用显式本地
+          # 产物 + 仓库 pin，不得偷读尚未存在的 v1.10.0 assets。
+          PDG_MOSDNS_RELEASE_FETCH_FORBIDDEN: "1"
         run: bash tests/${{ matrix.script }}
 
   # 串行 hermetic 守卫: 就算将来有人把这些脚本又塞回同一个环境顺序跑, 也必须全绿。
@@ -565,6 +577,7 @@ jobs:
       - name: "E2E 串行 hermetic (同一容器里按原顺序连着跑, 每个都必须全绿)"
         env:
           PDG_E2E_ISOLATED: "1"
+          PDG_MOSDNS_RELEASE_FETCH_FORBIDDEN: "1"
           PDG_SERIAL_SCRIPTS: >-
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh

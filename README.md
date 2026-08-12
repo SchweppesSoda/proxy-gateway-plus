@@ -16,7 +16,7 @@ proxy-gateway-plus 基于 PrivDNS Gateway，是一个使用系统私密 DNS（Do
 - 国内域名返回真实 IP，手机直连。
 - 需要走代理的域名，网关把 A 记录改写成网关自己的 IP，流量因此回到网关；网关嗅探 SNI/Host，再按域名把连接交给对应出口，或从本机直出。
 
-手机上只有一条私密 DNS 设置，没有客户端，也没有 tun。出口、分流规则和故障组可在
+手机上只有一条私密 DNS 设置，没有客户端，也没有 tun。出口、分流规则和策略组可在
 Telegram Bot、可选 PDG Web 或 `pdg` 命令中管理；DoT 证书、安装和主机生命周期仍由
 对应的受管入口处理。
 
@@ -149,8 +149,10 @@ SNI / Host / QUIC 与规则选择出口。提供 clash_api，可按需临时开�
   `/etc/mosdns/rules/ruleset_direct.txt`，MosDNS 返回真实地址，手机不经 VPS。含
   `IP-CIDR/IP-CIDR6` 的规则集以及 `.mrs/.srs` 无法在 DNS 层兑现完整语义，会被明确拒绝。
   内建 direct-type 出口（默认 `JP`）含义不同：流量已经到达 VPS，再由 VPS 本机直出。
-  旧版默认 tag `jp` 会在 `pdg update` / `pdg migrate` 的受锁迁移中连同分流规则、故障组、
+  旧版默认 tag `jp` 会在 `pdg update` / `pdg migrate` 的受锁迁移中连同分流规则、策略组、
   默认出口、规则集元数据和派生 Mihomo 配置一起改为 `JP`；自定义 direct tag 不会被猜测改名。
+  管理员可用 `sudo pdg direct-tag set KFC_JP` 为本机设置自定义锚点；该操作经 CAS/pdgtx
+  同步全部引用、重新派生并校验 Mihomo、观察服务，任何失败都会回滚。新装默认仍为 `JP`。
 - 指向非 literal-direct 出口的可展开 source 规则集，会将其中的域名项事务派生到
   `/etc/mosdns/rules/ruleset_hijack.txt`。MosDNS 在宽泛国内直连判断前先匹配该集合，避免
   本应送入 Mihomo 的国内域名取得真实地址后绕过 VPS。编译后的二进制 `.mrs` 不做 DNS
@@ -187,11 +189,12 @@ SNI / Host / QUIC 与规则选择出口。提供 clash_api，可按需临时开�
 
 给 Bot 发 `/start` 进入菜单，常用功能：
 
-- 📤 出口管理：添加、删除、改名、排序出口，设置默认出口，新建/编辑故障切换组。
+- 📤 出口管理：添加、删除、改名、排序出口并设置默认出口。
   - 可直接粘贴的链接：`ss://`、`vmess://`、`vless://`（含 reality）、`trojan://`、`hysteria2://`、`tuic://`、`anytls://`、`socks5://`、`http://`，以及 Surge 的 `名字 = ss, …` 行。
   - shadowtls、ssh、hysteria（v1）、wireguard（endpoint）等出站不在直接支持之列：它们需要手写数据模型 `/etc/sing-box/config.json`，且 mihomo 未必能转换（渲染失败会被拒绝，不会静默丢弃）。
 - 📑 分流管理：把域名、`.list` / `.txt` 等规则集指到出口；默认其余国际走 VPS 直出。
-- 🔀 故障切换组：按探测延迟选择出口，并在出口不可用时切换。
+- 🔀 策略组：Bot 完整只读展示全部组；保留的写入口可维护 url-test 组。四种组类型、嵌套组、
+  provider 与 select 临时运行态切换由 Web 的独立“策略组”页面管理。
 - 📱 客户端：Android 显示私密 DNS 主机名；iOS 显示 iOS 描述文件入口。两个平台都提供「🌐 DoT 自定义域名」和「✈️ Telegram 出口」。
 - 🛠 运维：重启服务、更新规则库、备份/恢复、DNS 上游、TFO、观测面板；iOS 平台另有「🍏 位置改写（WLOC）」。
 
@@ -220,7 +223,14 @@ Web 可直接修改已有规则集的 target；这里的 literal `direct` 仍表
 Mihomo Clash API 探测；域名诊断分别呈现 DNS 实测证据与配置规则推演，网关出口推演不冒充
 真实数据包的出口验证。
 
-#### 配置导入、导出与模板（v1.9.0）
+Web 的“策略组”页面统一列出 `select`、`url-test`、`fallback`、`load-balance`，包括从
+Mihomo 导入的高级组；可维护成员、嵌套组、provider 以及类型专属的 URL、interval、tolerance
+和 strategy。其中 `url-test` 会按探测延迟选择出口，并在当前出口不可用时切换。配置保存仍走
+CAS/pdgtx、候选渲染、`mihomo -t`、服务观察和失败回滚。select
+卡片上的“临时切换”只调用本机 Clash API，不写 `/etc/sing-box/config.json`，Mihomo 重启后
+可能恢复到配置选择，页面会明确显示这一区别。
+
+#### 配置导入、导出与模板（v1.10.0）
 
 Web 的「配置导入与导出」提供三个受管入口：
 
@@ -249,8 +259,8 @@ Mihomo 校验的运行文件，不能反过来成为第二份事实来源。
 时间仍只运行一个维护任务。
 
 上传暂存在 root-only 的 `/var/lib/privdns-gateway/web-imports`，使用不可猜测 ID 和 SHA-256
-复核，预览默认 30 分钟失效并自动清理；Mihomo/MosDNS 与 v2 包的上传上限为 36 MiB，
-旧 PDG 包为保持兼容可上传至 68 MiB、解压至 64 MiB。新 v2 归档最多 512 个成员，
+复核，预览默认 30 分钟失效并自动清理；Mihomo/MosDNS 与 v3 包的上传上限为 36 MiB，
+旧 PDG 包为保持兼容可上传至 68 MiB、解压至 64 MiB。新 v3 归档最多 512 个成员，
 普通单成员不超过 8 MiB（模型成员不超过 24 MiB）、解压总量不超过 32 MiB，并检查路径、重复文件以及链接/设备类型。每次
 导出即使已有登录会话，也必须重新输入管理员
 密码；下载可能包含节点密码、UUID、provider URL 等敏感信息，只应保存到受信任设备并按
@@ -296,6 +306,7 @@ sudo pdg update     # 更新到 origin 最新可信发布（更新前快照，�
 sudo pdg update --target vX.Y.Z  # 精确更新到 origin/main 已公布的指定发布
 sudo pdg snapshot   # 手动留一份配置快照
 sudo pdg rollback   # 回滚到最近快照
+sudo pdg direct-tag set <TAG> # 事务化修改本机 direct 锚点并级联全部引用
 sudo pdg token      # 设置 / 更换 Bot token
 sudo pdg web status # 可选 Web 管理面；setup|enable|disable|status|password
 sudo pdg restart    # 重启服务

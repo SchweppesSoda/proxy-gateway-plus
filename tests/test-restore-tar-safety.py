@@ -328,7 +328,18 @@ def main():
         bot.RS_META = os.path.join(base, "opt/pdg-bot/rulesets.json")
         bot.RS_DIR = os.path.join(base, "etc/sing-box/rs")
         bot.BACKUP_FILES = [bot.SB, bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK, bot.RS_META]
-        json.dump({"outbounds": [], "route": {"rules": []}}, open(bot.SB, "w"))
+        json.dump({
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {"rules": [], "final": "direct"},
+            "_pdg": {
+                "schema": 3,
+                "policy-groups": [],
+                "mihomo": {
+                    "proxy-providers": {}, "rule-providers": {},
+                    "advanced": {}, "managed-files": {},
+                },
+            },
+        }, open(bot.SB, "w"))
         for p in (bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK):
             open(p, "w").write("x\n")
         json.dump({}, open(bot.RS_META, "w"))

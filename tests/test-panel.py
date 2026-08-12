@@ -359,7 +359,15 @@ bot.set_panel = real_set_panel
 managed = {"experimental": {"clash_api": {
     "external_controller": "0.0.0.0:9090", "secret": "TEMP",
     "external_ui": bot.UI_DIST, "external_ui_download_url": bot.ZASH_URL}},
-    "route": {"rules": []}}
+    "outbounds": [{"type": "direct", "tag": "direct"}],
+    "route": {"rules": [], "final": "direct"},
+    "_pdg": {
+        "schema": 3, "policy-groups": [],
+        "mihomo": {
+            "proxy-providers": {}, "rule-providers": {},
+            "advanced": {}, "managed-files": {},
+        },
+    }}
 san = copy.deepcopy(managed)
 assert bot._panel_sanitize_config(san) is True
 assert san["experimental"]["clash_api"] == {"external_controller": "127.0.0.1:9090"}
@@ -406,9 +414,9 @@ with tempfile.TemporaryDirectory() as td:
             del sys.modules[m]
     sb = td + "/etc/sing-box/config.json"
     mos = td + "/etc/mosdns/config.yaml"
-    Path(sb).write_text(json.dumps({"experimental": {"clash_api": {
-        "external_controller": "127.0.0.1:9090"}}, "route": {"rules": []},
-        "outbounds": [{"type": "direct", "tag": "direct"}]}), encoding="utf-8")
+    current = copy.deepcopy(managed)
+    current["experimental"]["clash_api"] = {"external_controller": "127.0.0.1:9090"}
+    Path(sb).write_text(json.dumps(current), encoding="utf-8")
     Path(mos).write_text("log: {level: info}\n", encoding="utf-8")
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w:gz") as tar:

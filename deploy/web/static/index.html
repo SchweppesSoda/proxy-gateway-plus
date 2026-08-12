@@ -65,6 +65,10 @@
               aria-selected="false" aria-controls="panel-exits" tabindex="-1" data-tab="exits">
         <span aria-hidden="true">⇥</span><span>出口</span>
       </button>
+      <button id="tab-groups" class="tab" type="button" role="tab"
+              aria-selected="false" aria-controls="panel-groups" tabindex="-1" data-tab="groups">
+        <span aria-hidden="true">⇄</span><span>策略组</span>
+      </button>
       <button id="tab-rules" class="tab" type="button" role="tab"
               aria-selected="false" aria-controls="panel-rules" tabindex="-1" data-tab="rules">
         <span aria-hidden="true">≡</span><span>分流</span>
@@ -169,22 +173,48 @@
           </div>
         </div>
 
-        <section class="surface">
-          <div class="section-heading"><div><p class="eyebrow">FAILOVER</p><h2>故障切换组</h2></div></div>
-          <form id="group-form" class="inline-form">
-            <div>
-              <label for="group-name">组名</label>
-              <input id="group-name" name="name" required maxlength="40" pattern="[A-Za-z0-9_.-]+"
-                     autocapitalize="none" spellcheck="false" placeholder="例如 main">
+        <section class="surface explainer">
+          <div><p class="eyebrow">POLICY GROUPS</p><h2>策略组已独立管理</h2></div>
+          <p>四种组类型、嵌套组和 provider 均在“策略组”页面统一配置。</p>
+          <button class="button ghost" type="button" data-go-tab="groups">前往策略组</button>
+        </section>
+      </section>
+
+      <section id="panel-groups" class="panel" role="tabpanel" aria-labelledby="tab-groups" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">POLICY GROUPS</p><h1>策略组</h1></div>
+          <span id="group-count" class="chip">0 个策略组</span>
+        </div>
+        <section class="surface accent-surface">
+          <div class="section-heading">
+            <div><p class="eyebrow">CONFIGURATION</p><h2 id="group-editor-title">创建策略组</h2></div>
+            <button id="group-cancel-edit" class="button ghost compact" type="button" hidden>取消编辑</button>
+          </div>
+          <form id="group-form" autocomplete="off">
+            <div class="inline-form">
+              <div><label for="group-name">组名</label><input id="group-name" required maxlength="64" pattern="[A-Za-z0-9_.-]+" autocapitalize="none" spellcheck="false"></div>
+              <div><label for="group-type">类型</label><select id="group-type"><option value="select">select</option><option value="url-test">url-test</option><option value="fallback">fallback</option><option value="load-balance">load-balance</option></select></div>
+              <div class="grow"><label for="group-members">成员 / 嵌套组</label><input id="group-members" autocapitalize="none" spellcheck="false" placeholder="空格分隔；可用 REJECT"></div>
+              <div class="grow"><label for="group-providers">Proxy providers</label><input id="group-providers" autocapitalize="none" spellcheck="false" placeholder="空格分隔，可留空"></div>
             </div>
-            <div class="grow">
-              <label for="group-members">成员</label>
-              <input id="group-members" name="members" required
-                     autocapitalize="none" spellcheck="false" placeholder="出口名，用空格分隔">
+            <div id="group-probe-options" class="inline-form">
+              <div class="grow"><label for="group-url">探测 URL</label><input id="group-url" type="url" value="https://www.gstatic.com/generate_204"></div>
+              <div><label for="group-interval">间隔（秒）</label><input id="group-interval" type="number" min="1" max="604800" value="180"></div>
+              <div id="group-tolerance-wrap"><label for="group-tolerance">容差（ms）</label><input id="group-tolerance" type="number" min="0" max="65535" value="50"></div>
+              <div id="group-strategy-wrap"><label for="group-strategy">负载策略</label><select id="group-strategy"><option value="consistent-hashing">consistent-hashing</option><option value="round-robin">round-robin</option><option value="sticky-sessions">sticky-sessions</option></select></div>
             </div>
-            <button class="button secondary" type="submit">新建组</button>
+            <div class="inline-form" aria-label="策略组可选安全字段">
+              <label><input id="group-lazy" type="checkbox"> lazy</label>
+              <label><input id="group-disable-udp" type="checkbox"> disable-udp</label>
+              <label><input id="group-hidden" type="checkbox"> hidden</label>
+            </div>
+            <div class="form-row end"><p class="field-help">保存走 CAS/pdgtx、候选渲染、Mihomo 校验和失败回滚。</p><button id="group-submit" class="button primary" type="submit">创建策略组</button></div>
           </form>
-          <div id="group-list" class="card-list compact-list" aria-live="polite"></div>
+        </section>
+        <section class="surface">
+          <div class="section-heading"><div><p class="eyebrow">ALL GROUPS</p><h2>全部策略组</h2></div></div>
+          <p class="field-help">select 的“临时切换”只改变 Mihomo 当前运行态，不写入权威模型，重启后可能恢复。</p>
+          <div id="group-list" class="card-list" aria-live="polite"></div>
         </section>
       </section>
 

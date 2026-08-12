@@ -19,11 +19,16 @@ PY
 cat >"$OLD/pdgprofile.py" <<'PY'
 raise RuntimeError("old parser must not be imported")
 PY
+cat >"$OLD/pdgmodel.py" <<'PY'
+raise RuntimeError("old model must not be imported")
+PY
 
 cat >"$NEW/pdg-bot.py" <<'PY'
 import json, sb2mihomo
 def load(): return {}
-def _render_mihomo_bytes(model):
+def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
+    assert rs_meta is None
+    assert mitm_domains is None
     return json.dumps({
         "tproxy-port": sb2mihomo.TPROXY,
         "sniffer": {"sniff": {"TLS": {"ports": [443, 10443]},
@@ -39,6 +44,9 @@ PY
 cat >"$NEW/pdgprofile.py" <<'PY'
 import sb2mihomo
 NEW_PARSER = sb2mihomo.TPROXY
+PY
+cat >"$NEW/pdgmodel.py" <<'PY'
+SCHEMA_VERSION = 3
 PY
 cp "$OLD/"*.py "$RUNTIME/"
 
@@ -86,6 +94,7 @@ _pdg_install_dataplane_bundle '$NEW'
 " || { echo "[FAIL] coherent runtime bundle install" >&2; exit 1; }
 grep -q 'TPROXY = 7895' "$RUNTIME/sb2mihomo.py" || exit 1
 grep -q 'NEW_PARSER' "$RUNTIME/pdgprofile.py" || exit 1
+grep -q 'SCHEMA_VERSION = 3' "$RUNTIME/pdgmodel.py" || exit 1
 grep -q 'tproxy-port' "$RUNTIME/bot.py" || exit 1
 ! grep -Rq 'OLD_CONVERTER\\|old parser' "$RUNTIME" || exit 1
 

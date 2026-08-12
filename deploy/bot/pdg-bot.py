@@ -19,6 +19,7 @@ import urllib.parse, urllib.request, urllib.error
 from collections import Counter
 # 保证能 import 同目录的 sb2mihomo —— 不管本模块是被当脚本跑, 还是被定时任务/健康检查/测试 import。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pdgmodel
 
 TOKEN = os.environ.get("PDG_BOT_TOKEN", "")
 ALLOWED = {int(x) for x in os.environ.get("PDG_BOT_ALLOWED", "").replace(" ", "").split(",") if x}
@@ -238,7 +239,8 @@ def _nav(key):
              {"text": "🗑 删除", "callback_data": "del_exit"}],
             [{"text": "🎯 默认出口", "callback_data": "setfinal"}, {"text": "↕️ 出口排序", "callback_data": "order_exit"},
              {"text": "✏️ 改名", "callback_data": "ren_exit"}],
-            [{"text": "🔀 新建故障组", "callback_data": "add_grp"}, {"text": "✏️ 改故障组", "callback_data": "edit_grp"}]]),
+            [{"text": "🔀 新建故障组", "callback_data": "add_grp"}, {"text": "✏️ 改故障组", "callback_data": "edit_grp"}],
+            [{"text": "📚 完整策略组查看", "callback_data": "policy_groups"}]]),
         "rule": ("📑 <b>分流管理</b> — 选一项:", [
             [{"text": "📋 规则", "callback_data": "rules"}, {"text": "➕ 加规则", "callback_data": "add_rule"},
              {"text": "🗑 删规则", "callback_data": "del_rule"}],
@@ -372,6 +374,26 @@ def clash_get(path):
     with urllib.request.urlopen(req, timeout=12) as r:
         return json.load(r)
 
+
+def clash_select(group, member):
+    """Change one select group's temporary Mihomo runtime choice.
+
+    This intentionally never touches the PDG model; Mihomo may forget it on a
+    restart and both Web/Bot surfaces describe it as temporary runtime state.
+    """
+    path = "/proxies/" + urllib.parse.quote(str(group), safe="")
+    req = urllib.request.Request(
+        CLASH + path,
+        data=json.dumps({"name": str(member)}).encode("utf-8"),
+        method="PUT",
+        headers={"Content-Type": "application/json"})
+    secret = _clash_secret()
+    if secret:
+        req.add_header("Authorization", "Bearer " + secret)
+    with urllib.request.urlopen(req, timeout=12) as response:
+        if response.status not in {200, 204}:
+            raise RuntimeError("Mihomo runtime selection failed")
+
 def clash_up():
     try:
         clash_get("/version"); return True
@@ -379,40 +401,32 @@ def clash_up():
         return False
 
 # ── sing-box ──
-def _model_schema_v2(c):
-    """Return an in-memory v2 view without writing the canonical model.
+def _model_schema_v3(c):
+    """Return an in-memory v3 view without writing the canonical model.
 
-    Legacy models become durable v2 only when a later ``tx_apply`` succeeds;
+    Legacy models become durable v3 only when a later ``tx_apply`` succeeds;
     merely reading status or rendering Mihomo must never cause an unguarded
     migration write.
     """
-    if not isinstance(c, dict):
-        raise ValueError("model must be an object")
-    meta = c.get("_pdg")
-    if meta is None:
-        meta = {}
-    if not isinstance(meta, dict) or meta.get("schema", 1) not in (1, 2):
-        raise ValueError("unsupported model schema")
-    mihomo = meta.get("mihomo") or {}
-    if not isinstance(mihomo, dict):
-        raise ValueError("invalid mihomo metadata")
-    defaults = {
-        "proxy-providers": {}, "rule-providers": {}, "proxy-groups": [],
-        "advanced": {}, "managed-files": {},
-    }
-    normalized = {}
-    for key, default in defaults.items():
-        value = mihomo.get(key, default)
-        if not isinstance(value, type(default)):
-            raise ValueError("invalid mihomo metadata field")
-        normalized[key] = value
-    c["_pdg"] = {"schema": 2, "mihomo": normalized}
-    return c
+    return pdgmodel.migrate(c)
+
+
+# Private compatibility name retained for older tests/extensions.  It now
+# returns the schema-v3 view; callers must never infer a durable schema from
+# this historical function name.
+_model_schema_v2 = _model_schema_v3
+
+
+def _model_snapshot():
+    """Read one exact model image and return its migrated view plus raw CAS."""
+    with open(SB, "rb") as stream:
+        raw = stream.read()
+    return (_model_schema_v3(json.loads(raw.decode("utf-8"))),
+            hashlib.sha256(raw).hexdigest())
 
 
 def load():
-    with open(SB, encoding="utf-8") as stream:
-        return _model_schema_v2(json.load(stream))
+    return _model_snapshot()[0]
 
 def _svc_active(unit, need=3, delay=0.6, max_polls=15):
     """确认服务"稳定" active: 要求连续 need 次观测都是 active。
@@ -1157,7 +1171,10 @@ def _pdg_config_io():
             raise ModuleNotFoundError("PDG strict configuration parser unavailable")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        required = ("_safe_yaml_load", "_safe_yaml_dump", "_mosdns_contract")
+        required = (
+            "_safe_yaml_load", "_safe_yaml_dump", "_mosdns_contract",
+            "normalize_model",
+        )
         if any(not callable(getattr(module, name, None)) for name in required):
             raise ModuleNotFoundError("PDG strict configuration parser unavailable")
         _PDG_CONFIG_IO_MODULE = module
@@ -1176,11 +1193,29 @@ def _mihomo_derive(staged):
     # 规则集元数据如果也在本次候选里, 渲染必须按**候选**来 —— 读现网旧文件会让新增的规则集
     # "翻译不了"被丢掉, 或者已删的又冒出来。
     staged_meta = staged.get("rs_meta")
+    rs_meta = (json.loads(staged_meta.decode("utf-8")) if staged_meta
+               else _rs_meta())
+    refused = _pdgtx().TxRefused
+    try:
+        # Every PDG ruleset metadata key is also a Mihomo rule-provider name,
+        # including disabled/direct entries which are not rendered today.
+        pdgmodel.validate_ruleset_namespace(model, set(rs_meta))
+    except (TypeError, ValueError) as exc:
+        raise refused("规则集 provider 命名空间冲突: %s" % str(exc)) from exc
+    routable = set(pdgmodel.routable_tags(model))
+    invalid_targets = sorted(
+        name for name, info in rs_meta.items()
+        if (not isinstance(info, dict)
+            or info.get("outbound") != "direct"
+            and info.get("outbound") not in routable)
+    )
+    if invalid_targets:
+        raise refused("规则集引用不可路由或不存在的出口: %s"
+                      % ", ".join(invalid_targets))
     data, meta = _render_mihomo_bytes(
-        model, rs_meta=json.loads(staged_meta.decode("utf-8")) if staged_meta else None)
+        model, rs_meta=rs_meta)
     # 用 TxRefused 而不是 ValueError: 事务对普通异常只报类型名(怕异常正文带出凭据), 而这两条
     # 恰恰必须**点名**是哪个出口/哪条规则被丢了, 否则用户根本不知道该改什么。
-    refused = _pdgtx().TxRefused
     bad = (meta or {}).get("unknown_proxies")
     if bad:
         raise refused("有出口 mihomo 无法转换(会被静默丢弃): %s"
@@ -1234,10 +1269,14 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
                     raise tx.TxRefused("PRECONDITION_FAILED: model 自预览后已变化")
             if model_raw is None:
                 raise tx.TxRefused("model 不存在")
-            c = _model_schema_v2(json.loads(model_raw.decode("utf-8")))
+            c = _model_schema_v3(json.loads(model_raw.decode("utf-8")))
             intent = _tfo_intent(c) if tfo_intent is None else tfo_intent
             model_mod(c)
             _tfo_apply(c, intent)                 # 加/改出口不冲掉 TFO 状态(语义与旧实现一致)
+            # Every writer crosses the same strict v3 validator immediately
+            # before staging.  This closes over Web, Bot, CLI and restore
+            # mutations instead of relying on the renderer to skip bad data.
+            c = _pdg_config_io().normalize_model(c)
             if model_expect is _MODEL_EXPECT_UNSET:
                 t.stage("model", _model_bytes(c))
             else:
@@ -1311,18 +1350,19 @@ def proxy_outbounds(c):
     return [o for o in c["outbounds"] if o.get("type") in PROXY_TYPES]
 
 def exit_tags(c):
-    """可作分流目标/默认出口的全部出口 (含 direct 与 urltest 故障组)。"""
-    return [o["tag"] for o in c["outbounds"]
-            if o.get("type") in PROXY_TYPES + ("direct", "urltest", "selector")]
+    """可作分流目标/默认出口的全部出口与一等策略组。"""
+    return pdgmodel.routable_tags(c)
 
 def concrete_tags(c):
     """具体出口 (可作故障组成员; 排除 urltest 组自身, 防嵌套环)。"""
     return [o["tag"] for o in c["outbounds"] if o.get("type") in PROXY_TYPES + ("direct",)]
 
 def deletable_tags(c):
-    """可删除的出口/组 (代理出口 + urltest 组; 不含内建 direct 锚点)。"""
-    return [o["tag"] for o in c["outbounds"]
-            if o.get("type") in PROXY_TYPES + ("urltest", "selector")]
+    """可删除的代理出口/策略组；不含本机 direct 锚点。"""
+    values = [o["tag"] for o in c["outbounds"]
+              if o.get("type") in PROXY_TYPES + ("selector", "urltest")]
+    values += [group["name"] for group in pdgmodel.policy_groups(c)]
+    return list(dict.fromkeys(values))
 
 
 DEFAULT_DIRECT_TAG = "JP"
@@ -1339,87 +1379,53 @@ def _direct_anchor_tag(c):
 
 
 def _mihomo_group_metadata(c):
-    meta = c.get("_pdg") if isinstance(c, dict) else None
-    mihomo = meta.get("mihomo") if isinstance(meta, dict) else None
-    groups = mihomo.get("proxy-groups") if isinstance(mihomo, dict) else None
-    return groups if isinstance(groups, list) else []
+    # Historical helper name retained; v3 groups are first-class PDG state.
+    return pdgmodel.policy_groups(c)
 
 
 def _mihomo_group_rename(c, old, new):
-    for group in _mihomo_group_metadata(c):
-        if not isinstance(group, dict):
-            continue
-        if group.get("name") == old:
-            group["name"] = new
-        if isinstance(group.get("proxies"), list):
-            group["proxies"] = [new if item == old else item for item in group["proxies"]]
+    pdgmodel.rename_references(c, old, new, rename_group=True)
 
 
 def _mihomo_group_delete(c, removed):
     removed = set(removed)
     groups = _mihomo_group_metadata(c)
-    groups[:] = [group for group in groups if not (
-        isinstance(group, dict) and group.get("name") in removed)]
-    for group in groups:
-        if isinstance(group, dict) and isinstance(group.get("proxies"), list):
-            group["proxies"] = [item for item in group["proxies"] if item not in removed]
+    while True:
+        groups[:] = [group for group in groups if not (
+            isinstance(group, dict) and group.get("name") in removed)]
+        newly_empty = set()
+        for group in groups:
+            if isinstance(group, dict) and isinstance(group.get("proxies"), list):
+                group["proxies"] = [item for item in group["proxies"]
+                                    if item not in removed]
+                if not group["proxies"] and not group.get("use"):
+                    newly_empty.add(group.get("name"))
+        newly_empty.discard(None)
+        if not newly_empty - removed:
+            break
+        removed |= newly_empty
 
 
 def _mihomo_group_update(c, name):
-    canonical = next((item for item in c.get("outbounds", [])
-                      if isinstance(item, dict) and item.get("tag") == name
-                      and item.get("type") in ("selector", "urltest")), None)
-    if canonical is None:
-        return
-    direct_tags = {item.get("tag") for item in c.get("outbounds", [])
-                   if isinstance(item, dict) and item.get("type") == "direct"}
-    for group in _mihomo_group_metadata(c):
-        if not isinstance(group, dict) or group.get("name") != name:
-            continue
-        group["type"] = "select" if canonical["type"] == "selector" else "url-test"
-        group["proxies"] = ["DIRECT" if item in direct_tags else item
-                            for item in canonical.get("outbounds", [])]
-        group.pop("use", None)
-        if canonical["type"] == "urltest":
-            group["url"] = canonical.get("url", DELAY_URL)
-            raw_interval = str(canonical.get("interval", "3m"))
-            match = re.fullmatch(r"(\d+)([smh]?)", raw_interval)
-            scale = {"": 1, "s": 1, "m": 60, "h": 3600}
-            group["interval"] = (int(match.group(1)) * scale[match.group(2)]
-                                 if match else 180)
-            group["tolerance"] = canonical.get("tolerance", 50)
-        return
+    # v3 has no mirror to synchronize.
+    return
 
 
 def _normalize_default_direct_tag(c):
-    """把旧模型唯一的 ``jp`` direct 锚点及其全部模型引用迁移为 ``JP``。
+    """Return a canonical v3 model and migrate the exact legacy ``jp`` tag.
 
-    返回是否发生改动。这里只识别本项目的精确旧默认值；自定义 direct 名称不猜测、不改写。
+    返回是否发生改动。自定义 direct 名称只随 schema 迁移原样保留，不猜测、不改写。
     """
-    direct = [
-        o for o in c.get("outbounds", [])
-        if o.get("type") == "direct" and isinstance(o.get("tag"), str) and o.get("tag")
-    ]
-    if len(direct) != 1 or direct[0].get("tag") != LEGACY_DIRECT_TAG:
-        return False
-    if any(o is not direct[0] and o.get("tag") == DEFAULT_DIRECT_TAG
-           for o in c.get("outbounds", [])):
-        raise ValueError("出口 JP 已存在，无法迁移旧 jp direct 锚点")
-
-    direct[0]["tag"] = DEFAULT_DIRECT_TAG
-    for outbound in c.get("outbounds", []):
-        if outbound.get("type") in ("urltest", "selector"):
-            outbound["outbounds"] = [
-                DEFAULT_DIRECT_TAG if tag == LEGACY_DIRECT_TAG else tag
-                for tag in outbound.get("outbounds", [])
-            ]
-    route = c.get("route", {})
-    for rule in route.get("rules", []):
-        if rule.get("outbound") == LEGACY_DIRECT_TAG:
-            rule["outbound"] = DEFAULT_DIRECT_TAG
-    if route.get("final") == LEGACY_DIRECT_TAG:
-        route["final"] = DEFAULT_DIRECT_TAG
-    return True
+    original = copy.deepcopy(c)
+    try:
+        migrated = pdgmodel.migrate(c)
+    except ValueError:
+        raise
+    if pdgmodel.direct_tag(migrated) == LEGACY_DIRECT_TAG:
+        migrated = pdgmodel.rebind_direct(migrated, DEFAULT_DIRECT_TAG)
+    c.clear()
+    c.update(migrated)
+    return c != original
 
 
 def _normalize_default_direct_meta(meta):
@@ -1431,11 +1437,24 @@ def _normalize_default_direct_meta(meta):
             changed = True
     return changed
 
+
+def _rebind_direct_meta(meta, old, new):
+    """Cascade a concrete machine direct tag through rulesets.json."""
+    changed = False
+    for item in meta.values():
+        if isinstance(item, dict) and item.get("outbound") == old:
+            item["outbound"] = new
+            changed = True
+    return changed
+
 def _tag(name, host, port):
     return re.sub(r"[^A-Za-z0-9_.-]", "-", (name or f"{host}:{port}"))[:40] or "exit"
 
 
-_RESERVED_EXIT_TAGS = {"direct", "直连", "block", "dns-out"}
+_RESERVED_EXIT_TAGS = (
+    {"direct", "直连", "block", "dns-out"}
+    | set(pdgmodel.RESERVED_TARGETS)
+)
 
 
 # ── 链接解析 (ss/vmess/trojan/vless) ──
@@ -1647,15 +1666,17 @@ def _parse_http(link):
     return ob
 
 # ── 故障切换组 (urltest) ──
-def add_group(name, members):
+def add_group(name, members, model_expect=None):
     c = load(); cands = concrete_tags(c)
     members = [m for m in members if m]
     name = _tag(name, "", "")
     if name in _RESERVED_EXIT_TAGS:
         return False, f"组名 {name} 是保留字, 换个名字"
-    existing = next((o for o in c.get("outbounds", []) if o.get("tag") == name), None)
-    if name in cands or existing is not None and existing.get("type") not in (
-            "urltest", "selector"):
+    existing_outbound = next((o for o in c.get("outbounds", [])
+                              if o.get("tag") == name), None)
+    existing_group = next((g for g in pdgmodel.policy_groups(c)
+                           if g.get("name") == name), None)
+    if name in cands or existing_outbound is not None:
         return False, f"组名 {name} 和现有出口冲突, 换个名字"
     bad = [m for m in members if m not in cands]
     if bad:
@@ -1663,17 +1684,19 @@ def add_group(name, members):
     if len(members) < 2:
         return False, "故障切换组至少要 2 个出口"
     def mod(cc):
-        for o in cc["outbounds"]:           # 已存在则原地改成员(保留在列表中的位置/类型)
-            if o.get("tag") == name and o.get("type") in ("urltest", "selector"):
-                o["outbounds"] = members
-                if o.get("type") == "urltest":
-                    o.setdefault("url", DELAY_URL); o.setdefault("interval", "3m"); o.setdefault("tolerance", 50)
-                _mihomo_group_update(cc, name)
+        for group in pdgmodel.policy_groups(cc):
+            if group.get("name") == name:
+                group["proxies"] = members
                 return
-        cc["outbounds"].append({"type": "urltest", "tag": name, "outbounds": members,
-                                "url": DELAY_URL, "interval": "3m", "tolerance": 50})
-        _mihomo_group_update(cc, name)
-    ok, msg = apply_sb(mod)
+        cc["_pdg"]["policy-groups"].append({
+            "name": name, "type": "url-test", "proxies": members, "use": [],
+            "url": DELAY_URL, "interval": 180, "tolerance": 50,
+        })
+    if model_expect is None:
+        ok, msg = apply_sb(mod)
+    else:
+        ok, msg = tx_apply(
+            "group_add", model_mod=mod, model_expect=model_expect)
     return ok, (f"✅ 故障切换组 <b>{name}</b> = {' › '.join(members)}\n"
                 "按探测延迟选择出口，并在出口不可用时切换。可在「🎯 设默认出口」或分流规则里选它。" if ok else msg)
 
@@ -3184,6 +3207,20 @@ def add_ruleset(url, target, label="", behavior=""):
         return False, "规则集元数据无法读取(%s)" % type(e).__name__
     m = dict(m)
     name = "rs_" + hashlib.sha1(url.encode()).hexdigest()[:8]
+    pdg_meta = c.get("_pdg") or {}
+    mihomo_meta = pdg_meta.get("mihomo") or {}
+    occupied = {
+        item.get("tag") for item in c.get("outbounds", [])
+        if isinstance(item, dict)
+    }
+    occupied |= {
+        group.get("name") for group in pdg_meta.get("policy-groups", [])
+        if isinstance(group, dict)
+    }
+    occupied |= set(mihomo_meta.get("proxy-providers") or {})
+    occupied |= set(mihomo_meta.get("rule-providers") or {})
+    if name in occupied:
+        return False, "规则集 provider 名 %s 与出口/策略组/provider 冲突" % name
     # 下载与解析全在**候选**阶段: 提交之前一个字节都不写进 RS_DIR。旧实现先落盘再 apply_sb,
     # 失败还要自己回退文件与元数据 —— 中间任何异常都会留下半截。
     try:
@@ -4047,7 +4084,10 @@ def reorder_exits(order):
 def rename_exit(old, new):
     """真改名: 改 outbound 的 tag, 并级联更新全部引用 —— 分流规则(含 TG 出口规则)、
     故障组成员、route.final、规则集元数据的 outbound 记录。direct(模板锚点, WDA 依赖其 tag)不可改。"""
-    c = load()
+    try:
+        c, model_sha = _model_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return False, "当前模型无法读取(%s)" % type(exc).__name__
     if old not in deletable_tags(c):
         return False, f"出口 {old} 不存在或不可改名(direct 出口是模板锚点)"
     new = _tag(new.strip(), "", "")
@@ -4055,22 +4095,31 @@ def rename_exit(old, new):
         return False, "新名字无效: 用字母/数字/_/./-(不支持中文), 40 字内"
     if new == old:
         return False, "新旧名字相同, 未改动"
-    if new in ("direct", "直连", "block", "dns-out"):
+    if new in _RESERVED_EXIT_TAGS:
         return False, f"{new} 是保留字, 换个名字"
-    if new in [o["tag"] for o in c["outbounds"]]:
+    occupied = {o.get("tag") for o in c["outbounds"] if isinstance(o, dict)}
+    occupied |= {group.get("name") for group in pdgmodel.policy_groups(c)}
+    mihomo = ((c.get("_pdg") or {}).get("mihomo") or {})
+    occupied |= set(mihomo.get("proxy-providers") or {})
+    occupied |= set(mihomo.get("rule-providers") or {})
+    if new in occupied - {old}:
         return False, f"名字 {new} 已被占用"
     def mod(cc):
         for o in cc["outbounds"]:
             if o.get("tag") == old:
                 o["tag"] = new
-            if o.get("type") in ("urltest", "selector"):
-                o["outbounds"] = [new if m == old else m for m in o.get("outbounds", [])]
-        for r in cc["route"]["rules"]:
-            if r.get("outbound") == old:
-                r["outbound"] = new
-        if cc["route"].get("final") == old:
-            cc["route"]["final"] = new
-        _mihomo_group_rename(cc, old, new)
+            # Legacy schema 1/2 snapshots can still reach maintenance code
+            # during an upgrade.  Close the canonical mirror as well; v3 has
+            # no selector/urltest outbounds, so this is a harmless no-op there.
+            if o.get("type") in {"selector", "urltest"}:
+                o["outbounds"] = [
+                    new if member == old else member
+                    for member in o.get("outbounds", [])
+                ]
+        pdgmodel.rename_references(
+            cc, old, new,
+            rename_group=any(group.get("name") == old
+                             for group in pdgmodel.policy_groups(cc)))
     # 规则集元数据也记着目标出口 —— 与 model 同一笔事务改, 免得内核改完名、元数据还指着旧的
     try:
         rsm, meta_sha = _rs_meta_snapshot()
@@ -4086,15 +4135,120 @@ def rename_exit(old, new):
         files["rs_meta"] = json.dumps(rsm, ensure_ascii=False, indent=2).encode("utf-8")
         file_expects["rs_meta"] = meta_sha
     ok, msg = tx_apply(
-        "exit_rename", model_mod=mod, files=files, file_expects=file_expects
+        "exit_rename", model_mod=mod, files=files,
+        file_expects=file_expects, model_expect=model_sha
     )
     if not ok:
         return False, msg
     return True, f"✅ 出口 <b>{old}</b> 已改名 <b>{new}</b>, 分流规则/故障组/默认出口里的引用已同步。"
 
+
+def delete_exit(tag):
+    """Delete one proxy/group and close every model/ruleset reference atomically."""
+    try:
+        current, model_sha = _model_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return False, "当前模型无法读取(%s)" % type(exc).__name__
+    if tag not in deletable_tags(current):
+        return False, "出口/组 %s 不存在或不可删除" % tag
+
+    preview = copy.deepcopy(current)
+    before_groups = {group.get("name") for group in pdgmodel.policy_groups(preview)}
+    preview["outbounds"] = [
+        outbound for outbound in preview["outbounds"]
+        if outbound.get("tag") != tag
+    ]
+    _mihomo_group_delete(preview, {tag})
+    after_groups = {group.get("name") for group in pdgmodel.policy_groups(preview)}
+    removed = {tag} | (before_groups - after_groups)
+    live_order = [name for name in pdgmodel.routable_tags_unchecked(preview)
+                  if name not in removed]
+    if not live_order:
+        return False, "删除后没有可用的回退出口"
+    fallback = live_order[0]
+
+    try:
+        rsm, meta_sha = _rs_meta_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return False, "规则集元数据无法读取(%s)" % type(exc).__name__
+    dirty = False
+    for info in rsm.values():
+        if isinstance(info, dict) and info.get("outbound") in removed:
+            info["outbound"] = fallback
+            dirty = True
+    files = {}
+    file_expects = {}
+    if dirty:
+        files["rs_meta"] = json.dumps(
+            rsm, ensure_ascii=False, indent=2).encode("utf-8")
+        file_expects["rs_meta"] = meta_sha
+
+    def modify(model):
+        if tag not in deletable_tags(model):
+            raise ValueError("exit/group changed")
+        model["outbounds"] = [
+            outbound for outbound in model["outbounds"]
+            if outbound.get("tag") != tag
+        ]
+        _mihomo_group_delete(model, {tag})
+        live = set(pdgmodel.routable_tags_unchecked(model))
+        if fallback not in live:
+            raise ValueError("fallback changed")
+        route = model.get("route") or {}
+        if route.get("final") not in live:
+            route["final"] = fallback
+        for rule in route.get("rules") or []:
+            if (isinstance(rule, dict) and rule.get("outbound") is not None
+                    and rule.get("outbound") not in live):
+                rule["outbound"] = fallback
+
+    ok, message = tx_apply(
+        "exit_delete", model_mod=modify, files=files,
+        file_expects=file_expects, model_expect=model_sha)
+    if not ok:
+        return False, message
+    return True, "✅ 已删除 %s；策略组、路由与规则集引用已同步。" % tag
+
+
+def set_direct_tag(new):
+    """Rename the unique machine direct anchor in one CAS/pdgtx commit."""
+    try:
+        current, model_sha = _model_snapshot()
+        old = pdgmodel.direct_tag(current)
+        new = str(new).strip()
+        pdgmodel.validate_direct_tag_setting(new)
+        # Full collision/shape preflight happens before taking the transaction.
+        pdgmodel.rebind_direct(current, new)
+    except (TypeError, ValueError) as exc:
+        return False, "direct tag 预检失败: %s" % str(exc)
+    if new == old:
+        return True, "direct tag 已是 %s，未改动" % new
+    try:
+        rsm, meta_sha = _rs_meta_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return False, "规则集元数据无法读取(%s)" % type(exc).__name__
+    files = {}
+    file_expects = {}
+    if _rebind_direct_meta(rsm, old, new):
+        files["rs_meta"] = json.dumps(
+            rsm, ensure_ascii=False, indent=2).encode("utf-8")
+        file_expects["rs_meta"] = meta_sha
+
+    def modify(model):
+        rebound = pdgmodel.rebind_direct(model, new)
+        model.clear()
+        model.update(rebound)
+
+    ok, message = tx_apply(
+        "direct_tag_set", model_mod=modify, files=files,
+        file_expects=file_expects, model_expect=model_sha)
+    if not ok:
+        return False, message
+    return True, ("✅ 本机 direct 锚点 <b>%s</b> → <b>%s</b>；策略组、分流、"
+                  "默认出口和规则集引用已在同一事务内同步。" % (old, new))
+
 def urltest_groups(c):
-    return [o["tag"] for o in c["outbounds"]
-            if o.get("type") in ("urltest", "selector")]
+    return [group["name"] for group in pdgmodel.policy_groups(c)]
 
 # ── Telegram 独立 SOCKS5(tg-proxy 入口)的出口选择 ──
 TG_INBOUND = "tg-proxy"
@@ -5465,20 +5619,37 @@ def _restore_commit(tmp, expected=None):
             cfg = json.loads(sb_new.decode("utf-8"))
         except Exception as e:  # noqa: BLE001
             return False, "备份里的网关配置不是合法 JSON(%s)" % type(e).__name__
+        try:
+            # A declared v3 model is a closed contract.  Reject malformed
+            # metadata before either sanitizer can add defaults or discard it.
+            pdgmodel.validate_declared_schema_shape(cfg)
+        except (TypeError, ValueError) as e:
+            return False, "备份里的 PDG v3 元数据不合法: %s" % e
         # 面板是临时运行态, 不随备份恢复; 平台净化要赶在校验/落盘之前
         _panel_sanitize_config(cfg)
         _platform_sanitize_model(cfg)
         try:
-            cfg = _model_schema_v2(cfg)
-            current_cfg = _model_schema_v2(json.loads(cur_sb.decode("utf-8")))
+            cfg = _model_schema_v3(cfg)
+            current_cfg = _model_schema_v3(json.loads(cur_sb.decode("utf-8")))
         except Exception as e:  # noqa: BLE001
-            return False, "备份或现网的 PDG v2 元数据不合法(%s)" % type(e).__name__
+            return False, "备份或现网的 PDG 模型不合法(%s)" % type(e).__name__
         try:
-            normalized_direct = _normalize_default_direct_tag(cfg)
+            legacy_jp = _direct_anchor_tag(cfg) == LEGACY_DIRECT_TAG
+            _normalize_default_direct_tag(cfg)
         except ValueError as e:
             return False, "备份里的旧 direct 出口不能安全迁移: %s" % e
-        if normalized_direct:
+        if legacy_jp:
             notes.append("旧 direct 出口 jp 及其引用已迁移为 JP")
+        backup_direct = pdgmodel.direct_tag(cfg)
+        current_direct = pdgmodel.direct_tag(current_cfg)
+        direct_rebound = backup_direct != current_direct
+        if direct_rebound:
+            try:
+                cfg = pdgmodel.rebind_direct(cfg, current_direct)
+            except ValueError as e:
+                return False, "备份 direct 出口无法绑定到本机锚点: %s" % e
+            notes.append("备份 direct 锚点 %s 已绑定到本机 %s" % (
+                backup_direct, current_direct))
         t.stage("model", _model_bytes(cfg), expect=expected.get("model", sb_sha))
         restored = ["config.json"]
         current_provider_files = current_cfg["_pdg"]["mihomo"]["managed-files"]
@@ -5528,7 +5699,13 @@ def _restore_commit(tmp, expected=None):
                 bak_meta_raw = f.read()
             try:
                 bak_meta = json.loads(bak_meta_raw.decode("utf-8"))
-                if normalized_direct and _normalize_default_direct_meta(bak_meta):
+                meta_changed = False
+                if legacy_jp and _normalize_default_direct_meta(bak_meta):
+                    meta_changed = True
+                if direct_rebound and _rebind_direct_meta(
+                        bak_meta, backup_direct, current_direct):
+                    meta_changed = True
+                if meta_changed:
                     bak_meta_raw = json.dumps(
                         bak_meta, ensure_ascii=False, indent=2).encode("utf-8")
                 plan, plan_notes = _restore_ruleset_plan(tmp, cur_meta, bak_meta)
@@ -5553,9 +5730,18 @@ def _restore_commit(tmp, expected=None):
             restored.append("ruleset_direct/ruleset_hijack.txt（重新派生）")
             n_del = sum(1 for v in plan.values() if v is None)
             restored.append("规则集 %d 个(删除 %d 个)" % (len(plan) - n_del, n_del))
-        elif normalized_direct:
-            # 旧备份不带元数据时保持现网条目，但其中若仍引用旧锚点，也必须与候选模型同批迁移。
-            if _normalize_default_direct_meta(cur_meta):
+        elif legacy_jp or direct_rebound:
+            # 旧备份不带元数据时保持现网条目，但其中若仍引用旧锚点，也必须与候选模型同批迁移/绑定。
+            cur_meta_changed = False
+            if legacy_jp and _normalize_default_direct_meta(cur_meta):
+                cur_meta_changed = True
+            if direct_rebound and _rebind_direct_meta(
+                    cur_meta, backup_direct, current_direct):
+                cur_meta_changed = True
+            if legacy_jp and direct_rebound and _rebind_direct_meta(
+                    cur_meta, DEFAULT_DIRECT_TAG, current_direct):
+                cur_meta_changed = True
+            if cur_meta_changed:
                 cur_meta_new = json.dumps(
                     cur_meta, ensure_ascii=False, indent=2).encode("utf-8")
                 t.stage("rs_meta", cur_meta_new, expect=meta_sha)
@@ -5619,8 +5805,12 @@ def _dot_host():
     return _DOT_HOST
 
 def _groups_desc(c):
-    g = [o for o in c["outbounds"] if o.get("type") in ("urltest", "selector")]
-    return "\n".join(f"🔀 故障组 <b>{o['tag']}</b>: {' › '.join(o.get('outbounds', []))}" for o in g)
+    return "\n".join(
+        f"🔀 策略组 <b>{group['name']}</b> ({group['type']}): "
+        f"{' › '.join(group.get('proxies', []))}"
+        + ((" · provider=" + ",".join(group.get("use", [])))
+           if group.get("use") else "")
+        for group in pdgmodel.policy_groups(c))
 
 def status_text():
     svc = _core_svc()
@@ -5652,9 +5842,33 @@ def exits_text():
     for o in c["outbounds"]:
         if o.get("type") == "direct":
             lines.append(f'• <b>{o["tag"]}</b>  direct（本机直出）')
-        elif o.get("type") in ("urltest", "selector"):
-            lines.append(f'• <b>{o["tag"]}</b>  故障组 → {" › ".join(o.get("outbounds", []))}')
+    for group in pdgmodel.policy_groups(c):
+        lines.append(
+            f'• <b>{group["name"]}</b>  {group["type"]} 策略组 → '
+            f'{" › ".join(group.get("proxies", []))}'
+            + ((" · provider=" + ",".join(group.get("use", [])))
+               if group.get("use") else ""))
     return "出口:\n" + ("\n".join(lines) or "(无)")
+
+
+def policy_groups_text():
+    """Complete read-only projection of every first-class policy group."""
+    groups = pdgmodel.policy_groups(load())
+    if not groups:
+        return "策略组:\n(无)"
+    lines = ["📚 <b>PDG 策略组（完整只读）</b>"]
+    for group in groups:
+        lines.append(f"\n• <b>{group['name']}</b>  type={group['type']}")
+        lines.append("  proxies=" + (", ".join(group.get("proxies", [])) or "(无)"))
+        lines.append("  use=" + (", ".join(group.get("use", [])) or "(无)"))
+        options = []
+        for key in ("url", "interval", "tolerance", "strategy", "lazy",
+                    "disable-udp", "hidden"):
+            if key in group:
+                options.append(f"{key}={group[key]}")
+        if options:
+            lines.append("  " + " · ".join(options))
+    return "\n".join(lines)
 
 def rules_text():
     c = load(); lines = []; m = _rs_meta()
@@ -5699,6 +5913,8 @@ def handle_cb(chat, mid, data):
         state.pop(chat, None); del_sel.pop(chat, None)   # 返回/切页 = 放弃进行中的输入流程和勾选, 免得下一条文字被旧状态误吃
     if data in ("menu", "status"):
         edit(chat, mid, status_text(), MENU); return
+    if data == "policy_groups":
+        edit(chat, mid, policy_groups_text(), EXIT_BACK); return
     if data.startswith("nav:"):
         title, kb = _nav(data[4:]); edit(chat, mid, title, kb); return
     if data == "setdot":
@@ -5772,8 +5988,8 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "选要改的故障组:", kb_pick("egrp", gs, EXIT_BACK)); return
     if data.startswith("egrp:"):
         name = data[5:]; state[chat] = "edit_grp:" + name
-        cur = next((o.get("outbounds", []) for o in load()["outbounds"]
-                    if o.get("tag") == name and o.get("type") in ("urltest", "selector")), [])
+        cur = next((group.get("proxies", []) for group in pdgmodel.policy_groups(load())
+                    if group.get("name") == name), [])
         edit(chat, mid, f"发 <b>{name}</b> 组的新成员(空格分隔, 按顺序, 至少2个)。\n"
              f"当前: <code>{' '.join(cur) or '空'}</code>\n可选: {', '.join(concrete_tags(load()))}\n"
              f"例: <code>hk tw us</code>\n/cancel 取消。", EXIT_BACK); return
@@ -6047,24 +6263,7 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, msg, OPS_BACK); return
     if data.startswith("delx:"):
         tag = data[5:]
-        def mod(c):
-            before_tags = {o.get("tag") for o in c["outbounds"] if isinstance(o, dict)}
-            c["outbounds"] = [o for o in c["outbounds"] if o.get("tag") != tag]
-            for o in c["outbounds"]:
-                if o.get("type") in ("urltest", "selector"):
-                    o["outbounds"] = [m for m in o.get("outbounds", []) if m != tag]
-            c["outbounds"] = [o for o in c["outbounds"]
-                              if not (o.get("type") in ("urltest", "selector")
-                                      and not o.get("outbounds"))]
-            after_tags = {o.get("tag") for o in c["outbounds"] if isinstance(o, dict)}
-            _mihomo_group_delete(c, before_tags - after_tags)
-            live = {o["tag"] for o in c["outbounds"]}
-            for r in c["route"]["rules"]:
-                if r.get("outbound") and r["outbound"] not in live:
-                    r["outbound"] = c["route"].get("final", "hk")
-            if c["route"].get("final") not in live:
-                c["route"]["final"] = next((t for t in exit_tags(c)), "direct")
-        ok, msg = apply_sb(mod)
+        ok, msg = delete_exit(tag)
         edit(chat, mid, f"✅ 已删除 {tag}" if ok else msg, EXIT_BACK); return
     if data.startswith("fin:"):
         tag = data[4:]
@@ -6090,6 +6289,8 @@ def handle_text(chat, text, mid=None):
             send(chat, traffic_text(), BACK); return
         if cmd == "/exits":
             send(chat, exits_text(), BACK); return
+        if cmd == "/groups":
+            send(chat, policy_groups_text(), BACK); return
         if cmd == "/rules":
             send(chat, rules_text(), BACK); return
         if cmd == "/addexit":

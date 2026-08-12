@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""默认 direct 锚点 JP：模型迁移、WDA 动态引用与生产接线回归。"""
+"""本机 direct 锚点：v3 迁移、自定义、全引用闭包与生产接线回归。"""
 import copy
 import importlib.util
 import json
@@ -23,6 +23,7 @@ spec = importlib.util.spec_from_file_location("pdg_bot_direct_tag", BOT)
 bot = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(bot)
+import sb2mihomo  # noqa: E402
 
 
 def old_model():
@@ -45,7 +46,10 @@ def old_model():
 cfg = old_model()
 assert bot._normalize_default_direct_tag(cfg) is True
 assert cfg["outbounds"][0]["tag"] == "JP"
-assert cfg["outbounds"][2]["outbounds"] == ["JP", "hk"]
+assert cfg["_pdg"]["schema"] == 3
+assert cfg["_pdg"]["policy-groups"][0]["proxies"] == ["JP", "hk"]
+assert not any(item.get("type") in {"selector", "urltest"}
+               for item in cfg["outbounds"])
 assert cfg["route"]["rules"][1]["outbound"] == "JP"
 assert cfg["route"]["final"] == "JP"
 assert bot._direct_anchor_tag(cfg) == "JP"
@@ -61,9 +65,11 @@ assert meta["legacy"]["outbound"] == "JP"
 assert meta["phone"]["outbound"] == "direct"
 assert meta["proxy"]["outbound"] == "hk"
 
-custom = {"outbounds": [{"type": "direct", "tag": "LOCAL"}], "route": {"rules": []}}
-assert bot._normalize_default_direct_tag(custom) is False
+custom = {"outbounds": [{"type": "direct", "tag": "LOCAL"}],
+          "route": {"rules": [], "final": "LOCAL"}}
+assert bot._normalize_default_direct_tag(custom) is True
 assert custom["outbounds"][0]["tag"] == "LOCAL"
+assert bot._normalize_default_direct_tag(custom) is False
 
 collision = old_model()
 collision["outbounds"].append({"type": "shadowsocks", "tag": "JP"})
@@ -120,6 +126,80 @@ bot.load = lambda: copy.deepcopy(ambiguous)
 ok, msg = bot.set_wda_mode(True)
 assert not ok and "只能有一个" in msg
 
+# 专用 direct-tag 操作在一次 CAS/pdgtx 调用中修改模型和 rulesets 元数据；
+# Mihomo 的内建 DIRECT 保持字面量，不把机器自定义名泄漏成不存在的 proxy。
+direct_model = bot.pdgmodel.migrate({
+    "outbounds": [
+        {"type": "direct", "tag": "JP"},
+        {"type": "shadowsocks", "tag": "hk", "server": "127.0.0.1",
+         "server_port": 8388, "method": "aes-128-gcm", "password": "x"},
+    ],
+    "route": {
+        "rules": [
+            {"domain_suffix": ["direct.example"], "outbound": "JP"},
+            {"domain_suffix": ["group.example"], "outbound": "nested"},
+        ],
+        "final": "JP",
+    },
+    "_pdg": {"schema": 3, "policy-groups": [
+        {"name": "choice", "type": "select", "proxies": ["JP", "hk"], "use": []},
+        {"name": "nested", "type": "fallback", "proxies": ["choice", "JP"],
+         "use": [], "url": "https://www.gstatic.com/generate_204", "interval": 180},
+    ], "mihomo": {"proxy-providers": {}, "rule-providers": {},
+                     "advanced": {}, "managed-files": {}}},
+})
+direct_meta = {
+    "machine": {"outbound": "JP"},
+    "phone": {"outbound": "direct"},
+    "proxy": {"outbound": "hk"},
+}
+captured = {}
+bot.load = lambda: copy.deepcopy(direct_model)
+bot._model_snapshot = lambda: (copy.deepcopy(direct_model), "c" * 64)
+bot._rs_meta_snapshot = lambda: (copy.deepcopy(direct_meta), "a" * 64)
+
+def fake_direct_tx(op, model_mod=None, files=None, file_expects=None, **_kwargs):
+    candidate = copy.deepcopy(direct_model)
+    model_mod(candidate)
+    captured.update(op=op, candidate=candidate, files=files,
+                    file_expects=file_expects,
+                    model_expect=_kwargs.get("model_expect"))
+    return True, "committed"
+
+bot.tx_apply = fake_direct_tx
+ok, msg = bot.set_direct_tag("KFC_JP")
+assert ok, msg
+renamed = captured["candidate"]
+assert captured["op"] == "direct_tag_set"
+assert captured["file_expects"] == {"rs_meta": "a" * 64}
+assert captured["model_expect"] == "c" * 64
+renamed_meta = json.loads(captured["files"]["rs_meta"].decode())
+assert renamed_meta["machine"]["outbound"] == "KFC_JP"
+assert renamed_meta["phone"]["outbound"] == "direct"
+assert renamed["outbounds"][0]["tag"] == "KFC_JP"
+assert renamed["_pdg"]["policy-groups"][0]["proxies"] == ["KFC_JP", "hk"]
+assert renamed["_pdg"]["policy-groups"][1]["proxies"] == ["choice", "KFC_JP"]
+assert renamed["route"]["rules"][0]["outbound"] == "KFC_JP"
+assert renamed["route"]["final"] == "KFC_JP"
+rendered, _warnings = sb2mihomo.singbox_to_mihomo(renamed)
+choice = next(group for group in rendered["proxy-groups"] if group["name"] == "choice")
+assert choice["proxies"] == ["DIRECT", "hk"]
+
+# Collision and transaction failure are fail-closed and cannot mutate the source model.
+for bad in ("choice", "hk", "DIRECT", "DiReCt", "REJECT", "jp", "JP", "bad tag"):
+    bot.load = lambda: copy.deepcopy(direct_model)
+    bot._model_snapshot = lambda: (copy.deepcopy(direct_model), "c" * 64)
+    ok, _msg = bot.set_direct_tag(bad)
+    assert not ok, bad
+unchanged = copy.deepcopy(direct_model)
+bot.load = lambda: unchanged
+bot._model_snapshot = lambda: (copy.deepcopy(unchanged), "d" * 64)
+bot._rs_meta_snapshot = lambda: (copy.deepcopy(direct_meta), "b" * 64)
+bot.tx_apply = lambda *_args, **_kwargs: (False, "rolled back")
+ok, msg = bot.set_direct_tag("KFC_JP")
+assert not ok and msg == "rolled back"
+assert unchanged == direct_model
+
 template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
 assert template["outbounds"] == [{"type": "direct", "tag": "JP"}]
 assert template["route"]["final"] == "JP"
@@ -143,4 +223,4 @@ for required in (
 run_all = pdg_source[pdg_source.index("run_all_migrations(){"):]
 assert "migrate_default_direct_tag || return 1" in run_all
 
-print("direct-tag JP regression OK")
+print("direct-tag v3/custom regression OK")

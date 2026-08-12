@@ -468,15 +468,19 @@ def main():
     # ── 10. 丢更新窗口(六): 前置条件必须对应"候选所依据的那一份" ──
     box4 = Box(); tx4 = load_tx(box4.env)
     box4.up("mihomo"); box4.up("mosdns")
+    pdg_v3 = {"schema": 3, "policy-groups": [], "mihomo": {
+        "proxy-providers": {}, "rule-providers": {}, "advanced": {}, "managed-files": {}}}
     model_v1 = json.dumps({"outbounds": [{"type": "direct", "tag": "v1"}],
-                           "route": {"rules": []}, "inbounds": []}).encode()
+                           "route": {"rules": [], "final": "v1"}, "inbounds": [],
+                           "_pdg": pdg_v3}).encode()
     box4.put("/etc/sing-box/config.json", model_v1)
     # A: 读旧配置(此刻还没 stage)
     tA = tx4.Tx("bot", "A-read-old")
     curA, shaA = tA.read_for_update("model")
     # B: 中途提交了自己的修改
     model_v2 = json.dumps({"outbounds": [{"type": "direct", "tag": "v2-from-B"}],
-                           "route": {"rules": []}, "inbounds": []}).encode()
+                           "route": {"rules": [], "final": "v2-from-B"}, "inbounds": [],
+                           "_pdg": pdg_v3}).encode()
     tB = tx4.Tx("bot", "B-commit")
     tB.stage("model", model_v2)
     resB = tB.commit()
@@ -485,6 +489,7 @@ def main():
     # A: 基于旧内容算出候选再 stage/commit → 必须撞前置条件
     modelA = json.loads(curA.decode())
     modelA["outbounds"][0]["tag"] = "v1-modified-by-A"
+    modelA["route"]["final"] = "v1-modified-by-A"
     tA.stage("model", json.dumps(modelA).encode())
     try:
         tA.commit()
@@ -625,8 +630,9 @@ def main():
     box8 = Box(); tx8 = load_tx(box8.env)
     box8.up("mosdns"); box8.up("mihomo")
     box8.put("/etc/sing-box/config.json", json.dumps(
-        {"outbounds": [{"type": "direct", "tag": "hk"}], "route": {"rules": []},
-         "inbounds": []}).encode())
+        {"outbounds": [{"type": "direct", "tag": "hk"}],
+         "route": {"rules": [], "final": "hk"}, "inbounds": [],
+         "_pdg": pdg_v3}).encode())
     os.makedirs(box8.path("/etc/sing-box/rs"), exist_ok=True)
     box8.put("/opt/pdg-bot/rulesets.json", b"{}", 0o644)
     for _m in list(sys.modules):
@@ -703,8 +709,10 @@ def main():
     box9.up("mosdns"); box9.up("mihomo")
     box9.put("/etc/sing-box/config.json", json.dumps(
         {"outbounds": [{"type": "shadowsocks", "tag": "hk", "server": "1.1.1.1",
-                        "server_port": 1, "method": "aes-256-gcm", "password": "p"}],
-         "route": {"rules": []}, "inbounds": [{"type": "direct", "tag": "in"}]}).encode())
+                        "server_port": 1, "method": "aes-256-gcm", "password": "p"},
+                       {"type": "direct", "tag": "direct"}],
+         "route": {"rules": [], "final": "direct"},
+         "inbounds": [{"type": "direct", "tag": "in"}], "_pdg": pdg_v3}).encode())
     box9.put("/etc/privdns-gateway/profile.env", b"PDG_TFO=0\n", 0o600)
     # sysctl 桩: -w/-p 记账并记住当前值, -n 复读它 —— 事务的复读校验才有意义
     with open(os.path.join(box9.bin, "sysctl"), "w") as f:
@@ -1270,8 +1278,10 @@ def main():
     box18.up("mosdns"); box18.up("mihomo")
     box18.put("/etc/sing-box/config.json", json.dumps(
         {"outbounds": [{"type": "shadowsocks", "tag": "hk", "server": "1.1.1.1",
-                        "server_port": 1, "method": "aes-256-gcm", "password": "SECRET_SENTINEL"}],
-         "route": {"rules": []}, "inbounds": []}).encode())
+                        "server_port": 1, "method": "aes-256-gcm", "password": "SECRET_SENTINEL"},
+                       {"type": "direct", "tag": "direct"}],
+         "route": {"rules": [], "final": "direct"}, "inbounds": [],
+         "_pdg": pdg_v3}).encode())
     for _m in list(sys.modules):
         if _m == "pdgtx":
             del sys.modules[_m]

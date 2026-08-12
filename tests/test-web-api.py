@@ -160,9 +160,24 @@ class FakeBot:
             f"bad ss://{PLAIN_SECRET}@secret.example"
         )
         self.before_file_expect_check = None
+        self.before_model_expect_check = None
+        self.runtime_selections = []
+        self.runtime_now = {}
+        self.runtime_all = {}
+        self.pdgmodel = types.SimpleNamespace(
+            rename_references=self._rename_model_references,
+            validate_direct_tag_setting=lambda value: (
+                (_ for _ in ()).throw(ValueError("reserved"))
+                if value.casefold() in {"direct", "jp"} else value))
 
     def load(self):
         return copy.deepcopy(self.model)
+
+    def _model_snapshot(self):
+        raw = json.dumps(
+            self.model, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        return copy.deepcopy(self.model), hashlib.sha256(raw).hexdigest()
 
     def _rs_meta(self):
         return copy.deepcopy(self.meta)
@@ -175,11 +190,67 @@ class FakeBot:
 
     def exit_tags(self, model):
         allowed = self.PROXY_TYPES + ("direct", "urltest")
-        return [
+        tags = [
             item["tag"]
             for item in model.get("outbounds", [])
             if item.get("type") in allowed
         ]
+        tags.extend(item.get("name") for item in (
+            (model.get("_pdg") or {}).get("policy-groups") or [])
+                    if isinstance(item, dict) and isinstance(item.get("name"), str))
+        return tags
+
+    @staticmethod
+    def _rename_model_references(model, old, new, *, rename_group=False):
+        groups = (model.get("_pdg") or {}).get("policy-groups") or []
+        for group in groups:
+            if rename_group and group.get("name") == old:
+                group["name"] = new
+            group["proxies"] = [new if value == old else value
+                                for value in group.get("proxies", [])]
+        route = model.get("route") or {}
+        if route.get("final") == old:
+            route["final"] = new
+        for rule in route.get("rules") or []:
+            if rule.get("outbound") == old:
+                rule["outbound"] = new
+
+    @staticmethod
+    def _mihomo_group_delete(model, removed):
+        removed = set(removed)
+        groups = (model.get("_pdg") or {}).get("policy-groups") or []
+        while True:
+            groups[:] = [item for item in groups if item.get("name") not in removed]
+            empty = set()
+            for group in groups:
+                group["proxies"] = [value for value in group.get("proxies", [])
+                                    if value not in removed]
+                if not group["proxies"] and not group.get("use"):
+                    empty.add(group.get("name"))
+            if not empty - removed:
+                return
+            removed |= empty
+
+    def clash_get(self, path):
+        name = path.rsplit("/", 1)[-1]
+        return {"now": self.runtime_now.get(name),
+                "all": copy.deepcopy(self.runtime_all.get(name, []))}
+
+    def clash_select(self, group, member):
+        self.runtime_selections.append((group, member))
+        self.runtime_now[group] = member
+
+    def set_direct_tag(self, new):
+        current = next((item.get("tag") for item in self.model.get("outbounds", [])
+                        if item.get("type") == "direct"), None)
+        if current is None:
+            return False, "direct missing"
+        def modify(model):
+            for item in model["outbounds"]:
+                if item.get("type") == "direct":
+                    item["tag"] = new
+            self._rename_model_references(model, current, new)
+        return self.tx_apply("direct_tag_set", model_mod=modify)
 
     def concrete_tags(self, model):
         allowed = self.PROXY_TYPES + ("direct",)
@@ -208,8 +279,18 @@ class FakeBot:
             "services": tuple(services or ()),
             "file_keys": [],
             "file_expects": {},
+            "model_expect": kwargs.get("model_expect"),
         }
         try:
+            if "model_expect" in kwargs:
+                hook = self.before_model_expect_check
+                if callable(hook):
+                    self.before_model_expect_check = None
+                    hook(self)
+                _model, current_revision = self._model_snapshot()
+                if kwargs["model_expect"] != current_revision:
+                    self.transactions.append(record)
+                    return False, "PRECONDITION_FAILED: model changed"
             if model_mod is not None:
                 model_mod(candidate)
             record["file_keys"] = sorted((files or {}).keys())
@@ -301,8 +382,14 @@ class FakeBot:
         self.model["outbounds"] = [by_tag[tag] for tag in order]
         return True, "reordered"
 
-    def add_group(self, tag, members):
+    def add_group(self, tag, members, model_expect=None):
         self.wrapper_calls.append(("add_group", tag, tuple(members)))
+        hook = self.before_model_expect_check
+        if callable(hook):
+            self.before_model_expect_check = None
+            hook(self)
+        if model_expect is not None and model_expect != self._model_snapshot()[1]:
+            return False, "PRECONDITION_FAILED: model changed"
         allowed = set(self.concrete_tags(self.model))
         if not set(members).issubset(allowed):
             return False, "unknown member"
@@ -537,8 +624,11 @@ class FakeBot:
             )
         return FakeResult(returncode=0, stdout="ok\n")
 
-    @staticmethod
-    def clash_get(path):
+    def clash_get(self, path):
+        if path.startswith("/proxies/"):
+            name = path.rsplit("/", 1)[-1]
+            return {"now": self.runtime_now.get(name),
+                    "all": copy.deepcopy(self.runtime_all.get(name, []))}
         if path == "/connections":
             return {
                 "uploadTotal": 30,
@@ -1393,6 +1483,60 @@ class WebAPITestCase(unittest.TestCase):
         self.assertFalse(any(item.get("tag") == "choice"
                              for item in self.fake.model["outbounds"]))
 
+    def test_legacy_group_writes_are_cas_pinned_with_optional_revision(self):
+        self.login()
+        created = self.request(
+            "POST", "/api/v1/groups",
+            {"name": "legacy", "members": ["hk", "tw"]})
+        self.assertEqual(created["status"], 201, created["text"])
+        self.assertTrue(created["json"]["data"]["deprecated"])
+
+        stale = "0" * 64
+        before = copy.deepcopy(self.fake.model)
+        rejected = self.request(
+            "PATCH", "/api/v1/groups/legacy",
+            {"revision": stale, "members": ["tw", "hk"]})
+        self.assert_error(rejected, 409)
+        self.assertEqual(self.fake.model, before)
+
+        def concurrent_change(fake):
+            fake.model.setdefault("route", {}).setdefault("rules", []).append({
+                "domain_suffix": ["concurrent.example"], "outbound": "hk"})
+
+        operations = [
+            ("POST", "/api/v1/groups",
+             {"name": "racing", "members": ["hk", "tw"]}),
+            ("PATCH", "/api/v1/groups/legacy",
+             {"members": ["tw", "hk"]}),
+            ("DELETE", "/api/v1/groups/legacy", None),
+        ]
+        for method, path, body in operations:
+            with self.subTest(method=method):
+                before_group = copy.deepcopy(self.fake.model["outbounds"])
+                self.fake.before_model_expect_check = concurrent_change
+                response = (self.request(method, path) if body is None
+                            else self.request(method, path, body))
+                self.assert_error(response, 409)
+                self.assertEqual(self.fake.model["outbounds"], before_group)
+                self.assertTrue(any(
+                    rule.get("domain_suffix") == ["concurrent.example"]
+                    for rule in self.fake.model["route"]["rules"]))
+
+        revision = self.fake._model_snapshot()[1]
+        deleted = self.request(
+            "DELETE", "/api/v1/groups/legacy", {"revision": revision})
+        self.assertEqual(deleted["status"], 200, deleted["text"])
+        self.assertNotIn("deprecated", deleted["json"]["data"])
+
+    def test_direct_tag_reserved_compatibility_names_reject_atomically(self):
+        self.login()
+        for name in ("direct", "DiReCt", "jp", "JP"):
+            before = copy.deepcopy(self.fake.model)
+            with self.subTest(name=name):
+                response = self.request("PUT", "/api/v1/direct-tag", {"tag": name})
+                self.assert_error(response, 400)
+                self.assertEqual(self.fake.model, before)
+
     def test_diagnostics_are_structured_and_drop_internal_fields(self):
         self.login()
         exits = self.request(
@@ -2051,6 +2195,145 @@ class WebAPITestCase(unittest.TestCase):
         self.assertEqual(applied["json"]["data"]["action"], "config-import")
         self.assertIn(
             ("start", "config-import", FakeConfigIO.IMPORT_ID), self.jobs.calls)
+
+    def test_policy_groups_v3_crud_cas_runtime_and_direct_tag_routes(self):
+        self.login()
+        self.fake.model = {
+            "outbounds": [
+                {"type": "direct", "tag": "KFC_JP"},
+                {"type": "shadowsocks", "tag": "hk"},
+                {"type": "shadowsocks", "tag": "tw"},
+            ],
+            "route": {
+                "rules": [{"domain_suffix": ["group.example"],
+                           "outbound": "choice"}],
+                "final": "choice",
+            },
+            "_pdg": {"schema": 3, "policy-groups": [{
+                "name": "choice", "type": "select",
+                "proxies": ["KFC_JP", "hk"], "use": [],
+            }], "mihomo": {"proxy-providers": {"remote": {}},
+                              "rule-providers": {}, "advanced": {},
+                              "managed-files": {}}},
+        }
+        self.fake.runtime_now = {"choice": "DIRECT"}
+        self.fake.runtime_all = {"choice": ["DIRECT", "hk"]}
+        groups = self.request("GET", "/api/v1/policy-groups")
+        self.assertEqual(groups["status"], 200, groups["text"])
+        payload = groups["json"]["data"]
+        self.assertEqual(payload["items"][0]["runtimeSelected"], "KFC_JP")
+        self.assertEqual(payload["items"][0]["runtimeCandidates"], ["KFC_JP", "hk"])
+        self.assertEqual(payload["providers"], ["remote"])
+        self.assertIn("choice", payload["targets"])
+        self.assertRegex(payload["revision"], r"^[0-9a-f]{64}$")
+
+        created = self.request("POST", "/api/v1/policy-groups", {
+            "revision": payload["revision"],
+            "name": "failover", "type": "fallback",
+            "proxies": ["choice", "tw"], "use": [],
+            "url": "https://www.gstatic.com/generate_204", "interval": 120,
+        })
+        self.assertEqual(created["status"], 201, created["text"])
+        self.assertEqual(created["json"]["data"]["type"], "fallback")
+        after_create = self.request("GET", "/api/v1/policy-groups")["json"]["data"]
+        self.fake.meta["rs_deadbeef"]["outbound"] = "failover"
+        patched = self.request(
+            "PATCH", "/api/v1/policy-groups/failover", {
+                "revision": after_create["revision"],
+                "name": "balanced", "type": "load-balance",
+                "proxies": ["choice", "tw"], "use": [],
+                "url": "https://www.gstatic.com/generate_204", "interval": 300,
+                "strategy": "round-robin",
+            })
+        self.assertEqual(patched["status"], 200, patched["text"])
+        self.assertEqual(patched["json"]["data"]["name"], "balanced")
+        self.assertEqual(self.fake.meta["rs_deadbeef"]["outbound"], "balanced")
+        self.assertEqual(self.fake.transactions[-1]["file_keys"], ["rs_meta"])
+        self.assertEqual(set(self.fake.transactions[-1]["file_expects"]), {"rs_meta"})
+        self.assertEqual(self.fake.transactions[-1]["model_expect"],
+                         after_create["revision"])
+
+        before_transactions = len(self.fake.transactions)
+        selected = self.request(
+            "PUT", "/api/v1/policy-groups/choice/runtime",
+            {"member": "KFC_JP"})
+        self.assertEqual(selected["status"], 200, selected["text"])
+        self.assertFalse(selected["json"]["data"]["persistent"])
+        self.assertEqual(self.fake.runtime_selections[-1], ("choice", "DIRECT"))
+        self.assertEqual(len(self.fake.transactions), before_transactions)
+
+        after_patch = self.request("GET", "/api/v1/policy-groups")["json"]["data"]
+        deleted = self.request(
+            "DELETE", "/api/v1/policy-groups/balanced",
+            {"revision": after_patch["revision"]})
+        self.assertEqual(deleted["status"], 200, deleted["text"])
+        self.assertFalse(any(item.get("name") == "balanced" for item in
+                             self.fake.model["_pdg"]["policy-groups"]))
+        renamed_direct = self.request(
+            "PUT", "/api/v1/direct-tag", {"tag": "LOCAL_EGRESS"})
+        self.assertEqual(renamed_direct["status"], 200, renamed_direct["text"])
+        self.assertEqual(self.fake.model["outbounds"][0]["tag"], "LOCAL_EGRESS")
+        self.assertEqual(
+            self.fake.model["_pdg"]["policy-groups"][0]["proxies"][0],
+            "LOCAL_EGRESS")
+
+    def test_policy_group_runtime_provider_candidates_reject_mapping_and_stale_cas(self):
+        self.login()
+        self.fake.model = {
+            "outbounds": [
+                {"type": "direct", "tag": "KFC_JP"},
+                {"type": "block", "tag": "deny"},
+                {"type": "shadowsocks", "tag": "hk"},
+            ],
+            "route": {"rules": [], "final": "provider_only"},
+            "_pdg": {"schema": 3, "policy-groups": [
+                {"name": "provider_only", "type": "select", "proxies": [],
+                 "use": ["remote"]},
+                {"name": "literal_reject", "type": "select",
+                 "proxies": ["REJECT", "hk"], "use": []},
+                {"name": "mapped_block", "type": "select",
+                 "proxies": ["deny", "hk"], "use": []},
+            ], "mihomo": {"proxy-providers": {"remote": {}},
+                            "rule-providers": {}, "advanced": {},
+                            "managed-files": {}}},
+        }
+        self.fake.runtime_now = {
+            "provider_only": "provider node 1",
+            "literal_reject": "REJECT", "mapped_block": "REJECT",
+        }
+        self.fake.runtime_all = {
+            "provider_only": ["provider node 1", "provider-node-2"],
+            "literal_reject": ["REJECT", "hk"],
+            "mapped_block": ["REJECT", "hk"],
+        }
+        response = self.request("GET", "/api/v1/policy-groups")
+        self.assertEqual(response["status"], 200, response["text"])
+        payload = response["json"]["data"]
+        items = {item["name"]: item for item in payload["items"]}
+        self.assertEqual(items["provider_only"]["runtimeCandidates"],
+                         ["provider node 1", "provider-node-2"])
+        self.assertEqual(items["provider_only"]["runtimeSelected"], "provider node 1")
+        self.assertEqual(items["literal_reject"]["runtimeSelected"], "REJECT")
+        self.assertEqual(items["mapped_block"]["runtimeSelected"], "deny")
+
+        before_model = copy.deepcopy(self.fake.model)
+        selected = self.request(
+            "PUT", "/api/v1/policy-groups/provider_only/runtime",
+            {"member": "provider-node-2"})
+        self.assertEqual(selected["status"], 200, selected["text"])
+        self.assertEqual(self.fake.runtime_selections[-1],
+                         ("provider_only", "provider-node-2"))
+        self.assertEqual(self.fake.model, before_model)
+
+        stale_revision = payload["revision"]
+        self.fake.model["route"]["final"] = "hk"
+        before_groups = copy.deepcopy(self.fake.model["_pdg"]["policy-groups"])
+        stale = self.request("POST", "/api/v1/policy-groups", {
+            "revision": stale_revision, "name": "stale", "type": "select",
+            "proxies": ["hk"], "use": [],
+        })
+        self.assert_error(stale, 409)
+        self.assertEqual(self.fake.model["_pdg"]["policy-groups"], before_groups)
 
 
 class PersistentJobStoreTestCase(unittest.TestCase):

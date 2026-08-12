@@ -37,6 +37,9 @@ import tempfile
 import time
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pdgmodel
+
 SCHEMA_VERSION = 1
 MAX_MANAGED_FILE = 8 * 1024 * 1024
 MAX_MODEL_FILE = 24 * 1024 * 1024
@@ -668,19 +671,18 @@ def _v_json_model(path, data, ctx):
             return False, "config.json 的 per-proxy Mihomo 扩展字段不安全"
     meta = doc.get("_pdg")
     if meta is not None:
-        if not isinstance(meta, dict) or set(meta) - {"schema", "mihomo"}:
+        if not isinstance(meta, dict) or set(meta) != {
+                "schema", "policy-groups", "mihomo"}:
             return False, "config.json 的 _pdg 元数据不合法"
-        if meta.get("schema") != 2 or not isinstance(meta.get("mihomo"), dict):
-            return False, "config.json 的 _pdg schema 不是受支持的 v2"
+        if meta.get("schema") != 3 or not isinstance(meta.get("mihomo"), dict):
+            return False, "config.json 的 _pdg schema 不是受支持的 v3"
         mihomo = meta["mihomo"]
-        expected = {"proxy-providers", "rule-providers", "proxy-groups",
-                    "advanced", "managed-files"}
+        expected = {"proxy-providers", "rule-providers", "advanced", "managed-files"}
         if set(mihomo) != expected:
             return False, "config.json 的 Mihomo 扩展字段不完整"
         if not all(isinstance(mihomo[key], typ) for key, typ in (
                 ("proxy-providers", dict), ("rule-providers", dict),
-                ("proxy-groups", list), ("advanced", dict),
-                ("managed-files", dict))):
+                ("advanced", dict), ("managed-files", dict))):
             return False, "config.json 的 Mihomo 扩展字段类型不合法"
         pdg_owned = {
             "allow-lan", "bind-address", "dns", "external-controller",
@@ -747,95 +749,39 @@ def _v_json_model(path, data, ctx):
                         return False, "config.json 的远程 %s URL/path 不合法" % kind
         if local_leaves != set(managed):
             return False, "config.json 的 managed provider 引用闭包不完整"
-        groups = mihomo["proxy-groups"]
-        group_names = set()
+        groups = meta["policy-groups"]
+        if not isinstance(groups, list):
+            return False, "config.json 的 policy-groups 类型不合法"
         for group in groups:
             if (not isinstance(group, dict) or not safe_advanced(group)
-                    or not isinstance(group.get("name"), str)
-                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", group["name"])
-                    or group["name"] in group_names
-                    or group.get("type") not in ("select", "url-test", "fallback", "load-balance")
-                    or not isinstance(group.get("proxies", []), list)
-                    or not isinstance(group.get("use", []), list)
                     or not group_schema(group)):
-                return False, "config.json 的 proxy-group 元数据不合法"
-            group_names.add(group["name"])
-        tags = {item.get("tag") for item in doc.get("outbounds", [])
-                if isinstance(item, dict) and isinstance(item.get("tag"), str)}
-        direct_tags = {item.get("tag") for item in doc.get("outbounds", [])
-                       if isinstance(item, dict) and item.get("type") == "direct"
-                       and isinstance(item.get("tag"), str)}
-        if direct_tags & {"DIRECT", "REJECT"}:
-            return False, "config.json 的 direct tag 与 Mihomo 保留目标冲突"
-        proxy_tags = {item.get("tag") for item in doc.get("outbounds", [])
-                      if isinstance(item, dict) and isinstance(item.get("tag"), str)
-                      and item.get("type") not in ("direct", "selector", "urltest")}
-        if group_names & proxy_tags:
-            return False, "config.json 的 proxy 与 proxy-group 名称冲突"
-        if group_names & (direct_tags | {"DIRECT", "REJECT"}):
-            return False, "config.json 的 proxy-group 名称与保留目标冲突"
-        canonical_groups = {
-            item.get("tag"): item for item in doc.get("outbounds", [])
-            if isinstance(item, dict) and item.get("type") in ("selector", "urltest")
-        }
-        for group in groups:
-            canonical = canonical_groups.get(group["name"])
-            representable = not group.get("use") and "REJECT" not in group.get("proxies", [])
-            if canonical is None:
-                if group["type"] in ("select", "url-test") and representable:
-                    return False, "config.json 的可编辑 Mihomo group 缺 canonical outbound"
-                continue
-            expected_type = "select" if canonical.get("type") == "selector" else "url-test"
-            if group["type"] != expected_type or not representable:
-                return False, "config.json 的 canonical 与 Mihomo proxy-group 表示不一致"
-            direct_tag = next(iter(direct_tags), None)
-            metadata_members = [direct_tag if item == "DIRECT" else item
-                                for item in group.get("proxies", [])]
-            if metadata_members != canonical.get("outbounds", []):
-                return False, "config.json 的 canonical 与 Mihomo group 成员不一致"
-            if expected_type == "url-test":
-                interval = group.get("interval", 180)
-                canonical_interval = str(canonical.get("interval", "180s"))
-                match = re.fullmatch(r"(\d+)([smh]?)", canonical_interval)
-                scale = {"": 1, "s": 1, "m": 60, "h": 3600}
-                seconds = int(match.group(1)) * scale[match.group(2)] if match else -1
-                if (type(interval) is not int or interval != seconds
-                        or group.get("url", "https://www.gstatic.com/generate_204")
-                        != canonical.get("url", "https://www.gstatic.com/generate_204")
-                        or group.get("tolerance", 50) != canonical.get("tolerance", 50)):
-                    return False, "config.json 的 canonical 与 Mihomo group 探针不一致"
-        known = tags | group_names | {"DIRECT", "REJECT"}
-        graph = {}
-        for group in groups:
-            members = group.get("proxies", [])
-            uses = group.get("use", [])
-            if (any(not isinstance(item, str) or item not in known for item in members)
-                    or any(not isinstance(item, str) or item not in mihomo["proxy-providers"]
-                           for item in uses)):
-                return False, "config.json 的 proxy-group 引用未定义对象"
-            graph[group["name"]] = {item for item in members if item in group_names}
-        visiting, visited = set(), set()
-        def visit_group(name):
-            if name in visiting:
-                return False
-            if name in visited:
-                return True
-            visiting.add(name)
-            if not all(visit_group(child) for child in graph.get(name, ())):
-                return False
-            visiting.remove(name); visited.add(name)
-            return True
-        if not all(visit_group(name) for name in graph):
-            return False, "config.json 的 proxy-group 存在循环引用"
+                return False, "config.json 的 policy-group 元数据不合法"
+        try:
+            pdgmodel.validate(doc)
+        except (TypeError, ValueError) as exc:
+            return False, "config.json 的 policy-group/路由闭包不合法: %s" % str(exc)
         ruleset_ok, rule_meta, ruleset_error = _candidate_ruleset_meta(ctx)
         if not ruleset_ok:
             return False, ruleset_error
         # Use every PDG metadata key, not only providers rendered at runtime.
         # ``direct`` and legacy ``.srs`` entries still occupy the PDG-owned
         # namespace and could otherwise become latent imported providers after
-        # a later metadata edit.
-        if set(mihomo["rule-providers"]) & set(rule_meta):
-            return False, "导入 rule-provider 与 PDG 规则集同名"
+        # a later metadata edit.  The shared validator also reserves Clash's
+        # built-ins (DIRECT/REJECT) and the current machine direct anchor.
+        try:
+            pdgmodel.validate_ruleset_namespace(doc, set(rule_meta))
+        except (TypeError, ValueError) as exc:
+            return False, "PDG 规则集 provider 命名空间冲突: %s" % str(exc)
+        routable = set(pdgmodel.routable_tags(doc))
+        invalid_targets = sorted(
+            name for name, info in rule_meta.items()
+            if (not isinstance(info, dict)
+                or info.get("outbound") != "direct"
+                and info.get("outbound") not in routable)
+        )
+        if invalid_targets:
+            return False, ("PDG 规则集引用不可路由或不存在的出口: "
+                           + ", ".join(invalid_targets))
     return True, ""
 
 

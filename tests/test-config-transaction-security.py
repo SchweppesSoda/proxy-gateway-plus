@@ -131,9 +131,13 @@ def main():
 
     # ── 5. 凭据脱敏: 全链路都不许出现哨兵 ──
     model = {"outbounds": [{"type": "vmess", "tag": "x", "server": "1.2.3.4",
-                            "server_port": 443, "uuid": SENTINEL_UUID,
-                            "password": SENTINEL_PW}],
-             "route": {"rules": []}, "inbounds": [],
+                             "server_port": 443, "uuid": SENTINEL_UUID,
+                             "password": SENTINEL_PW},
+                            {"type": "direct", "tag": "direct"}],
+             "route": {"rules": [], "final": "direct"}, "inbounds": [],
+             "_pdg": {"schema": 3, "policy-groups": [], "mihomo": {
+                 "proxy-providers": {}, "rule-providers": {},
+                 "advanced": {}, "managed-files": {}}},
              "experimental": {"clash_api": {"secret": SENTINEL_TOKEN}}}
     t = tx.Tx("test", "secrets")
     t.stage("model", json.dumps(model).encode())

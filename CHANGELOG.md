@@ -2,6 +2,26 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-08-12 — v1.10.0
+
+- PDG 权威模型升级为 schema v3，策略组只保存在 `_pdg.policy-groups`，不再与
+  selector/urltest outbound 或 `_pdg.mihomo.proxy-groups` 双重表示。v2 读取迁移会合并两份
+  表示并保留顺序、provider 与安全字段；成员、类型或探测参数不一致时 fail closed，成功的
+  CAS/pdgtx 事务才会持久化 v3。旧备份仍可导入。
+- `select`、`url-test`、`fallback`、`load-balance` 成为统一的一等策略组；共享验证器检查
+  proxy/group/provider/内建 Mihomo 名称冲突、类型字段白名单、成员与 provider 引用闭包、
+  嵌套 DAG、默认出口与规则目标。Mihomo 始终从模型派生并通过 `mihomo -t`，不开放 raw takeover。
+- Web 新增独立“策略组”页面和受认证 API，可查看导入的高级组，创建、编辑、改名、删除四种
+  组，配置嵌套成员、provider、探测与负载均衡选项。select 的“临时切换”单独调用 Clash API，
+  明确不写权威模型、重启后可能恢复；Bot 的只读状态/出口列表同步显示全部组类型、成员和 provider。
+- 新增 `sudo pdg direct-tag set <TAG>` 与受认证 Web API，自定义本机唯一 direct 锚点。操作在
+  同一 CAS/pdgtx 事务中级联模型策略组、路由规则、`route.final` 与 ruleset metadata，重新派生
+  Mihomo、校验、观察服务并在失败时回滚；Mihomo 字面量仍是内建 `DIRECT`。新装默认继续是 `JP`，
+  精确旧值 `jp` 仍迁移到 `JP`，其他自定义名称不会被猜测改回。
+- PDG/Mihomo 导入和 Telegram/Web 备份恢复会把外来 direct 绑定到当前机器的自定义锚点；新增
+  v2→v3 一致性、四种组渲染、嵌套/provider/循环、direct 全引用与 Web CRUD/CAS/运行态专项回归。
+  v1.10.0 Release 继续携带并校验 amd64/arm64 两份钉死的 MosDNS 修补产物。
+
 ## 2026-08-11 — v1.9.0
 
 - PDG Web 新增受管配置迁移中心：PDG v2 完整包、Mihomo YAML/安全归档及 MosDNS

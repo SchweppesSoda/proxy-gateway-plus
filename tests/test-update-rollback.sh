@@ -51,6 +51,7 @@ HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
 mkdir -p "$REPO/deploy/bot"
 cp "$ROOT/deploy/bot/pdg-bot.py" "$REPO/deploy/bot/pdg-bot.py"
 cp "$ROOT/deploy/bot/pdgtx.py" "$REPO/deploy/bot/pdgtx.py"
+cp "$ROOT/deploy/bot/pdgmodel.py" "$REPO/deploy/bot/pdgmodel.py"
 mkdir -p "$REPO/deploy/web"
 cp "$ROOT/deploy/web/pdg-web-job.py" "$REPO/deploy/web/pdg-web-job.py"
 cp "$ROOT/deploy/web/pdgconfigio.py" "$REPO/deploy/web/pdgconfigio.py"
@@ -81,6 +82,7 @@ SB="$WORK/root"; mkdir -p "$SB/etc/privdns-gateway"
 cat > "$WORK/harness.sh" <<EOF
 SNAP_DIR="$SNAP"
 REPO_DIR="$REPO"
+export PYTHONPATH="$REPO/deploy/bot${PYTHONPATH:+:$PYTHONPATH}"
 SB="$SB"
 PDG_ROOT_PREFIX="$SB"
 PROFILE_ENV="$SB/etc/privdns-gateway/profile.env"
@@ -96,6 +98,14 @@ _pdg_snapshot_abort(){
   echo "unexpected rollback abort: \${7:-missing reason}" >&2
   return 1
 }
+# These rollback fixtures intentionally omit config.json so their kernel gates
+# stay out of scope.  Direct-tag candidate rebinding has its own real helper
+# regression; inject the newly required successful preflight at this boundary.
+_pdg_snapshot_rebind_direct(){ return 0; }
+# C4 exercises the archived-kernel validation/rollback branch, not candidate
+# rendering (covered by renderer and direct-rebind suites).  Preserve its
+# archived config while satisfying cmd_rollback's new derivation dependency.
+_pdg_render_mihomo_candidate(){ return 0; }
 # cmd_rollback 会用到的 units.sh / 归属助手: 沙箱里没有真 /etc, 一并打桩(与 systemctl/nft 同理)
 pdg_write_unit(){ return 0; }
 pdg_unit_mihomo(){ echo "[Unit]"; }

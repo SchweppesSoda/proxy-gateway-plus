@@ -32,8 +32,11 @@ def bad(m):
 from txbox import Box, load_tx  # noqa: E402
 
 
+PDG_V3 = {"schema": 3, "policy-groups": [], "mihomo": {
+    "proxy-providers": {}, "rule-providers": {}, "advanced": {}, "managed-files": {}}}
 MODEL = json.dumps({"outbounds": [{"type": "direct", "tag": "direct"}],
-                    "route": {"rules": []}, "inbounds": []}).encode()
+                    "route": {"rules": [], "final": "direct"}, "inbounds": [],
+                    "_pdg": PDG_V3}).encode()
 
 PROFILE_SENTINEL_TLS_PORTS = [443, 10443]
 PROFILE_FIXTURE = (
@@ -158,8 +161,9 @@ def main():
 
     # ── 4. 正常提交: 原子落盘 + 服务动作 + 观察 + 材料清理 ──
     newmodel = json.dumps({"outbounds": [{"type": "direct", "tag": "direct"}],
-                           "route": {"rules": [{"domain_suffix": ["a.com"], "outbound": "direct"}]},
-                           "inbounds": []}).encode()
+                           "route": {"rules": [{"domain_suffix": ["a.com"], "outbound": "direct"}],
+                                     "final": "direct"},
+                           "inbounds": [], "_pdg": PDG_V3}).encode()
     t = tx.Tx("test", "add-rule")
     t.stage("model", newmodel)
     t.stage("mosdns_rule:custom_hijack.txt", b"domain:a.com\n")
@@ -201,7 +205,8 @@ def main():
     box2.put("/etc/sing-box/config.json", MODEL)
     box2.up("mihomo")
     crashy = json.dumps({"outbounds": [{"type": "direct", "tag": "CRASHME"}],
-                         "route": {"rules": []}, "inbounds": []}).encode()
+                         "route": {"rules": [], "final": "CRASHME"}, "inbounds": [],
+                         "_pdg": PDG_V3}).encode()
     t = tx2.Tx("test", "crashy")
     t.stage("model", crashy); t.service("restart:mihomo")
     res = t.commit()
@@ -366,17 +371,17 @@ def main():
     _isolate_bot_runtime(b, box8)
     os.makedirs(b.RS_DIR, exist_ok=True)
     ruleset_model = json.dumps(
-        {"outbounds": [{"type": "direct", "tag": "jp"}],
-         "route": {"rules": []}, "inbounds": []}
+        {"outbounds": [{"type": "direct", "tag": "JP"}],
+         "route": {"rules": [], "final": "JP"}, "inbounds": [], "_pdg": PDG_V3}
     ).encode()
     box8.put("/etc/sing-box/config.json", ruleset_model)
     good_old = b'{"version":1,"rules":[{"domain":["old-good.example"]}]}'
     bad_old = b'{"version":1,"rules":[{"domain":["old-bad.example"]}]}'
     box8.put("/etc/sing-box/rs/rs_good.json", good_old, 0o644)
     box8.put("/etc/sing-box/rs/rs_bad.json", bad_old, 0o644)
-    meta = {"rs_good": {"url": "https://x/good.list", "outbound": "jp", "format": "source",
+    meta = {"rs_good": {"url": "https://x/good.list", "outbound": "JP", "format": "source",
                         "path": b.RS_DIR + "/rs_good.json", "label": "好源"},
-            "rs_bad": {"url": "https://x/bad.list", "outbound": "jp", "format": "source",
+            "rs_bad": {"url": "https://x/bad.list", "outbound": "JP", "format": "source",
                        "path": b.RS_DIR + "/rs_bad.json", "label": "坏源"}}
     box8.put("/opt/pdg-bot/rulesets.json", json.dumps(meta).encode(), 0o644)
 

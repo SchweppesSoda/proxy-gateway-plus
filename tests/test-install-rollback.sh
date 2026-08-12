@@ -246,6 +246,7 @@ printf 'MARK=0x504447\nMASK=0xffffffff\nTABLE=7895\nPRIORITY=17895\n' \
 printf 'PDG_QUIC_MODE=tproxy\n' >"$SB/etc/privdns-gateway/profile.env"
 printf 'parser\n' >"$SB/opt/pdg-bot/pdgprofile.py"
 printf 'converter\n' >"$SB/opt/pdg-bot/sb2mihomo.py"
+printf 'model\n' >"$SB/opt/pdg-bot/pdgmodel.py"
 printf '[Unit]\n' >"$SB/etc/systemd/system/pdg-quic-routing.service"
 cat >"$SB/usr/local/libexec/pdg-quic-routing.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -263,7 +264,8 @@ for kept in \
   "$SB/usr/local/libexec/pdg-quic-routing.sh" \
   "$SB/etc/systemd/system/pdg-quic-routing.service" \
   "$SB/opt/pdg-bot/pdgprofile.py" \
-  "$SB/opt/pdg-bot/sb2mihomo.py"; do
+  "$SB/opt/pdg-bot/sb2mihomo.py" \
+  "$SB/opt/pdg-bot/pdgmodel.py"; do
   [[ -e "$kept" ]] || bad "L: recovery 文件被删: $kept"
 done
 
