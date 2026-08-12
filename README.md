@@ -225,7 +225,8 @@ Mihomo Clash API 探测；域名诊断分别呈现 DNS 实测证据与配置规�
 
 Web 的“策略组”页面统一列出 `select`、`url-test`、`fallback`、`load-balance`，包括从
 Mihomo 导入的高级组；可维护成员、嵌套组、provider 以及类型专属的 URL、interval、tolerance
-和 strategy。配置保存仍走 CAS/pdgtx、候选渲染、`mihomo -t`、服务观察和失败回滚。select
+和 strategy。其中 `url-test` 会按探测延迟选择出口，并在当前出口不可用时切换。配置保存仍走
+CAS/pdgtx、候选渲染、`mihomo -t`、服务观察和失败回滚。select
 卡片上的“临时切换”只调用本机 Clash API，不写 `/etc/sing-box/config.json`，Mihomo 重启后
 可能恢复到配置选择，页面会明确显示这一区别。
 
