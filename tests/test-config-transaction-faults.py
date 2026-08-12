@@ -652,8 +652,6 @@ def main():
         return (3, False)
 
     b3._build_source = _build_normal_provider
-    b3._render_mihomo_bytes = lambda model, rs_meta=None: (
-        json.dumps({"proxies": [], "rules": [], "rule-providers": rs_meta or {}}).encode(), {})
     bt3 = b3._pdgtx()
     bt3.svc_stable = lambda unit, **k: (True, "")
     bt3.health_snapshot = lambda services, relax_units=(): {"svc:" + u: True for u in services}

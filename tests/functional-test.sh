@@ -70,10 +70,30 @@ fi
 
 # ── 2. 起 3 个 mock SOCKS5 出口 ──
 LOGA="$WORK/a.log"; LOGB="$WORK/b.log"; LOGD="$WORK/d.log"
+OUTA="$WORK/a.out"; OUTB="$WORK/b.out"; OUTD="$WORK/d.out"
 : > "$LOGA"; : > "$LOGB"; : > "$LOGD"
-python3 "$HERE/mock_socks.py" 11080 "$LOGA" & PIDS+=($!)
-python3 "$HERE/mock_socks.py" 11081 "$LOGB" & PIDS+=($!)
-python3 "$HERE/mock_socks.py" 11082 "$LOGD" & PIDS+=($!)
+python3 "$HERE/mock_socks.py" 11080 "$LOGA" >"$OUTA" 2>&1 & SOCKS_A_PID=$!; PIDS+=("$SOCKS_A_PID")
+python3 "$HERE/mock_socks.py" 11081 "$LOGB" >"$OUTB" 2>&1 & SOCKS_B_PID=$!; PIDS+=("$SOCKS_B_PID")
+python3 "$HERE/mock_socks.py" 11082 "$LOGD" >"$OUTD" 2>&1 & SOCKS_D_PID=$!; PIDS+=("$SOCKS_D_PID")
+
+wait_mock_socks(){  # $1=PID $2=端口 $3=进程输出
+  local pid="$1" port="$2" out="$3"
+  for _ in $(seq 1 50); do
+    if kill -0 "$pid" 2>/dev/null \
+      && python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(.2); sys.exit(0 if s.connect_ex(("127.0.0.1",int(sys.argv[1])))==0 else 1)' "$port"; then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  echo "---- mock SOCKS :$port 输出 ----" >&2
+  cat "$out" >&2
+  fail "mock SOCKS :$port 未就绪"
+}
+
+wait_mock_socks "$SOCKS_A_PID" 11080 "$OUTA"
+wait_mock_socks "$SOCKS_B_PID" 11081 "$OUTB"
+wait_mock_socks "$SOCKS_D_PID" 11082 "$OUTD"
 
 # ── 3. 写 mihomo 测试配置: 显式 named TCP redir listener + SNI 覆盖, 按域名分流 ──
 # (JSON 即合法 YAML；测试与生产使用同一 JSON/YAML 配置格式)
