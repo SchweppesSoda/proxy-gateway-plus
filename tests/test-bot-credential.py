@@ -26,6 +26,22 @@ _REAL_APPLY_SB = bot.apply_sb        # 真 apply_sb(含 _cfg_guard); fresh_mocks
 SECRET = "SECRET_SENTINEL_pw_abc123"
 _rec = threading.Lock()
 
+
+def valid_tx_model():
+    """Minimal canonical authority accepted before transaction lock tests."""
+    return {
+        "outbounds": [{"tag": "orig", "type": "direct"}],
+        "route": {"rules": [], "final": "orig"},
+        "_pdg": {
+            "schema": 3,
+            "policy-groups": [],
+            "mihomo": {
+                "proxy-providers": {}, "rule-providers": {},
+                "advanced": {}, "managed-files": {},
+            },
+        },
+    }
+
 def ss_link(pw, tag="myexit"):
     ui = base64.urlsafe_b64encode(f"aes-128-gcm:{pw}".encode()).decode().rstrip("=")
     return f"ss://{ui}@203.0.113.9:8388#{tag}"
@@ -186,7 +202,7 @@ os.environ["PDG_STABLE_SAMPLES"] = "1"
 bot.SB = _sbroot + "/etc/sing-box/config.json"
 bot.MIHOMO_DIR = _sbroot + "/etc/mihomo"; bot.MIHOMO_CFG = bot.MIHOMO_DIR + "/config.yaml"
 bot.LOCKFILE = os.environ["PDG_LOCKFILE"]
-_json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, open(bot.SB, "w"))
+_json.dump(valid_tx_model(), open(bot.SB, "w"))
 bot.apply_sb = _REAL_APPLY_SB
 bot._PDGTX_MODULE = None
 _tx = bot._pdgtx()
@@ -205,7 +221,7 @@ def _timeout_validator(path, data, ctx):
 
 
 _tx.VALIDATORS["mihomo_check"] = _timeout_validator
-ok, msg = bot.apply_sb(lambda c: c["outbounds"].append({"tag": "new", "type": "direct"}))
+ok, msg = bot.apply_sb(lambda c: c["outbounds"].append({"tag": "new", "type": "block"}))
 assert ok is False, ("校验异常必须返回失败", ok, msg)
 assert SECRET not in msg
 restored = _json.load(open(bot.SB))
@@ -226,7 +242,7 @@ os.environ["PDG_TX_FSROOT"] = _lkroot
 os.environ["PDG_TX_ROOT"] = _lkroot + "/var/lib/privdns-gateway/tx"
 os.environ["PDG_LOCKFILE"] = tmp.name
 bot.SB = _lkroot + "/etc/sing-box/config.json"
-_json.dump({"outbounds": [{"tag": "orig", "type": "direct"}]}, open(bot.SB, "w"))
+_json.dump(valid_tx_model(), open(bot.SB, "w"))
 bot._PDGTX_MODULE = None
 holder = subprocess.Popen(["flock", "-x", tmp.name, "-c", "sleep 3"])
 time.sleep(0.4)
