@@ -26,7 +26,9 @@ PY
 cat >"$NEW/pdg-bot.py" <<'PY'
 import json, sb2mihomo
 def load(): return {}
-def _render_mihomo_bytes(model):
+def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
+    assert rs_meta is None
+    assert mitm_domains is None
     return json.dumps({
         "tproxy-port": sb2mihomo.TPROXY,
         "sniffer": {"sniff": {"TLS": {"ports": [443, 10443]},
