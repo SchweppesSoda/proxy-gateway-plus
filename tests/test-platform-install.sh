@@ -200,7 +200,9 @@ cat > "$WORK/sbg.json" <<'JSON'
 {"inbounds":[{"type":"direct","tag":"in-https","listen_port":443},
              {"type":"direct","tag":"in-gms-5228","listen_port":5228},
              {"type":"direct","tag":"in-gms-5229","listen_port":5229},
-             {"type":"direct","tag":"in-gms-5230","listen_port":5230}],"outbounds":[],"route":{}}
+             {"type":"direct","tag":"in-gms-5230","listen_port":5230}],
+ "outbounds":[{"type":"direct","tag":"direct"}],
+ "route":{"rules":[],"final":"direct"}}
 JSON
 printf 'table inet pdg {\n  chain input { ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept }\n}\n' > "$WORK/nfg"
 _pdg_platform(){ echo ios; }
@@ -217,7 +219,9 @@ run_ok "migrate_ios_gms_cleanup(幂等)" migrate_ios_gms_cleanup "$WORK/sbg.json
 # Android 上该清理跳过
 _pdg_platform(){ echo android; }
 cat > "$WORK/sba.json" <<'JSON'
-{"inbounds":[{"type":"direct","tag":"in-gms-5228","listen_port":5228}],"outbounds":[],"route":{}}
+{"inbounds":[{"type":"direct","tag":"in-gms-5228","listen_port":5228}],
+ "outbounds":[{"type":"direct","tag":"direct"}],
+ "route":{"rules":[],"final":"direct"}}
 JSON
 run_ok "migrate_ios_gms_cleanup(Android)" migrate_ios_gms_cleanup "$WORK/sba.json" "$WORK/nfg"
 grep -q 'in-gms-5228' "$WORK/sba.json" && ok "Android: iOS GMS 清理不执行(保留 GMS)" || bad "Android 误删了 GMS"
