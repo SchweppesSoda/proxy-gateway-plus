@@ -9,28 +9,38 @@ import sys
 import threading
 
 
+def recv_exact(conn, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("unexpected EOF")
+        data.extend(chunk)
+    return bytes(data)
+
+
 def handle(conn, logf):
     try:
         conn.settimeout(5)
-        hdr = conn.recv(2)                       # VER, NMETHODS
-        if len(hdr) < 2 or hdr[0] != 0x05:
+        hdr = recv_exact(conn, 2)                # VER, NMETHODS
+        if hdr[0] != 0x05:
             return
-        conn.recv(hdr[1])                        # METHODS
+        recv_exact(conn, hdr[1])                 # METHODS
         conn.sendall(b"\x05\x00")                # 选 no-auth
-        req = conn.recv(4)                       # VER CMD RSV ATYP
-        if len(req) < 4 or req[1] != 0x01:       # 只处理 CONNECT
+        req = recv_exact(conn, 4)                # VER CMD RSV ATYP
+        if req[1] != 0x01:                       # 只处理 CONNECT
             return
         atyp = req[3]
         if atyp == 0x01:                         # IPv4
-            addr = socket.inet_ntoa(conn.recv(4))
+            addr = socket.inet_ntoa(recv_exact(conn, 4))
         elif atyp == 0x03:                       # 域名(sniff 出来的 SNI)
-            ln = conn.recv(1)[0]
-            addr = conn.recv(ln).decode("utf-8", "replace")
+            ln = recv_exact(conn, 1)[0]
+            addr = recv_exact(conn, ln).decode("utf-8", "replace")
         elif atyp == 0x04:                       # IPv6
-            addr = socket.inet_ntop(socket.AF_INET6, conn.recv(16))
+            addr = socket.inet_ntop(socket.AF_INET6, recv_exact(conn, 16))
         else:
             return
-        port = int.from_bytes(conn.recv(2), "big")
+        port = int.from_bytes(recv_exact(conn, 2), "big")
         with open(logf, "a") as f:
             f.write(f"{addr}:{port}\n")
         conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")  # 成功, BND 0.0.0.0:0
