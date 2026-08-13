@@ -452,17 +452,24 @@
   function activateTab(name, focus = false) {
     if (!$("#panel-" + name)) return;
     state.activeTab = name;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     $$(".tab").forEach((tab) => {
       const active = tab.dataset.tab === name;
       tab.classList.toggle("active", active);
       tab.setAttribute("aria-selected", String(active));
       tab.tabIndex = active ? 0 : -1;
       if (active && focus) tab.focus();
+      if (active) {
+        tab.scrollIntoView({
+          block: "nearest",
+          inline: "nearest",
+          behavior: reducedMotion ? "auto" : "smooth",
+        });
+      }
     });
     $$(".panel").forEach((panel) => {
       panel.hidden = panel.id !== `panel-${name}`;
     });
-    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
     loadTab(name);
   }

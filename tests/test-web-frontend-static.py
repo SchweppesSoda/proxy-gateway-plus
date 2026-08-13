@@ -94,10 +94,44 @@ assert password_attrs.get("type") == "password"
 assert password_attrs.get("minlength") == "12"
 assert parser.elements["ruleset-label"][1].get("maxlength") == "40"
 
-# The six frozen native tabs are present.
-for tab_id in ("overview", "exits", "rules", "dns", "runtime", "ops"):
-    assert f"tab-{tab_id}" in parser.elements
-    assert f"panel-{tab_id}" in parser.elements
+# The seven native tabs form one complete, ordered tab/panel relationship.
+tab_ids = ("overview", "exits", "groups", "rules", "dns", "runtime", "ops")
+for tab_id in tab_ids:
+    tab_tag, tab_attrs = parser.elements[f"tab-{tab_id}"]
+    assert tab_tag == "button"
+    assert tab_attrs.get("role") == "tab"
+    assert tab_attrs.get("data-tab") == tab_id
+    assert tab_attrs.get("aria-controls") == f"panel-{tab_id}"
+    panel_tag, panel_attrs = parser.elements[f"panel-{tab_id}"]
+    assert panel_tag == "section"
+    assert panel_attrs.get("role") == "tabpanel"
+    assert panel_attrs.get("aria-labelledby") == f"tab-{tab_id}"
+assert [INDEX_SOURCE.index(f'id="tab-{tab_id}"') for tab_id in tab_ids] == sorted(
+    INDEX_SOURCE.index(f'id="tab-{tab_id}"') for tab_id in tab_ids
+)
+
+# On 320–430px portrait screens, seven equal grid columns remain on one row and
+# keep a 2.75rem (44px at the root size) minimum touch width. Horizontal scroll
+# remains only as a fallback when side safe areas leave less than that minimum.
+mobile_style = STYLE_SOURCE[:STYLE_SOURCE.index("@media (min-width: 760px)")]
+mobile_bar = re.search(r"(?ms)^\.tab-bar\s*\{(.*?)^\}", mobile_style).group(1)
+mobile_tab = re.search(r"(?ms)^\.tab\s*\{(.*?)^\}", mobile_style).group(1)
+for declaration in (
+    "display: grid", "grid-template-columns: repeat(7, minmax(2.75rem, 1fr))",
+    "overflow-x: auto",
+    "overflow-y: hidden", "scroll-snap-type: x proximity",
+):
+    assert declaration in mobile_bar
+assert "var(--safe-left)" in mobile_bar and "var(--safe-right)" in mobile_bar
+assert "min-height: 3.4rem" in mobile_tab
+assert "min-width: 2.75rem" in mobile_tab
+assert "white-space: nowrap" in mobile_tab
+desktop_style = STYLE_SOURCE[STYLE_SOURCE.index("@media (min-width: 760px)"):]
+assert "flex-direction: column" in desktop_style
+assert "overflow: visible" in desktop_style
+activate_tab = function_source("activateTab")
+assert "tab.scrollIntoView" in activate_tab
+assert 'inline: "nearest"' in activate_tab
 
 # Doctor results are rendered as a structured, live status panel rather than a
 # preformatted text dump.
