@@ -96,11 +96,11 @@ sudo pdg doctor --deep
 
 ## 发布自有 asset
 
-v1.10.0 的长期目录已精确钉死为
-`https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.10.0`。正式发布前：
+v1.10.1 的长期目录已精确钉死为
+`https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.10.1`。正式发布前：
 
 1. 用 KFC 和 Actions 分别运行仓库构建脚本，确认同架构 raw SHA256 一致。
-2. 把两个 raw binary 以脚本定义的精确文件名上传到 v1.10.0 GitHub Release；同时附上各自
+2. 把两个 raw binary 以脚本定义的精确文件名上传到 v1.10.1 GitHub Release；同时附上各自
    的 `.sha256` 和 `.provenance.json`（`.env` 只是离线部署便利文件，不是信任锚）。
 3. 确认 base URL 与项目 tag 一致，amd64 / arm64 raw SHA256 与 `lib/versions.sh` 完全一致。
 4. 从 Release URL 实际下载两架构 raw asset 并复核 SHA256，再运行供应链测试和安装/更新

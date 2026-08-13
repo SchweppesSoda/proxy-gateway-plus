@@ -94,10 +94,145 @@ assert password_attrs.get("type") == "password"
 assert password_attrs.get("minlength") == "12"
 assert parser.elements["ruleset-label"][1].get("maxlength") == "40"
 
-# The six frozen native tabs are present.
-for tab_id in ("overview", "exits", "rules", "dns", "runtime", "ops"):
-    assert f"tab-{tab_id}" in parser.elements
-    assert f"panel-{tab_id}" in parser.elements
+# The seven native tabs form one complete, ordered tab/panel relationship.
+tab_ids = ("overview", "exits", "groups", "rules", "dns", "runtime", "ops")
+for tab_id in tab_ids:
+    tab_tag, tab_attrs = parser.elements[f"tab-{tab_id}"]
+    assert tab_tag == "button"
+    assert tab_attrs.get("role") == "tab"
+    assert tab_attrs.get("data-tab") == tab_id
+    assert tab_attrs.get("aria-controls") == f"panel-{tab_id}"
+    panel_tag, panel_attrs = parser.elements[f"panel-{tab_id}"]
+    assert panel_tag == "section"
+    assert panel_attrs.get("role") == "tabpanel"
+    assert panel_attrs.get("aria-labelledby") == f"tab-{tab_id}"
+assert [INDEX_SOURCE.index(f'id="tab-{tab_id}"') for tab_id in tab_ids] == sorted(
+    INDEX_SOURCE.index(f'id="tab-{tab_id}"') for tab_id in tab_ids
+)
+
+# Mobile keeps four explicitly primary canonical tabs plus an independent More
+# button. Every current or future canonical tab without the primary marker is
+# projected into the drawer; the More action is deliberately outside tablist.
+primary_ids = ("overview", "exits", "groups", "rules")
+assert all("data-mobile-primary" in parser.elements[f"tab-{tab_id}"][1]
+           for tab_id in primary_ids)
+assert all("data-mobile-primary" not in parser.elements[f"tab-{tab_id}"][1]
+           for tab_id in set(tab_ids) - set(primary_ids))
+tab_list_tag, tab_list_attrs = parser.elements["canonical-tab-list"]
+assert tab_list_tag == "div" and tab_list_attrs.get("role") == "tablist"
+more_tag, more_attrs = parser.elements["mobile-more-button"]
+assert more_tag == "button" and more_attrs.get("role") != "tab"
+assert more_attrs.get("aria-haspopup") == "dialog"
+assert more_attrs.get("aria-expanded") == "false"
+assert more_attrs.get("aria-controls") == "mobile-more-dialog"
+tab_list_start = INDEX_SOURCE.index('id="canonical-tab-list"')
+tab_list_end = INDEX_SOURCE.index("</div>", tab_list_start)
+assert INDEX_SOURCE.index('id="mobile-more-button"') > tab_list_end
+dialog_tag, dialog_attrs = parser.elements["mobile-more-dialog"]
+assert dialog_tag == "dialog" and dialog_attrs.get("aria-labelledby") == "mobile-more-title"
+assert dialog_attrs.get("aria-modal") == "true"
+assert parser.elements["mobile-more-items"][0] == "nav"
+
+# On 320–430px portrait screens, the five bottom targets stay on one row and
+# keep a 2.75rem (44px at the root size) minimum touch width. Safe-area padding
+# and overflow remain as a fallback, while desktop restores the canonical list.
+mobile_style = STYLE_SOURCE[:STYLE_SOURCE.index("@media (min-width: 760px)")]
+mobile_bar = re.search(r"(?ms)^\.tab-bar\s*\{(.*?)^\}", mobile_style).group(1)
+mobile_list = re.search(r"(?ms)^\.tab-list\s*\{(.*?)^\}", mobile_style).group(1)
+mobile_control = re.search(
+    r"(?ms)^\.tab,\s*^\.mobile-more-button\s*\{(.*?)^\}", mobile_style
+).group(1)
+for declaration in (
+    "display: grid", "grid-template-columns: repeat(5, minmax(2.75rem, 1fr))",
+    "overflow-x: auto",
+    "overflow-y: hidden", "scroll-snap-type: x proximity",
+):
+    assert declaration in mobile_bar
+assert "grid-template-columns: repeat(4, minmax(2.75rem, 1fr))" in mobile_list
+assert "grid-column: 1 / span 4" in mobile_list
+assert ".tab:not([data-mobile-primary])" in mobile_style
+assert "var(--safe-left)" in mobile_bar and "var(--safe-right)" in mobile_bar
+assert "min-height: 3.4rem" in mobile_control
+assert "min-width: 2.75rem" in mobile_control
+assert "white-space: nowrap" in mobile_control
+assert "var(--safe-bottom)" in mobile_style
+sheet_style = re.search(r"(?ms)^\.mobile-more-sheet\s*\{(.*?)^\}", mobile_style).group(1)
+for safe_edge in ("--safe-left", "--safe-right", "--safe-bottom"):
+    assert safe_edge in sheet_style
+app_shell_style = re.search(r"(?ms)^\.app-shell\s*\{(.*?)^\}", mobile_style).group(1)
+assert "padding-bottom: calc(5.4rem + var(--safe-bottom))" in app_shell_style
+desktop_style = STYLE_SOURCE[STYLE_SOURCE.index("@media (min-width: 760px)"):]
+assert "flex-direction: column" in desktop_style
+assert "overflow: visible" in desktop_style
+assert ".mobile-more-button" in desktop_style and "display: none" in desktop_style
+assert ".tab:not([data-mobile-primary])" in desktop_style
+
+# Drawer behavior is DOM-derived and keeps canonical activate/load ownership:
+# modal focus, Escape/click-outside close, selection close, focus restoration,
+# keyboard reachability, active semantics and responsive teardown are all wired.
+overflow_tabs = function_source("mobileOverflowTabs")
+assert "data-mobile-primary" in overflow_tabs
+for forbidden in ('"dns"', '"runtime"', '"ops"'):
+    assert forbidden not in overflow_tabs
+render_more = function_source("renderMobileMoreItems")
+assert "mobileOverflowTabs()" in render_more
+assert "document.createDocumentFragment()" in render_more
+assert "items.replaceChildren(fragment)" in render_more
+sync_more = function_source("syncMobileMoreState")
+assert 'more.setAttribute("aria-current", "page")' in sync_more
+assert 'item.setAttribute("aria-current", "page")' in sync_more
+open_more = function_source("openMobileMore")
+assert "dialog.showModal()" in open_more
+assert "requestAnimationFrame" in open_more and "target.focus()" in open_more
+close_more = function_source("closeMobileMore")
+assert "dialog.close()" in close_more and '$("#mobile-more-button").focus()' in close_more
+more_keys = function_source("mobileMoreKeydown")
+for key in ("ArrowUp", "ArrowDown", "Home", "End"):
+    assert key in more_keys
+semantics = function_source("syncNavigationSemantics")
+for contract in (
+    'tabList.removeAttribute("role")',
+    'tabList.setAttribute("role", "tablist")',
+    'tab.removeAttribute("role")',
+    'tab.removeAttribute("aria-selected")',
+    'tab.tabIndex = primary ? 0 : -1',
+    'tab.setAttribute("aria-hidden", "true")',
+    'tab.setAttribute("aria-current", "page")',
+    'panel.setAttribute("role", "region")',
+    'panel.setAttribute("aria-label", mobileTabLabel(tab))',
+    'tab.setAttribute("role", "tab")',
+    'tab.setAttribute("aria-selected", String(active))',
+    'tab.tabIndex = active ? 0 : -1',
+    'panel.setAttribute("role", "tabpanel")',
+    'panel.setAttribute("aria-labelledby", tab.id)',
+    'panel.removeAttribute("aria-label")',
+):
+    assert contract in semantics
+bind_events = function_source("bindEvents")
+for event_name in ('"cancel"', '"click"', '"close"', '"change"'):
+    assert event_name in bind_events
+assert "event.target === event.currentTarget" in bind_events
+assert "closeMobileMore(true)" in bind_events
+assert "closeMobileMore(false)" in bind_events
+assert "mobileNavigationQuery.matches" in bind_events
+assert "syncNavigationSemantics()" in bind_events
+assert "if (mobileNavigationQuery.matches) return" in bind_events
+assert "focusWasInMore" in bind_events
+assert "focusWasInMobileNavigation = Boolean(focusedTab) || focusWasInMore" in bind_events
+assert "!mobileNavigationQuery.matches && focusWasInMobileNavigation" in bind_events
+assert "tab.dataset.tab === state.activeTab)?.focus()" in bind_events
+assert '!focusedTab.hasAttribute("data-mobile-primary")' in bind_events
+assert '$("#mobile-more-button").addEventListener("keydown"' in bind_events
+assert '["ArrowUp", "ArrowDown"]' in bind_events
+show_authenticated = function_source("showAuthenticated")
+assert "closeMobileMore(false)" in show_authenticated
+activate_tab = function_source("activateTab")
+assert "syncMobileMoreState(name)" in activate_tab
+assert "syncNavigationSemantics(name)" in activate_tab
+assert '$("#mobile-more-button")' in activate_tab
+assert "navigationTarget?.scrollIntoView" in activate_tab
+assert 'inline: "nearest"' in activate_tab
+assert "loadTab(name)" in activate_tab
 
 # Doctor results are rendered as a structured, live status panel rather than a
 # preformatted text dump.

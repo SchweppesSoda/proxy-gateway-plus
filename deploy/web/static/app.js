@@ -27,7 +27,8 @@
     maintenancePollTimer: 0,
     maintenancePollDisconnected: false,
     importPreview: null,
-    exportKind: ""
+    exportKind: "",
+    mobileMoreRestoreFocus: false
   };
 
   class ApiError extends Error {
@@ -41,6 +42,7 @@
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+  const mobileNavigationQuery = window.matchMedia("(max-width: 759px)");
 
   function node(tag, className, text) {
     const item = document.createElement(tag);
@@ -339,6 +341,7 @@
     $("#login-view").hidden = authenticated;
     $("#app-view").hidden = !authenticated;
     if (!authenticated) {
+      closeMobileMore(false);
       stopMaintenancePolling();
       state.csrf = "";
       state.sessionExpiresAt = 0;
@@ -449,20 +452,149 @@
     });
   }
 
+  function mobileOverflowTabs() {
+    return $$(".tab").filter((tab) => !tab.hasAttribute("data-mobile-primary"));
+  }
+
+  function mobileTabLabel(tab) {
+    return tab.querySelector("span:last-child")?.textContent?.trim() || tab.dataset.tab;
+  }
+
+  function renderMobileMoreItems() {
+    const items = $("#mobile-more-items");
+    const fragment = document.createDocumentFragment();
+    mobileOverflowTabs().forEach((tab) => {
+      const button = node("button", "mobile-more-item");
+      button.type = "button";
+      button.dataset.moreTab = tab.dataset.tab;
+      button.setAttribute("aria-controls", tab.getAttribute("aria-controls"));
+      const icon = node(
+        "span", "mobile-more-item-icon",
+        tab.querySelector("span:first-child")?.textContent || "•"
+      );
+      icon.setAttribute("aria-hidden", "true");
+      button.append(icon, node("span", "mobile-more-item-label", mobileTabLabel(tab)));
+      fragment.append(button);
+    });
+    items.replaceChildren(fragment);
+  }
+
+  function syncMobileMoreState(name = state.activeTab) {
+    const more = $("#mobile-more-button");
+    const activeOverflow = mobileNavigationQuery.matches
+      ? mobileOverflowTabs().find((tab) => tab.dataset.tab === name) : null;
+    more.classList.toggle("active", Boolean(activeOverflow));
+    if (activeOverflow) {
+      more.setAttribute("aria-current", "page");
+      more.setAttribute("aria-label", `更多功能，当前：${mobileTabLabel(activeOverflow)}`);
+    } else {
+      more.removeAttribute("aria-current");
+      more.setAttribute("aria-label", "更多功能");
+    }
+    $$("[data-more-tab]", $("#mobile-more-items")).forEach((item) => {
+      const active = item.dataset.moreTab === name;
+      item.classList.toggle("active", active);
+      if (active) item.setAttribute("aria-current", "page");
+      else item.removeAttribute("aria-current");
+    });
+  }
+
+  function openMobileMore() {
+    if (!mobileNavigationQuery.matches || !mobileOverflowTabs().length) return;
+    const dialog = $("#mobile-more-dialog");
+    renderMobileMoreItems();
+    syncMobileMoreState();
+    $("#mobile-more-button").setAttribute("aria-expanded", "true");
+    if (!dialog.open) dialog.showModal();
+    window.requestAnimationFrame(() => {
+      const items = $$("[data-more-tab]", $("#mobile-more-items"));
+      const target = items.find((item) => item.dataset.moreTab === state.activeTab)
+        || items[0] || $("#mobile-more-close");
+      target.focus();
+    });
+  }
+
+  function closeMobileMore(restoreFocus = true) {
+    const dialog = $("#mobile-more-dialog");
+    state.mobileMoreRestoreFocus = restoreFocus;
+    if (dialog.open) dialog.close();
+    else if (restoreFocus && mobileNavigationQuery.matches) $("#mobile-more-button").focus();
+  }
+
+  function mobileMoreKeydown(event) {
+    if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    const items = $$("[data-more-tab]", $("#mobile-more-items"));
+    const current = items.indexOf(event.target.closest("[data-more-tab]"));
+    if (current < 0 || !items.length) return;
+    event.preventDefault();
+    let next = current;
+    if (event.key === "Home") next = 0;
+    if (event.key === "End") next = items.length - 1;
+    if (event.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+    if (event.key === "ArrowDown") next = (current + 1) % items.length;
+    items[next].focus();
+  }
+
+  function syncNavigationSemantics(name = state.activeTab) {
+    const mobile = mobileNavigationQuery.matches;
+    const tabList = $("#canonical-tab-list");
+    if (mobile) tabList.removeAttribute("role");
+    else tabList.setAttribute("role", "tablist");
+    $$(".tab").forEach((tab) => {
+      const active = tab.dataset.tab === name;
+      const primary = tab.hasAttribute("data-mobile-primary");
+      const panel = $("#" + tab.getAttribute("aria-controls"));
+      if (mobile) {
+        tab.removeAttribute("role");
+        tab.removeAttribute("aria-selected");
+        tab.tabIndex = primary ? 0 : -1;
+        if (primary) {
+          tab.removeAttribute("aria-hidden");
+          if (active) tab.setAttribute("aria-current", "page");
+          else tab.removeAttribute("aria-current");
+        } else {
+          tab.setAttribute("aria-hidden", "true");
+          tab.removeAttribute("aria-current");
+        }
+        panel.setAttribute("role", "region");
+        panel.removeAttribute("aria-labelledby");
+        panel.setAttribute("aria-label", mobileTabLabel(tab));
+      } else {
+        tab.setAttribute("role", "tab");
+        tab.setAttribute("aria-selected", String(active));
+        tab.removeAttribute("aria-current");
+        tab.removeAttribute("aria-hidden");
+        tab.tabIndex = active ? 0 : -1;
+        panel.setAttribute("role", "tabpanel");
+        panel.setAttribute("aria-labelledby", tab.id);
+        panel.removeAttribute("aria-label");
+      }
+    });
+  }
+
   function activateTab(name, focus = false) {
     if (!$("#panel-" + name)) return;
     state.activeTab = name;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     $$(".tab").forEach((tab) => {
       const active = tab.dataset.tab === name;
       tab.classList.toggle("active", active);
-      tab.setAttribute("aria-selected", String(active));
-      tab.tabIndex = active ? 0 : -1;
-      if (active && focus) tab.focus();
+    });
+    syncNavigationSemantics(name);
+    syncMobileMoreState(name);
+    const canonicalTab = $$(".tab").find((tab) => tab.dataset.tab === name);
+    const navigationTarget = mobileNavigationQuery.matches
+      && canonicalTab && !canonicalTab.hasAttribute("data-mobile-primary")
+      ? $("#mobile-more-button") : canonicalTab;
+    if (navigationTarget && focus) navigationTarget.focus();
+    navigationTarget?.scrollIntoView({
+      block: "nearest",
+      inline: "nearest",
+      behavior: reducedMotion ? "auto" : "smooth",
     });
     $$(".panel").forEach((panel) => {
       panel.hidden = panel.id !== `panel-${name}`;
     });
-    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     window.scrollTo({ top: 0, behavior: reducedMotion ? "auto" : "smooth" });
     loadTab(name);
   }
@@ -2590,6 +2722,7 @@
     $$(".tab").forEach((tab) => {
       tab.addEventListener("click", () => activateTab(tab.dataset.tab));
       tab.addEventListener("keydown", (event) => {
+        if (mobileNavigationQuery.matches) return;
         if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
         event.preventDefault();
         const tabs = $$(".tab");
@@ -2602,6 +2735,59 @@
         activateTab(tabs[next].dataset.tab, true);
       });
     });
+
+    renderMobileMoreItems();
+    syncNavigationSemantics();
+    syncMobileMoreState();
+    $("#mobile-more-button").addEventListener("click", openMobileMore);
+    $("#mobile-more-button").addEventListener("keydown", (event) => {
+      if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      openMobileMore();
+    });
+    $("#mobile-more-close").addEventListener("click", () => closeMobileMore(true));
+    $("#mobile-more-items").addEventListener("click", (event) => {
+      const item = event.target.closest("[data-more-tab]");
+      if (!item) return;
+      activateTab(item.dataset.moreTab);
+      closeMobileMore(true);
+    });
+    $("#mobile-more-items").addEventListener("keydown", mobileMoreKeydown);
+    $("#mobile-more-dialog").addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeMobileMore(true);
+    });
+    $("#mobile-more-dialog").addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) closeMobileMore(true);
+    });
+    $("#mobile-more-dialog").addEventListener("close", () => {
+      $("#mobile-more-button").setAttribute("aria-expanded", "false");
+      if (state.mobileMoreRestoreFocus && mobileNavigationQuery.matches) {
+        $("#mobile-more-button").focus();
+      }
+      state.mobileMoreRestoreFocus = false;
+    });
+    const mobileNavigationChanged = () => {
+      const focusedTab = document.activeElement?.closest?.(".tab");
+      const focusWasInMore = document.activeElement === $("#mobile-more-button")
+        || $("#mobile-more-dialog").contains(document.activeElement);
+      const focusWasInMobileNavigation = Boolean(focusedTab) || focusWasInMore;
+      if (!mobileNavigationQuery.matches) closeMobileMore(false);
+      renderMobileMoreItems();
+      syncNavigationSemantics();
+      syncMobileMoreState();
+      if (mobileNavigationQuery.matches && focusedTab
+          && !focusedTab.hasAttribute("data-mobile-primary")) {
+        $("#mobile-more-button").focus();
+      } else if (!mobileNavigationQuery.matches && focusWasInMobileNavigation) {
+        $$(".tab").find((tab) => tab.dataset.tab === state.activeTab)?.focus();
+      }
+    };
+    if (typeof mobileNavigationQuery.addEventListener === "function") {
+      mobileNavigationQuery.addEventListener("change", mobileNavigationChanged);
+    } else {
+      mobileNavigationQuery.addListener(mobileNavigationChanged);
+    }
 
     $$("[data-go-tab]").forEach((button) => {
       button.addEventListener("click", () => activateTab(button.dataset.goTab, true));
