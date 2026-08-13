@@ -56,34 +56,44 @@
       </div>
     </header>
 
-    <nav class="tab-bar" aria-label="主要功能" role="tablist">
-      <button id="tab-overview" class="tab active" type="button" role="tab"
-              aria-selected="true" aria-controls="panel-overview" data-tab="overview">
-        <span aria-hidden="true">◫</span><span>总览</span>
-      </button>
-      <button id="tab-exits" class="tab" type="button" role="tab"
-              aria-selected="false" aria-controls="panel-exits" tabindex="-1" data-tab="exits">
-        <span aria-hidden="true">⇥</span><span>出口</span>
-      </button>
-      <button id="tab-groups" class="tab" type="button" role="tab"
-              aria-selected="false" aria-controls="panel-groups" tabindex="-1" data-tab="groups">
-        <span aria-hidden="true">⇄</span><span>策略组</span>
-      </button>
-      <button id="tab-rules" class="tab" type="button" role="tab"
-              aria-selected="false" aria-controls="panel-rules" tabindex="-1" data-tab="rules">
-        <span aria-hidden="true">≡</span><span>分流</span>
-      </button>
-      <button id="tab-dns" class="tab" type="button" role="tab"
-              aria-selected="false" aria-controls="panel-dns" tabindex="-1" data-tab="dns">
-        <span aria-hidden="true">◎</span><span>DNS</span>
-      </button>
-      <button id="tab-runtime" class="tab" type="button" role="tab"
-              aria-selected="false" aria-controls="panel-runtime" tabindex="-1" data-tab="runtime">
-        <span aria-hidden="true">⌁</span><span>实时</span>
-      </button>
-      <button id="tab-ops" class="tab" type="button" role="tab"
-              aria-selected="false" aria-controls="panel-ops" tabindex="-1" data-tab="ops">
-        <span aria-hidden="true">⌘</span><span>运维</span>
+    <nav class="tab-bar" aria-label="主要功能">
+      <div id="canonical-tab-list" class="tab-list" role="tablist">
+        <button id="tab-overview" class="tab active" type="button" role="tab"
+                aria-selected="true" aria-controls="panel-overview" data-tab="overview"
+                data-mobile-primary>
+          <span aria-hidden="true">◫</span><span>总览</span>
+        </button>
+        <button id="tab-exits" class="tab" type="button" role="tab"
+                aria-selected="false" aria-controls="panel-exits" tabindex="-1" data-tab="exits"
+                data-mobile-primary>
+          <span aria-hidden="true">⇥</span><span>出口</span>
+        </button>
+        <button id="tab-groups" class="tab" type="button" role="tab"
+                aria-selected="false" aria-controls="panel-groups" tabindex="-1" data-tab="groups"
+                data-mobile-primary>
+          <span aria-hidden="true">⇄</span><span>策略组</span>
+        </button>
+        <button id="tab-rules" class="tab" type="button" role="tab"
+                aria-selected="false" aria-controls="panel-rules" tabindex="-1" data-tab="rules"
+                data-mobile-primary>
+          <span aria-hidden="true">≡</span><span>分流</span>
+        </button>
+        <button id="tab-dns" class="tab" type="button" role="tab"
+                aria-selected="false" aria-controls="panel-dns" tabindex="-1" data-tab="dns">
+          <span aria-hidden="true">◎</span><span>DNS</span>
+        </button>
+        <button id="tab-runtime" class="tab" type="button" role="tab"
+                aria-selected="false" aria-controls="panel-runtime" tabindex="-1" data-tab="runtime">
+          <span aria-hidden="true">⌁</span><span>实时</span>
+        </button>
+        <button id="tab-ops" class="tab" type="button" role="tab"
+                aria-selected="false" aria-controls="panel-ops" tabindex="-1" data-tab="ops">
+          <span aria-hidden="true">⌘</span><span>运维</span>
+        </button>
+      </div>
+      <button id="mobile-more-button" class="mobile-more-button" type="button"
+              aria-haspopup="dialog" aria-expanded="false" aria-controls="mobile-more-dialog">
+        <span aria-hidden="true">•••</span><span>更多</span>
       </button>
     </nav>
 
@@ -489,6 +499,17 @@
   </div>
 
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <dialog id="mobile-more-dialog" class="mobile-more-dialog" aria-modal="true"
+          aria-labelledby="mobile-more-title">
+    <section class="mobile-more-sheet">
+      <div class="mobile-more-heading">
+        <div><p class="eyebrow">MORE</p><h2 id="mobile-more-title">更多功能</h2></div>
+        <button id="mobile-more-close" class="icon-button" type="button" aria-label="关闭更多功能">×</button>
+      </div>
+      <nav id="mobile-more-items" class="mobile-more-items" aria-label="更多功能"></nav>
+    </section>
+  </dialog>
 
   <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
     <form method="dialog">
