@@ -19,7 +19,7 @@ MOSDNS_PATCH_REV="pdg-notickets.1"
 MOSDNS_BUILD_VERSION="${MOSDNS_VER}-${MOSDNS_PATCH_REV}"
 MOSDNS_PATCH_FILE="patches/mosdns/v5.3.4-session-tickets-disabled.patch"
 # 自有 GitHub Release 产物目录，不带末尾 /；必须与包含这些 pin 的项目 tag 一致。
-MOSDNS_PDG_ASSET_BASE_URL="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.10.0"
+MOSDNS_PDG_ASSET_BASE_URL="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.10.1"
 MIHOMO_VER="v1.19.29"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
 ZASHBOARD_VER="v3.15.0"       # 观测面板(纯静态前端, 由 external_ui 托管; dist-no-fonts 最小、不依赖 CDN; mihomo 原生 clash 核也可托管)
 
