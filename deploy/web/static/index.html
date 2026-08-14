@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0b1720">
-  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#101719">
+  <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
   <meta name="application-name" content="私有 DNS 网关">
   <meta name="apple-mobile-web-app-title" content="私有 DNS 网关">
@@ -12,6 +12,7 @@
   <title>私有 DNS 网关</title>
   <link rel="manifest" href="./manifest.webmanifest">
   <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <script src="./theme.js"></script>
   <link rel="stylesheet" href="./style.css">
   <script src="./app.js" defer></script>
 </head>
@@ -51,6 +52,8 @@
       </div>
       <div class="header-actions">
         <span id="session-state" class="session-state" title="会话状态">已连接</span>
+        <button id="theme-toggle" class="icon-button theme-toggle" type="button"
+                aria-label="切换主题" title="主题：跟随系统">◐</button>
         <button id="refresh-button" class="icon-button" type="button" aria-label="刷新当前页面" title="刷新">↻</button>
         <button id="logout-button" class="button ghost compact" type="button">退出</button>
       </div>
@@ -71,7 +74,7 @@
         <button id="tab-groups" class="tab" type="button" role="tab"
                 aria-selected="false" aria-controls="panel-groups" tabindex="-1" data-tab="groups"
                 data-mobile-primary>
-          <span aria-hidden="true">⇄</span><span>策略组</span>
+          <span aria-hidden="true">⇄</span><span aria-label="代理策略组">代理组</span>
         </button>
         <button id="tab-rules" class="tab" type="button" role="tab"
                 aria-selected="false" aria-controls="panel-rules" tabindex="-1" data-tab="rules"
@@ -140,7 +143,7 @@
 
         <section class="surface accent-surface">
           <div class="section-heading">
-            <div><p class="eyebrow">NEW EXIT</p><h2>添加出口</h2></div>
+            <div><p class="eyebrow">NEW EXIT</p><h2>添加代理节点</h2></div>
           </div>
           <form id="exit-form" autocomplete="off">
             <label for="exit-link">节点链接</label>
@@ -149,7 +152,7 @@
                       placeholder="粘贴节点链接，提交后会立即从页面清除"></textarea>
             <div class="form-row end">
               <p class="field-help">支持的协议由服务器校验。页面不会回显或记录原始链接。</p>
-              <button class="button primary" type="submit">安全添加</button>
+              <button class="button primary" type="submit">添加节点</button>
             </div>
           </form>
         </section>
@@ -160,7 +163,7 @@
               <div><p class="eyebrow">EXITS</p><h2>出口列表</h2></div>
               <button id="test-exits" class="button ghost compact" type="button">测速全部</button>
             </div>
-            <p class="field-help">测速检查所有实际出口节点（包括 VPS 直出锚点）；故障切换组本轮不单独测试。手机直连是分流伪目标，不在出口列表中。</p>
+            <p class="field-help">测速检查所有实际出口节点（包括 VPS 直出锚点）；故障切换代理策略组本轮不单独测试。手机直连是分流伪目标，不在出口列表中。</p>
             <div id="exit-list" class="card-list" aria-live="polite"></div>
           </section>
           <div class="stack">
@@ -184,28 +187,34 @@
         </div>
 
         <section class="surface explainer">
-          <div><p class="eyebrow">POLICY GROUPS</p><h2>策略组已独立管理</h2></div>
-          <p>四种组类型、嵌套组和 provider 均在“策略组”页面统一配置。</p>
-          <button class="button ghost" type="button" data-go-tab="groups">前往策略组</button>
+          <div><p class="eyebrow">POLICY GROUPS</p><h2>代理策略组已独立管理</h2></div>
+          <p>四种组类型、嵌套组和代理提供器均在“代理策略组”页面统一配置。</p>
+          <button class="button ghost" type="button" data-go-tab="groups">前往代理策略组</button>
         </section>
       </section>
 
       <section id="panel-groups" class="panel" role="tabpanel" aria-labelledby="tab-groups" hidden>
         <div class="page-heading">
-          <div><p class="eyebrow">POLICY GROUPS</p><h1>策略组</h1></div>
-          <span id="group-count" class="chip">0 个策略组</span>
+          <div><p class="eyebrow">POLICY GROUPS</p><h1>代理策略组</h1></div>
+          <span id="group-count" class="chip">0 个代理策略组</span>
         </div>
         <section class="surface accent-surface">
           <div class="section-heading">
-            <div><p class="eyebrow">CONFIGURATION</p><h2 id="group-editor-title">创建策略组</h2></div>
+            <div><p class="eyebrow">CONFIGURATION</p><h2 id="group-editor-title">创建代理策略组</h2></div>
             <button id="group-cancel-edit" class="button ghost compact" type="button" hidden>取消编辑</button>
           </div>
           <form id="group-form" autocomplete="off">
-            <div class="inline-form">
-              <div><label for="group-name">组名</label><input id="group-name" required maxlength="64" pattern="[A-Za-z0-9_.-]+" autocapitalize="none" spellcheck="false"></div>
-              <div><label for="group-type">类型</label><select id="group-type"><option value="select">select</option><option value="url-test">url-test</option><option value="fallback">fallback</option><option value="load-balance">load-balance</option></select></div>
-              <div class="grow"><label for="group-members">成员 / 嵌套组</label><input id="group-members" autocapitalize="none" spellcheck="false" placeholder="空格分隔；可用 REJECT"></div>
-              <div class="grow"><label for="group-providers">Proxy providers</label><input id="group-providers" autocapitalize="none" spellcheck="false" placeholder="空格分隔，可留空"></div>
+            <div class="group-editor-grid">
+              <div><label for="group-name">代理策略组名称</label><input id="group-name" required autocapitalize="none" spellcheck="false" aria-describedby="group-name-help"><p id="group-name-help" class="field-help">支持中文、空格、emoji 和常见符号，最多 64 个字符。</p></div>
+              <div><label for="group-type">组类型</label><select id="group-type"><option value="select">手动选择（select）</option><option value="url-test">自动测速（url-test）</option><option value="fallback">故障切换（fallback）</option><option value="load-balance">负载均衡（load-balance）</option></select></div>
+              <section class="selection-field" aria-labelledby="group-members-label">
+                <div class="selection-field-heading"><div><span id="group-members-label" class="field-label">组成员</span><p class="field-help">可添加代理节点、其他代理策略组或内建动作；顺序会保留。</p></div><button id="group-add-member" class="button ghost compact" type="button">添加成员</button></div>
+                <div id="group-member-chips" class="selection-chips" role="list" aria-label="已选组成员"></div>
+              </section>
+              <section class="selection-field" aria-labelledby="group-providers-label">
+                <div class="selection-field-heading"><div><span id="group-providers-label" class="field-label">代理提供器（Provider）</span><p class="field-help">可选；Provider 提供的节点会由 Mihomo 在运行时展开。</p></div><button id="group-add-provider" class="button ghost compact" type="button">添加 Provider</button></div>
+                <div id="group-provider-chips" class="selection-chips" role="list" aria-label="已选代理提供器"></div>
+              </section>
             </div>
             <div id="group-probe-options" class="inline-form">
               <div class="grow"><label for="group-url">探测 URL</label><input id="group-url" type="url" value="https://www.gstatic.com/generate_204"></div>
@@ -213,16 +222,16 @@
               <div id="group-tolerance-wrap"><label for="group-tolerance">容差（ms）</label><input id="group-tolerance" type="number" min="0" max="65535" value="50"></div>
               <div id="group-strategy-wrap"><label for="group-strategy">负载策略</label><select id="group-strategy"><option value="consistent-hashing">consistent-hashing</option><option value="round-robin">round-robin</option><option value="sticky-sessions">sticky-sessions</option></select></div>
             </div>
-            <div class="inline-form" aria-label="策略组可选安全字段">
-              <label><input id="group-lazy" type="checkbox"> lazy</label>
-              <label><input id="group-disable-udp" type="checkbox"> disable-udp</label>
-              <label><input id="group-hidden" type="checkbox"> hidden</label>
+            <div class="option-switch-grid" aria-label="代理策略组可选设置">
+              <label class="option-switch"><span><b>按需测速</b><small>lazy</small></span><input id="group-lazy" type="checkbox" role="switch"><i aria-hidden="true"></i></label>
+              <label class="option-switch"><span><b>禁用 UDP</b><small>disable-udp</small></span><input id="group-disable-udp" type="checkbox" role="switch"><i aria-hidden="true"></i></label>
+              <label class="option-switch"><span><b>隐藏代理策略组</b><small>hidden</small></span><input id="group-hidden" type="checkbox" role="switch"><i aria-hidden="true"></i></label>
             </div>
-            <div class="form-row end"><p class="field-help">保存走 CAS/pdgtx、候选渲染、Mihomo 校验和失败回滚。</p><button id="group-submit" class="button primary" type="submit">创建策略组</button></div>
+            <div class="form-row end"><p class="field-help">保存前会校验配置；校验失败不会应用任何更改。</p><button id="group-submit" class="button primary" type="submit">创建代理策略组</button></div>
           </form>
         </section>
         <section class="surface">
-          <div class="section-heading"><div><p class="eyebrow">ALL GROUPS</p><h2>全部策略组</h2></div></div>
+          <div class="section-heading"><div><p class="eyebrow">ALL GROUPS</p><h2>全部代理策略组</h2></div></div>
           <p class="field-help">select 的“临时切换”只改变 Mihomo 当前运行态，不写入权威模型，重启后可能恢复。</p>
           <div id="group-list" class="card-list" aria-live="polite"></div>
         </section>
@@ -259,7 +268,7 @@
               <div class="inline-form">
                 <div class="grow">
                   <label for="ruleset-label">显示名称（可选）</label>
-                  <input id="ruleset-label" name="label" maxlength="40" placeholder="例如 OpenAI">
+                  <input id="ruleset-label" name="label" maxlength="64" placeholder="例如 OpenAI">
                 </div>
                 <div>
                   <label for="ruleset-target">目标</label>
@@ -555,6 +564,33 @@
         <button class="button warning" type="submit">继续确认</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="text-entry-dialog" class="confirm-dialog text-entry-dialog"
+          aria-labelledby="text-entry-title">
+    <form id="text-entry-form" method="dialog" autocomplete="off">
+      <h2 id="text-entry-title">编辑名称</h2>
+      <p id="text-entry-message" class="muted"></p>
+      <label id="text-entry-label" for="text-entry-value">名称</label>
+      <input id="text-entry-value" type="text" required autocapitalize="none" spellcheck="false">
+      <p id="text-entry-help" class="field-help"></p>
+      <div class="dialog-actions">
+        <button class="button ghost" type="button" data-text-entry-cancel>取消</button>
+        <button id="text-entry-submit" class="button primary" type="submit">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="group-picker-dialog" class="picker-dialog" aria-labelledby="group-picker-title">
+    <section class="picker-sheet">
+      <div class="picker-heading">
+        <div><h2 id="group-picker-title">添加成员</h2><p id="group-picker-help" class="field-help"></p></div>
+        <button id="group-picker-close" class="icon-button" type="button" aria-label="关闭选择器">×</button>
+      </div>
+      <label for="group-picker-search">搜索</label>
+      <input id="group-picker-search" type="search" autocomplete="off" placeholder="输入名称筛选">
+      <div id="group-picker-options" class="picker-options" role="listbox" aria-label="可选项目"></div>
+    </section>
   </dialog>
 
   <noscript>

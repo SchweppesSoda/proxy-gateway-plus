@@ -830,6 +830,7 @@ install -m755 "$REPO_DIR"/deploy/web/pdgconfigio.py       /opt/pdg-web/
 install -m755 "$REPO_DIR"/deploy/web/pdg-web-setup.py     /opt/pdg-web/
 install -m644 "$REPO_DIR"/deploy/web/pdgwebconfig.py      /opt/pdg-web/
 install -m644 "$REPO_DIR"/deploy/web/static/index.html    /opt/pdg-web/static/
+install -m644 "$REPO_DIR"/deploy/web/static/theme.js      /opt/pdg-web/static/
 install -m644 "$REPO_DIR"/deploy/web/static/app.js        /opt/pdg-web/static/
 install -m644 "$REPO_DIR"/deploy/web/static/style.css     /opt/pdg-web/static/
 install -m644 "$REPO_DIR"/deploy/web/static/manifest.webmanifest /opt/pdg-web/static/

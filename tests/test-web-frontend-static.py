@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "deploy/web/static"
 INDEX_SOURCE = (STATIC / "index.html").read_text(encoding="utf-8")
 APP_SOURCE = (STATIC / "app.js").read_text(encoding="utf-8")
+THEME_SOURCE = (STATIC / "theme.js").read_text(encoding="utf-8")
 STYLE_SOURCE = (STATIC / "style.css").read_text(encoding="utf-8")
 MANIFEST = json.loads((STATIC / "manifest.webmanifest").read_text(encoding="utf-8"))
 
@@ -77,22 +78,47 @@ for asset in parser.assets:
     assert not parsed.scheme and not parsed.netloc, f"external asset: {asset}"
     assert not parsed.query and not parsed.fragment, f"query-bearing asset: {asset}"
 assert set(parser.assets) == {
-    "./manifest.webmanifest", "./icon.svg", "./style.css", "./app.js",
+    "./manifest.webmanifest", "./icon.svg", "./theme.js", "./style.css", "./app.js",
 }
 for sink in (
     "innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
     "localStorage", "sessionStorage", "new Function", "eval(",
 ):
-    assert sink not in APP_SOURCE, sink
+    assert sink not in APP_SOURCE + THEME_SOURCE, sink
 assert "@import" not in STYLE_SOURCE
 assert not re.search(r"url\s*\(\s*['\"]?https?://", STYLE_SOURCE, re.I)
+
+# Theme selection is applied before the stylesheet, follows the operating
+# system by default, and persists only the non-sensitive preference in a
+# SameSite cookie.  The app never falls back to Web Storage.
+theme_at = INDEX_SOURCE.index('./theme.js')
+style_at = INDEX_SOURCE.index('./style.css')
+assert theme_at < style_at
+assert parser.elements["theme-toggle"][0] == "button"
+for snippet in (
+    'const COOKIE_NAME = "pdg_theme";',
+    'const MODES = ["system", "light", "dark"];',
+    'window.matchMedia("(prefers-color-scheme: dark)")',
+    'document.documentElement.dataset.theme = theme;',
+    'SameSite=Strict',
+    'window.PDGTheme',
+):
+    assert snippet in THEME_SOURCE, snippet
+assert ':root[data-theme="light"]' in STYLE_SOURCE
+assert ':root[data-theme="dark"]' in STYLE_SOURCE
+html_style = re.search(r"(?ms)^html\s*\{(.*?)^\}", STYLE_SOURCE).group(1)
+assert "min-width: 0" in html_style
+assert ".toast {\n  border-color: var(--line-strong);" in STYLE_SOURCE
+assert "background: var(--surface-strong);" in STYLE_SOURCE
+assert ".login-card {\n  border-color: var(--line);" in STYLE_SOURCE
+assert "background: var(--surface);" in STYLE_SOURCE
 
 # Browser-side password policy agrees with setup's minimum.
 password_tag, password_attrs = parser.elements["login-password"]
 assert password_tag == "input"
 assert password_attrs.get("type") == "password"
 assert password_attrs.get("minlength") == "12"
-assert parser.elements["ruleset-label"][1].get("maxlength") == "40"
+assert parser.elements["ruleset-label"][1].get("maxlength") == "64"
 
 # The seven native tabs form one complete, ordered tab/panel relationship.
 tab_ids = ("overview", "exits", "groups", "rules", "dns", "runtime", "ops")
@@ -166,6 +192,17 @@ assert "flex-direction: column" in desktop_style
 assert "overflow: visible" in desktop_style
 assert ".mobile-more-button" in desktop_style and "display: none" in desktop_style
 assert ".tab:not([data-mobile-primary])" in desktop_style
+
+# At sub-520px widths every form/action target is at least 44px high, while
+# the switch glyph itself remains compact.  The 320px header drops only its
+# visual brand copy instead of forcing a horizontal scrollbar.
+for contract in (
+    ".button.compact,\n  .mini-button,",
+    ".order-actions button {\n    width: 2.75rem;\n    height: 2.75rem;",
+    ".icon-button {\n    width: 2.75rem;\n    min-width: 2.75rem;",
+    ".brand > div:last-child {\n    display: none;",
+):
+    assert contract in STYLE_SOURCE, contract
 
 # Drawer behavior is DOM-derived and keeps canonical activate/load ownership:
 # modal focus, Escape/click-outside close, selection close, focus restoration,
@@ -311,8 +348,8 @@ for snippet in (
     "settings.hijack_mode",
     "settings.quic_mode",
     "settings.firewall_mode",
-    'body: { name: name.trim() }',
-    'const { data } = await api("/policy-groups");',
+    'body: { name }',
+    'api("/policy-groups"), api("/exits")',
     'state.groupRevision = typeof data?.revision === "string" ? data.revision : "";',
     'runtimeCandidates: Array.isArray(item.runtimeCandidates)',
     'revision: state.editingGroup ? state.editingGroupRevision : state.groupRevision,',
@@ -357,7 +394,7 @@ assert 'errorMessage(error, "DNS 上游")' in save_dns
 # Rules and rulesets both retain phone-direct semantics, clearly distinguished from
 # the built-in VPS-local direct outbound used by default-exit controls.
 target_options = function_source("targetOptions")
-assert '"手机直连（MosDNS 返回真实地址，不经过 VPS）"' in target_options
+assert '"手机直连"' in target_options
 load_rules = function_source("loadRules")
 assert 'targetOptions($("#rule-target"));' in load_rules
 assert 'targetOptions($("#ruleset-target"));' in load_rules
@@ -376,6 +413,67 @@ ruleset_action = function_source("handleRulesetAction")
 assert 'method: "PUT"' in ruleset_action
 assert 'body: { target }' in ruleset_action
 assert '/target`' in ruleset_action
+
+# User-facing names remain Unicode from form input through ordered selections
+# and every name-bearing API route.  Members/providers are structured arrays,
+# never whitespace-delimited text, and native prompt() is not part of the flow.
+for element_id in (
+    "group-member-chips", "group-provider-chips", "group-add-member",
+    "group-add-provider", "text-entry-dialog", "group-picker-dialog",
+    "group-picker-search", "group-picker-options",
+):
+    assert element_id in parser.elements
+assert "window.prompt" not in APP_SOURCE
+normalize_name = function_source("normalizeIdentifierName")
+for snippet in (
+    '.normalize("NFC")', "Array.from(name)", "new TextEncoder().encode(name)",
+    "points.length > 64", "bytes.length > 256", "UNSAFE_NAME_CODEPOINTS",
+    "FORMAT_CONTROL_RE.test(character)", "codepoint !== 0x200d",
+):
+    assert snippet in normalize_name, snippet
+identifier_path = function_source("identifierPath")
+assert 'return `~${btoa(binary)' in identifier_path
+assert 'replaceAll("+", "-")' in identifier_path
+assert 'replaceAll("/", "_")' in identifier_path
+text_entry = function_source("requestTextEntry")
+assert "maxLength = 64" in text_entry
+assert "input.maxLength = maxLength" in text_entry
+add_group = function_source("addGroup")
+assert "const proxies = state.groupMembers.slice();" in add_group
+assert "const use = state.groupProviderSelection.slice();" in add_group
+assert ".split(" not in add_group
+add_ruleset = function_source("addRuleset")
+assert "label = normalizeIdentifierName(label)" in add_ruleset
+ruleset_action = function_source("handleRulesetAction")
+assert 'normalizedLabel = label.trim() ? normalizeIdentifierName(label) : ""' in ruleset_action
+edit_group = function_source("editGroup")
+assert "state.groupMembers = group.proxies.slice();" in edit_group
+assert "state.groupProviderSelection = group.use.slice();" in edit_group
+for path_fragment in (
+    "`/exits/${identifierPath(tag)}`",
+    "`/policy-groups/${identifierPath(editing)}`",
+    "`/policy-groups/${identifierPath(tag)}/runtime`",
+    "`/rulesets/${identifierPath(name)}/target`",
+):
+    assert path_fragment in APP_SOURCE, path_fragment
+
+# Checkbox/radio sizing is type-specific.  The three group flags render as
+# compact 32x18 switches while the full label remains a 44px click target.
+for switch_id, visible_label, technical_name in (
+    ("group-lazy", "按需测速", "lazy"),
+    ("group-disable-udp", "禁用 UDP", "disable-udp"),
+    ("group-hidden", "隐藏代理策略组", "hidden"),
+):
+    tag, attrs = parser.elements[switch_id]
+    assert tag == "input" and attrs.get("type") == "checkbox"
+    assert attrs.get("role") == "switch"
+    assert visible_label in INDEX_SOURCE and technical_name in INDEX_SOURCE
+assert 'input[type="checkbox"]' in STYLE_SOURCE
+assert 'input[type="radio"]' in STYLE_SOURCE
+option_switch = re.search(r"(?ms)^\.option-switch\s*\{(.*?)^\}", STYLE_SOURCE).group(1)
+assert "min-height: 2.75rem" in option_switch
+switch_glyph = re.search(r"(?ms)^\.option-switch i\s*\{(.*?)^\}", STYLE_SOURCE).group(1)
+assert "width: 2rem" in switch_glyph and "height: 1.125rem" in switch_glyph
 
 # Concrete proxy connections are replaced in a dedicated secure dialog.  The
 # selected tag is carried in UI state, never accepted from the pasted link, and
@@ -412,7 +510,7 @@ replaceable = function_source("isReplaceableProxy")
 assert '!["direct", "urltest"].includes(item.type)' in replaceable
 assert "isReplaceableProxy(item)" in render_exits
 diagnostic_badge = function_source("exitDiagnosticBadge")
-assert '"故障组本轮不单测"' in diagnostic_badge
+assert '"故障切换代理策略组本轮不单测"' in diagnostic_badge
 assert "isProbeableExit(item)" in diagnostic_badge
 assert "result.delayMs" in diagnostic_badge
 assert 'status === "unavailable"' in diagnostic_badge

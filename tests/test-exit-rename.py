@@ -101,15 +101,20 @@ ok, msg = bot.rename_exit("tw", "main")                      # 与现有出口/�
 assert not ok and "占用" in msg, msg
 ok, msg = bot.rename_exit("tw", "tw")                        # 同名
 assert not ok, msg
-ok, msg = bot.rename_exit("tw", "中文名")                     # 非法字符(清洗后无字母数字)
-assert not ok, msg
-ok, msg = bot.rename_exit("tw", "direct")                    # 保留字
+unicode_name = "东京/Reality｜主用 <&>"
+ok, msg = bot.rename_exit("tw", unicode_name)                 # Unicode/符号完整保留
+assert ok, msg
+assert any(o["tag"] == unicode_name for o in cfg["outbounds"])
+yr = next(r for r in cfg["route"]["rules"] if r.get("domain_suffix") == ["y.com"])
+assert yr["outbound"] == unicode_name
+assert "&lt;&amp;&gt;" in msg and "<&>" not in msg                # Telegram HTML 转义
+ok, msg = bot.rename_exit(unicode_name, "direct")             # 保留字
 assert not ok, msg
 snap = copy.deepcopy(cfg)
 
 # ── 事务失败 → 原样返回错误, 元数据不动(同一笔事务, 不会只落一半) ──
 bot.tx_apply = lambda op, **kw: (False, "boom")
-ok, msg = bot.rename_exit("tw", "tw9")
+ok, msg = bot.rename_exit(unicode_name, "tw9")
 assert not ok and msg == "boom"
 assert meta["rs_11111111"]["outbound"] == "hk2"
 assert cfg == snap
