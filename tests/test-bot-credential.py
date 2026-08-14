@@ -87,15 +87,15 @@ def no_secret(sent):
     with _rec:
         return not any(SECRET in x for x in sent)
 
-# ── deleteMessage 成功 → 只显示出口名, 无手动删提示 ──────────────────────────
+# ── deleteMessage 成功 → 只显示代理节点名, 无手动删提示 ──────────────────────
 bot._EXEC = SyncExec()
 sent, posts = fresh_mocks(delete_ok=True)
 bot.state[1] = "add_exit"
 bot.handle_text(1, ss_link(SECRET), mid=555)
 assert wait_for(deleted(posts, 555)), "应尝试删除原消息"
-assert wait_for(sent_has(sent, "已添加出口")), sent
+assert wait_for(sent_has(sent, "已添加代理节点")), sent
 assert not any("未能自动删除" in s for s in sent) and no_secret(sent)
-print("[OK]   deleteMessage 成功 + 成功回复只显示出口名, 不含密码")
+print("[OK]   deleteMessage 成功 + 成功回复只显示代理节点名, 不含密码")
 
 # ── deleteMessage 失败 → 提示手动删除 ────────────────────────────────────────
 sent, posts = fresh_mocks(delete_ok=False)
@@ -112,7 +112,7 @@ bot.state[7] = "add_exit"
 bot.handle_text(7, ss_link(SECRET), mid=777)
 assert wait_for(deleted(posts, 777)), "BUSY 拒绝时凭据消息仍必须被删除"
 assert wait_for(sent_has(sent, "正在处理")), "应提示正在处理上一项操作"
-assert not any("已添加出口" in s for s in sent), "BUSY 时不该真的添加出口"
+assert not any("已添加代理节点" in s for s in sent), "BUSY 时不该真的添加代理节点"
 assert no_secret(sent)
 bot._release_busy(7)
 print("[OK]   BUSY 拒绝路径: 凭据消息仍被删除 + 提示正在处理")
@@ -149,7 +149,7 @@ assert 2 not in bot.state, "发送节点后应立即清除待输入状态"
 with _rec:
     sent.clear()
 bot.handle_text(2, "just some random text", mid=2)
-assert not any("已添加出口" in s or "未能自动删除" in s for s in sent), "第二条不该被当 add_exit"
+assert not any("已添加代理节点" in s or "未能自动删除" in s for s in sent), "第二条不该被当 add_exit"
 print("[OK]   发送后立即清状态, 第二条文字不被旧 add_exit 吃掉")
 
 # ── 主处理函数快速返回(后台很慢时)────────────────────────────────────────────
