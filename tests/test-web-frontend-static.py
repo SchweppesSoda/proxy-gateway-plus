@@ -94,7 +94,22 @@ assert not re.search(r"url\s*\(\s*['\"]?https?://", STYLE_SOURCE, re.I)
 theme_at = INDEX_SOURCE.index('./theme.js')
 style_at = INDEX_SOURCE.index('./style.css')
 assert theme_at < style_at
-assert parser.elements["theme-toggle"][0] == "button"
+theme_toggle_tag, theme_toggle_attrs = parser.elements["theme-toggle"]
+assert theme_toggle_tag == "button"
+assert theme_toggle_attrs.get("aria-haspopup") == "dialog"
+assert theme_toggle_attrs.get("aria-controls") == "theme-dialog"
+assert theme_toggle_attrs.get("aria-expanded") == "false"
+theme_dialog_tag, theme_dialog_attrs = parser.elements["theme-dialog"]
+assert theme_dialog_tag == "dialog"
+assert theme_dialog_attrs.get("aria-modal") == "true"
+assert theme_dialog_attrs.get("aria-labelledby") == "theme-dialog-title"
+for mode in ("system", "light", "dark"):
+    assert f'data-theme-mode="{mode}"' in INDEX_SOURCE
+theme_bind = function_source("bindEvents")
+assert '$("#theme-toggle").addEventListener("click", openThemeDialog);' in theme_bind
+assert "PDGTheme?.cycle()" not in theme_bind
+assert "PDGTheme?.set(option.dataset.themeMode)" in theme_bind
+assert "aria-pressed" in function_source("updateThemeButton")
 for snippet in (
     'const COOKIE_NAME = "pdg_theme";',
     'const MODES = ["system", "light", "dark"];',
@@ -281,11 +296,33 @@ assert "doctor-health" in parser.elements
 load_overview = function_source("loadOverview")
 assert 'renderDoctorSummary($("#doctor-summary"), info.doctor);' in load_overview
 assert "doctorSummaryText" not in APP_SOURCE
+assert 'level === "info"' in function_source("doctorTone")
+assert 'node("details", "doctor-group")' in function_source("renderDoctorSummary")
+assert "section.open = groupCounts.fail > 0 || groupCounts.warn > 0;" in APP_SOURCE
+for wording in (
+    "核心服务均运行正常：", "已正确解析到本机地址",
+    "证书与运行配置使用同一加密 DNS 域名",
+    "透明代理仅接收来自客户端网段",
+):
+    assert wording in APP_SOURCE
 for selector in (
     ".doctor-result", ".doctor-stats", ".doctor-group",
     ".doctor-check", ".doctor-check-state",
 ):
     assert selector in STYLE_SOURCE
+
+# Runtime and traffic data use purpose-built cards and lists. Nested API
+# objects must never fall back to raw JSON in the visible summary.
+load_runtime = function_source("loadRuntime")
+assert 'renderRuntimeSummary($("#runtime-summary"), runtime.value.data);' in load_runtime
+assert 'renderTrafficSummary($("#traffic-summary"), traffic.value.data);' in load_runtime
+for selector in (
+    ".summary-metric-grid", ".summary-metric", ".traffic-exit-list",
+    ".traffic-exit-row", ".summary-notice",
+):
+    assert selector in STYLE_SOURCE
+for label in ("内核运行信息", "当前连接与流量", "网络运行模式"):
+    assert label in INDEX_SOURCE
 
 # Configuration migration keeps credentials/files out of long-lived DOM state,
 # exposes only same-origin templates, and participates in the maintenance gate.
@@ -373,8 +410,9 @@ for kind in ("remote", "local"):
     assert current_tag == "div"
     assert replacement_tag == "textarea"
     assert "value" not in replacement_attrs
-assert "当前配置（只读安全摘要）" in INDEX_SOURCE
-assert "展示值可能省略路径、查询参数或凭据" in INDEX_SOURCE
+assert "当前国际 DNS 上游" in INDEX_SOURCE
+assert "当前国内 DNS 上游" in INDEX_SOURCE
+assert "为保护凭据，地址可能省略路径或查询参数" in INDEX_SOURCE
 
 load_dns = function_source("loadDns")
 assert 'renderCurrentDns($("#dns-current-remote"), data?.remote);' in load_dns

@@ -2209,7 +2209,19 @@ select option {
 }
 
 .theme-toggle {
+  display: inline-flex;
+  width: auto;
+  min-width: 4.4rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0 0.65rem;
   font-size: 1rem;
+}
+
+.theme-toggle-label {
+  font-size: 0.79rem;
+  font-weight: 700;
 }
 
 .tab-bar {
@@ -2309,12 +2321,64 @@ select option {
   background: var(--surface);
 }
 
+.doctor-stats {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.doctor-stat {
+  display: inline-flex;
+  min-width: 4.5rem;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.3rem;
+  padding: 0.38rem 0.55rem;
+}
+
+.doctor-stat.info strong {
+  color: var(--cyan);
+}
+
 .doctor-group-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  cursor: pointer;
+  list-style: none;
   background: var(--surface-strong);
+}
+
+.doctor-group-heading::-webkit-details-marker {
+  display: none;
+}
+
+.doctor-group-heading::after {
+  align-self: center;
+  color: var(--muted);
+  content: "⌄";
+  font-size: 0.9rem;
+  transition: transform 150ms ease;
+}
+
+.doctor-group[open] > .doctor-group-heading::after {
+  transform: rotate(180deg);
+}
+
+.doctor-group:not([open]) > .doctor-group-heading {
+  border-bottom: 0;
 }
 
 .doctor-check + .doctor-check {
   border-top-color: var(--line);
+}
+
+.doctor-check.info .doctor-check-marker {
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 12%, transparent);
+}
+
+.doctor-check-state.info {
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 9%, transparent);
 }
 
 .doctor-result-copy span,
@@ -2331,6 +2395,113 @@ select option {
 .doctor-group-heading span,
 .doctor-check-state {
   font-size: 0.79rem;
+}
+
+.runtime-summary,
+.traffic-summary {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.summary-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.summary-metric {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 0.2rem;
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-subtle);
+}
+
+.summary-metric-label,
+.summary-metric-detail {
+  color: var(--muted);
+  font-size: 0.79rem;
+}
+
+.summary-metric-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.96rem;
+}
+
+.summary-subheading,
+.import-section-title {
+  margin: 0.15rem 0 0;
+  color: var(--text);
+  font-size: 0.84rem;
+}
+
+.compact-status-list .status-row {
+  min-height: 2.35rem;
+}
+
+.summary-notice {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--surface-subtle);
+  font-size: 0.79rem;
+}
+
+.summary-notice.warn {
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--line));
+  color: var(--warning);
+}
+
+.traffic-exit-list {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.traffic-exit-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.65rem 0.75rem;
+  background: var(--surface-subtle);
+}
+
+.traffic-exit-row + .traffic-exit-row {
+  border-top: 1px solid var(--line);
+}
+
+.traffic-exit-copy {
+  display: grid;
+  min-width: 0;
+  gap: 0.12rem;
+}
+
+.traffic-exit-copy strong {
+  overflow-wrap: anywhere;
+  font-size: 0.83rem;
+}
+
+.traffic-exit-copy span,
+.traffic-exit-bytes {
+  color: var(--muted);
+  font-size: 0.79rem;
+}
+
+.traffic-exit-bytes {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.compact-empty {
+  padding: 0.8rem;
 }
 
 .field-help {
@@ -2516,9 +2687,100 @@ select option {
 .picker-dialog,
 .text-entry-dialog,
 .confirm-dialog,
+.theme-dialog,
 .mobile-more-dialog {
   color: var(--text);
   background: var(--surface);
+}
+
+.theme-dialog {
+  width: min(calc(100% - 2rem), 29rem);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+
+.theme-sheet {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1rem;
+}
+
+.theme-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.theme-heading h2 {
+  margin: 0;
+}
+
+.theme-options {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.theme-option {
+  display: grid;
+  width: 100%;
+  min-height: 3.65rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--surface-subtle);
+  text-align: left;
+}
+
+.theme-option:hover,
+.theme-option.selected {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+}
+
+.theme-option > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 0.1rem;
+}
+
+.theme-option b {
+  font-size: 0.84rem;
+}
+
+.theme-option small {
+  color: var(--muted);
+  font-size: 0.79rem;
+  font-weight: 500;
+}
+
+.theme-option-icon {
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  font-size: 1rem;
+}
+
+.theme-option-check {
+  visibility: hidden;
+  color: var(--accent);
+  font-size: 0.9rem;
+  font-weight: 900;
+}
+
+.theme-option.selected .theme-option-check {
+  visibility: visible;
 }
 
 .picker-dialog {
@@ -2534,6 +2796,7 @@ select option {
 .picker-dialog::backdrop,
 .text-entry-dialog::backdrop,
 .confirm-dialog::backdrop,
+.theme-dialog::backdrop,
 .mobile-more-dialog::backdrop {
   background: var(--backdrop);
   backdrop-filter: blur(3px);
@@ -2759,10 +3022,58 @@ small,
     min-width: 2.75rem;
   }
 
+  .theme-toggle {
+    width: 2.75rem;
+    min-width: 2.75rem;
+    padding: 0;
+  }
+
+  .theme-toggle-label {
+    display: none;
+  }
+
+  .summary-metric-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .traffic-exit-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.25rem;
+  }
+
+  .traffic-exit-bytes {
+    text-align: left;
+    white-space: normal;
+  }
+
+  .doctor-group-heading {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .doctor-group-heading span {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .doctor-group-heading::after {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
   .picker-dialog {
     width: 100%;
     max-width: none;
     max-height: 84vh;
+    margin: auto 0 0;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 16px 16px 0 0;
+  }
+
+  .theme-dialog {
+    width: 100%;
+    max-width: none;
     margin: auto 0 0;
     border-right: 0;
     border-bottom: 0;

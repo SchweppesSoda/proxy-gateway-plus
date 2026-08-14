@@ -8,7 +8,14 @@
   function readMode() {
     const match = document.cookie.split(";").map((item) => item.trim())
       .find((item) => item.startsWith(`${COOKIE_NAME}=`));
-    const value = match ? decodeURIComponent(match.slice(COOKIE_NAME.length + 1)) : "system";
+    let value = "system";
+    if (match) {
+      try {
+        value = decodeURIComponent(match.slice(COOKIE_NAME.length + 1));
+      } catch (_error) {
+        value = "system";
+      }
+    }
     return MODES.includes(value) ? value : "system";
   }
 
@@ -38,9 +45,14 @@
 
   let mode = readMode();
   paint(mode);
-  media.addEventListener("change", () => {
+  const systemThemeChanged = () => {
     if (mode === "system") paint(mode);
-  });
+  };
+  if (typeof media.addEventListener === "function") {
+    media.addEventListener("change", systemThemeChanged);
+  } else if (typeof media.addListener === "function") {
+    media.addListener(systemThemeChanged);
+  }
 
   window.PDGTheme = Object.freeze({
     get mode() { return mode; },

@@ -1223,6 +1223,20 @@ class WebAPITestCase(unittest.TestCase):
             "application/manifest+json; charset=utf-8",
         )
 
+    def test_overview_preserves_informational_checks(self):
+        checks = types.SimpleNamespace(
+            run=lambda: [
+                ("ok", "服务", "全部运行正常"),
+                ("info", "透明代理范围说明", "本机查询不经过透明代理"),
+            ]
+        )
+        with mock.patch.object(
+                pdgcontrol.importlib, "import_module", return_value=checks):
+            overview = self.control.overview()
+        self.assertEqual(
+            [item["level"] for item in overview["doctor"]], ["ok", "info"]
+        )
+
     def test_every_mutation_route_and_transaction_semantics(self):
         self.login()
 

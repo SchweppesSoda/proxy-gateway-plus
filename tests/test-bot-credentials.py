@@ -61,6 +61,8 @@ def main():
     lvl, _, detail = checks.check_services()
     if lvl != "ok":
         bad("未配凭据 + pdg-bot 未运行, 服务检查却不是 ok: %s %s" % (lvl, detail))
+    if "均运行正常" not in detail or "都在" in detail:
+        bad("服务检查的成功说明不够明确: %s" % detail)
     ok("未配凭据 + pdg-bot 未运行 → 服务检查 ok(不是故障)")
     lvl, _, detail = checks.check_bot_credentials()
     if lvl != "info" or "未配置" not in detail:
