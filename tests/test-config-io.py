@@ -590,6 +590,64 @@ class ArchiveTests(unittest.TestCase):
 
 
 class ModelAndConversionTests(unittest.TestCase):
+    def test_mihomo_unicode_names_round_trip_exactly(self):
+        document = {
+            "proxies": [
+                {"name": "🇭🇰 香港 · IEPL #1", "type": "socks5",
+                 "server": "hk.example", "port": 1080},
+                {"name": "东京/Reality｜主用", "type": "socks5",
+                 "server": "jp.example", "port": 1080},
+            ],
+            "proxy-providers": {
+                "机场 Provider / 香港": {
+                    "type": "http",
+                    "url": "https://provider.example/sub.yaml",
+                    "path": "./providers/unicode.yaml",
+                    "interval": 3600,
+                }
+            },
+            "rule-providers": {},
+            "proxy-groups": [{
+                "name": "精选 / 自动 #1",
+                "type": "select",
+                "proxies": ["东京/Reality｜主用", "🇭🇰 香港 · IEPL #1"],
+                "use": ["机场 Provider / 香港"],
+            }],
+            "rules": ["DOMAIN-SUFFIX,example.com,精选 / 自动 #1",
+                      "MATCH,精选 / 自动 #1"],
+        }
+
+        converted, warnings = cio.mihomo_to_model(
+            document, model(), archive=None, config_name="config.yaml")
+        self.assertFalse(warnings)
+        self.assertEqual(
+            [item["tag"] for item in converted["outbounds"]
+             if item.get("type") != "direct"],
+            ["🇭🇰 香港 · IEPL #1", "东京/Reality｜主用"],
+        )
+        group = converted["_pdg"]["policy-groups"][0]
+        self.assertEqual(group["name"], "精选 / 自动 #1")
+        self.assertEqual(group["proxies"],
+                         ["东京/Reality｜主用", "🇭🇰 香港 · IEPL #1"])
+        self.assertEqual(group["use"], ["机场 Provider / 香港"])
+
+        rendered, _metadata = sb2mihomo.singbox_to_mihomo(converted)
+        self.assertEqual([item["name"] for item in rendered["proxies"]],
+                         ["🇭🇰 香港 · IEPL #1", "东京/Reality｜主用"])
+        rendered_group = rendered["proxy-groups"][0]
+        self.assertEqual(rendered_group["name"], "精选 / 自动 #1")
+        self.assertEqual(rendered_group["proxies"],
+                         ["东京/Reality｜主用", "🇭🇰 香港 · IEPL #1"])
+        self.assertEqual(rendered_group["use"], ["机场 Provider / 香港"])
+        self.assertIn("机场 Provider / 香港", rendered["proxy-providers"])
+        self.assertIn("DOMAIN-SUFFIX,example.com,精选 / 自动 #1", rendered["rules"])
+
+        invalid = copy.deepcopy(document)
+        invalid["proxies"][0]["name"] = "长" * 65
+        with self.assertRaisesRegex(cio.ImportInvalid, "1-64 Unicode code points"):
+            cio.mihomo_to_model(
+                invalid, model(), archive=None, config_name="config.yaml")
+
     def test_declared_v3_malformed_shape_fails_in_bot_and_config_io(self):
         bot_module = load_bot_module()
         candidate = model()

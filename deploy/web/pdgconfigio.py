@@ -65,7 +65,7 @@ PREVIEW_TTL = 30 * 60
 # older regular-file claims can be atomically taken over by the janitor.
 CLAIM_PROTECTION_TTL = 2 * 60 * 60
 _IMPORT_ID_RE = re.compile(r"^imp-[a-f0-9]{32}$")
-_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_MACHINE_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _SAFE_ARCHIVE_LEAF_RE = re.compile(r"^[A-Za-z0-9_.@+ -]{1,128}$")
 _HEX64_RE = re.compile(r"^[a-f0-9]{64}$")
 _PROVIDER_EXT_RE = re.compile(r"\.(?:ya?ml|json|txt|mrs)$", re.I)
@@ -158,6 +158,27 @@ def _pdgmodel():
             raise ImportInvalid("PDG schema validator is unavailable")
         _PDG_MODEL_MODULE = module
     return _PDG_MODEL_MODULE
+
+
+def _normalize_name(value: Any, label: str) -> str:
+    try:
+        return _pdgmodel().normalize_name(value, label)
+    except (TypeError, ValueError) as exc:
+        detail = {
+            "length": "must be 1-64 Unicode code points and at most 256 UTF-8 bytes",
+            "unsafe": "contains a control, bidirectional, or unsafe invisible character",
+            "canonical": "must use NFC and have no surrounding whitespace",
+            "encoding": "must be valid UTF-8 text",
+            "type": "must be text",
+        }.get(getattr(exc, "reason", None), "is invalid")
+        raise ImportInvalid(label + " " + detail) from exc
+
+
+def _valid_name(value: Any) -> bool:
+    try:
+        return bool(_pdgmodel().is_valid_name(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _sha(data: bytes) -> str:
@@ -722,7 +743,7 @@ def _validate_native_mihomo_metadata(model: dict[str, Any], metadata: dict[str, 
     for collection_name, collection in (("proxy-provider", providers),
                                         ("rule-provider", rule_providers)):
         for name, provider in collection.items():
-            if (not isinstance(name, str) or not _TAG_RE.fullmatch(name)
+            if (not _valid_name(name)
                     or not isinstance(provider, dict)
                     or not _validate_safe_value(provider)):
                 raise ImportInvalid(collection_name + " metadata is invalid")
@@ -761,7 +782,7 @@ def _validate_native_mihomo_metadata(model: dict[str, Any], metadata: dict[str, 
     for group in groups:
         if (not isinstance(group, dict) or not _validate_safe_value(group)
                 or not isinstance(group.get("name"), str)
-                or not _TAG_RE.fullmatch(group["name"])
+                or not _valid_name(group["name"])
                 or group["name"] in group_names
                 or group.get("type") not in {"select", "url-test", "fallback", "load-balance"}
                 or not isinstance(group.get("proxies", []), list)
@@ -846,9 +867,9 @@ def _choose_config(files: dict[str, bytes], kind: str) -> tuple[str, bytes]:
 def _proxy_to_model(item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
         raise ImportInvalid("proxy entry must be a mapping")
-    name = item.get("name")
+    name = _normalize_name(item.get("name"), "proxy name")
     typ = item.get("type")
-    if not isinstance(name, str) or not _TAG_RE.fullmatch(name) or not isinstance(typ, str):
+    if not isinstance(typ, str):
         raise ImportInvalid("proxy name or type is invalid")
     mapping = {
         "ss": "shadowsocks", "socks5": "socks", "socks": "socks",
@@ -924,6 +945,7 @@ def _safe_target(
         return direct_tag
     if value == "REJECT" and block_tag:
         return block_tag
+    value = _normalize_name(value, "policy target")
     if value not in known:
         raise ImportInvalid("rule references an undefined policy target")
     return value
@@ -958,7 +980,8 @@ def _rules_to_model(
             raise ImportInvalid("Mihomo rule value is invalid")
         key = _SUPPORTED_RULES[kind]
         if key == "rule_set":
-            out.append({"rule_set": value, "outbound": target})
+            out.append({"rule_set": _normalize_name(value, "rule provider name"),
+                        "outbound": target})
         else:
             out.append({key: [value], "outbound": target})
     if not match_seen:
@@ -970,7 +993,8 @@ def _managed_provider(
         name: str, provider: Any, archive: dict[str, bytes] | None,
         config_name: str, managed_files: dict[str, str], provider_kind: str,
         referenced_members: set[str]) -> dict[str, Any]:
-    if not isinstance(name, str) or not _TAG_RE.fullmatch(name) or not isinstance(provider, dict):
+    name = _normalize_name(name, "provider name")
+    if not isinstance(provider, dict):
         raise ImportInvalid("provider definition is invalid")
     result = copy.deepcopy(provider)
     path = result.get("path")
@@ -1030,13 +1054,19 @@ def mihomo_to_model(
     if not isinstance(raw_proxy_providers, dict) or not isinstance(raw_rule_providers, dict):
         raise ImportInvalid("proxy-providers and rule-providers must be mappings")
     for name, provider in raw_proxy_providers.items():
-        providers[name] = _managed_provider(
-            name, provider, archive, config_name, managed_files, "proxy-provider",
+        canonical = _normalize_name(name, "proxy provider name")
+        if canonical in providers:
+            raise ImportInvalid("proxy provider names must be unique after normalization")
+        providers[canonical] = _managed_provider(
+            canonical, provider, archive, config_name, managed_files, "proxy-provider",
             referenced_members)
     rule_providers = {}
     for name, provider in raw_rule_providers.items():
-        rule_providers[name] = _managed_provider(
-            name, provider, archive, config_name, managed_files, "rule-provider",
+        canonical = _normalize_name(name, "rule provider name")
+        if canonical in rule_providers:
+            raise ImportInvalid("rule provider names must be unique after normalization")
+        rule_providers[canonical] = _managed_provider(
+            canonical, provider, archive, config_name, managed_files, "rule-provider",
             referenced_members)
     if archive is not None:
         expected_members = {config_name} | referenced_members
@@ -1051,14 +1081,24 @@ def mihomo_to_model(
     group_names = set()
     managed_groups = []
     for group in groups:
-        if not isinstance(group, dict) or not isinstance(group.get("name"), str) or not (
-                _TAG_RE.fullmatch(group["name"])):
+        if not isinstance(group, dict):
             raise ImportInvalid("proxy group is invalid")
-        if group["name"] in group_names or group.get("type") not in {
+        canonical_group = copy.deepcopy(group)
+        canonical_group["name"] = _normalize_name(group.get("name"), "proxy group name")
+        canonical_group["proxies"] = [
+            _normalize_name(member, "proxy group member")
+            if member not in {"DIRECT", "REJECT"} else member
+            for member in (group.get("proxies") or [])
+        ]
+        canonical_group["use"] = [
+            _normalize_name(provider, "proxy provider name")
+            for provider in (group.get("use") or [])
+        ]
+        if canonical_group["name"] in group_names or group.get("type") not in {
                 "select", "url-test", "fallback", "load-balance"}:
             raise ImportInvalid("proxy group type or name is invalid")
-        group_names.add(group["name"])
-        managed_groups.append(copy.deepcopy(group))
+        group_names.add(canonical_group["name"])
+        managed_groups.append(canonical_group)
     if names & group_names:
         raise ImportInvalid("proxy and group names must not collide")
     if (names | group_names) & ({direct_tag} | _reserved_targets()):
@@ -1466,7 +1506,7 @@ def _ruleset_names(data: bytes, *, source: str) -> set[str]:
         raise ImportInvalid(source + " PDG ruleset metadata is too large or empty")
     doc = _strict_json(data)
     if not isinstance(doc, dict) or any(
-            not isinstance(name, str) or not _TAG_RE.fullmatch(name) for name in doc):
+            not _valid_name(name) for name in doc):
         raise ImportInvalid(source + " PDG ruleset metadata is invalid")
     names = set(doc)
     reserved = sorted(names & _reserved_targets())
@@ -1589,7 +1629,7 @@ def _single_direct(model: dict[str, Any], label: str) -> tuple[dict[str, Any], s
     direct = [item for item in model.get("outbounds", [])
               if isinstance(item, dict) and item.get("type") == "direct"]
     if (len(direct) != 1 or not isinstance(direct[0].get("tag"), str)
-            or not _TAG_RE.fullmatch(direct[0]["tag"])):
+            or not _MACHINE_TAG_RE.fullmatch(direct[0]["tag"])):
         raise ImportInvalid(
             label + " PDG model must contain exactly one valid direct outbound")
     return direct[0], direct[0]["tag"]
@@ -2418,8 +2458,7 @@ class ConfigIO:
                             "incomingNames", "existingNames"}
                         or type(collision_state["incomingPresent"]) is not bool
                         or any(not isinstance(values, list)
-                               or any(not isinstance(name, str)
-                                      or not _TAG_RE.fullmatch(name)
+                               or any(not _valid_name(name)
                                       for name in values)
                                for values in (
                                    collision_state["incoming"],

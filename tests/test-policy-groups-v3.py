@@ -147,6 +147,74 @@ class MigrationTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_unicode_names_normalize_once_and_preserve_every_reference(self):
+        candidate = v3_model()
+        candidate["outbounds"][1]["tag"] = "  🇭🇰 香港 · IEPL #1  "
+        candidate["outbounds"][2]["tag"] = "Cafe\u0301 / 主用"
+        candidate["_pdg"]["mihomo"]["proxy-providers"] = {
+            " 机场 Provider｜香港 ": {
+                "type": "http",
+                "url": "https://provider.example/sub.yaml",
+                "path": "/etc/mihomo/providers/unicode.yaml",
+                "interval": 3600,
+            }
+        }
+        candidate["_pdg"]["policy-groups"] = [{
+            "name": "东京/Reality｜主用",
+            "type": "select",
+            "proxies": ["  🇭🇰 香港 · IEPL #1  ", "Cafe\u0301 / 主用"],
+            "use": [" 机场 Provider｜香港 "],
+        }]
+        candidate["route"]["final"] = "东京/Reality｜主用"
+
+        result = pdgmodel.migrate(candidate)
+        self.assertEqual(
+            [item["tag"] for item in result["outbounds"][1:]],
+            ["🇭🇰 香港 · IEPL #1", "Café / 主用"],
+        )
+        group = result["_pdg"]["policy-groups"][0]
+        self.assertEqual(group["name"], "东京/Reality｜主用")
+        self.assertEqual(group["proxies"], ["🇭🇰 香港 · IEPL #1", "Café / 主用"])
+        self.assertEqual(group["use"], ["机场 Provider｜香港"])
+        self.assertIn("机场 Provider｜香港", result["_pdg"]["mihomo"]["proxy-providers"])
+
+    def test_nfc_equivalent_names_collide_in_the_canonical_namespace(self):
+        candidate = v3_model()
+        candidate["outbounds"][1]["tag"] = "Café"
+        candidate["outbounds"][2]["tag"] = "Cafe\u0301"
+        candidate["route"]["final"] = "Café"
+        with self.assertRaises(pdgmodel.ModelError):
+            pdgmodel.migrate(candidate)
+
+    def test_name_contract_rejects_controls_and_keeps_emoji_zwj(self):
+        accepted = (
+            "🇭🇰 香港 · IEPL #1",
+            "东京/Reality｜主用",
+            "空 格 / % # ? < > &",
+            "家庭 👨\u200d👩\u200d👧\u200d👦",
+            "界" * 64,
+            "😀" * 64,
+        )
+        for value in accepted:
+            with self.subTest(accepted=value):
+                self.assertEqual(pdgmodel.validate_name(value), value)
+
+        rejected = (
+            "", "   ", "line\nbreak", "trailing\n", "\tleading",
+            "nul\x00name", "c1\x85name",
+            "bidi\u202eoverride", "isolate\u2066name", "zero\u200bwidth",
+            "nonjoin\u200cname", "tag\U000e0001name",
+            "bom\ufeffname", "a" * 65, "😀" * 65,
+        )
+        for value in rejected:
+            with self.subTest(rejected=repr(value)), self.assertRaises(
+                    pdgmodel.NameValidationError) as raised:
+                pdgmodel.normalize_name(value)
+            self.assertIn(raised.exception.reason,
+                          {"type", "encoding", "length", "unsafe", "canonical"})
+
+        self.assertEqual(pdgmodel.normalize_name("  Cafe\u0301  "), "Café")
+
     def test_namespace_member_provider_and_route_target_closure(self):
         candidates = []
         base = v3_model()
@@ -251,6 +319,21 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(pdgmodel.ModelError):
                 pdgmodel.validate_ruleset_namespace(base, {name})
         pdgmodel.validate_ruleset_namespace(base, {"rs_safe"})
+        pdgmodel.validate_ruleset_namespace(base, {"规则集 / 香港 #1"})
+        with self.assertRaisesRegex(pdgmodel.ModelError, "Unicode normalization"):
+            pdgmodel.validate_ruleset_namespace(base, ["é", "e\u0301"])
+
+    def test_unicode_ruleset_provider_keeps_name_and_uses_safe_cache_leaf(self):
+        self.assertEqual(pdgtx._pdg_ruleset_cache_stem("rs_safe"), "rs_safe")
+        name = "规则集 / 香港 #1"
+        stem = pdgtx._pdg_ruleset_cache_stem(name)
+        self.assertRegex(stem, r"^u-[0-9a-f]{64}$")
+        self.assertEqual(stem, pdgtx._pdg_ruleset_cache_stem(name))
+        self.assertNotIn(name, stem)
+        with self.assertRaises(ValueError):
+            pdgtx._pdg_ruleset_cache_stem("e\u0301")
+        with self.assertRaises(pdgmodel.NameValidationError):
+            pdgtx._pdg_ruleset_cache_stem("bad\u202ename")
 
     def test_transaction_validator_closes_ruleset_route_targets(self):
         candidate = v3_model()
@@ -281,6 +364,37 @@ class ValidationTests(unittest.TestCase):
 
 
 class RenderingAndImportTests(unittest.TestCase):
+    def test_unicode_names_render_without_rewriting_or_splitting(self):
+        candidate = v3_model()
+        candidate["outbounds"][1]["tag"] = "🇭🇰 香港 · IEPL #1"
+        candidate["outbounds"][2]["tag"] = "东京/Reality｜主用"
+        candidate["_pdg"]["mihomo"]["proxy-providers"] = {
+            "机场 Provider｜香港": {
+                "type": "http",
+                "url": "https://provider.example/sub.yaml",
+                "path": "/etc/mihomo/providers/unicode.yaml",
+                "interval": 3600,
+            }
+        }
+        candidate["_pdg"]["policy-groups"] = [{
+            "name": "精选 / 自动 #1",
+            "type": "select",
+            "proxies": ["🇭🇰 香港 · IEPL #1", "东京/Reality｜主用"],
+            "use": ["机场 Provider｜香港"],
+        }]
+        candidate["route"]["final"] = "精选 / 自动 #1"
+
+        rendered, _metadata = sb2mihomo.singbox_to_mihomo(pdgmodel.migrate(candidate))
+        self.assertEqual(
+            [item["name"] for item in rendered["proxies"]],
+            ["🇭🇰 香港 · IEPL #1", "东京/Reality｜主用"],
+        )
+        group = next(item for item in rendered["proxy-groups"]
+                     if item["name"] == "精选 / 自动 #1")
+        self.assertEqual(group["proxies"], ["🇭🇰 香港 · IEPL #1", "东京/Reality｜主用"])
+        self.assertEqual(group["use"], ["机场 Provider｜香港"])
+        self.assertEqual(rendered["rules"][-1], "MATCH,精选 / 自动 #1")
+
     def test_all_four_group_types_nested_provider_and_reserved_targets_render(self):
         candidate = v3_model()
         candidate["outbounds"].insert(1, {"type": "block", "tag": "block"})

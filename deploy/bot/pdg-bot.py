@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, contextlib, copy, fcntl, hashlib, http.client, io, ipaddress, json, os, plistlib, posixpath, re, shutil, socket, stat, subprocess, sys, tarfile, tempfile, threading, time, uuid
+import base64, contextlib, copy, fcntl, hashlib, html, http.client, io, ipaddress, json, os, plistlib, posixpath, re, shutil, socket, stat, subprocess, sys, tarfile, tempfile, threading, time, uuid
 import concurrent.futures
 import datetime
 import importlib.util
@@ -239,7 +239,7 @@ def _nav(key):
              {"text": "🗑 删除", "callback_data": "del_exit"}],
             [{"text": "🎯 默认出口", "callback_data": "setfinal"}, {"text": "↕️ 出口排序", "callback_data": "order_exit"},
              {"text": "✏️ 改名", "callback_data": "ren_exit"}],
-            [{"text": "🔀 新建故障组", "callback_data": "add_grp"}, {"text": "✏️ 改故障组", "callback_data": "edit_grp"}],
+            [{"text": "🔀 新建故障切换组", "callback_data": "add_grp"}, {"text": "✏️ 改故障切换组", "callback_data": "edit_grp"}],
             [{"text": "📚 完整策略组查看", "callback_data": "policy_groups"}]]),
         "rule": ("📑 <b>分流管理</b> — 选一项:", [
             [{"text": "📋 规则", "callback_data": "rules"}, {"text": "➕ 加规则", "callback_data": "add_rule"},
@@ -832,13 +832,13 @@ def wloc_add_gen(name, lat, lon):
     if w is None:
         return False, busy_msg(), 0
     if st["hot"]:
-        return True, (f"✅ 当前目标坐标已更新：<b>{name}</b>（{lat}, {lon}）\n"
+        return True, (f"✅ 当前目标坐标已更新：<b>{_esc(name)}</b>（{lat}, {lon}）\n"
                       "WLOC 已热加载，无需重启网关服务，也不用再去列表里点一次。\n\n"
                       "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), st["gen"]
     if st["was_active"] or st["first"]:
-        return True, (f"✅ 已保存当前目标 <b>{name}</b>（{lat}, {lon}）\n"
+        return True, (f"✅ 已保存当前目标 <b>{_esc(name)}</b>（{lat}, {lon}）\n"
                       "WLOC 未开启，这个坐标还不会生效 —— 点「✅ 开启」后才会改写定位。"), 0
-    return True, (f"✅ 已添加地点 <b>{name}</b>（{lat}, {lon}）\n"
+    return True, (f"✅ 已添加地点 <b>{_esc(name)}</b>（{lat}, {lon}）\n"
                   "当前目标没变；要用它请到「📍 地点/切换」点它。"), 0
 
 def wloc_add(name, lat, lon):
@@ -884,12 +884,13 @@ def wloc_del(name):
             ww["active"] = None
             ww["enabled"] = False
         ok, msg = _mitm_transact(_txn)               # 失败则不落新态, 回滚旧态
-        return (True, f"✅ 已删除 <b>{name}</b>（已无地点，WLOC 已关闭）") if ok else (False, msg)
+        return (True, f"✅ 已删除 <b>{_esc(name)}</b>（已无地点，WLOC 已关闭）") if ok else (False, msg)
     if not st.get("was_active"):
-        return True, f"✅ 已删除 <b>{name}</b>"
+        return True, f"✅ 已删除 <b>{_esc(name)}</b>"
     if st.get("next"):
-        return True, f"✅ 已删除 <b>{name}</b>，当前目标切到 <b>{st['next']}</b>"
-    return True, f"✅ 已删除 <b>{name}</b>（已无地点）"
+        return True, (f"✅ 已删除 <b>{_esc(name)}</b>，当前目标切到 "
+                      f"<b>{_esc(st['next'])}</b>")
+    return True, f"✅ 已删除 <b>{_esc(name)}</b>（已无地点）"
 
 def wloc_switch_gen(name):
     """切换激活地点。返回 (ok, msg, generation)。
@@ -914,9 +915,9 @@ def wloc_switch_gen(name):
         return False, "没有这个地点", 0
     loc = _wloc_active(w)
     if not w.get("enabled"):
-        return True, (f"✅ 已选中 <b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
+        return True, (f"✅ 已选中 <b>{_esc(name)}</b>（{loc['lat']}, {loc['lon']}）\n"
                       "WLOC 未开启，这个地点还不会生效 —— 点「✅ 开启」后才会改写定位。"), w["generation"]
-    return True, (f"✅ 网关目标已切换：<b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
+    return True, (f"✅ 网关目标已切换：<b>{_esc(name)}</b>（{loc['lat']}, {loc['lon']}）\n"
                   "WLOC 已热加载，无需重启网关服务。\n\n"
                   "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), w["generation"]
 
@@ -1013,7 +1014,7 @@ def _wloc_hit_text(st, target):
     """把一次命中翻译成给用户的话。区分三种结局, 不含糊。"""
     if st.get("upstream_ok") and st.get("patched"):
         return (f"✅ 已收到 iPhone 的新定位请求\n"
-                f"Apple 网络定位响应已改写为：<b>{target}</b>\n\n"
+                f"Apple 网络定位响应已改写为：<b>{_esc(target)}</b>\n\n"
                 "若地图仍显示旧位置，属于 iOS 缓存或 GPS 覆盖。")
     if not st.get("upstream_ok"):
         return (f"❌ 收到了 iPhone 的新定位请求，但网关取 Apple 原始响应失败"
@@ -1448,7 +1449,25 @@ def _rebind_direct_meta(meta, old, new):
     return changed
 
 def _tag(name, host, port):
-    return re.sub(r"[^A-Za-z0-9_.-]", "-", (name or f"{host}:{port}"))[:40] or "exit"
+    """Canonicalize a user-visible proxy name without replacing characters."""
+    if isinstance(name, str) and name.strip():
+        return pdgmodel.normalize_name(name, "proxy name")
+    fallback = f"{host}:{port}".strip(":") or "exit"
+    try:
+        return pdgmodel.normalize_name(fallback, "proxy name")
+    except ValueError:
+        digest = hashlib.sha256(fallback.encode("utf-8", "strict")).hexdigest()[:12]
+        return "exit-" + digest
+
+
+def _name_error_text(exc):
+    return {
+        "length": "名称必须为 1–64 个 Unicode 字符，且不超过 256 个 UTF-8 字节",
+        "unsafe": "名称不能包含换行、控制字符、双向控制符或危险隐形字符",
+        "canonical": "名称必须使用 NFC 规范形式且首尾不能有空白",
+        "encoding": "名称必须是有效的 UTF-8 文本",
+        "type": "名称必须是文本",
+    }.get(getattr(exc, "reason", None), "名称无效")
 
 
 _RESERVED_EXIT_TAGS = (
@@ -1490,7 +1509,7 @@ def parse_link(link):
     return outbound
 
 def _b64(s):
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "ignore")
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode("utf-8", "strict")
 
 def _parse_ss(link):
     body = link[5:]; tag = ""
@@ -1669,18 +1688,25 @@ def _parse_http(link):
 def add_group(name, members, model_expect=None):
     c = load(); cands = concrete_tags(c)
     members = [m for m in members if m]
-    name = _tag(name, "", "")
+    try:
+        name = _tag(name, "", "")
+        members = [pdgmodel.normalize_name(member, "group member") for member in members]
+    except pdgmodel.NameValidationError as exc:
+        return False, "代理策略组名称或成员无效: " + _name_error_text(exc)
+    except (TypeError, ValueError) as exc:
+        return False, "代理策略组名称或成员无效: %s" % str(exc)
     if name in _RESERVED_EXIT_TAGS:
-        return False, f"组名 {name} 是保留字, 换个名字"
+        return False, f"组名 {_esc(name)} 是保留字, 换个名字"
     existing_outbound = next((o for o in c.get("outbounds", [])
                               if o.get("tag") == name), None)
     existing_group = next((g for g in pdgmodel.policy_groups(c)
                            if g.get("name") == name), None)
     if name in cands or existing_outbound is not None:
-        return False, f"组名 {name} 和现有出口冲突, 换个名字"
+        return False, f"组名 {_esc(name)} 和现有出口冲突, 换个名字"
     bad = [m for m in members if m not in cands]
     if bad:
-        return False, f"未知成员: {', '.join(bad)}\n只能用具体出口: {', '.join(cands)}"
+        return False, (f"未知成员: {_esc(', '.join(bad))}\n"
+                       f"只能用具体出口: {_esc(', '.join(cands))}")
     if len(members) < 2:
         return False, "故障切换组至少要 2 个出口"
     def mod(cc):
@@ -1697,7 +1723,7 @@ def add_group(name, members, model_expect=None):
     else:
         ok, msg = tx_apply(
             "group_add", model_mod=mod, model_expect=model_expect)
-    return ok, (f"✅ 故障切换组 <b>{name}</b> = {' › '.join(members)}\n"
+    return ok, (f"✅ 故障切换代理策略组 <b>{_esc(name)}</b> = {_esc(' › '.join(members))}\n"
                 "按探测延迟选择出口，并在出口不可用时切换。可在「🎯 设默认出口」或分流规则里选它。" if ok else msg)
 
 # ── 直连表 (mosdns) ──
@@ -2703,9 +2729,9 @@ def _ruleset_hijack_bytes(meta, staged, watched):
         if info.get("outbound") == "direct":
             continue
         leaf = managed[name]
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", str(name))[:80] or "ruleset"
+        display_name = pdgmodel.normalize_name(name, "ruleset name")
         if not leaf.endswith(".json"):
-            notes.append("# %s: binary provider 未展开；DNS 不猜测其域名\n" % safe_name)
+            notes.append("# %s: binary provider 未展开；DNS 不猜测其域名\n" % display_name)
             continue
         target = "ruleset:" + leaf
         data = staged.get(target, watched.get(target))
@@ -2717,7 +2743,7 @@ def _ruleset_hijack_bytes(meta, staged, watched):
         for prefix in combined:
             combined[prefix].update(entries[prefix])
         if has_ip:
-            notes.append("# %s: IP-CIDR 不可转换为 DNS 名称，未猜测\n" % safe_name)
+            notes.append("# %s: IP-CIDR 不可转换为 DNS 名称，未猜测\n" % display_name)
     lines = ["# pdg-bot 代理规则集 DNS 劫持聚合（事务派生；不要手工编辑）\n"]
     lines.extend(notes)
     for prefix in ("full", "domain", "keyword"):
@@ -3183,9 +3209,18 @@ def _mrs_behavior_of_file(path):
 
 
 def add_ruleset(url, target, label="", behavior=""):
+    if not isinstance(label, str):
+        return False, "规则集显示名称必须是文本"
+    label = label.strip()
+    if label:
+        try:
+            label = pdgmodel.normalize_name(label, "ruleset display name")
+        except pdgmodel.NameValidationError as exc:
+            return False, "规则集" + _name_error_text(exc)
     c = load()
     if target not in exit_tags(c) and target != "direct":
-        return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))} 或 direct"
+        return False, (f"出口 {_esc(target)} 不存在; 可选: "
+                       f"{_esc(', '.join(exit_tags(c)))} 或 direct")
     low = url.lower().split("?", 1)[0]
     if target == "direct" and not _ruleset_direct_interface_ready():
         return False, (
@@ -3289,8 +3324,8 @@ def add_ruleset(url, target, label="", behavior=""):
     m[name] = {"url": url, "outbound": target, "format": fmt, "path": path, "count": count}
     if behavior in MRS_BEHAVIORS:
         m[name]["behavior"] = behavior
-    if label.strip():
-        m[name]["label"] = label.strip()[:40]
+    if label:
+        m[name]["label"] = label
     # model / 规则集文件 / 元数据 一次提交: 渲染派生时读的是**这份 staged 元数据**, 所以
     # 不再需要"元数据必须先落地"那种取巧, 也不会出现"文件在、元数据不在"的中间态。
     ok, msg = tx_apply("ruleset_add", model_mod=mod, files={
@@ -3302,9 +3337,9 @@ def add_ruleset(url, target, label="", behavior=""):
         meaning = (
             "手机本地直连（MosDNS 返回真实地址，不经 VPS）"
             if target == "direct"
-            else target
+            else _esc(target)
         )
-        return True, f"规则集已添加 → {meaning}（{cntdesc}，{label.strip() or name}）" + warn
+        return True, f"规则集已添加 → {meaning}（{cntdesc}，{_esc(label or name)}）" + warn
     return False, msg
 
 def set_ruleset_label(name, label):
@@ -3315,7 +3350,14 @@ def set_ruleset_label(name, label):
         return False, "规则集元数据无法读取(%s)" % type(e).__name__
     if name not in m:
         return False, "规则集不存在(可能已删), 重开列表再试"
-    label = label.strip()[:40]
+    if not isinstance(label, str):
+        return False, "规则集显示名称必须是文本"
+    label = label.strip()
+    if label:
+        try:
+            label = pdgmodel.normalize_name(label, "ruleset display name")
+        except pdgmodel.NameValidationError as exc:
+            return False, "规则集" + _name_error_text(exc)
     if label:
         m[name]["label"] = label
     else:
@@ -3323,7 +3365,7 @@ def set_ruleset_label(name, label):
     ok, msg = tx_apply("ruleset_label", files={
         "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")},
         file_expects={"rs_meta": meta_sha})
-    return (True, f"✅ 规则集名称已设为「{label or name}」") if ok else (False, msg)
+    return (True, f"✅ 规则集名称已设为「{_esc(label or name)}」") if ok else (False, msg)
 
 
 def set_ruleset_target(name, target):
@@ -3462,7 +3504,7 @@ def del_ruleset(name):
         ruleset_direct=True,
         file_expects={"rs_meta": meta_sha},
     )
-    return (True, f"已删除规则集 {label}") if ok else (False, msg)
+    return (True, f"已删除规则集 {_esc(label)}") if ok else (False, msg)
 
 
 def refresh_rulesets():
@@ -3742,7 +3784,7 @@ def traffic_text():
             for cn in conns:
                 tag = (cn.get("chains") or ["?"])[0]
                 cnt[tag] += 1; up[tag] += cn.get("upload", 0); dn[tag] += cn.get("download", 0)
-            lines = [f"• <b>{t}</b>: {cnt[t]}条 ↑{_fmt_bytes(up[t])} ↓{_fmt_bytes(dn[t])}"
+            lines = [f"• <b>{_esc(t)}</b>: {cnt[t]}条 ↑{_fmt_bytes(up[t])} ↓{_fmt_bytes(dn[t])}"
                      for t, _ in cnt.most_common()]
             parts.append("📈 <b>实时(内核本会话, 重启清零)</b>\n"
                          f"会话累计 ↑{_fmt_bytes(d.get('uploadTotal'))} ↓{_fmt_bytes(d.get('downloadTotal'))}\n"
@@ -3772,9 +3814,6 @@ def doctor_text():
 
 # ── 更新(检查 → 确认 → 后台执行)──
 PDG_REPO = "/opt/privdns-gateway"
-
-def _esc(s):
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def _git(*args, t=60):
     return subprocess.run(["git", "-C", PDG_REPO, *args], capture_output=True, text=True, timeout=t)
@@ -3871,7 +3910,8 @@ def add_rule(domain, target):
         return ok, (f"已把 {domain} 设为直连" if ok else msg)
     c = load()
     if target not in exit_tags(c):
-        return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))} 或 direct"
+        return False, (f"出口 {_esc(target)} 不存在; 可选: "
+                       f"{_esc(', '.join(exit_tags(c)))} 或 direct")
 
     def mod(cc):
         for r in cc["route"]["rules"]:
@@ -3893,7 +3933,7 @@ def add_rule(domain, target):
         files=files,
         file_expects={"mosdns_rule:custom_hijack.txt": hijack_sha},
     )
-    return ok, (f"已把 {domain} → {target}" if ok else msg)
+    return ok, (f"已把 {_esc(domain)} → {_esc(target)}" if ok else msg)
 
 def del_rule(domain):
     domain = domain.strip().lstrip(".").lower(); removed = []
@@ -4059,27 +4099,27 @@ def reassign_rule(idx, target):
     if idx < 0 or idx >= len(rules) or "outbound" not in rules[idx]:
         return False, "该规则已变动, 请重开列表再试"
     if target not in exit_tags(c):
-        return False, f"出口 {target} 不存在"
+        return False, f"出口 {_esc(target)} 不存在"
     if rules[idx].get("rule_set"):
         return set_ruleset_target(rules[idx]["rule_set"], target)
     old = rules[idx]["outbound"]
     if old == target:
-        return True, f"已经是 {target}, 未改动"
+        return True, f"已经是 {_esc(target)}, 未改动"
     def mod(cc):
         cc["route"]["rules"][idx]["outbound"] = target
         cc["route"]["rules"] = _merge_domain_rules(cc["route"]["rules"])
     ok, msg = apply_sb(mod)
-    return ok, (f"✅ 该规则出口 {old} → {target}" if ok else msg)
+    return ok, (f"✅ 该规则出口 {_esc(old)} → {_esc(target)}" if ok else msg)
 
 def reorder_exits(order):
     c = load(); allt = [o["tag"] for o in c["outbounds"]]
     order = [t for t in order if t]
     if set(order) != set(allt):
-        return False, f"必须且只能列全部出口(空格分隔): {', '.join(allt)}"
+        return False, f"必须且只能逐行列出全部出口: {_esc(', '.join(allt))}"
     def mod(cc):
         cc["outbounds"].sort(key=lambda o: order.index(o["tag"]))
     ok, msg = apply_sb(mod)
-    return ok, (f"✅ 出口顺序已更新: {' › '.join(order)}" if ok else msg)
+    return ok, (f"✅ 出口顺序已更新: {_esc(' › '.join(order))}" if ok else msg)
 
 def rename_exit(old, new):
     """真改名: 改 outbound 的 tag, 并级联更新全部引用 —— 分流规则(含 TG 出口规则)、
@@ -4089,21 +4129,24 @@ def rename_exit(old, new):
     except Exception as exc:  # noqa: BLE001
         return False, "当前模型无法读取(%s)" % type(exc).__name__
     if old not in deletable_tags(c):
-        return False, f"出口 {old} 不存在或不可改名(direct 出口是模板锚点)"
-    new = _tag(new.strip(), "", "")
-    if not re.search(r"[A-Za-z0-9]", new):
-        return False, "新名字无效: 用字母/数字/_/./-(不支持中文), 40 字内"
+        return False, f"出口 {_esc(old)} 不存在或不可改名(direct 出口是模板锚点)"
+    try:
+        new = _tag(new, "", "")
+    except pdgmodel.NameValidationError as exc:
+        return False, "新名字无效: " + _name_error_text(exc)
+    except (TypeError, ValueError) as exc:
+        return False, "新名字无效: %s" % str(exc)
     if new == old:
         return False, "新旧名字相同, 未改动"
     if new in _RESERVED_EXIT_TAGS:
-        return False, f"{new} 是保留字, 换个名字"
+        return False, f"{_esc(new)} 是保留字, 换个名字"
     occupied = {o.get("tag") for o in c["outbounds"] if isinstance(o, dict)}
     occupied |= {group.get("name") for group in pdgmodel.policy_groups(c)}
     mihomo = ((c.get("_pdg") or {}).get("mihomo") or {})
     occupied |= set(mihomo.get("proxy-providers") or {})
     occupied |= set(mihomo.get("rule-providers") or {})
     if new in occupied - {old}:
-        return False, f"名字 {new} 已被占用"
+        return False, f"名字 {_esc(new)} 已被占用"
     def mod(cc):
         for o in cc["outbounds"]:
             if o.get("tag") == old:
@@ -4140,7 +4183,7 @@ def rename_exit(old, new):
     )
     if not ok:
         return False, msg
-    return True, f"✅ 出口 <b>{old}</b> 已改名 <b>{new}</b>, 分流规则/故障组/默认出口里的引用已同步。"
+    return True, f"✅ 出口 <b>{_esc(old)}</b> 已改名 <b>{_esc(new)}</b>, 分流规则/代理策略组/默认出口里的引用已同步。"
 
 
 def delete_exit(tag):
@@ -4150,7 +4193,7 @@ def delete_exit(tag):
     except Exception as exc:  # noqa: BLE001
         return False, "当前模型无法读取(%s)" % type(exc).__name__
     if tag not in deletable_tags(current):
-        return False, "出口/组 %s 不存在或不可删除" % tag
+        return False, "出口/组 %s 不存在或不可删除" % _esc(tag)
 
     preview = copy.deepcopy(current)
     before_groups = {group.get("name") for group in pdgmodel.policy_groups(preview)}
@@ -4207,7 +4250,7 @@ def delete_exit(tag):
         file_expects=file_expects, model_expect=model_sha)
     if not ok:
         return False, message
-    return True, "✅ 已删除 %s；策略组、路由与规则集引用已同步。" % tag
+    return True, "✅ 已删除 %s；代理策略组、路由与规则集引用已同步。" % _esc(tag)
 
 
 def set_direct_tag(new):
@@ -4264,14 +4307,14 @@ def set_tg_exit(tag):
     """钉 Telegram(tg-proxy)走某出口; tag 空 = 跟随默认出口(删掉专属规则)。"""
     c = load()
     if tag and tag not in exit_tags(c):
-        return False, f"出口 {tag} 不存在"
+        return False, f"出口 {_esc(tag)} 不存在"
     def mod(cc):
         cc["route"]["rules"] = [r for r in cc["route"]["rules"] if r.get("inbound") != [TG_INBOUND]]
         if tag:  # 放在 reject 之后、域名/规则集规则之前, 确保优先按入口判定
             idx = 1 if cc["route"]["rules"] and cc["route"]["rules"][0].get("action") == "reject" else 0
             cc["route"]["rules"].insert(idx, {"inbound": [TG_INBOUND], "outbound": tag})
     ok, msg = apply_sb(mod)
-    return ok, (f"✅ Telegram 出口 → {tag or '默认出口'}" if ok else msg)
+    return ok, (f"✅ Telegram 出口 → {_esc(tag or '默认出口')}" if ok else msg)
 
 # ── 测域名: 输入域名 → 直连 or 哪个出口(命中哪条规则/规则集) ──
 def _internal_probe_ip():
@@ -5806,9 +5849,9 @@ def _dot_host():
 
 def _groups_desc(c):
     return "\n".join(
-        f"🔀 策略组 <b>{group['name']}</b> ({group['type']}): "
-        f"{' › '.join(group.get('proxies', []))}"
-        + ((" · provider=" + ",".join(group.get("use", [])))
+        f"🔀 代理策略组 <b>{_esc(group['name'])}</b> ({_esc(group['type'])}): "
+        f"{_esc(' › '.join(group.get('proxies', [])))}"
+        + ((" · provider=" + _esc(",".join(group.get("use", []))))
            if group.get("use") else "")
         for group in pdgmodel.policy_groups(c))
 
@@ -5822,31 +5865,32 @@ def status_text():
     g = _groups_desc(c)
     final = c["route"].get("final")
     nrules = sum(1 for r in c["route"]["rules"] if r.get("outbound"))
-    split = "国内直连" + (f" / {nrules} 条分流规则" if nrules else "") + f" / 其余→{final}"
+    split = ("国内直连" + (f" / {nrules} 条分流规则" if nrules else "")
+             + f" / 其余→{_esc(final)}")
     return ("🖥 <b>PrivDNS Gateway</b>\n\n"
             f"{dot('mosdns')} mosdns（DNS 分流, 带缓存）\n"
             f"{dot(svc)} {svc}（流量出口）\n"
             f"{dot('pdg-bot')} pdg-bot（管理）\n\n"
             f"📡 DoT: <code>{_dot_host()}:853</code>（{'iOS 描述文件' if _platform() == 'ios' else 'Android 私密 DNS'}）\n"
             f"🌐 IP: <code>{_server_ip()}</code>\n"
-            f"📤 出口({len(exits)}): {', '.join(exits)}\n"
+            f"📤 出口({len(exits)}): {_esc(', '.join(exits))}\n"
             + (g + "\n" if g else "")
-            + f"🎯 默认出口(其余国际): <b>{final}</b>\n"
+            + f"🎯 默认出口(其余国际): <b>{_esc(final)}</b>\n"
             f"📚 规则集: {len(_rs_meta())} 个\n"
             f"🌏 分流: {split}")
 
 def exits_text():
     c = load(); lines = []
     for o in proxy_outbounds(c):
-        lines.append(f'• <b>{o["tag"]}</b>  {o["type"]}  {o.get("server")}:{o.get("server_port")}')
+        lines.append(f'• <b>{_esc(o["tag"])}</b>  {_esc(o["type"])}  {_esc(o.get("server"))}:{o.get("server_port")}')
     for o in c["outbounds"]:
         if o.get("type") == "direct":
-            lines.append(f'• <b>{o["tag"]}</b>  direct（本机直出）')
+            lines.append(f'• <b>{_esc(o["tag"])}</b>  direct（本机直出）')
     for group in pdgmodel.policy_groups(c):
         lines.append(
-            f'• <b>{group["name"]}</b>  {group["type"]} 策略组 → '
-            f'{" › ".join(group.get("proxies", []))}'
-            + ((" · provider=" + ",".join(group.get("use", [])))
+            f'• <b>{_esc(group["name"])}</b>  {_esc(group["type"])} 代理策略组 → '
+            f'{_esc(" › ".join(group.get("proxies", [])))}'
+            + ((" · provider=" + _esc(",".join(group.get("use", []))))
                if group.get("use") else ""))
     return "出口:\n" + ("\n".join(lines) or "(无)")
 
@@ -5855,17 +5899,17 @@ def policy_groups_text():
     """Complete read-only projection of every first-class policy group."""
     groups = pdgmodel.policy_groups(load())
     if not groups:
-        return "策略组:\n(无)"
-    lines = ["📚 <b>PDG 策略组（完整只读）</b>"]
+        return "代理策略组:\n(无)"
+    lines = ["📚 <b>PDG 代理策略组（完整只读）</b>"]
     for group in groups:
-        lines.append(f"\n• <b>{group['name']}</b>  type={group['type']}")
-        lines.append("  proxies=" + (", ".join(group.get("proxies", [])) or "(无)"))
-        lines.append("  use=" + (", ".join(group.get("use", [])) or "(无)"))
+        lines.append(f"\n• <b>{_esc(group['name'])}</b>  type={_esc(group['type'])}")
+        lines.append("  proxies=" + _esc(", ".join(group.get("proxies", [])) or "(无)"))
+        lines.append("  use=" + _esc(", ".join(group.get("use", [])) or "(无)"))
         options = []
         for key in ("url", "interval", "tolerance", "strategy", "lazy",
                     "disable-udp", "hidden"):
             if key in group:
-                options.append(f"{key}={group[key]}")
+                options.append(f"{key}={_esc(group[key])}")
         if options:
             lines.append("  " + " · ".join(options))
     return "\n".join(lines)
@@ -5878,25 +5922,54 @@ def rules_text():
         if r.get("rule_set"):
             info = m.get(r["rule_set"], {})
             label = info.get("label") or r["rule_set"]
-            lines.append(f'→ <b>{r["outbound"]}</b>: [规则集 {label} · {info.get("count","?")}条]')
+            lines.append(f'→ <b>{_esc(r["outbound"])}</b>: [规则集 {_esc(label)} · {info.get("count","?")}条]')
         else:
             doms = r.get("domain_suffix", []) + r.get("domain", [])
             if doms:
-                lines.append(f'→ <b>{r["outbound"]}</b>: ' + ", ".join(doms[:12]) + (" …" if len(doms) > 12 else ""))
-    txt = "分流规则:\n" + ("\n".join(lines) or f"(无显式规则, 其余→{c['route'].get('final')})")
+                lines.append(f'→ <b>{_esc(r["outbound"])}</b>: ' + _esc(", ".join(doms[:12])) + (" …" if len(doms) > 12 else ""))
+    txt = "分流规则:\n" + ("\n".join(lines) or
+                           f"(无显式规则, 其余→{_esc(c['route'].get('final'))})")
     d = _read_direct()
     if d:
-        txt += "\n\n自定义直连: " + ", ".join(d[:20])
+        txt += "\n\n自定义直连: " + _esc(", ".join(d[:20]))
     return txt
 
+
+def _esc(value):
+    """Escape user-controlled display text for Telegram HTML mode."""
+    return html.escape(str(value), quote=False)
+
+
+def _callback_token(value):
+    digest = hashlib.sha256(str(value).encode("utf-8", "strict")).digest()[:9]
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _callback_data(prefix, value):
+    data = f"{prefix}:~{_callback_token(value)}"
+    if len(data.encode("utf-8")) > 64:
+        raise ValueError("callback data exceeds Telegram limit")
+    return data
+
+
+def _resolve_callback(raw, candidates):
+    """Resolve digest callbacks and accept pre-upgrade raw ASCII callbacks."""
+    values = [item for item in candidates if isinstance(item, str)]
+    if raw.startswith("~"):
+        token = raw[1:]
+        matches = [item for item in values if _callback_token(item) == token]
+        return matches[0] if len(matches) == 1 else None
+    return raw if raw in values else None
+
 def kb_pick(prefix, tags, back=BACK):
-    rows = [[{"text": t, "callback_data": f"{prefix}:{t}"}] for t in tags]
+    rows = [[{"text": t, "callback_data": _callback_data(prefix, t)}] for t in tags]
     rows.extend(_back_rows(back))
     return {"inline_keyboard": rows}
 
 def kb_pick_named(prefix, items, back=BACK):
     """items=[(value, 显示文字)]: 按钮显示文字, 回调用 value。"""
-    rows = [[{"text": label, "callback_data": f"{prefix}:{value}"}] for value, label in items]
+    rows = [[{"text": label, "callback_data": _callback_data(prefix, value)}]
+            for value, label in items]
     rows.extend(_back_rows(back))
     return {"inline_keyboard": rows}
 
@@ -5955,12 +6028,13 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "发一条节点链接：<code>ss:// vmess:// trojan:// vless://(含 reality) hysteria2:// tuic:// anytls:// socks5:// http://</code>,或 Surge 的 <code>名字 = ss, …</code> 行\n/cancel 取消。", EXIT_BACK); return
     if data == "add_grp":
         state[chat] = "add_group"
-        edit(chat, mid, "发「<b>组名 出口1 出口2 …</b>」建故障切换组(按探测延迟选择出口，不可用时切换)。\n"
-             f"可选成员: {', '.join(concrete_tags(load()))}\n例: <code>main hk tw us</code>\n"
+        edit(chat, mid, "逐行发送：<b>第一行是代理策略组名称，后续每行一个成员</b>。\n"
+             f"可选成员: {_esc(', '.join(concrete_tags(load())))}\n"
+             "例：<code>主用策略组\n香港 IEPL\n东京/Reality</code>\n"
              "建好后可在「🎯 设默认出口」或规则里选它。/cancel 取消。", EXIT_BACK); return
     if data == "add_rule":
         state[chat] = "add_rule"
-        edit(chat, mid, f"发「<b>域名 出口</b>」，出口: {', '.join(exit_tags(load()))} 或 <b>direct</b>\n例: <code>netflix.com hk</code> / <code>x.cn direct</code>\n/cancel 取消。", RULE_BACK); return
+        edit(chat, mid, f"逐行发送：<b>第一行域名，第二行出口</b>。\n出口: {_esc(', '.join(exit_tags(load())))} 或 <b>direct</b>\n例: <code>netflix.com\n香港 IEPL</code>\n/cancel 取消。", RULE_BACK); return
     if data == "edit_rule":
         rs = editable_rules(load())
         if not rs:
@@ -5970,29 +6044,36 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "选要改出口的规则:", {"inline_keyboard": rows}); return
     if data.startswith("er:"):
         idx = data[3:]
-        rows = [[{"text": t, "callback_data": f"ero:{idx}:{t}"}] for t in exit_tags(load())]
+        rows = [[{"text": t, "callback_data": f"ero:{idx}:~{_callback_token(t)}"}]
+                for t in exit_tags(load())]
         rows.extend(_back_rows(RULE_BACK))
         edit(chat, mid, "改到哪个出口:", {"inline_keyboard": rows}); return
     if data.startswith("ero:"):
-        _, idx, target = data.split(":", 2)
+        _, idx, raw_target = data.split(":", 2)
+        target = _resolve_callback(raw_target, exit_tags(load()))
+        if target is None:
+            edit(chat, mid, "❌ 这个出口选择已经失效，请重新打开规则列表。", RULE_BACK); return
         ok, msg = reassign_rule(int(idx), target); edit(chat, mid, msg if ok else ("❌ " + msg), RULE_BACK); return
     if data == "order_exit":
         state[chat] = "order_exit"
         cur = [o["tag"] for o in load()["outbounds"]]
-        edit(chat, mid, "发新的出口顺序(空格分隔, 含全部出口)。\n"
-             f"当前: <code>{' '.join(cur)}</code>\n例: <code>hk tw JP us auto</code>\n/cancel 取消。", EXIT_BACK); return
+        edit(chat, mid, "逐行发送新的出口顺序，必须包含全部出口。\n"
+             f"当前:\n<code>{_esc(chr(10).join(cur))}</code>\n/cancel 取消。", EXIT_BACK); return
     if data == "edit_grp":
         gs = urltest_groups(load())
         if not gs:
-            edit(chat, mid, "还没有故障组, 先用「🔀 新建故障组」建一个。", EXIT_BACK); return
-        edit(chat, mid, "选要改的故障组:", kb_pick("egrp", gs, EXIT_BACK)); return
+            edit(chat, mid, "还没有故障切换代理策略组，请先新建一个。", EXIT_BACK); return
+        edit(chat, mid, "选择要修改的故障切换代理策略组:", kb_pick("egrp", gs, EXIT_BACK)); return
     if data.startswith("egrp:"):
-        name = data[5:]; state[chat] = "edit_grp:" + name
+        name = _resolve_callback(data[5:], urltest_groups(load()))
+        if name is None:
+            edit(chat, mid, "❌ 这个代理策略组选择已经失效，请重新打开列表。", EXIT_BACK); return
+        state[chat] = "edit_grp:" + name
         cur = next((group.get("proxies", []) for group in pdgmodel.policy_groups(load())
                     if group.get("name") == name), [])
-        edit(chat, mid, f"发 <b>{name}</b> 组的新成员(空格分隔, 按顺序, 至少2个)。\n"
-             f"当前: <code>{' '.join(cur) or '空'}</code>\n可选: {', '.join(concrete_tags(load()))}\n"
-             f"例: <code>hk tw us</code>\n/cancel 取消。", EXIT_BACK); return
+        edit(chat, mid, f"逐行发送 <b>{_esc(name)}</b> 的新成员，按顺序且至少两个。\n"
+             f"当前:\n<code>{_esc(chr(10).join(cur) or '空')}</code>\n"
+             f"可选: {_esc(', '.join(concrete_tags(load())))}\n/cancel 取消。", EXIT_BACK); return
     if data == "del_rule":
         del_sel[chat] = set()
         items, kb = del_rule_kb(chat)
@@ -6017,13 +6098,11 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "发个域名, 查它走哪个出口/规则(还是国内直连)。\n例: <code>netflix.com</code>\n/cancel 取消。", RULE_BACK); return
     if data == "add_rs":
         state[chat] = "add_rs"
-        edit(chat, mid, "发「<b>规则集URL 出口 [名称]</b>」(后缀 .list / .txt / .yaml / .mrs)。\n"
-             f"出口: {', '.join(exit_tags(load()))}，或 direct（手机取得真实地址后本地直连，不经 VPS）。\n"
+        edit(chat, mid, "逐行发送：<b>规则集 URL、出口、可选显示名称、可选类型</b>。\n"
+             f"出口: {_esc(', '.join(exit_tags(load())))}，或 direct（手机取得真实地址后本地直连，不经 VPS）。\n"
              "注意：direct-type 出口（如 JP）表示流量已到 VPS 后由 VPS 本机直出，与 literal direct 不同。\n"
-             "名称可留空(之后用「✏️ 改规则集名」改)。\n"
-             "例: <code>https://.../Binance.list tw 币安</code>\n"
-             "· .mrs 认不出类型时需在末尾补: <code>https://.../geo.mrs tw 名称 domain</code>"
-             "（可选 domain / ipcidr；不能用于 literal direct）\n"
+             "例: <code>https://.../Binance.list\n香港 IEPL\n币安</code>\n"
+             "· .mrs 认不出类型时第四行可写 domain / ipcidr（不能用于 literal direct）\n"
              "/cancel 取消。", RULE_BACK); return
     if data == "del_rs":
         if not _rs_meta():
@@ -6034,36 +6113,47 @@ def handle_cb(chat, mid, data):
             edit(chat, mid, "没有已添加的规则集", RULE_BACK); return
         edit(chat, mid, "选择要改名的规则集：", kb_pick_named("ers", _rs_items(), RULE_BACK)); return
     if data.startswith("ers:"):
-        name = data[4:]; state[chat] = "rs_label:" + name
+        name = _resolve_callback(data[4:], _rs_meta().keys())
+        if name is None:
+            edit(chat, mid, "❌ 这个规则集选择已经失效，请重新打开列表。", RULE_BACK); return
+        state[chat] = "rs_label:" + name
         cur = _rs_meta().get(name, {}).get("label") or name
-        edit(chat, mid, f"发规则集 <code>{name}</code> 的新名称(显示用, 如 <b>币安</b> / <b>OpenAI</b>)。\n"
-             f"当前: {cur}\n发「-」清除自定义名。/cancel 取消。", RULE_BACK); return
+        edit(chat, mid, f"发规则集 <code>{_esc(name)}</code> 的新名称(显示用, 如 <b>币安</b> / <b>OpenAI</b>)。\n"
+             f"当前: {_esc(cur)}\n发「-」清除自定义名。/cancel 取消。", RULE_BACK); return
     if data == "tgexit":
         c = load(); cur = _tg_exit(c)
-        rows = [[{"text": ("✓ " if t == cur else "") + t, "callback_data": "tgx:" + t}] for t in exit_tags(c)]
+        rows = [[{"text": ("✓ " if t == cur else "") + t,
+                  "callback_data": _callback_data("tgx", t)}] for t in exit_tags(c)]
         rows.append([{"text": ("✓ " if not cur else "") + "跟随默认出口", "callback_data": "tgx:"}])
         rows.append([{"text": "⬅️ 返回主菜单", "callback_data": "menu"}])
         edit(chat, mid, "✈️ Telegram(SOCKS5 :8445)走哪个出口?\n"
-             f"当前: <b>{cur or '默认出口'}</b>\n手机里 Telegram→设置→数据和存储→代理 填 SOCKS5 <code>{_server_ip()}:8445</code>。",
+             f"当前: <b>{_esc(cur or '默认出口')}</b>\n手机里 Telegram→设置→数据和存储→代理 填 SOCKS5 <code>{_server_ip()}:8445</code>。",
              {"inline_keyboard": rows}); return
     if data.startswith("tgx:"):
-        ok, msg = set_tg_exit(data[4:])
+        raw_target = data[4:]
+        target = "" if raw_target == "" else _resolve_callback(raw_target, exit_tags(load()))
+        if target is None:
+            edit(chat, mid, "❌ 这个出口选择已经失效，请重新打开列表。", MENU); return
+        ok, msg = set_tg_exit(target)
         if ok:
             msg += ("\n\n在 Telegram → 设置 → 数据和存储 → 代理 → 加 <b>SOCKS5</b>:\n"
                     f"服务器 <code>{_server_ip()}</code>\n端口 <code>8445</code>\n(无需用户名/密码)")
         edit(chat, mid, msg if ok else ("❌ " + msg), MENU); return
     if data == "del_exit":
         tags = deletable_tags(load())
-        edit(chat, mid, "选择要删除的出口/故障组：" if tags else "没有可删的出口",
+        edit(chat, mid, "选择要删除的代理节点/代理策略组：" if tags else "没有可删的出口",
              kb_pick("delx", tags, EXIT_BACK) if tags else EXIT_BACK); return
     if data == "ren_exit":
         tags = deletable_tags(load())
-        edit(chat, mid, "选择要改名的出口/故障组：" if tags else "没有可改名的出口",
+        edit(chat, mid, "选择要改名的代理节点/代理策略组：" if tags else "没有可改名的出口",
              kb_pick("renx", tags, EXIT_BACK) if tags else EXIT_BACK); return
     if data.startswith("renx:"):
-        old = data[5:]; state[chat] = "rename_exit:" + old
-        edit(chat, mid, f"发出口 <b>{old}</b> 的新名字(字母/数字/_/./-, 40 字内)。\n"
-             "分流规则、故障组、默认出口里的引用会一并同步。/cancel 取消。", EXIT_BACK); return
+        old = _resolve_callback(data[5:], deletable_tags(load()))
+        if old is None:
+            edit(chat, mid, "❌ 这个出口选择已经失效，请重新打开列表。", EXIT_BACK); return
+        state[chat] = "rename_exit:" + old
+        edit(chat, mid, f"发出口 <b>{_esc(old)}</b> 的新名字（支持中文、空格、emoji 和常见符号，最多 64 个字符）。\n"
+             "分流规则、代理策略组、默认出口里的引用会一并同步。/cancel 取消。", EXIT_BACK); return
     if data == "setfinal":
         edit(chat, mid, "「其余国际」默认走哪个出口/组：", kb_pick("fin", exit_tags(load()), EXIT_BACK)); return
     if data == "ios":
@@ -6135,7 +6225,7 @@ def handle_cb(chat, mid, data):
         if _platform() != "ios":
             edit(chat, mid, "位置改写(WLOC)仅 iOS 平台可用。", OPS_BACK); return
         w = _wloc_state(); on = bool(w.get("enabled")); loc = _wloc_active(w)
-        cur = f"<b>{w['active']}</b>({loc['lat']}, {loc['lon']})" if loc else "未设"
+        cur = f"<b>{_esc(w['active'])}</b>({loc['lat']}, {loc['lon']})" if loc else "未设"
         edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n状态: <b>{'🟢 开启' if on else '关闭'}</b>　当前: {cur}　地点: {len(w['locations'])} 个\n\n"
              "WLOC 只修改 Apple 网络定位响应中的坐标，不修改 GPS 数据。使用前需要安装并信任网关 CA。\n\n"
              "<b>首次使用顺序:</b>\n"
@@ -6262,15 +6352,22 @@ def handle_cb(chat, mid, data):
                    + "\n· ".join(str(x)[:120] for x in rs_failed[:5]))
         edit(chat, mid, msg, OPS_BACK); return
     if data.startswith("delx:"):
-        tag = data[5:]
+        tag = _resolve_callback(data[5:], deletable_tags(load()))
+        if tag is None:
+            edit(chat, mid, "❌ 这个出口选择已经失效，请重新打开列表。", EXIT_BACK); return
         ok, msg = delete_exit(tag)
-        edit(chat, mid, f"✅ 已删除 {tag}" if ok else msg, EXIT_BACK); return
+        edit(chat, mid, f"✅ 已删除 {_esc(tag)}" if ok else _esc(msg), EXIT_BACK); return
     if data.startswith("fin:"):
-        tag = data[4:]
+        tag = _resolve_callback(data[4:], exit_tags(load()))
+        if tag is None:
+            edit(chat, mid, "❌ 这个出口选择已经失效，请重新打开列表。", EXIT_BACK); return
         ok, msg = apply_sb(lambda c: c["route"].__setitem__("final", tag))
-        edit(chat, mid, f"✅ 默认出口 → {tag}" if ok else msg, EXIT_BACK); return
+        edit(chat, mid, f"✅ 默认出口 → {_esc(tag)}" if ok else _esc(msg), EXIT_BACK); return
     if data.startswith("delrs:"):
-        ok, msg = del_ruleset(data[6:]); edit(chat, mid, ("✅ " if ok else "") + msg, RULE_BACK); return
+        name = _resolve_callback(data[6:], _rs_meta().keys())
+        if name is None:
+            edit(chat, mid, "❌ 这个规则集选择已经失效，请重新打开列表。", RULE_BACK); return
+        ok, msg = del_ruleset(name); edit(chat, mid, ("✅ " if ok else "") + msg, RULE_BACK); return
 
 # ── 文本 ──
 def handle_text(chat, text, mid=None):
@@ -6296,15 +6393,15 @@ def handle_text(chat, text, mid=None):
         if cmd == "/addexit":
             state[chat] = "add_exit"; send(chat, "发节点链接：<code>ss:// vmess:// trojan:// vless:// hysteria2:// tuic:// anytls:// socks5:// http://</code>,或 Surge 的 <code>名字 = ss, …</code> 行。/cancel 取消。", BACK); return
         if cmd == "/group":
-            state[chat] = "add_group"; send(chat, "发「<b>组名 出口1 出口2 …</b>」建故障切换组。/cancel 取消。", BACK); return
+            state[chat] = "add_group"; send(chat, "逐行发送：第一行代理策略组名称，后续每行一个成员。/cancel 取消。", BACK); return
         if cmd == "/addrule":
-            state[chat] = "add_rule"; send(chat, f"发「<b>域名 出口</b>」，出口: {', '.join(exit_tags(load()))} 或 <b>direct</b>。/cancel 取消。", BACK); return
+            state[chat] = "add_rule"; send(chat, f"逐行发送域名和出口。出口: {_esc(', '.join(exit_tags(load())))} 或 <b>direct</b>。/cancel 取消。", BACK); return
         if cmd == "/delrule":
             state[chat] = "del_rule"; send(chat, "发要删除的域名。/cancel 取消。", BACK); return
         if cmd == "/addrs":
             state[chat] = "add_rs"; send(
                 chat,
-                "发「<b>规则集URL 出口 [名称] [类型]</b>」（支持 .list / .txt / .yaml / .mrs；"
+                "逐行发送规则集 URL、出口、可选名称、可选类型（支持 .list / .txt / .yaml / .mrs；"
                 "出口也可填 direct=手机本地直连，不经 VPS；.mrs 不能用于 direct，类型一般自动识别，"
                 "认不出时再补 domain/ipcidr）。/cancel 取消。",
                 BACK,
@@ -6354,6 +6451,9 @@ def handle_text(chat, text, mid=None):
         def task(link=link):
             try:
                 ob = parse_link(link)
+            except pdgmodel.NameValidationError as exc:
+                send_plain(chat, "解析失败: 代理节点" + _name_error_text(exc))
+                return
             except Exception:  # noqa: BLE001        # 不回显原始链接/异常正文(可能含凭据)
                 send_plain(chat, "解析失败: 链接格式不支持或有误(内容已隐去,可重发正确链接)")
                 return
@@ -6364,7 +6464,7 @@ def handle_text(chat, text, mid=None):
             ok, msg = apply_sb(mod)
             link = ob = None                         # 尽力减少凭据在内存驻留(非安全擦除, Python 无法保证)
             if ok:
-                send_plain(chat, f"✅ 已添加出口 <b>{tag}</b>")
+                send_plain(chat, f"✅ 已添加代理节点 <b>{_esc(tag)}</b>")
             elif msg in (BUSY_MSG, NOLOCK_MSG):       # 锁冲突/锁不可用: 原样回显(不是校验失败)
                 send_plain(chat, "❌ " + msg)
             else:                                    # 校验/重启失败: 正文可能含凭据 → 通用提示
@@ -6372,37 +6472,38 @@ def handle_text(chat, text, mid=None):
         run_bg(chat, task)
         return
     if act == "add_group":
-        p = text.split()
-        if len(p) < 3:
-            send_plain(chat, "格式: 组名 出口1 出口2 …(至少2个出口)"); return
-        ok, msg = add_group(p[0], p[1:]); send_plain(chat, msg if ok else ("❌ " + msg)); return
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) < 3:
+            send_plain(chat, "格式: 第一行代理策略组名称，后续至少两行成员"); return
+        ok, msg = add_group(lines[0], lines[1:]); send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "order_exit":
-        ok, msg = reorder_exits(text.replace(",", " ").split()); send_plain(chat, msg if ok else ("❌ " + msg)); return
+        order = [line.strip() for line in text.splitlines() if line.strip()]
+        ok, msg = reorder_exits(order); send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act.startswith("edit_grp:"):
-        ok, msg = add_group(act.split(":", 1)[1], text.replace(",", " ").split())
+        members = [line.strip() for line in text.splitlines() if line.strip()]
+        ok, msg = add_group(act.split(":", 1)[1], members)
         send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act.startswith("rename_exit:"):
         ok, msg = rename_exit(act.split(":", 1)[1], text)
         send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "add_rule":
-        p = text.split()
-        send_plain(chat, "格式: 域名 出口" if len(p) != 2 else (lambda r: ("✅ " if r[0] else "") + r[1])(add_rule(p[0], p[1])))
+        p = [line.strip() for line in text.splitlines() if line.strip()]
+        send_plain(chat, "格式: 第一行域名，第二行出口" if len(p) != 2 else (lambda r: ("✅ " if r[0] else "") + r[1])(add_rule(p[0], p[1])))
         return
     if act == "del_rule":
         ok, msg = del_rule(text); send_plain(chat, ("✅ " if ok else "") + msg); return
     if act == "test_dom":
         send_plain(chat, test_domain(text)); return
     if act == "add_rs":
-        p = text.split()
-        if len(p) < 2:
-            send_plain(chat, "格式: 规则集URL 出口 [名称] [类型(仅 .mrs 且认不出类型时需要)]"); return
-        # .mrs 的类型一般从文件二进制头认出来; 末尾若显式写了 domain/ipcidr 就当类型, 其余算名称
-        behavior = ""
-        rest = p[2:]
-        if rest and rest[-1].lower() in MRS_BEHAVIORS:
-            behavior = rest[-1].lower(); rest = rest[:-1]
+        p = [line.strip() for line in text.splitlines() if line.strip()]
+        if not 2 <= len(p) <= 4:
+            send_plain(chat, "格式: 第一行规则集 URL，第二行出口，第三行可选名称，第四行可选类型"); return
+        behavior = p[3].lower() if len(p) == 4 else ""
+        if behavior and behavior not in MRS_BEHAVIORS:
+            send_plain(chat, "第四行类型只能是 domain 或 ipcidr"); return
+        label = p[2] if len(p) >= 3 else ""
         send_plain(chat, "正在下载规则集…")
-        ok, msg = add_ruleset(p[0], p[1], " ".join(rest), behavior)
+        ok, msg = add_ruleset(p[0], p[1], label, behavior)
         send_plain(chat, ("✅ " if ok else "") + msg); return
     if act.startswith("rs_label:"):
         name = act.split(":", 1)[1]

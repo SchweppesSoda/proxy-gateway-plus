@@ -11,11 +11,26 @@ from __future__ import annotations
 
 import copy
 import re
+import unicodedata
 from typing import Any
 
 
 SCHEMA_VERSION = 3
+# Machine-only tags (the direct/block/DNS plumbing) deliberately stay ASCII.
+# User-facing proxy, policy-group and provider names use ``normalize_name``.
 TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+NAME_MAX_CODEPOINTS = 64
+NAME_MAX_UTF8_BYTES = 256
+# Invisible format controls that can spoof/reorder labels or make two names
+# visually indistinguishable.  U+200D (ZWJ) is intentionally allowed so
+# ordinary emoji sequences remain intact.
+_DANGEROUS_NAME_CODEPOINTS = frozenset({
+    0x00AD, 0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5,
+    0x180E, 0x200B, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C,
+    0x202D, 0x202E, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
+    0x2066, 0x2067, 0x2068, 0x2069, 0x206A, 0x206B, 0x206C,
+    0x206D, 0x206E, 0x206F, 0x3164, 0xFEFF, 0xFFA0,
+})
 GROUP_TYPES = frozenset({"select", "url-test", "fallback", "load-balance"})
 # Keep this set in lock-step with ``sb2mihomo.PROXY_TYPES`` and the Bot's
 # editable exit inventory.  Other sing-box outbounds (notably ``dns``) are
@@ -55,6 +70,65 @@ class ModelError(ValueError):
     pass
 
 
+class NameValidationError(ModelError):
+    """Stable name-validation failure that never embeds the rejected value."""
+
+    def __init__(self, reason: str, label: str = "name"):
+        self.reason = reason
+        messages = {
+            "type": "is not a text name",
+            "encoding": "is not valid UTF-8",
+            "length": "must be 1-64 characters and at most 256 UTF-8 bytes",
+            "unsafe": "contains a control or unsafe invisible character",
+            "canonical": "is not NFC-normalized or has outer whitespace",
+        }
+        super().__init__(label + " " + messages.get(reason, "is invalid"))
+
+
+def normalize_name(value: Any, label: str = "name") -> str:
+    """Return the canonical user-facing identifier without lossy rewriting.
+
+    Names are UTF-8/NFC display strings.  Only surrounding whitespace is
+    discarded; internal whitespace, CJK, emoji and punctuation are preserved.
+    """
+    if not isinstance(value, str):
+        raise NameValidationError("type", label)
+    canonical = unicodedata.normalize("NFC", value)
+    for ch in canonical:
+        codepoint = ord(ch)
+        category = unicodedata.category(ch)
+        if (codepoint < 0x20 or 0x7F <= codepoint <= 0x9F
+                or category in {"Cs", "Zl", "Zp"}
+                or (category == "Cf" and codepoint != 0x200D)
+                or codepoint in _DANGEROUS_NAME_CODEPOINTS):
+            raise NameValidationError("unsafe", label)
+    name = canonical.strip()
+    try:
+        encoded = name.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise NameValidationError("encoding", label) from exc
+    if (not name or len(name) > NAME_MAX_CODEPOINTS
+            or len(encoded) > NAME_MAX_UTF8_BYTES):
+        raise NameValidationError("length", label)
+    return name
+
+
+def validate_name(value: Any, label: str = "name") -> str:
+    """Validate a stored canonical name and return it unchanged."""
+    name = normalize_name(value, label)
+    if name != value:
+        raise NameValidationError("canonical", label)
+    return name
+
+
+def is_valid_name(value: Any, *, canonical: bool = True) -> bool:
+    try:
+        (validate_name if canonical else normalize_name)(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def validate_declared_schema_shape(model: Any) -> None:
     """Reject a declared v3 envelope before defaults or normalization run."""
     if not isinstance(model, dict):
@@ -82,6 +156,10 @@ def _tag(value: Any, label: str) -> str:
     if not isinstance(value, str) or not TAG_RE.fullmatch(value):
         raise ModelError(label + " is not a valid tag")
     return value
+
+
+def _name(value: Any, label: str) -> str:
+    return validate_name(value, label)
 
 
 def direct_tag(model: dict[str, Any]) -> str:
@@ -114,7 +192,7 @@ def _canonical_group(outbound: dict[str, Any], direct: str) -> dict[str, Any]:
     if typ not in {"selector", "urltest"}:
         raise ModelError("not a legacy canonical group")
     group: dict[str, Any] = {
-        "name": _tag(outbound.get("tag"), "group name"),
+        "name": _name(outbound.get("tag"), "group name"),
         "type": "select" if typ == "selector" else "url-test",
         "proxies": copy.deepcopy(outbound.get("outbounds", [])),
         "use": [],
@@ -154,7 +232,7 @@ def _legacy_groups(
     for raw in raw_groups:
         if not isinstance(raw, dict):
             raise ModelError("invalid legacy proxy group")
-        name = _tag(raw.get("name"), "group name")
+        name = _name(raw.get("name"), "group name")
         if name in metadata:
             raise ModelError("duplicate legacy proxy group: " + name)
         group = copy.deepcopy(raw)
@@ -195,6 +273,78 @@ def _legacy_groups(
                 and not raw.get("use") and "REJECT" not in raw.get("proxies", [])):
             raise ModelError("legacy editable policy group is missing its mirror: " + name)
     return [metadata[name] for name in order]
+
+
+def _canonicalize_user_names(model: dict[str, Any]) -> None:
+    """Normalize every user-facing namespace key and its modeled references."""
+    meta = model.get("_pdg") or {}
+    mihomo = meta.get("mihomo") or {}
+    groups = meta.get("policy-groups") or []
+    aliases: dict[str, str] = {}
+
+    def remember(value: Any, label: str) -> str:
+        canonical = normalize_name(value, label)
+        aliases[value] = canonical
+        return canonical
+
+    for outbound in model.get("outbounds", []):
+        if (isinstance(outbound, dict)
+                and outbound.get("type") in PROXY_OUTBOUND_TYPES):
+            outbound["tag"] = remember(outbound.get("tag"), "outbound tag")
+    for group in groups:
+        if isinstance(group, dict):
+            group["name"] = remember(group.get("name"), "group name")
+
+    for field, label in (("proxy-providers", "proxy provider name"),
+                         ("rule-providers", "rule provider name")):
+        collection = mihomo.get(field)
+        if not isinstance(collection, dict):
+            continue
+        rebuilt = {}
+        for raw, value in collection.items():
+            canonical = remember(raw, label)
+            if canonical in rebuilt:
+                raise ModelError(label + " collides after Unicode normalization")
+            rebuilt[canonical] = value
+        mihomo[field] = rebuilt
+
+    def reference(value: Any, label: str) -> str:
+        if not isinstance(value, str):
+            raise ModelError(label + " is not a valid name")
+        return aliases.get(value, normalize_name(value, label))
+
+    for outbound in model.get("outbounds", []):
+        if not isinstance(outbound, dict):
+            continue
+        if isinstance(outbound.get("detour"), str):
+            outbound["detour"] = reference(outbound["detour"], "outbound detour")
+        if isinstance(outbound.get("outbounds"), list):
+            outbound["outbounds"] = [
+                reference(item, "outbound member") for item in outbound["outbounds"]]
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group["proxies"] = [
+            item if item == "REJECT" else reference(item, "group member")
+            for item in (group.get("proxies") or [])
+        ]
+        group["use"] = [
+            reference(item, "proxy provider name")
+            for item in (group.get("use") or [])
+        ]
+    route = model.get("route") or {}
+    if isinstance(route.get("final"), str):
+        route["final"] = reference(route["final"], "route target")
+    for rule in route.get("rules", []) or []:
+        if not isinstance(rule, dict):
+            continue
+        if isinstance(rule.get("outbound"), str):
+            rule["outbound"] = reference(rule["outbound"], "route target")
+        if isinstance(rule.get("rule_set"), str):
+            rule["rule_set"] = reference(rule["rule_set"], "rule provider name")
+    for rule_set in route.get("rule_set", []) or []:
+        if isinstance(rule_set, dict) and isinstance(rule_set.get("tag"), str):
+            rule_set["tag"] = reference(rule_set["tag"], "rule provider name")
 
 
 def migrate(model: Any) -> dict[str, Any]:
@@ -252,6 +402,7 @@ def migrate(model: Any) -> dict[str, Any]:
         "policy-groups": groups,
         "mihomo": normalized_mihomo,
     }
+    _canonicalize_user_names(result)
     validate(result)
     return result
 
@@ -259,7 +410,7 @@ def migrate(model: Any) -> dict[str, Any]:
 def _validate_group(group: Any) -> tuple[str, list[str], list[str]]:
     if not isinstance(group, dict):
         raise ModelError("policy group must be an object")
-    name = _tag(group.get("name"), "group name")
+    name = _name(group.get("name"), "group name")
     typ = group.get("type")
     if typ not in GROUP_TYPES or set(group) - GROUP_FIELDS[typ]:
         raise ModelError("policy group contains unsupported runtime fields for its type: " + name)
@@ -312,7 +463,8 @@ def validate(model: dict[str, Any]) -> None:
     for outbound in model["outbounds"]:
         if not isinstance(outbound, dict):
             raise ModelError("outbound must be an object")
-        name = _tag(outbound.get("tag"), "outbound tag")
+        validator = _name if outbound.get("type") in PROXY_OUTBOUND_TYPES else _tag
+        name = validator(outbound.get("tag"), "outbound tag")
         if name in outbound_names:
             raise ModelError("duplicate outbound tag: " + name)
         if outbound.get("type") in {"selector", "urltest"}:
@@ -332,7 +484,7 @@ def validate(model: dict[str, Any]) -> None:
 
     provider_names = set(providers) | set(rule_providers)
     for name in provider_names:
-        _tag(name, "provider name")
+        _name(name, "provider name")
     occupied = outbound_names | set(groups) | set(providers) | set(rule_providers)
     if len(occupied) != (len(outbound_names) + len(groups) + len(providers)
                          + len(rule_providers)):
@@ -420,7 +572,10 @@ def model_namespace(model: dict[str, Any]) -> set[str]:
 def validate_ruleset_namespace(model: dict[str, Any], names: Any) -> None:
     if not isinstance(names, (set, frozenset, list, tuple)):
         raise ModelError("ruleset provider names are invalid")
-    checked = {_tag(name, "ruleset provider name") for name in names}
+    canonical = [normalize_name(name, "ruleset provider name") for name in names]
+    checked = set(canonical)
+    if len(checked) != len(canonical):
+        raise ModelError("ruleset provider names collide after Unicode normalization")
     collisions = sorted(checked & (model_namespace(model) | set(RESERVED_TARGETS)))
     if collisions:
         raise ModelError("ruleset provider names 与 Mihomo 命名空间同名: "

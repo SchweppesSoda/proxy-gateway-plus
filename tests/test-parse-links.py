@@ -3,10 +3,17 @@
 嵌套字段用 __ 表示层级, 如 tls__server_name → tls.server_name。"""
 import base64
 import importlib.util
+import json
 import os
 import sys
+import types
+import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.name == "nt":
+    # Production uses POSIX file locking, but these parser-only tests do not.
+    sys.modules.setdefault("fcntl", types.SimpleNamespace(
+        flock=lambda *_args: None, LOCK_EX=1, LOCK_NB=2, LOCK_UN=8))
 spec = importlib.util.spec_from_file_location("pdgbot", os.path.join(ROOT, "deploy/bot/pdg-bot.py"))
 m = importlib.util.module_from_spec(spec)
 try:
@@ -15,6 +22,14 @@ except SystemExit:
     pass
 
 fails = 0
+
+
+def fragment(value):
+    return urllib.parse.quote(value, safe="")
+
+
+UNICODE_NAME = "🇭🇰 香港 · IEPL #1"
+PUNCTUATED_NAME = "东京/Reality｜主用 % # ? < > &"
 
 
 def _deep(d, path):
@@ -41,55 +56,86 @@ def check(name, got, **want):
 
 # Surge ss 行(SS2022 + tfo + udp-relay)
 check("Surge ss 行",
-      m.parse_link('🇭🇰 X = ss, 1.2.3.4, 11111, encrypt-method=2022-blake3-aes-128-gcm, '
+      m.parse_link(UNICODE_NAME + ' = ss, 1.2.3.4, 11111, encrypt-method=2022-blake3-aes-128-gcm, '
                    'password="ab+C/9==", tfo=true, udp-relay=true'),
-      type="shadowsocks", server="1.2.3.4", server_port=11111,
+      type="shadowsocks", tag=UNICODE_NAME, server="1.2.3.4", server_port=11111,
       method="2022-blake3-aes-128-gcm", password="ab+C/9==", tcp_fast_open=True)
 
 # ss:// SIP002
 ui = base64.urlsafe_b64encode(b"aes-256-gcm:pass123").decode().rstrip("=")
-check("ss:// (b64 用户信息)", m.parse_link("ss://%s@5.6.7.8:8388#name" % ui),
-      type="shadowsocks", server="5.6.7.8", server_port=8388, method="aes-256-gcm", password="pass123")
+check("ss:// (b64 用户信息)", m.parse_link(
+      "ss://%s@5.6.7.8:8388#%s" % (ui, fragment(UNICODE_NAME))),
+      type="shadowsocks", tag=UNICODE_NAME, server="5.6.7.8", server_port=8388,
+      method="aes-256-gcm", password="pass123")
 
 # hysteria2
 check("hysteria2://",
       m.parse_link("hysteria2://mypass@h2.example.com:8443?sni=h2.example.com&insecure=1&"
-                   "obfs=salamander&obfs-password=ob#HY2"),
-      type="hysteria2", server="h2.example.com", server_port=8443, password="mypass",
+                   "obfs=salamander&obfs-password=ob#" + fragment(PUNCTUATED_NAME)),
+      type="hysteria2", tag=PUNCTUATED_NAME, server="h2.example.com", server_port=8443, password="mypass",
       tls__server_name="h2.example.com", tls__insecure=True, obfs__type="salamander", obfs__password="ob")
 
 # tuic
 check("tuic://",
       m.parse_link("tuic://uuid-1234:tpass@tuic.example.com:443?sni=tuic.example.com&"
-                   "congestion_control=bbr&alpn=h3#TUIC"),
-      type="tuic", server="tuic.example.com", server_port=443, uuid="uuid-1234", password="tpass",
+                   "congestion_control=bbr&alpn=h3#" + fragment(UNICODE_NAME)),
+      type="tuic", tag=UNICODE_NAME, server="tuic.example.com", server_port=443, uuid="uuid-1234", password="tpass",
       tls__server_name="tuic.example.com", tls__alpn=["h3"], congestion_control="bbr")
 
 # vless reality
 check("vless:// reality",
       m.parse_link("vless://uuid-9@r.example.com:443?security=reality&pbk=PUBKEY&sid=ab12&"
-                   "fp=chrome&flow=xtls-rprx-vision&type=tcp&sni=www.microsoft.com#REALITY"),
-      type="vless", server="r.example.com", server_port=443, uuid="uuid-9", flow="xtls-rprx-vision",
+                   "fp=chrome&flow=xtls-rprx-vision&type=tcp&sni=www.microsoft.com#" + fragment(PUNCTUATED_NAME)),
+      type="vless", tag=PUNCTUATED_NAME, server="r.example.com", server_port=443, uuid="uuid-9", flow="xtls-rprx-vision",
       tls__server_name="www.microsoft.com", tls__reality__enabled=True, tls__reality__public_key="PUBKEY",
       tls__reality__short_id="ab12", tls__utls__fingerprint="chrome")
 
 # vless gRPC: serviceName= 要进 transport.service_name(不是只看 path)
 check("vless:// grpc serviceName",
       m.parse_link("vless://11111111-2222-3333-4444-555555555555@g.example.com:443?"
-                   "security=tls&type=grpc&serviceName=mygrpc&sni=g.example.com#GRPC"),
-      type="vless", transport__type="grpc", transport__service_name="mygrpc")
+                   "security=tls&type=grpc&serviceName=mygrpc&sni=g.example.com#" + fragment(UNICODE_NAME)),
+      type="vless", tag=UNICODE_NAME, transport__type="grpc", transport__service_name="mygrpc")
 
 # anytls
-check("anytls://", m.parse_link("anytls://atpass@a.example.com:443?sni=a.example.com#ANYTLS"),
-      type="anytls", server="a.example.com", server_port=443, password="atpass", tls__server_name="a.example.com")
+check("anytls://", m.parse_link("anytls://atpass@a.example.com:443?sni=a.example.com#" + fragment(UNICODE_NAME)),
+      type="anytls", tag=UNICODE_NAME, server="a.example.com", server_port=443, password="atpass", tls__server_name="a.example.com")
 
 # socks5
-check("socks5://", m.parse_link("socks5://user:pass@1.2.3.4:1080#SOCKS"),
-      type="socks", server="1.2.3.4", server_port=1080, version="5", username="user", password="pass")
+check("socks5://", m.parse_link("socks5://user:pass@1.2.3.4:1080#" + fragment(PUNCTUATED_NAME)),
+      type="socks", tag=PUNCTUATED_NAME, server="1.2.3.4", server_port=1080, version="5", username="user", password="pass")
 
 # http
-check("http://", m.parse_link("http://user:pass@1.2.3.4:8080#HTTP"),
-      type="http", server="1.2.3.4", server_port=8080, username="user", password="pass")
+check("http://", m.parse_link("http://user:pass@1.2.3.4:8080#" + fragment(UNICODE_NAME)),
+      type="http", tag=UNICODE_NAME, server="1.2.3.4", server_port=8080, username="user", password="pass")
+
+# trojan and vmess carry names through their respective fragment/JSON fields.
+check("trojan://", m.parse_link(
+      "trojan://secret@t.example.com:443?sni=t.example.com#" + fragment(PUNCTUATED_NAME)),
+      type="trojan", tag=PUNCTUATED_NAME, server="t.example.com", server_port=443,
+      password="secret")
+vmess_payload = base64.urlsafe_b64encode(json.dumps({
+    "v": "2", "ps": UNICODE_NAME, "add": "v.example.com", "port": "443",
+    "id": "11111111-2222-3333-4444-555555555555", "aid": "0", "scy": "auto",
+    "net": "tcp", "tls": "tls", "sni": "v.example.com",
+}, ensure_ascii=False).encode("utf-8")).decode("ascii").rstrip("=")
+check("vmess://", m.parse_link("vmess://" + vmess_payload),
+      type="vmess", tag=UNICODE_NAME, server="v.example.com", server_port=443)
+
+# NFC normalization is explicit; absent names alone get a deterministic host:port fallback.
+check("NFC 名称", m.parse_link(
+      "socks5://1.2.3.4:1080#" + fragment("  Cafe\u0301 / 主用  ")),
+      type="socks", tag="Café / 主用")
+check("缺失名称 fallback", m.parse_link("ss://%s@5.6.7.8:8388" % ui),
+      type="shadowsocks", tag="5.6.7.8:8388")
+
+for bad_name in ("line\nbreak", "trailing\n", "\tleading", "nul\x00name", "bidi\u202eoverride",
+                 "zero\u200bwidth", "nonjoin\u200cname", "a" * 65, "😀" * 65):
+    shown = bad_name.encode("unicode_escape").decode("ascii")
+    try:
+        m.parse_link("socks5://1.2.3.4:1080#" + fragment(bad_name))
+        print("[FAIL] 非法名称未报错", shown); fails += 1
+    except ValueError:
+        print("[OK]   非法名称正确报错", shown)
 
 # 非法
 try:

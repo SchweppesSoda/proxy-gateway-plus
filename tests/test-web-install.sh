@@ -19,6 +19,7 @@ required=(
   deploy/web/pdg-webctl.sh
   deploy/web/pdg-web.service
   deploy/web/static/index.html
+  deploy/web/static/theme.js
   deploy/web/static/app.js
   deploy/web/static/style.css
   deploy/web/static/manifest.webmanifest
@@ -42,7 +43,7 @@ done
 [[ "$syntax_ok" == 1 ]] && ok "相关 shell 脚本通过 bash -n" || bad "shell 语法错误"
 
 install_ok=1
-for path in pdg-web.py pdg-web-job.py pdgcontrol.py pdgconfigio.py pdg-web-setup.py pdgwebconfig.py index.html app.js style.css \
+for path in pdg-web.py pdg-web-job.py pdgcontrol.py pdgconfigio.py pdg-web-setup.py pdgwebconfig.py index.html theme.js app.js style.css \
             manifest.webmanifest icon.svg pdg-webctl.sh pdg-web.service; do
   grep -qF "deploy/web/${path}" "$ROOT/install.sh" \
     || grep -qF "deploy/web/static/${path}" "$ROOT/install.sh" \
@@ -126,6 +127,7 @@ for exact in \
   "opt/pdg-web/pdg-web.py" "opt/pdg-web/pdg-web-job.py" "opt/pdg-web/pdgcontrol.py" \
   "opt/pdg-web/pdgconfigio.py" \
   "opt/pdg-web/pdg-web-setup.py" "opt/pdg-web/pdgwebconfig.py" \
+  "opt/pdg-web/static/theme.js" \
   "opt/pdg-web/static/manifest.webmanifest" \
   "opt/pdg-web/static/templates/mihomo-import.example.yaml" \
   "opt/pdg-web/static/templates/mosdns-import.example.yaml" \

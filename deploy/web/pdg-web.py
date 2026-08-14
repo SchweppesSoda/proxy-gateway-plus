@@ -23,6 +23,7 @@ import stat
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections import defaultdict, deque
 from typing import Any
@@ -73,6 +74,14 @@ LOGIN_KDF_SLOTS = 2
 
 _PERCENT_BAD_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _PATH_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_PATH_NAME_TOKEN_RE = re.compile(r"^~([A-Za-z0-9_-]{2,342})$")
+_DANGEROUS_NAME_CODEPOINTS = frozenset({
+    0x00AD, 0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5,
+    0x180E, 0x200B, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C,
+    0x202D, 0x202E, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
+    0x2066, 0x2067, 0x2068, 0x2069, 0x206A, 0x206B, 0x206C,
+    0x206D, 0x206E, 0x206F, 0x3164, 0xFEFF, 0xFFA0,
+})
 _PATH_DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
@@ -407,6 +416,33 @@ def _ip_trusted(config: WebConfig, socket_ip: str) -> bool:
 def _strict_path_segment(raw: str, *, kind: str) -> str:
     if not raw or len(raw) > 768 or _PERCENT_BAD_RE.search(raw):
         raise ValidationError("Path identifier is invalid.")
+    if kind == "tag" and raw.startswith("~"):
+        match = _PATH_NAME_TOKEN_RE.fullmatch(raw)
+        if match is None:
+            raise ValidationError("Path identifier is invalid.")
+        token = match.group(1)
+        try:
+            decoded_bytes = base64.urlsafe_b64decode(
+                token + "=" * (-len(token) % 4))
+            if base64.urlsafe_b64encode(decoded_bytes).decode("ascii").rstrip("=") != token:
+                raise ValueError("non-canonical base64url")
+            decoded = decoded_bytes.decode("utf-8", "strict")
+            encoded = decoded.encode("utf-8", "strict")
+        except (UnicodeDecodeError, UnicodeEncodeError, ValueError) as exc:
+            raise ValidationError("Path identifier is invalid.") from exc
+        if (not decoded or decoded.strip() != decoded
+                or unicodedata.normalize("NFC", decoded) != decoded
+                or len(decoded) > 64 or len(encoded) > 256):
+            raise ValidationError("Path identifier is invalid.")
+        for ch in decoded:
+            codepoint = ord(ch)
+            category = unicodedata.category(ch)
+            if (codepoint < 0x20 or 0x7F <= codepoint <= 0x9F
+                    or category in {"Cs", "Zl", "Zp"}
+                    or (category == "Cf" and codepoint != 0x200D)
+                    or codepoint in _DANGEROUS_NAME_CODEPOINTS):
+                raise ValidationError("Path identifier is invalid.")
+        return decoded
     try:
         decoded_bytes = urllib.parse.unquote_to_bytes(raw)
         decoded = decoded_bytes.decode("utf-8", "strict")

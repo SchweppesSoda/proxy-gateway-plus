@@ -20,6 +20,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.parse
 from unittest import mock
 
 
@@ -52,6 +53,10 @@ PLAIN_SECRET = "TOPSECRET-CREDENTIAL"
 
 def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _name_path(value: str) -> str:
+    return "~" + _b64url(value.encode("utf-8"))
 
 
 class FakeResult:
@@ -363,6 +368,7 @@ class FakeBot:
                 ]
         if not found:
             return False, "not found"
+        self._rename_model_references(self.model, old, new)
         route = self.model["route"]
         if route.get("final") == old:
             route["final"] = new
@@ -2334,6 +2340,164 @@ class WebAPITestCase(unittest.TestCase):
         })
         self.assert_error(stale, 409)
         self.assertEqual(self.fake.model["_pdg"]["policy-groups"], before_groups)
+
+    def test_unicode_name_paths_cover_crud_runtime_and_legacy_ascii(self):
+        self.login()
+
+        # Existing ASCII clients remain valid without the canonical marker.
+        legacy = self.request(
+            "PATCH", "/api/v1/exits/hk", {"name": "hk_legacy"})
+        self.assertEqual(legacy["status"], 200, legacy["text"])
+        restored = self.request(
+            "PATCH", "/api/v1/exits/hk_legacy", {"name": "hk"})
+        self.assertEqual(restored["status"], 200, restored["text"])
+
+        proxy = "东京/Reality｜主用 % # ? < > &"
+        renamed_proxy = "🇭🇰 香港 · IEPL #1"
+        group = "代理策略组 / 主用 #1"
+        renamed_group = "自动 / 香港｜精选"
+        ruleset = "规则集 / AI #1"
+        self.fake.model = {
+            "outbounds": [
+                {"type": "direct", "tag": "KFC_JP"},
+                {"type": "shadowsocks", "tag": proxy, "server": "jp.example",
+                 "server_port": 443, "password": PLAIN_SECRET},
+            ],
+            "route": {
+                "rules": [{"rule_set": ruleset, "outbound": group}],
+                "rule_set": [{"tag": ruleset, "type": "local", "format": "source",
+                              "path": "/etc/sing-box/rs/unicode.json"}],
+                "final": group,
+            },
+            "_pdg": {"schema": 3, "policy-groups": [{
+                "name": group, "type": "select",
+                "proxies": [proxy, "KFC_JP"], "use": [],
+            }], "mihomo": {"proxy-providers": {}, "rule-providers": {},
+                              "advanced": {}, "managed-files": {}}},
+        }
+        self.fake.meta = {ruleset: {
+            "url": "https://rules.example/ai.txt", "outbound": group,
+            "format": "source", "path": "/etc/sing-box/rs/unicode.json",
+            "count": 2,
+        }}
+        clash_group = urllib.parse.quote(group, safe="")
+        self.fake.runtime_now = {clash_group: proxy}
+        self.fake.runtime_all = {clash_group: [proxy, "DIRECT"]}
+
+        proxy_path = _name_path(proxy)
+        replaced = self.request(
+            "PUT", f"/api/v1/exits/{proxy_path}",
+            {"link": f"ss://{PLAIN_SECRET}@replacement.example:443#ignored"})
+        self.assertEqual(replaced["status"], 200, replaced["text"])
+        self.assertEqual(replaced["json"]["data"]["tag"], proxy)
+
+        renamed = self.request(
+            "PATCH", f"/api/v1/exits/{proxy_path}", {"name": renamed_proxy})
+        self.assertEqual(renamed["status"], 200, renamed["text"])
+        self.assertEqual(renamed["json"]["data"]["tag"], renamed_proxy)
+        self.assertEqual(
+            self.fake.model["_pdg"]["policy-groups"][0]["proxies"][0],
+            renamed_proxy,
+        )
+
+        # Refresh the runtime fixture after the proxy rename and select it by
+        # the group's canonical UTF-8 Base64URL path.
+        self.fake.runtime_now = {clash_group: renamed_proxy}
+        self.fake.runtime_all = {clash_group: [renamed_proxy, "DIRECT"]}
+        selected = self.request(
+            "PUT", f"/api/v1/policy-groups/{_name_path(group)}/runtime",
+            {"member": renamed_proxy})
+        self.assertEqual(selected["status"], 200, selected["text"])
+        self.assertEqual(self.fake.runtime_selections[-1], (group, renamed_proxy))
+
+        payload = self.request("GET", "/api/v1/policy-groups")["json"]["data"]
+        patched = self.request(
+            "PATCH", f"/api/v1/policy-groups/{_name_path(group)}", {
+                "revision": payload["revision"], "name": renamed_group,
+                "type": "select", "proxies": [renamed_proxy, "KFC_JP"], "use": [],
+            })
+        self.assertEqual(patched["status"], 200, patched["text"])
+        self.assertEqual(patched["json"]["data"]["name"], renamed_group)
+
+        relabeled = self.request(
+            "PATCH", f"/api/v1/rulesets/{_name_path(ruleset)}",
+            {"label": "AI / 中文规则"})
+        self.assertEqual(relabeled["status"], 200, relabeled["text"])
+        retargeted = self.request(
+            "PUT", f"/api/v1/rulesets/{_name_path(ruleset)}/target",
+            {"target": renamed_proxy})
+        self.assertEqual(retargeted["status"], 200, retargeted["text"])
+        deleted_ruleset = self.request(
+            "DELETE", f"/api/v1/rulesets/{_name_path(ruleset)}")
+        self.assertEqual(deleted_ruleset["status"], 200, deleted_ruleset["text"])
+
+        latest = self.request("GET", "/api/v1/policy-groups")["json"]["data"]
+        deleted_group = self.request(
+            "DELETE", f"/api/v1/policy-groups/{_name_path(renamed_group)}",
+            {"revision": latest["revision"]})
+        self.assertEqual(deleted_group["status"], 200, deleted_group["text"])
+        deleted_proxy = self.request(
+            "DELETE", f"/api/v1/exits/{_name_path(renamed_proxy)}")
+        self.assertEqual(deleted_proxy["status"], 200, deleted_proxy["text"])
+
+        invalid_tokens = (
+            "~", "~***", "~YWJj=", "~_w",
+            _name_path(" Cafe\u0301 "), _name_path("bidi\u202eoverride"),
+            _name_path("nonjoin\u200cname"),
+        )
+        for token in invalid_tokens:
+            with self.subTest(token=token):
+                self.assert_error(self.request(
+                    "PATCH", f"/api/v1/exits/{token}", {"name": "safe"}), 400)
+
+    def test_name_validation_errors_are_specific_without_echoing_input(self):
+        self.login()
+        ruleset = "rs_deadbeef"
+        display_name = "规则集 / 香港 #1 🧪"
+        renamed = self.request(
+            "PATCH", f"/api/v1/rulesets/{ruleset}", {"label": display_name})
+        self.assertEqual(renamed["status"], 200, renamed["text"])
+        self.assertEqual(renamed["json"]["data"]["label"], display_name)
+
+        too_long = "敏" * 65
+        response = self.request(
+            "PATCH", "/api/v1/exits/hk", {"name": too_long})
+        error = self.assert_error(response, 400)
+        self.assertIn("1–64", error["message"])
+        self.assertNotIn(too_long, response["text"])
+
+        unsafe = "safe\u202ename"
+        response = self.request(
+            "PATCH", "/api/v1/exits/hk", {"name": unsafe})
+        error = self.assert_error(response, 400)
+        self.assertIn("危险隐形字符", error["message"])
+        self.assertNotIn(unsafe, response["text"])
+
+        response = self.request(
+            "PATCH", f"/api/v1/rulesets/{ruleset}", {"label": unsafe})
+        error = self.assert_error(response, 400)
+        self.assertIn("危险隐形字符", error["message"])
+        self.assertNotIn(unsafe, response["text"])
+
+        response = self.request(
+            "PATCH", f"/api/v1/rulesets/{ruleset}", {"label": too_long})
+        error = self.assert_error(response, 400)
+        self.assertIn("1–64", error["message"])
+        self.assertNotIn(too_long, response["text"])
+
+        class LinkNameFailure(ValueError):
+            reason = "length"
+
+        original = self.fake.parse_link
+        try:
+            self.fake.parse_link = lambda _link: (_ for _ in ()).throw(LinkNameFailure())
+            response = self.request(
+                "POST", "/api/v1/exits", {"link": "ss://secret@example.invalid"})
+        finally:
+            self.fake.parse_link = original
+        error = self.assert_error(response, 400)
+        self.assertIn("1–64", error["message"])
+        self.assertNotIn("secret@example", response["text"])
 
 
 class PersistentJobStoreTestCase(unittest.TestCase):

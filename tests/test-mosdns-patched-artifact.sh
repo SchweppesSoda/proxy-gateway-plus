@@ -22,7 +22,7 @@ pdg_verify_sha256 "$PATCH" "${PDG_SHA256[mosdns-patch]}" "MosDNS patch" \
    && "$MOSDNS_BUILD_VERSION" == v5.3.4-pdg-notickets.1 ]] \
   && ok "官方 commit、Go 与 flavor marker 均精确 pin" || bad "provenance pin 漂移"
 
-EXPECTED_RELEASE_BASE="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.10.1"
+EXPECTED_RELEASE_BASE="https://github.com/SchweppesSoda/proxy-gateway-plus/releases/download/v1.11.0"
 AMD64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-amd64"
 ARM64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-arm64"
 [[ "$MOSDNS_PDG_ASSET_BASE_URL" == "$EXPECTED_RELEASE_BASE" \
@@ -30,7 +30,7 @@ ARM64_ASSET="mosdns-v5.3.4-pdg-notickets.1-linux-arm64"
    && "$(pdg_mosdns_asset_name arm64)" == "$ARM64_ASSET" \
    && $(grep -Fc 'ASSET="mosdns-${MOSDNS_VER}-${MOSDNS_PATCH_REV}-linux-${ARCH}"' \
         "$ROOT/tools/build-mosdns-patched.sh") == 1 ]] \
-  && ok "v1.10.1 Release 目录、helper 与构建产物名精确一致" \
+  && ok "v1.11.0 Release 目录、helper 与构建产物名精确一致" \
   || bad "Release 目录或 MosDNS asset 命名漂移"
 
 cat >"$WORK/stock" <<'EOF'
@@ -117,7 +117,7 @@ pdg_prepare_mosdns_candidate arm64 "$WORK/release-arm64" \
   && ok "amd64/arm64 均只从精确 tag asset URL 下载并校验" \
   || bad "双架构 Release 下载 URL、命名或候选校验失败"
 
-# CI validates a commit before v1.10.1 assets can exist.  Its explicit guard
+# CI validates a commit before v1.11.0 assets can exist.  Its explicit guard
 # must stop release-channel I/O, while the same guard must not disable the
 # hash-pinned local artifact channel used by install E2E.
 rm -rf "$WORK/candidate"; mkdir "$WORK/candidate"

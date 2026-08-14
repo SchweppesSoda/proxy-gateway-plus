@@ -19,13 +19,21 @@ import os
 import re
 import sys
 import threading
+import unicodedata
 import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 
-_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_MACHINE_TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_DANGEROUS_NAME_CODEPOINTS = frozenset({
+    0x00AD, 0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5,
+    0x180E, 0x200B, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C,
+    0x202D, 0x202E, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
+    0x2066, 0x2067, 0x2068, 0x2069, 0x206A, 0x206B, 0x206C,
+    0x206D, 0x206E, 0x206F, 0x3164, 0xFEFF, 0xFFA0,
+})
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
@@ -184,10 +192,44 @@ def _safe_text(value: Any, limit: int = 128) -> str:
     return text[:limit]
 
 
-def _tag(value: Any, *, field: str = "tag") -> str:
-    if not isinstance(value, str) or not _TAG_RE.fullmatch(value):
-        raise ValidationError(f"{field} is invalid.")
-    return value
+def _name_public_message(reason: str | None = None) -> str:
+    return {
+        "length": "名称必须为 1–64 个 Unicode 字符，且不超过 256 个 UTF-8 字节。",
+        "unsafe": "名称不能包含换行、控制字符、双向控制符或危险隐形字符。",
+        "canonical": "名称必须使用 NFC 规范形式且首尾不能有空白。",
+        "encoding": "名称必须是有效的 UTF-8 文本。",
+        "type": "名称必须是文本。",
+    }.get(reason, "名称无效。")
+
+
+def _normalize_name_fallback(value: Any, *, field: str = "tag") -> str:
+    """Test-double fallback; production delegates to the shared pdgmodel helper."""
+    if not isinstance(value, str):
+        raise ValidationError(_name_public_message("type"))
+    canonical = unicodedata.normalize("NFC", value)
+    for ch in canonical:
+        codepoint = ord(ch)
+        category = unicodedata.category(ch)
+        if (codepoint < 0x20 or 0x7F <= codepoint <= 0x9F
+                or category in {"Cs", "Zl", "Zp"}
+                or (category == "Cf" and codepoint != 0x200D)
+                or codepoint in _DANGEROUS_NAME_CODEPOINTS):
+            raise ValidationError(_name_public_message("unsafe"))
+    name = canonical.strip()
+    try:
+        encoded = name.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise ValidationError(_name_public_message("encoding")) from exc
+    if not name or len(name) > 64 or len(encoded) > 256:
+        raise ValidationError(_name_public_message("length"))
+    return name
+
+
+def _valid_name(value: Any) -> bool:
+    try:
+        return _normalize_name_fallback(value) == value
+    except ValidationError:
+        return False
 
 
 def _domain(value: Any) -> str:
@@ -295,6 +337,30 @@ class PDGControl:
         self._job_store_init_lock = threading.Lock()
         self._config_io_init_lock = threading.Lock()
         self._diagnostic_slots = threading.BoundedSemaphore(1)
+
+    def _name(self, value: Any, *, field: str = "name") -> str:
+        helper = getattr(getattr(self.bot, "pdgmodel", None), "normalize_name", None)
+        try:
+            return (helper(value, field) if callable(helper)
+                    else _normalize_name_fallback(value, field=field))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                _name_public_message(getattr(exc, "reason", None))) from exc
+
+    def _tag(self, value: Any, *, field: str = "tag") -> str:
+        name = self._name(value, field=field)
+        if name in _MIHOMO_RESERVED:
+            raise ValidationError("名称与系统保留名称冲突。")
+        return name
+
+    def _valid_name(self, value: Any) -> bool:
+        helper = getattr(getattr(self.bot, "pdgmodel", None), "is_valid_name", None)
+        if callable(helper):
+            try:
+                return bool(helper(value))
+            except (TypeError, ValueError):
+                return False
+        return _valid_name(value)
 
     # ---- common ---------------------------------------------------------
     def _load(self) -> dict[str, Any]:
@@ -494,7 +560,7 @@ class PDGControl:
                 continue
             tag = item.get("tag")
             typ = item.get("type")
-            if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+            if not self._valid_name(tag):
                 continue
             if not isinstance(typ, str) or not _SAFE_TYPE_RE.fullmatch(typ):
                 typ = "unknown"
@@ -520,7 +586,7 @@ class PDGControl:
             if kind == "group":
                 view["members"] = [
                     member for member in item.get("outbounds", [])
-                    if isinstance(member, str) and _TAG_RE.fullmatch(member)
+                    if self._valid_name(member)
                 ][:64]
             out.append(view)
         return out
@@ -546,7 +612,7 @@ class PDGControl:
         try:
             targets = [
                 value for value in self.bot.exit_tags(model)
-                if isinstance(value, str) and _TAG_RE.fullmatch(value)
+                if self._valid_name(value)
             ]
         except Exception:
             targets = [
@@ -660,11 +726,11 @@ class PDGControl:
         metadata = ((model.get("_pdg") or {}).get("mihomo") or {})
         providers = sorted(
             name for name in (metadata.get("proxy-providers") or {})
-            if isinstance(name, str) and _TAG_RE.fullmatch(name))
+            if self._valid_name(name))
         return {
             "items": self._group_items(model),
             "targets": [value for value in self.bot.exit_tags(model)
-                        if isinstance(value, str) and _TAG_RE.fullmatch(value)],
+                        if self._valid_name(value)],
             "providers": providers,
             "revision": revision,
         }
@@ -677,7 +743,7 @@ class PDGControl:
             if not isinstance(rule, dict) or "outbound" not in rule or rule.get("rule_set"):
                 continue
             outbound = rule.get("outbound")
-            if not isinstance(outbound, str) or not _TAG_RE.fullmatch(outbound):
+            if not self._valid_name(outbound):
                 continue
             for kind, key in (("suffix", "domain_suffix"), ("exact", "domain")):
                 for value in rule.get(key) or []:
@@ -699,7 +765,7 @@ class PDGControl:
         try:
             values = [
                 value for value in self.bot.exit_tags(model)
-                if isinstance(value, str) and _TAG_RE.fullmatch(value)
+                if self._valid_name(value)
             ]
         except Exception:
             values = []
@@ -713,15 +779,15 @@ class PDGControl:
     def _ruleset_items(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for name, item in self._meta().items():
-            if not isinstance(name, str) or not _TAG_RE.fullmatch(name) or not isinstance(item, dict):
+            if not self._valid_name(name) or not isinstance(item, dict):
                 continue
             view: dict[str, Any] = {
                 "name": name,
-                "label": _safe_text(item.get("label") or name, 40),
+                "label": _safe_text(item.get("label") or name, 64),
                 "target": (
                     item.get("outbound")
                     if isinstance(item.get("outbound"), str)
-                    and _TAG_RE.fullmatch(item["outbound"])
+                    and self._valid_name(item["outbound"])
                     else "unknown"
                 ),
                 "url": _safe_endpoint(item.get("url")),
@@ -859,7 +925,7 @@ class PDGControl:
                 continue
             chains = conn.get("chains")
             tag = chains[0] if isinstance(chains, list) and chains else "unknown"
-            if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+            if not self._valid_name(tag):
                 tag = "unknown"
             counts[tag] += 1
             up = conn.get("upload")
@@ -1124,7 +1190,7 @@ class PDGControl:
             tag = item.get("tag")
             status = item.get("status")
             if (
-                    not isinstance(tag, str) or not _TAG_RE.fullmatch(tag)
+                    not self._valid_name(tag)
                     or tag not in allowed or tag in seen
                     or status not in {
                         "ok", "timeout", "unreachable", "unavailable"}):
@@ -1209,7 +1275,7 @@ class PDGControl:
             "confidence": confidence,
         }
         target = raw.get("target")
-        if isinstance(target, str) and _TAG_RE.fullmatch(target):
+        if self._valid_name(target):
             try:
                 allowed = set(self._targets())
             except Exception:
@@ -1229,13 +1295,16 @@ class PDGControl:
             outbound = self.bot.parse_link(link)
         except Exception as exc:
             link = ""
+            if getattr(exc, "reason", None):
+                raise ValidationError(
+                    _name_public_message(getattr(exc, "reason", None))) from exc
             raise ValidationError("Proxy link is invalid.") from exc
         link = ""
         if not isinstance(outbound, dict):
             raise ValidationError("Proxy link is invalid.")
         tag = outbound.get("tag")
         typ = outbound.get("type")
-        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+        if not self._valid_name(tag):
             raise ValidationError("Proxy link is invalid.")
         if typ not in set(getattr(self.bot, "PROXY_TYPES", ())):
             raise ValidationError("Proxy link is invalid.")
@@ -1256,9 +1325,9 @@ class PDGControl:
         return self._public_exit_item(item)
 
     def rename_exit(self, old: str, body: dict[str, Any]) -> dict[str, Any]:
-        old = _tag(old)
+        old = self._tag(old)
         _dict_keys(body, allowed={"name"}, required={"name"})
-        new = _tag(body["name"])
+        new = self._tag(body["name"])
         if new == old:
             raise ConflictError()
         fn = getattr(self.bot, "rename_exit", None)
@@ -1274,7 +1343,7 @@ class PDGControl:
     def replace_exit(self, tag: str, body: dict[str, Any]) -> dict[str, Any]:
         """Replace connection details while preserving tag, position and references."""
 
-        tag = _tag(tag)
+        tag = self._tag(tag)
         _dict_keys(body, allowed={"link"}, required={"link"})
         current = next(
             (item for item in self._exit_items() if item["tag"] == tag), None)
@@ -1329,7 +1398,7 @@ class PDGControl:
             self, tag: str, *, group_only: bool = False,
             model: dict[str, Any] | None = None,
             model_expect: str | None = None) -> None:
-        tag = _tag(tag)
+        tag = self._tag(tag)
         before = next((item for item in self._exit_items(model)
                        if item["tag"] == tag), None)
         if before is None or not before["deletable"]:
@@ -1423,7 +1492,7 @@ class PDGControl:
         order = body["order"]
         if not isinstance(order, list) or not 1 <= len(order) <= 128:
             raise ValidationError()
-        tags = [_tag(value) for value in order]
+        tags = [self._tag(value) for value in order]
         if len(set(tags)) != len(tags):
             raise ValidationError()
         fn = getattr(self.bot, "reorder_exits", None)
@@ -1434,7 +1503,7 @@ class PDGControl:
 
     def set_default_exit(self, body: dict[str, Any]) -> dict[str, Any]:
         _dict_keys(body, allowed={"tag"}, required={"tag"})
-        tag = _tag(body["tag"])
+        tag = self._tag(body["tag"])
 
         def modify(model):
             allowed = set(self.bot.exit_tags(model))
@@ -1461,7 +1530,7 @@ class PDGControl:
         # Backward-compatible legacy Web payload creates a url-test group.
         legacy_payload = isinstance(body, dict) and set(body) == {"name", "members"}
         if legacy_payload and (current_model.get("_pdg") or {}).get("schema") != 3:
-            tag = _tag(body["name"])
+            tag = self._tag(body["name"])
             members = self._members(body["members"])
             fn = getattr(self.bot, "add_group", None)
             if not callable(fn):
@@ -1506,7 +1575,7 @@ class PDGControl:
     def _members(self, value: Any) -> list[str]:
         if not isinstance(value, list) or not 2 <= len(value) <= 64:
             raise ValidationError("members is invalid.")
-        members = [_tag(item, field="member") for item in value]
+        members = [self._tag(item, field="member") for item in value]
         if len(set(members)) != len(members):
             raise ValidationError("members is invalid.")
         return members
@@ -1524,7 +1593,7 @@ class PDGControl:
             raise ValidationError("group type is invalid.")
         group: dict[str, Any] = {"type": typ}
         if require_name or "name" in body:
-            group["name"] = _tag(body["name"], field="name")
+            group["name"] = self._tag(body["name"], field="name")
         for key in ("proxies", "use"):
             value = body.get(key, [])
             if (not isinstance(value, list) or len(value) > 128
@@ -1535,7 +1604,7 @@ class PDGControl:
                 if key == "proxies" and item == "REJECT":
                     items.append(item)
                 else:
-                    items.append(_tag(item, field=key))
+                    items.append(self._tag(item, field=key))
             if len(items) != len(set(items)):
                 raise ValidationError(key + " is invalid.")
             group[key] = items
@@ -1582,7 +1651,7 @@ class PDGControl:
     def patch_group(
             self, old: str, body: dict[str, Any], *, _model=None,
             _model_expect: str | None = None) -> dict[str, Any]:
-        old = _tag(old)
+        old = self._tag(old)
         deprecated = False
         if _model is None:
             body, model_snapshot, _model_expect, deprecated = (
@@ -1676,7 +1745,7 @@ class PDGControl:
     def delete_group(
             self, tag: str, body: dict[str, Any] | None = None, *, _model=None,
             _model_expect: str | None = None) -> dict[str, Any]:
-        tag = _tag(tag)
+        tag = self._tag(tag)
         deprecated = False
         if _model is None:
             candidate, current, _model_expect, deprecated = (
@@ -1746,7 +1815,7 @@ class PDGControl:
         return result
 
     def select_group_runtime(self, tag: str, body: dict[str, Any]) -> dict[str, Any]:
-        tag = _tag(tag)
+        tag = self._tag(tag)
         _dict_keys(body, allowed={"member"}, required={"member"})
         member = body["member"]
         if (not isinstance(member, str) or not 1 <= len(member) <= 256
@@ -1789,7 +1858,7 @@ class PDGControl:
 
     def set_direct_tag(self, body: dict[str, Any]) -> dict[str, Any]:
         _dict_keys(body, allowed={"tag"}, required={"tag"})
-        tag = _tag(body["tag"])
+        tag = self._tag(body["tag"])
         validator = getattr(getattr(self.bot, "pdgmodel", None),
                             "validate_direct_tag_setting", None)
         if callable(validator):
@@ -1809,7 +1878,7 @@ class PDGControl:
         domain = _domain(body["domain"])
         target = _string(body["target"], field="target", maximum=64)
         if target != "direct":
-            target = _tag(target, field="target")
+            target = self._tag(target, field="target")
         if any(item["domain"] == domain for item in self._rule_items()):
             raise ConflictError()
         fn = getattr(self.bot, "add_rule", None)
@@ -1826,7 +1895,7 @@ class PDGControl:
             raise NotFoundError()
         target = _string(body["target"], field="target", maximum=64)
         if target != "direct":
-            target = _tag(target, field="target")
+            target = self._tag(target, field="target")
         files: dict[str, bytes] = {}
         file_expects: dict[str, str | None] = {}
         snapshot = getattr(self.bot, "_domain_file_snapshot", None)
@@ -1923,9 +1992,11 @@ class PDGControl:
             raise ValidationError("url is invalid.") from exc
         if parsed.scheme not in {"https", "http"} or not parsed.hostname:
             raise ValidationError("url is invalid.")
-        target = _tag(body["target"], field="target")
+        target = self._tag(body["target"], field="target")
         label = _string(
-            body.get("label", ""), field="label", maximum=40, allow_empty=True)
+            body.get("label", ""), field="label", maximum=256, allow_empty=True)
+        if label:
+            label = self._name(label, field="label")
         behavior = body.get("behavior", "")
         if behavior not in {"", "domain", "ipcidr", "classical"}:
             raise ValidationError("behavior is invalid.")
@@ -1939,12 +2010,14 @@ class PDGControl:
                     {"name": name, "label": label or name, "target": target})
 
     def patch_ruleset(self, name: str, body: dict[str, Any]) -> dict[str, Any]:
-        name = _tag(name, field="name")
+        name = self._tag(name, field="name")
         _dict_keys(body, allowed={"label"}, required={"label"})
         current = self._meta().get(name)
         if not isinstance(current, dict):
             raise NotFoundError()
-        label = _string(body["label"], field="label", maximum=40, allow_empty=True)
+        label = _string(body["label"], field="label", maximum=256, allow_empty=True)
+        if label:
+            label = self._name(label, field="label")
         fn = getattr(self.bot, "set_ruleset_label", None)
         if not callable(fn):
             raise UnavailableError()
@@ -1954,11 +2027,11 @@ class PDGControl:
 
     def set_ruleset_target(
             self, name: str, body: dict[str, Any]) -> dict[str, Any]:
-        name = _tag(name, field="name")
+        name = self._tag(name, field="name")
         _dict_keys(body, allowed={"target"}, required={"target"})
         if name not in self._meta():
             raise NotFoundError()
-        target = _tag(body["target"], field="target")
+        target = self._tag(body["target"], field="target")
         if target not in set(self._targets()):
             raise ValidationError("target is invalid.")
         fn = getattr(self.bot, "set_ruleset_target", None)
@@ -1971,7 +2044,7 @@ class PDGControl:
         )
 
     def delete_ruleset(self, name: str) -> dict[str, Any]:
-        name = _tag(name, field="name")
+        name = self._tag(name, field="name")
         if name not in self._meta():
             raise NotFoundError()
         fn = getattr(self.bot, "del_ruleset", None)

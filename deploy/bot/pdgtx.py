@@ -132,7 +132,7 @@ _MOSDNS_RULE_RE = re.compile(r"^[A-Za-z0-9_!.-]+\.txt$")
 _RULESET_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
 _MIHOMO_PROVIDER_RE = re.compile(r"^[a-f0-9]{64}\.(yaml|yml|json|txt|mrs)$")
-_PDG_RULESET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_LEGACY_SAFE_RULESET_LEAF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 # 目标 → 该目标牵动哪个服务(决定基线范围、观察范围)
 _TARGET_SVC = {
@@ -722,7 +722,7 @@ def _v_json_model(path, data, ctx):
         for kind, field in (("proxy-provider", "proxy-providers"),
                             ("rule-provider", "rule-providers")):
             for name, provider in mihomo[field].items():
-                if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name)
+                if (not pdgmodel.is_valid_name(name)
                         or not isinstance(provider, dict) or not safe_advanced(provider)
                         or not provider_schema(kind, provider)):
                     return False, "config.json 的 %s 元数据不合法" % kind
@@ -785,6 +785,22 @@ def _v_json_model(path, data, ctx):
     return True, ""
 
 
+def _pdg_ruleset_cache_stem(name):
+    """Return a safe cache leaf without changing the public provider name.
+
+    Existing ASCII names keep their historical on-disk path.  Unicode names
+    use a deterministic digest because the public contract allows path
+    separators and up to 256 UTF-8 bytes, both of which are unsuitable for a
+    portable single filesystem component.
+    """
+    canonical = pdgmodel.normalize_name(name, "ruleset provider name")
+    if canonical != name:
+        raise ValueError("ruleset provider name is not NFC canonical")
+    if _LEGACY_SAFE_RULESET_LEAF_RE.fullmatch(canonical):
+        return canonical
+    return "u-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _pdg_mihomo_rule_providers(ctx):
     """Return the exact PDG-owned HTTP rule-providers for this candidate.
 
@@ -806,8 +822,10 @@ def _pdg_mihomo_rule_providers(ctx):
     for name, info in meta.items():
         if not isinstance(name, str) or not isinstance(info, dict):
             return False, {}, {}, "候选 rulesets.json 条目不合法"
-        if not _PDG_RULESET_NAME_RE.fullmatch(name):
-            return False, {}, {}, "候选 PDG rule-provider 名称不是安全叶"
+        try:
+            cache_stem = _pdg_ruleset_cache_stem(name)
+        except (TypeError, ValueError, pdgmodel.ModelError):
+            return False, {}, {}, "候选 PDG rule-provider 名称不符合 Unicode 名称规范"
         url = info.get("url", "")
         if (not isinstance(url, str) or len(url) > 8192
                 or not re.fullmatch(r"https?://[^\s\x00]+", url, re.I)):
@@ -857,7 +875,7 @@ def _pdg_mihomo_rule_providers(ctx):
         expected[name] = {
             "type": "http", "url": url, "behavior": behavior,
             "format": provider_format,
-            "path": "./ruleset/%s.%s" % (name, extensions[provider_format]),
+            "path": "./ruleset/%s.%s" % (cache_stem, extensions[provider_format]),
             "interval": 86400,
         }
     return True, expected, probe_sources, ""

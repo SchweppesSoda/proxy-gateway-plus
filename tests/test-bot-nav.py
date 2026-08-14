@@ -2,6 +2,9 @@
 """Static regressions for Telegram bot navigation after operation results."""
 import re
 from pathlib import Path
+import os
+import sys
+import types
 
 ROOT = Path(__file__).resolve().parents[1]
 bot = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
@@ -102,6 +105,10 @@ assert answer_pos < handle_pos, "answerCallbackQuery should be sent before slow 
 # 否则: 点「iOS 描述文件」进入 ios_ssid 输入态 → 点返回 → 下一条随手发的文字被误当 SSID 名单生成描述文件。
 import importlib.util
 
+if os.name == "nt":
+    sys.modules.setdefault("fcntl", types.SimpleNamespace(
+        flock=lambda *_args: None, LOCK_EX=1, LOCK_NB=2, LOCK_UN=8))
+
 spec = importlib.util.spec_from_file_location("pdg_bot", ROOT / "deploy/bot/pdg-bot.py")
 mod = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
@@ -117,3 +124,59 @@ for data in ("menu", "status", "nav:client", "nav:exit", "nav:rule", "nav:ops"):
     mod.handle_cb(1, 9, data)
     assert 1 not in mod.state, f"{data} 后待输入状态应被清掉"
     assert 1 not in mod.del_sel, f"{data} 后删除勾选应被清掉"
+
+# Dynamic names never enter Telegram's 64-byte callback payload.  The digest is
+# resolved against the current candidate set, so a deleted/renamed (stale)
+# choice fails closed; pre-upgrade raw ASCII callbacks remain compatible.
+unicode_name = "东京/Reality｜主用 % # ? < > & 👨\u200d👩\u200d👧\u200d👦"
+callback = mod._callback_data("renx", unicode_name)
+assert len(callback.encode("utf-8")) <= 64
+assert unicode_name not in callback
+assert callback.startswith("renx:~")
+raw_token = callback.split(":", 1)[1]
+assert mod._resolve_callback(raw_token, [unicode_name, "hk"]) == unicode_name
+assert mod._resolve_callback(raw_token, ["hk"]) is None, "过期摘要令牌必须安全失效"
+assert mod._resolve_callback("hk", ["hk", unicode_name]) == "hk"
+assert mod._resolve_callback("missing", ["hk", unicode_name]) is None
+
+keyboard = mod.kb_pick("delx", [unicode_name])
+button = keyboard["inline_keyboard"][0][0]
+assert button["text"] == unicode_name
+assert unicode_name not in button["callback_data"]
+assert len(button["callback_data"].encode("utf-8")) <= 64
+assert mod._esc("<东京 & 香港>") == "&lt;东京 &amp; 香港&gt;"
+
+# Ruleset display names follow the same Unicode contract: preserve the stored
+# value exactly after NFC/outer-trim normalization, reject unsafe/long input
+# instead of truncating, and escape the dynamic HTML confirmation.
+ruleset_meta = {"rs_demo": {"url": "https://example.invalid/list.txt",
+                            "outbound": "direct"}}
+mod._rs_meta_snapshot = lambda: (ruleset_meta, "revision")
+mod.tx_apply = lambda *_args, **_kwargs: (True, "ok")
+ok, message = mod.set_ruleset_label("rs_demo", "  <东京 & 香港>  ")
+assert ok
+assert ruleset_meta["rs_demo"]["label"] == "<东京 & 香港>"
+assert "&lt;东京 &amp; 香港&gt;" in message
+ok, message = mod.set_ruleset_label("rs_demo", "敏" * 65)
+assert not ok and "1–64" in message
+assert ruleset_meta["rs_demo"]["label"] == "<东京 & 香港>"
+ok, message = mod.set_ruleset_label("rs_demo", "bad\u202ename")
+assert not ok and "危险隐形字符" in message
+
+# Derived MosDNS comments are still part of the exported/rendered artifact: do
+# not reintroduce the old ASCII replacement merely because the name is written
+# after a comment marker.
+ruleset_note_name = "东京/Reality｜主用 % # ? < > & 👨\u200d👩\u200d👧\u200d👦"
+ruleset_notes = mod._ruleset_hijack_bytes(
+    {
+        ruleset_note_name: {
+            "url": "https://example.invalid/domain.mrs",
+            "outbound": "hk",
+            "format": "mrs",
+            "path": "/etc/sing-box/rs/u-unicode-note.mrs",
+        }
+    },
+    {},
+    {},
+).decode("utf-8")
+assert f"# {ruleset_note_name}: binary provider" in ruleset_notes
