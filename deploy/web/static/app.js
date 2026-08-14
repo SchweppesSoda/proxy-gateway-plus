@@ -121,6 +121,7 @@
 
   function formatLabel(key) {
     const labels = {
+      available: "接口状态",
       active: "运行状态",
       status: "状态",
       service: "服务",
@@ -129,8 +130,11 @@
       connection_count: "连接数",
       upload: "上传",
       download: "下载",
+      uploadTotal: "累计上传",
+      downloadTotal: "累计下载",
       upload_total: "累计上传",
       download_total: "累计下载",
+      byExit: "按出口统计",
       memory: "内存占用",
       memory_usage: "内存占用",
       today: "今日",
@@ -144,12 +148,61 @@
       default: "默认出口",
       default_exit: "默认出口",
       tfo: "TCP Fast Open",
-      hijack_mode: "DNS 劫持模式",
-      quic_mode: "QUIC 模式",
-      firewall_mode: "防火墙模式",
-      version: "版本"
+      hijack_mode: "DNS 劫持范围",
+      quic_mode: "QUIC 处理方式",
+      firewall_mode: "入站访问控制",
+      version: "内核版本",
+      outbounds: "出口总数",
+      rules: "分流规则",
+      managedFiles: "受管文件",
+      bundleMosdns: "包含 MosDNS 配置",
+      bundleRulesets: "包含规则集元数据",
+      proxies: "代理节点",
+      proxyProviders: "代理提供器（Provider）",
+      proxyGroups: "代理策略组",
+      ruleProviders: "规则提供器（Provider）",
+      plugins: "MosDNS 插件",
+      mode: "应用方式"
     };
-    return labels[key] || String(key).replaceAll("_", " ");
+    return labels[key] || String(key).replace(/([a-z])([A-Z])/g, "$1 $2").replaceAll("_", " ");
+  }
+
+  function formatSummaryValue(key, value) {
+    const enumLabels = {
+      hijack_mode: {
+        all: "代理所有中国大陆以外域名",
+        gfw: "仅代理规则列表中的域名",
+        unknown: "配置状态未知"
+      },
+      quic_mode: {
+        tproxy: "透明代理 QUIC（TProxy）",
+        reject: "阻断 QUIC，并回落到 TCP",
+        unknown: "配置状态未知"
+      },
+      firewall_mode: {
+        managed: "由 PDG 管理",
+        external: "由外部防火墙管理",
+        unknown: "配置状态未知"
+      },
+      mode: { replace: "完整替换", merge: "合并现有配置" }
+    };
+    if (enumLabels[key]?.[value]) return enumLabels[key][value];
+    if (["upload", "download", "uploadTotal", "downloadTotal",
+      "upload_total", "download_total", "memory", "memory_usage"].includes(key)) {
+      return formatBytes(value);
+    }
+    if (["outbounds", "rules", "managedFiles", "proxies", "proxyProviders",
+      "proxyGroups", "ruleProviders", "plugins"].includes(key)
+        && Number.isFinite(Number(value))) {
+      return `${new Intl.NumberFormat("zh-CN").format(Number(value))} 项`;
+    }
+    if (key === "available" && typeof value === "boolean") {
+      return value ? "正常" : "暂不可用";
+    }
+    if (["bundleMosdns", "bundleRulesets"].includes(key) && typeof value === "boolean") {
+      return value ? "是" : "否";
+    }
+    return readableValue(value);
   }
 
   function formatExitName(tag) {
@@ -196,7 +249,7 @@
     entries.forEach(([key, value]) => {
       const row = node("div", "kv-row");
       row.append(node("span", "kv-key", formatLabel(key)));
-      row.append(node("span", "kv-value", readableValue(value)));
+      row.append(node("span", "kv-value", formatSummaryValue(key, value)));
       target.append(row);
     });
   }
@@ -257,9 +310,37 @@
     const labels = { system: "跟随系统", light: "浅色", dark: "深色" };
     const icons = { system: "◐", light: "☀", dark: "☾" };
     const mode = window.PDGTheme.mode;
-    button.textContent = icons[mode] || "◐";
-    button.title = `主题：${labels[mode] || labels.system}`;
-    button.setAttribute("aria-label", `切换主题，当前${labels[mode] || labels.system}`);
+    const label = labels[mode] || labels.system;
+    $("#theme-toggle-icon").textContent = icons[mode] || icons.system;
+    button.title = `界面主题：${label}`;
+    button.setAttribute("aria-label", `选择界面主题，当前${label}`);
+    $$("#theme-dialog [data-theme-mode]").forEach((option) => {
+      const selected = option.dataset.themeMode === mode;
+      option.classList.toggle("selected", selected);
+      option.setAttribute("aria-pressed", String(selected));
+    });
+  }
+
+  function closeThemeDialog(restoreFocus = true) {
+    const dialog = $("#theme-dialog");
+    $("#theme-toggle").setAttribute("aria-expanded", "false");
+    if (dialog.open) dialog.close();
+    if (restoreFocus) $("#theme-toggle").focus();
+  }
+
+  function openThemeDialog() {
+    const dialog = $("#theme-dialog");
+    if (typeof dialog.showModal !== "function") {
+      window.PDGTheme?.set(window.PDGTheme.resolved === "dark" ? "light" : "dark");
+      updateThemeButton();
+      return;
+    }
+    updateThemeButton();
+    $("#theme-toggle").setAttribute("aria-expanded", "true");
+    if (!dialog.open) dialog.showModal();
+    window.requestAnimationFrame(() => {
+      $("[data-theme-mode][aria-pressed='true']", dialog)?.focus();
+    });
   }
 
   function normalizePath(path) {
@@ -408,6 +489,7 @@
     $("#login-view").hidden = authenticated;
     $("#app-view").hidden = !authenticated;
     if (!authenticated) {
+      closeThemeDialog(false);
       closeMobileMore(false);
       stopMaintenancePolling();
       state.csrf = "";
@@ -710,11 +792,40 @@
     }
   }
 
+  function serviceStateLevel(value) {
+    if (value === true) return "good";
+    if (value === false || value === null || value === undefined || value === "") return "bad";
+    const stateValue = String(value).trim().toLowerCase();
+    if (/^(active|ok|good|running|ready|true|正常|运行中)$/.test(stateValue)) return "good";
+    if (/^(warn|warning|degraded|unknown|activating|警告|未知|启动中)$/.test(stateValue)) return "warn";
+    return "bad";
+  }
+
+  function serviceStateLabel(value) {
+    const level = serviceStateLevel(value);
+    if (level === "good") return "运行中";
+    if (level === "warn") return "状态待确认";
+    return "未运行";
+  }
+
+  function serviceName(name) {
+    return ({
+      "pdg-quic-routing": "QUIC 路由",
+      mosdns: "MosDNS",
+      mihomo: "Mihomo",
+      "pdg-bot": "Telegram Bot",
+      "pdg-web": "Web 控制台",
+      "pdg-probe81": "iOS 网络探测",
+      "pdg-mitm": "定位服务插件"
+    })[name] || formatLabel(name);
+  }
+
   function overviewHealth(status, doctor) {
     if (status === null || status === undefined || status === "") return "warn";
-    const flattened = JSON.stringify(safeObject({ status, doctor }) || {}).toLowerCase();
-    if (/(fail|failed|inactive|error|critical|失败|异常)/.test(flattened)) return "bad";
-    if (/(warn|warning|degraded|unknown|警告|未知)/.test(flattened)) return "warn";
+    const serviceLevels = serviceEntries(status).map((item) => serviceStateLevel(item.value));
+    const doctorLevels = doctorEntries(doctor).map((item) => item.level);
+    if (serviceLevels.includes("bad") || doctorLevels.includes("fail")) return "bad";
+    if (serviceLevels.includes("warn") || doctorLevels.includes("warn")) return "warn";
     return "good";
   }
 
@@ -722,10 +833,9 @@
     if (typeof status === "string") return safeString(status, 80);
     if (Array.isArray(status)) return `${status.length} 项状态`;
     if (status && typeof status === "object") {
-      const active = Object.values(status).filter((value) =>
-        value === true || String(value).toLowerCase() === "active" || String(value).toLowerCase() === "ok"
-      ).length;
-      return `${active}/${Object.keys(status).length} 正常`;
+      const values = Object.values(status);
+      const active = values.filter((value) => serviceStateLevel(value) === "good").length;
+      return `${active}/${values.length} 正常`;
     }
     return "状态未知";
   }
@@ -734,8 +844,151 @@
     const level = String(item?.level || item?.status || "").toLowerCase();
     if (/(fail|failed|error|critical|失败|异常)/.test(level)) return "fail";
     if (/(warn|warning|degraded|unknown|警告|未知)/.test(level)) return "warn";
+    if (/(info|notice|说明|提示)/.test(level)) return "info";
     if (/(ok|good|pass|passed|success|正常|通过)/.test(level)) return "ok";
     return "warn";
+  }
+
+  function doctorTitle(title) {
+    const labels = {
+      "平台": "客户端平台",
+      "服务": "核心服务",
+      "Bot 凭据": "Telegram Bot",
+      "mihomo 版本": "Mihomo 内核",
+      "MosDNS 修补版": "MosDNS 内核",
+      "DoT A 记录": "DoT 域名解析",
+      "DoT 域名一致性": "DoT 配置一致性",
+      "内网卡段": "客户端网段",
+      "透明数据面": "透明代理配置",
+      "防火墙": "端口访问控制",
+      "input 链冲突": "防火墙规则冲突",
+      "代理入口": "透明代理入口",
+      "GMS 推送": "Google 推送通道",
+      "GMS 残留": "Google 推送残留",
+      "限流": "DNS 请求保护",
+      "内存模式": "DNS 缓存策略",
+      "证书": "TLS 证书",
+      "本机DNS": "DNS 服务响应",
+      "mihomo 配置": "Mihomo 配置",
+      "规则集": "分流规则集",
+      "配置事务": "配置变更",
+      "DoT 握手(853)": "DoT 加密连接",
+      "DoT 会话恢复": "DoT 会话安全",
+      "DNS 解析(国内)": "国内域名解析",
+      "clash_api": "Mihomo 控制接口",
+      "DNS 上游探测": "DNS 上游连通性",
+      "代理劫持验证": "透明代理范围说明",
+      "MITM结构": "定位服务接管配置",
+      "MITM 插件": "定位服务插件",
+      "iOS 探测(:81)": "iOS 网络探测"
+    };
+    return labels[title] || title;
+  }
+
+  function doctorDetail(title, detail, level) {
+    let text = safeString(detail, 1200).trim();
+    if (title === "平台" && /^(android|ios)$/i.test(text)) {
+      return text.toLowerCase() === "android" ? "Android" : "iOS";
+    }
+    if (title === "服务" && (/ 都在$/u.test(text) || text.startsWith("核心服务均运行正常："))) {
+      const services = text.startsWith("核心服务均运行正常：")
+        ? text.slice("核心服务均运行正常：".length).split("、").filter(Boolean)
+        : text.replace(/ 都在$/u, "").split("/").filter(Boolean);
+      return `${services.length} 项核心服务均在运行：${services.map(serviceName).join("、")}`;
+    }
+    if (title === "Bot 凭据" && text.includes("token + 允许 id 均已配置")) {
+      return "凭据与授权用户均已配置，Bot 服务运行正常";
+    }
+    if (title === "mihomo 版本") {
+      const version = text.match(/v?([0-9]+(?:\.[0-9]+){2})/u)?.[1];
+      if (version && level === "ok") return `版本 v${version}，由当前 PDG 发布统一维护`;
+    }
+    if (title === "MosDNS 修补版" && level === "ok") {
+      const build = text.match(/^([^ ]+) \(([^)]+)\)/u);
+      if (build) return `版本 ${build[1]}，${build[2]} 架构，构建来源校验通过`;
+    }
+    if (title === "DoT A 记录" && level === "ok") {
+      const address = text.replaceAll("✓", "").trim().match(/^(.+?)\s*→\s*([^ ]+)$/u);
+      if (address) return `加密 DNS 域名 ${address[1]} 已正确解析到本机地址 ${address[2]}`;
+    }
+    if (title === "DoT 域名一致性" && level === "ok") {
+      return `证书与运行配置使用同一加密 DNS 域名：${text.replaceAll("✓", "").trim()}`;
+    }
+    if (title === "内网卡段" && level === "ok") {
+      return `透明代理仅接收来自客户端网段 ${text} 的流量`;
+    }
+    if (title === "透明数据面" && level === "ok") {
+      const match = text.match(/^mode=([^;]+); QUIC=([^;]+); TLS=([^;]+); HTTP=([^;]+);/u);
+      if (match) {
+        const firewall = match[1] === "external" ? "外部防火墙" : "PDG 受管防火墙";
+        const quic = match[2] === "tproxy" ? "TProxy" : "阻断并回落 TCP";
+        return `${firewall}模式；QUIC 使用 ${quic}；透明接管端口：TLS ${match[3]}，HTTP ${match[4]}。持久配置与运行状态一致`;
+      }
+    }
+    if (title === "防火墙" && text.includes("external 模式：PDG 未管理 input 暴露面")) {
+      return "PDG 未接管主机入站访问控制；端口开放范围由外部防火墙负责";
+    }
+    if (title === "input 链冲突" && text.includes("external 模式：PDG 无 input hook")) {
+      return "未发现与 PDG 冲突的主机入站规则；端口开放范围由外部防火墙负责";
+    }
+    if (title === "代理入口" && level === "ok") {
+      const ports = text.match(/TCP 端口 ([0-9,]+)/u)?.[1];
+      const target = text.match(/mihomo :(\d+)/iu)?.[1];
+      if (ports && target) return `来自客户端网段的 TCP ${ports} 已转交 Mihomo 端口 ${target}`;
+    }
+    if (title === "GMS 推送" && level === "ok") {
+      return "Android 推送端口 5228–5230 已接入 Mihomo 透明代理";
+    }
+    if (title === "限流" && level === "ok") {
+      return "已启用单客户端 DNS 请求保护：持续 200 次/秒，允许短时突发 400 次";
+    }
+    if (title === "内存模式" && level === "ok") {
+      const match = text.match(/^(低内存|标准|未知).*?cache=(\d+|\?)/iu);
+      if (match) return `${match[1]}配置，DNS 缓存容量 ${match[2] === "?" ? "未知" : new Intl.NumberFormat("zh-CN").format(Number(match[2])) + " 条"}`;
+    }
+    if (title === "证书" && level === "ok") return "证书有效期超过 14 天";
+    if (title === "本机DNS" && level === "ok") return "MosDNS 正常响应本机查询";
+    if (title === "mihomo 配置" && level === "ok") return "配置语法校验通过";
+    if (title === "规则集" && level === "ok") {
+      const count = text.match(/(\d+) 个/u)?.[1];
+      if (count) return `${count} 个规则集均可由 Mihomo 正常加载`;
+    }
+    if (title === "配置事务" && level === "ok") {
+      const operationLabels = { rulesets_refresh: "规则集刷新", snapshot: "快照创建", update: "软件升级" };
+      const recent = text.match(/最近一笔:\s*([^ )]+)\s+([^ )]+)/u);
+      if (recent) {
+        const operation = operationLabels[recent[1]] || recent[1];
+        const status = recent[2] === "COMMITTED" ? "已提交" : recent[2];
+        return `当前没有未完成的配置变更；最近一次${operation}${status}`;
+      }
+      return "当前没有未完成的配置变更";
+    }
+    if (title === "DoT 握手(853)" && level === "ok") {
+      const match = text.match(/\((TLSv[^,]+), SNI=([^)]+)\)/u);
+      if (match) return `证书链和域名校验通过；协议 ${match[1]}，服务域名 ${match[2]}`;
+    }
+    if (title === "DoT 会话恢复" && level === "ok") {
+      const tls = text.match(/TLS=(TLSv[^,)]+)/u)?.[1];
+      return `两次加密 DNS 连接均成功，且未复用 TLS 会话${tls ? `；协议 ${tls}` : ""}`;
+    }
+    if (title === "DNS 解析(国内)" && level === "ok") {
+      return text.replace(/→/gu, "解析为").replace(/\(直连\)$/u, "，按直连处理");
+    }
+    if (title === "clash_api" && level === "ok") {
+      const count = text.match(/,\s*(\d+) 个出站\/组/u)?.[1];
+      return `控制接口仅在本机可访问${count ? `，已加载 ${count} 个代理节点或策略组` : ""}`;
+    }
+    if (title === "DNS 上游探测" && level === "ok") {
+      return text.replace("国际remote", "国际 DNS")
+        .replace("国内local", "国内 DNS")
+        .replace(/\s*;\s*/gu, "；")
+        .replace(/(\d+)\/(\d+) 最慢/gu, "$1/$2 可用，最慢");
+    }
+    if (title === "代理劫持验证" && level === "info") {
+      const cidr = text.match(/来源 ([^ ]+) 生效/u)?.[1];
+      return `${cidr ? `透明代理仅对客户端网段 ${cidr} 生效。` : ""}本机查询不经过透明代理；如需端到端验证，请使用连接该网段的手机测试`;
+    }
+    return text.replaceAll("✓", "").replace(/, /gu, "，").replace(/; /gu, "；");
   }
 
   function doctorEntries(doctor) {
@@ -749,10 +1002,12 @@
           };
         }
         const clean = safeObject(item) || {};
+        const level = doctorLevel(clean);
+        const rawTitle = safeString(clean.check || clean.name || clean.title || `检查项 ${index + 1}`, 80);
         return {
-          level: doctorLevel(clean),
-          title: safeString(clean.check || clean.name || clean.title || `检查项 ${index + 1}`, 80),
-          detail: safeString(clean.detail || clean.message || clean.status || "未提供说明", 1200)
+          level,
+          title: doctorTitle(rawTitle),
+          detail: doctorDetail(rawTitle, clean.detail || clean.message || clean.status || "未提供说明", level)
         };
       });
     }
@@ -768,17 +1023,17 @@
 
   function doctorGroup(title) {
     const groups = [
-      { key: "runtime", label: "运行环境", match: /(平台|服务|凭据|版本|mihomo|mosdns|bot)/i },
-      { key: "dns", label: "私密 DNS", match: /(dot|dns|域名|解析|证书|tls 会话)/i },
-      { key: "dataplane", label: "网络与数据面", match: /(内网|网卡|透明|数据面|代理入口|gms|fcm|quic|路由|出口|劫持)/i },
-      { key: "security", label: "安全边界", match: /(防火墙|input|暴露|开放中继|端口冲突)/i },
-      { key: "transactions", label: "配置与维护", match: /(事务|更新|升级|回滚|快照|残留)/i }
+      { key: "runtime", label: "核心服务", match: /(平台|核心服务|telegram|mihomo(?: 内核| 配置| 控制接口)|mosdns 内核)/i },
+      { key: "dns", label: "加密 DNS", match: /(dot|dns|域名解析|tls 证书|会话安全)/i },
+      { key: "dataplane", label: "代理与网络", match: /(客户端网段|透明代理|google 推送|quic|路由|出口)/i },
+      { key: "security", label: "访问安全", match: /(防火墙|访问控制|请求保护|端口冲突)/i },
+      { key: "transactions", label: "配置与维护", match: /(配置变更|规则集|更新|升级|回滚|快照|残留)/i }
     ];
     return groups.find((group) => group.match.test(title)) || { key: "other", label: "其他检查" };
   }
 
   function doctorTone(level) {
-    return level === "fail" ? "bad" : level === "warn" ? "warn" : "good";
+    return level === "fail" ? "bad" : level === "warn" ? "warn" : level === "info" ? "info" : "good";
   }
 
   function renderDoctorSummary(target, doctor) {
@@ -795,31 +1050,35 @@
     const counts = entries.reduce((result, item) => {
       result[item.level] += 1;
       return result;
-    }, { ok: 0, warn: 0, fail: 0 });
+    }, { ok: 0, warn: 0, fail: 0, info: 0 });
     const tone = counts.fail ? "bad" : counts.warn ? "warn" : "good";
     healthPill.className = `status-pill ${tone}`;
     healthPill.textContent = counts.fail
       ? `${counts.fail} 项失败`
-      : counts.warn ? `${counts.warn} 项警告` : `${counts.ok} 项通过`;
+      : counts.warn ? `${counts.warn} 项警告` : "运行正常";
 
     const result = node("div", `doctor-result ${tone}`);
     const resultIcon = node("span", "doctor-result-icon", tone === "good" ? "✓" : tone === "warn" ? "!" : "×");
     resultIcon.setAttribute("aria-hidden", "true");
     const resultCopy = node("div", "doctor-result-copy");
     resultCopy.append(node("strong", "", tone === "good"
-      ? "全部检查通过"
-      : tone === "warn" ? "有项目需要留意" : "发现需要处理的问题"));
-    resultCopy.append(node("span", "", tone === "good"
-      ? `${counts.ok} 项检查均未发现问题`
-      : `通过 ${counts.ok} 项 · 警告 ${counts.warn} 项 · 失败 ${counts.fail} 项`));
+      ? "系统运行正常"
+      : tone === "warn" ? "存在需要关注的项目" : "发现需要处理的问题"));
+    const total = counts.ok + counts.warn + counts.fail + counts.info;
+    const explanation = [`共检查 ${total} 项`, `${counts.ok} 项正常`];
+    if (counts.info) explanation.push(`${counts.info} 项说明`);
+    if (counts.warn) explanation.push(`${counts.warn} 项警告`);
+    if (counts.fail) explanation.push(`${counts.fail} 项失败`);
+    resultCopy.append(node("span", "", explanation.join(" · ")));
     result.append(resultIcon, resultCopy);
 
     const stats = node("div", "doctor-stats");
     [
       { key: "fail", label: "失败" },
       { key: "warn", label: "警告" },
-      { key: "ok", label: "通过" }
-    ].forEach((item) => {
+      { key: "ok", label: "正常" },
+      { key: "info", label: "说明" }
+    ].filter((item) => counts[item.key] > 0).forEach((item) => {
       const stat = node("div", `doctor-stat ${item.key}`);
       stat.append(node("strong", "", counts[item.key]));
       stat.append(node("span", "", item.label));
@@ -837,20 +1096,30 @@
 
     const groups = node("div", "doctor-groups");
     grouped.forEach((group) => {
-      const section = node("section", "doctor-group");
-      const heading = node("div", "doctor-group-heading");
+      const section = node("details", "doctor-group");
+      const groupCounts = group.items.reduce((result, item) => {
+        result[item.level] += 1;
+        return result;
+      }, { ok: 0, warn: 0, fail: 0, info: 0 });
+      section.open = groupCounts.fail > 0 || groupCounts.warn > 0;
+      const heading = node("summary", "doctor-group-heading");
       heading.append(node("h3", "", group.label));
-      heading.append(node("span", "", `${group.items.length} 项`));
+      const groupState = groupCounts.fail
+        ? `${groupCounts.fail} 项失败`
+        : groupCounts.warn ? `${groupCounts.warn} 项警告`
+          : groupCounts.info ? `${groupCounts.ok} 项正常 · ${groupCounts.info} 项说明`
+            : `${groupCounts.ok} 项正常`;
+      heading.append(node("span", "", groupState));
       section.append(heading);
       const list = node("div", "doctor-check-list");
       group.items.forEach((entry) => {
         const item = node("article", `doctor-check ${doctorTone(entry.level)}`);
-        const marker = node("span", "doctor-check-marker", entry.level === "ok" ? "✓" : entry.level === "warn" ? "!" : "×");
+        const marker = node("span", "doctor-check-marker", entry.level === "ok" ? "✓" : entry.level === "warn" ? "!" : entry.level === "info" ? "i" : "×");
         marker.setAttribute("aria-hidden", "true");
         const copy = node("div", "doctor-check-copy");
         copy.append(node("strong", "", entry.title));
         copy.append(node("span", "", entry.detail));
-        const stateLabel = entry.level === "ok" ? "正常" : entry.level === "warn" ? "警告" : "失败";
+        const stateLabel = entry.level === "ok" ? "正常" : entry.level === "warn" ? "警告" : entry.level === "info" ? "说明" : "失败";
         item.append(marker, copy, node("span", `doctor-check-state ${doctorTone(entry.level)}`, stateLabel));
         list.append(item);
       });
@@ -891,11 +1160,12 @@
     $("#overview-version").textContent = safeString(info.version || "版本未知", 80);
     const cards = $("#overview-cards");
     empty(cards);
-    appendMetric(cards, "手机平台", info.platform === "ios" ? "iOS" : info.platform === "android" ? "Android" : readableValue(info.platform), "当前网关属性");
-    appendMetric(cards, "DoT 域名", safeString(info.dot_domain || "未配置", 120), "手机私密 DNS");
-    appendMetric(cards, "网关状态", overviewStatusSummary(info.status), "Mihomo · MosDNS");
+    appendMetric(cards, "客户端平台", info.platform === "ios" ? "iOS" : info.platform === "android" ? "Android" : readableValue(info.platform), "当前服务对象");
+    appendMetric(cards, "加密 DNS 域名", safeString(info.dot_domain || "未配置", 120), "Android 私有 DNS / iOS 加密 DNS");
+    appendMetric(cards, "核心服务", overviewStatusSummary(info.status), "核心服务运行状态");
     const health = overviewHealth(info.status, info.doctor);
-    appendMetric(cards, "自检结论", health === "good" ? "正常" : health === "warn" ? "有警告" : "需处理", "共享 doctor 检查");
+    const checkCount = doctorEntries(info.doctor).length;
+    appendMetric(cards, "系统检查", health === "good" ? "运行正常" : health === "warn" ? "需要关注" : "需要处理", checkCount ? `共 ${checkCount} 项检查` : "检查结果不可用");
 
     const healthPill = $("#overview-health");
     healthPill.className = `status-pill ${health}`;
@@ -904,15 +1174,11 @@
     const services = $("#service-list");
     empty(services);
     serviceEntries(info.status).forEach((item) => {
-      const value = readableValue(item.value);
-      const lower = value.toLowerCase();
-      const tone = /(active|ok|true|正常|运行)/.test(lower)
-        ? "good"
-        : /(warn|degraded|警告)/.test(lower) ? "warn" : "bad";
+      const tone = serviceStateLevel(item.value);
       const row = node("div", "status-row");
       row.append(node("span", `status-dot ${tone}`));
-      row.append(node("span", "status-name", formatLabel(item.name)));
-      row.append(node("span", "status-value", value));
+      row.append(node("span", "status-name", serviceName(item.name)));
+      row.append(node("span", "status-value", serviceStateLabel(item.value)));
       services.append(row);
     });
     renderDoctorSummary($("#doctor-summary"), info.doctor);
@@ -2248,6 +2514,94 @@
     }
   }
 
+  function appendSummaryMetric(target, label, value, detail = "", tone = "") {
+    const card = node("article", `summary-metric ${tone}`.trim());
+    card.append(node("span", "summary-metric-label", label));
+    card.append(node("strong", "summary-metric-value", value));
+    if (detail) card.append(node("span", "summary-metric-detail", detail));
+    target.append(card);
+  }
+
+  function renderRuntimeSummary(target, data) {
+    empty(target);
+    const runtime = safeObject(data) || {};
+    if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) {
+      target.append(node("div", "empty-state", "暂时无法读取内核运行信息"));
+      return;
+    }
+    const metrics = node("div", "summary-metric-grid");
+    appendSummaryMetric(
+      metrics,
+      "流量内核",
+      String(runtime.backend || "").toLowerCase() === "mihomo" ? "Mihomo" : readableValue(runtime.backend),
+      "负责透明代理与分流"
+    );
+    appendSummaryMetric(metrics, "内核版本", safeString(runtime.version || "未返回", 80), "当前运行版本");
+    appendSummaryMetric(metrics, "内存占用", formatBytes(runtime.memory), "Mihomo 当前使用量");
+    target.append(metrics);
+
+    const services = runtime.services && typeof runtime.services === "object"
+      && !Array.isArray(runtime.services) ? runtime.services : {};
+    const entries = serviceEntries(services);
+    if (entries.length) {
+      target.append(node("h3", "summary-subheading", "相关服务"));
+      const list = node("div", "status-list compact-status-list");
+      entries.forEach((item) => {
+        const tone = serviceStateLevel(item.value);
+        const row = node("div", "status-row");
+        row.append(node("span", `status-dot ${tone}`));
+        row.append(node("span", "status-name", serviceName(item.name)));
+        row.append(node("span", "status-value", serviceStateLabel(item.value)));
+        list.append(row);
+      });
+      target.append(list);
+    }
+  }
+
+  function renderTrafficSummary(target, data) {
+    empty(target);
+    const traffic = safeObject(data) || {};
+    if (!traffic || typeof traffic !== "object" || Array.isArray(traffic)) {
+      target.append(node("div", "empty-state", "暂时无法读取连接与流量数据"));
+      return;
+    }
+    if (traffic.available !== true) {
+      target.append(node("div", "summary-notice warn", "Mihomo 控制接口暂不可用，以下数值可能不完整。"));
+    }
+    const connectionCount = Number.isFinite(Number(traffic.connections))
+      ? Number(traffic.connections) : 0;
+    const metrics = node("div", "summary-metric-grid traffic-metrics");
+    appendSummaryMetric(
+      metrics,
+      "活动连接",
+      new Intl.NumberFormat("zh-CN").format(connectionCount),
+      "当前正在传输的连接"
+    );
+    appendSummaryMetric(metrics, "累计上传", formatBytes(traffic.uploadTotal), "本次内核运行期间");
+    appendSummaryMetric(metrics, "累计下载", formatBytes(traffic.downloadTotal), "本次内核运行期间");
+    target.append(metrics);
+
+    target.append(node("h3", "summary-subheading", "按出口统计"));
+    const exits = Array.isArray(traffic.byExit) ? traffic.byExit.slice(0, 128) : [];
+    if (!exits.length) {
+      target.append(node("div", "empty-state compact-empty", "当前没有活动连接"));
+      return;
+    }
+    const list = node("div", "traffic-exit-list");
+    exits.forEach((item) => {
+      if (!item || typeof item !== "object") return;
+      const row = node("div", "traffic-exit-row");
+      const copy = node("div", "traffic-exit-copy");
+      const name = item.tag === "unknown" ? "未识别出口" : formatExitName(item.tag || "未命名出口");
+      const count = Number.isFinite(Number(item.connections)) ? Number(item.connections) : 0;
+      copy.append(node("strong", "", name));
+      copy.append(node("span", "", `${new Intl.NumberFormat("zh-CN").format(count)} 个活动连接`));
+      row.append(copy, node("span", "traffic-exit-bytes", `上传 ${formatBytes(item.upload)} · 下载 ${formatBytes(item.download)}`));
+      list.append(row);
+    });
+    target.append(list);
+  }
+
   async function loadRuntime() {
     if (state.runtimeLoading) return;
     state.runtimeLoading = true;
@@ -2260,14 +2614,16 @@
       ]);
       const [runtime, traffic, logs] = results;
       if (runtime.status === "fulfilled") {
-        renderKeyValues($("#runtime-summary"), runtime.value.data, "暂无运行摘要");
+        renderRuntimeSummary($("#runtime-summary"), runtime.value.data);
       } else {
-        renderKeyValues($("#runtime-summary"), errorMessage(runtime.reason));
+        empty($("#runtime-summary"));
+        $("#runtime-summary").append(node("div", "empty-state", errorMessage(runtime.reason)));
       }
       if (traffic.status === "fulfilled") {
-        renderKeyValues($("#traffic-summary"), traffic.value.data, "暂无流量数据");
+        renderTrafficSummary($("#traffic-summary"), traffic.value.data);
       } else {
-        renderKeyValues($("#traffic-summary"), errorMessage(traffic.reason));
+        empty($("#traffic-summary"));
+        $("#traffic-summary").append(node("div", "empty-state", errorMessage(traffic.reason)));
       }
       if (logs.status === "fulfilled") {
         const lines = Array.isArray(logs.value.data?.lines) ? logs.value.data.lines : [];
@@ -2304,11 +2660,18 @@
 
   function formatBytes(value) {
     const bytes = Number(value);
-    if (!Number.isFinite(bytes) || bytes < 0) return "大小未知";
+    if (!Number.isFinite(bytes) || bytes < 0) return "—";
     if (bytes < 1024) return `${Math.round(bytes)} B`;
-    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
-    if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
-    return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+    const units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    let amount = bytes;
+    let unit = -1;
+    do {
+      amount /= 1024;
+      unit += 1;
+    } while (amount >= 1024 && unit < units.length - 1);
+    return `${new Intl.NumberFormat("zh-CN", {
+      maximumFractionDigits: amount >= 100 ? 0 : amount >= 10 ? 1 : 2
+    }).format(amount)} ${units[unit]}`;
   }
 
   function normalizeSnapshot(item) {
@@ -2664,8 +3027,9 @@
     empty(target);
     target.hidden = false;
     target.append(node("h3", "", "预览已完成，生产配置尚未修改"));
+    target.append(node("h4", "import-section-title", "导入内容概览"));
     const summary = node("div", "kv-list import-summary");
-    renderKeyValues(summary, preview.summary || {}, "没有可显示的变更摘要");
+    renderKeyValues(summary, preview.summary || {}, "没有可显示的配置变更");
     target.append(summary);
     const warnings = Array.isArray(preview.warnings) ? preview.warnings.slice(0, 20) : [];
     if (warnings.length) {
@@ -2696,7 +3060,12 @@
       conflictBox.append(node("strong", "", "同名项目处理"));
       conflicts.forEach((conflict) => {
         const row = node("label", "import-conflict-row");
-        row.append(node("span", "", `${safeString(conflict.kind, 30)} · ${safeString(conflict.name, 80)}`));
+        const kind = ({
+          name: "节点或策略组",
+          "proxy-provider": "代理提供器",
+          "rule-provider": "规则提供器"
+        })[conflict.kind] || "配置项目";
+        row.append(node("span", "", `${kind}：${safeString(conflict.name, 80)}`));
         const select = node("select");
         select.dataset.importConflict = safeString(conflict.conflictId, 64);
         const incoming = node("option", "", "使用导入内容");
@@ -3034,9 +3403,24 @@
     $("#login-form").addEventListener("submit", login);
     $("#logout-button").addEventListener("click", logout);
     updateThemeButton();
-    $("#theme-toggle").addEventListener("click", () => {
-      window.PDGTheme?.cycle();
-      updateThemeButton();
+    $("#theme-toggle").addEventListener("click", openThemeDialog);
+    $("#theme-dialog-close").addEventListener("click", () => closeThemeDialog(true));
+    $("#theme-dialog").addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeThemeDialog(true);
+    });
+    $("#theme-dialog").addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) closeThemeDialog(true);
+    });
+    $("#theme-dialog").addEventListener("close", () => {
+      $("#theme-toggle").setAttribute("aria-expanded", "false");
+    });
+    $$("#theme-dialog [data-theme-mode]").forEach((option) => {
+      option.addEventListener("click", () => {
+        window.PDGTheme?.set(option.dataset.themeMode);
+        updateThemeButton();
+        closeThemeDialog(true);
+      });
     });
     window.addEventListener("pdg-theme-change", updateThemeButton);
     $("#toggle-password").addEventListener("click", () => {

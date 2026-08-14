@@ -207,7 +207,7 @@ def check_services():
     names = expected_services()
     bad = [s for s in names if _run(["systemctl", "is-active", s])[1].strip() != "active"]
     return ("fail", "服务", "未运行: " + ", ".join(bad)) if bad \
-        else ("ok", "服务", "/".join(names) + " 都在")
+        else ("ok", "服务", "核心服务均运行正常：" + "、".join(names))
 
 
 def check_bot_credentials():

@@ -53,7 +53,11 @@
       <div class="header-actions">
         <span id="session-state" class="session-state" title="会话状态">已连接</span>
         <button id="theme-toggle" class="icon-button theme-toggle" type="button"
-                aria-label="切换主题" title="主题：跟随系统">◐</button>
+                aria-label="选择界面主题，当前跟随系统" title="界面主题：跟随系统"
+                aria-haspopup="dialog" aria-expanded="false" aria-controls="theme-dialog">
+          <span id="theme-toggle-icon" aria-hidden="true">◐</span>
+          <span class="theme-toggle-label">主题</span>
+        </button>
         <button id="refresh-button" class="icon-button" type="button" aria-label="刷新当前页面" title="刷新">↻</button>
         <button id="logout-button" class="button ghost compact" type="button">退出</button>
       </div>
@@ -125,7 +129,7 @@
           </section>
           <section class="surface">
             <div class="section-heading">
-              <div><p class="eyebrow">DOCTOR</p><h2>自检摘要</h2></div>
+              <div><p class="eyebrow">DOCTOR</p><h2>系统检查</h2></div>
               <span id="doctor-health" class="status-pill neutral">检查中</span>
             </div>
             <div id="doctor-summary" class="doctor-panel" aria-live="polite">
@@ -325,16 +329,16 @@
               <span class="status-dot good" aria-label="代理域名使用"></span>
             </div>
             <div class="dns-current-block">
-              <p class="dns-current-label">当前配置（只读安全摘要）</p>
+              <p class="dns-current-label">当前国际 DNS 上游</p>
               <div id="dns-current-remote" class="dns-current-list" role="list" aria-live="polite"></div>
-              <p class="field-help">展示值可能省略路径、查询参数或凭据，不能直接用于覆盖配置。</p>
+              <p class="field-help">为保护凭据，地址可能省略路径或查询参数；此处仅供核对。</p>
             </div>
             <form id="dns-remote-form" class="dns-replace-form" autocomplete="off">
               <label for="dns-remote">替换为完整地址，每行一个</label>
               <textarea id="dns-remote" name="addresses" rows="7" required
                         autocomplete="off" autocapitalize="none" spellcheck="false"
                         placeholder="留空表示不修改；请手动输入完整地址"></textarea>
-              <p class="field-help">替换框不会由当前摘要自动填充；提交后输入内容立即从页面清除。</p>
+              <p class="field-help">请手动输入完整地址。提交后，输入内容会立即从页面清除。</p>
               <button class="button primary wide" type="submit">替换国际上游</button>
             </form>
           </section>
@@ -344,16 +348,16 @@
               <span class="status-dot info" aria-label="直连域名使用"></span>
             </div>
             <div class="dns-current-block">
-              <p class="dns-current-label">当前配置（只读安全摘要）</p>
+              <p class="dns-current-label">当前国内 DNS 上游</p>
               <div id="dns-current-local" class="dns-current-list" role="list" aria-live="polite"></div>
-              <p class="field-help">展示值可能省略路径、查询参数或凭据，不能直接用于覆盖配置。</p>
+              <p class="field-help">为保护凭据，地址可能省略路径或查询参数；此处仅供核对。</p>
             </div>
             <form id="dns-local-form" class="dns-replace-form" autocomplete="off">
               <label for="dns-local">替换为完整地址，每行一个</label>
               <textarea id="dns-local" name="addresses" rows="7" required
                         autocomplete="off" autocapitalize="none" spellcheck="false"
                         placeholder="留空表示不修改；请手动输入完整地址"></textarea>
-              <p class="field-help">替换框不会由当前摘要自动填充；提交后输入内容立即从页面清除。</p>
+              <p class="field-help">请手动输入完整地址。提交后，输入内容会立即从页面清除。</p>
               <button class="button secondary wide" type="submit">替换国内上游</button>
             </form>
           </section>
@@ -383,12 +387,12 @@
         </div>
         <div class="runtime-grid">
           <section class="surface">
-            <div class="section-heading"><div><p class="eyebrow">RUNTIME</p><h2>运行摘要</h2></div></div>
-            <div id="runtime-summary" class="kv-list" aria-live="polite"></div>
+            <div class="section-heading"><div><p class="eyebrow">RUNTIME</p><h2>内核运行信息</h2></div></div>
+            <div id="runtime-summary" class="runtime-summary" aria-live="polite"></div>
           </section>
           <section class="surface">
-            <div class="section-heading"><div><p class="eyebrow">TRAFFIC</p><h2>流量</h2></div></div>
-            <div id="traffic-summary" class="kv-list" aria-live="polite"></div>
+            <div class="section-heading"><div><p class="eyebrow">TRAFFIC</p><h2>当前连接与流量</h2></div></div>
+            <div id="traffic-summary" class="traffic-summary" aria-live="polite"></div>
           </section>
           <section class="surface logs-surface">
             <div class="section-heading">
@@ -398,7 +402,7 @@
             <pre id="runtime-logs" class="logs" tabindex="0" aria-label="运行日志">等待加载…</pre>
           </section>
         </div>
-        <p class="field-help">此页只展示服务器返回的安全摘要，与临时 Zashboard 观测面板相互独立；持久配置仍在本控制台完成。</p>
+        <p class="field-help">连接数为当前活动连接；流量从 Mihomo 本次启动后累计。日志中的敏感内容已在服务器端遮盖。</p>
       </section>
 
       <section id="panel-ops" class="panel" role="tabpanel" aria-labelledby="tab-ops" hidden>
@@ -407,7 +411,7 @@
         </div>
         <div class="two-column">
           <section class="surface">
-            <div class="section-heading"><div><p class="eyebrow">SETTINGS</p><h2>运行设置</h2></div></div>
+            <div class="section-heading"><div><p class="eyebrow">SETTINGS</p><h2>网络运行模式</h2></div></div>
             <div id="settings-summary" class="kv-list"></div>
             <form id="tfo-form" class="toggle-row">
               <div>
@@ -508,6 +512,37 @@
   </div>
 
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <dialog id="theme-dialog" class="theme-dialog" aria-modal="true"
+          aria-labelledby="theme-dialog-title">
+    <section class="theme-sheet">
+      <div class="theme-heading">
+        <div>
+          <h2 id="theme-dialog-title">界面主题</h2>
+          <p class="field-help">选择后立即生效，并保存在当前浏览器的一枚普通 Cookie 中。</p>
+        </div>
+        <button id="theme-dialog-close" class="icon-button" type="button"
+                aria-label="关闭主题选择">×</button>
+      </div>
+      <div class="theme-options" role="group" aria-label="界面主题">
+        <button class="theme-option" type="button" data-theme-mode="system" aria-pressed="true">
+          <span class="theme-option-icon" aria-hidden="true">◐</span>
+          <span><b>跟随系统</b><small>随设备的深浅色设置自动切换</small></span>
+          <span class="theme-option-check" aria-hidden="true">✓</span>
+        </button>
+        <button class="theme-option" type="button" data-theme-mode="light" aria-pressed="false">
+          <span class="theme-option-icon" aria-hidden="true">☀</span>
+          <span><b>浅色</b><small>始终使用明亮界面</small></span>
+          <span class="theme-option-check" aria-hidden="true">✓</span>
+        </button>
+        <button class="theme-option" type="button" data-theme-mode="dark" aria-pressed="false">
+          <span class="theme-option-icon" aria-hidden="true">☾</span>
+          <span><b>深色</b><small>始终使用深色界面</small></span>
+          <span class="theme-option-check" aria-hidden="true">✓</span>
+        </button>
+      </div>
+    </section>
+  </dialog>
 
   <dialog id="mobile-more-dialog" class="mobile-more-dialog" aria-modal="true"
           aria-labelledby="mobile-more-title">

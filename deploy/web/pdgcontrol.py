@@ -868,7 +868,7 @@ class PDGControl:
             raw_results = checks.run()
             doctor = [
                 {
-                    "level": level if level in {"ok", "warn", "fail"} else "warn",
+                    "level": level if level in {"ok", "info", "warn", "fail"} else "warn",
                     "check": _safe_text(label, 80),
                     "detail": sanitize_log_line(detail),
                 }
