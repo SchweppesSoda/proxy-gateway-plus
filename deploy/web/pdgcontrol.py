@@ -2003,7 +2003,17 @@ class PDGControl:
         fn = getattr(self.bot, "add_ruleset", None)
         if not callable(fn):
             raise UnavailableError()
-        self._result(fn(url, target, label, behavior))
+        if target not in set(self._targets()):
+            raise ValidationError("规则集目标不存在，请刷新后重新选择。")
+        result = fn(url, target, label, behavior)
+        if (isinstance(result, tuple) and len(result) == 2
+                and result[0] is False and isinstance(result[1], str)
+                and result[1].startswith("下载/解析失败:")):
+            # Underlying exceptions may contain capability URLs or tokens.
+            # Only a fixed public message may cross the HTTP boundary.
+            raise ValidationError(
+                "规则集下载或解析失败，请检查源地址及文件格式；未应用本次修改。")
+        self._result(result)
         name = "rs_" + hashlib.sha1(url.encode()).hexdigest()[:8]
         url = ""
         return next((item for item in self._ruleset_items() if item["name"] == name),

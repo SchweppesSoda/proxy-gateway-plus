@@ -327,6 +327,9 @@ jobs:
       - name: "规则集完整性 (dropped 非空即拒/.srs 拒/真实 YAML provider + 真实 .mrs fixture 走本地 HTTP)"
         run: python3 tests/test-ruleset-integrity.py
 
+      - name: "Domain YAML provider parser (exact/suffix and wildcard rejection)"
+        run: python3 tests/test-ruleset-domain-provider.py
+
       - name: "bot 测域名规则集显示名回归"
         run: python3 tests/test-domain-label.py
 

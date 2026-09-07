@@ -2514,6 +2514,15 @@ def _fetch_surge(url, *, phone_direct=False):
             kw.append(p[1])
         elif t in ("IP-CIDR", "IP-CIDR6") and len(p) > 1:
             ip.append(p[1])
+        elif len(p) == 1 and "." in line:
+            # Domain payloads use exact hostnames and +.suffix, without a
+            # DOMAIN/DOMAIN-SUFFIX prefix (e.g. CustomRules AI.yaml).
+            # Other wildcards cannot be represented by these source-rule keys.
+            suffix = line.startswith("+.")
+            hostname = (line[2:] if suffix else line).lower()
+            if not _PHONE_DIRECT_DOMAIN_RE.fullmatch(hostname):
+                raise ValueError("域名规则集含不支持的域名或通配符")
+            (suf if suffix else dom).append(hostname)
         elif phone_direct and re.match(r"^[A-Z][A-Z0-9-]*$", t):
             unsupported.append(t)
     if phone_direct and ip:
@@ -2546,7 +2555,8 @@ def _build_source(url, path, *, phone_direct=False):
         rule["domain_keyword"] = kw
     if ip:
         rule["ip_cidr"] = ip
-    json.dump({"version": 1, "rules": [rule]}, open(path, "w"), ensure_ascii=False)
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump({"version": 1, "rules": [rule]}, stream, ensure_ascii=False)
     return len(dom) + len(suf) + len(kw) + len(ip), (len(dom) + len(suf) + len(kw) == 0)
 
 

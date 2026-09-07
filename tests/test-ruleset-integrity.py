@@ -457,6 +457,37 @@ def ruleset_main():
             else:
                 print("[SKIP] 本机无 mihomo, 跳过真内核校验(CI 的 e2e/functional job 会覆盖)")
 
+        # Domain YAML: exact names and +.suffix must survive add and refresh.
+        with tempfile.TemporaryDirectory() as tmp:
+            setup(tmp)
+            domain_file = Path(www) / "ai.yaml"
+            domain_file.write_text(
+                "payload:\n  - ai.google.dev\n  - '+.openai.com'\n", encoding="utf-8")
+            source_url = base + "/ai.yaml"
+            added, message = bot.add_ruleset(source_url, "hk", "AI")
+            if not added:
+                bad("domain YAML add failed: " + message)
+            info = next(iter(json.load(open(bot.RS_META)).values()))
+            parsed = json.load(open(info["path"]))["rules"][0]
+            if parsed != {"domain": ["ai.google.dev"], "domain_suffix": ["openai.com"]}:
+                bad("domain YAML exact/suffix semantics changed")
+            running = json.load(open(bot.MIHOMO_CFG))
+            if not any(str(rule).startswith("RULE-SET,") for rule in running.get("rules", [])):
+                bad("domain YAML is missing from running rules")
+            domain_file.write_text(
+                "payload:\n  - api.anthropic.com\n  - '+.openai.com'\n", encoding="utf-8")
+            count, failed = bot.refresh_rulesets()
+            parsed = json.load(open(info["path"]))["rules"][0]
+            if failed or count != 1 or parsed.get("domain") != ["api.anthropic.com"]:
+                bad("domain YAML refresh did not update the actual rules")
+            before = Path(info["path"]).read_bytes()
+            domain_file.write_text(
+                "payload:\n  - api.anthropic.com\n  - '*.openai.com'\n", encoding="utf-8")
+            count, failed = bot.refresh_rulesets()
+            if not failed or count or Path(info["path"]).read_bytes() != before:
+                bad("unsupported wildcard refresh did not preserve previous rules")
+            ok("domain YAML add/refresh preserves exact and suffix rules; unsupported wildcard keeps old rules")
+
         # ── .mrs: 必须按二进制下载, 不得进文本解析路径 ──
         with tempfile.TemporaryDirectory() as tmp:
             setup(tmp)

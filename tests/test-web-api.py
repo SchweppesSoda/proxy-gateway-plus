@@ -2216,6 +2216,26 @@ class WebAPITestCase(unittest.TestCase):
         self.assertIn(
             ("start", "config-import", FakeConfigIO.IMPORT_ID), self.jobs.calls)
 
+    def test_ruleset_source_failure_is_actionable_and_does_not_echo_secrets(self):
+        self.login()
+        with mock.patch.object(self.fake, "add_ruleset", return_value=(
+                False, "下载/解析失败: https://user:password@feed.example/?token=" + PLAIN_SECRET)):
+            result = self.request("POST", "/api/v1/rulesets", {
+                "url": "https://feed.example/ai.yaml", "target": "hk"})
+        self.assertEqual(result["status"], 400, result["text"])
+        self.assertIn("下载或解析失败", result["json"]["error"]["message"])
+        self.assertNotIn(PLAIN_SECRET, result["text"])
+        self.assertNotIn("user:password", result["text"])
+        self.assertNotIn("feed.example", result["text"])
+
+    def test_ruleset_unknown_target_is_rejected_before_download(self):
+        self.login()
+        with mock.patch.object(self.fake, "add_ruleset") as add:
+            result = self.request("POST", "/api/v1/rulesets", {
+                "url": "https://feed.example/ai.yaml", "target": "missing"})
+        self.assertEqual(result["status"], 400, result["text"])
+        add.assert_not_called()
+
     def test_policy_groups_v3_crud_cas_runtime_and_direct_tag_routes(self):
         self.login()
         self.fake.model = {
