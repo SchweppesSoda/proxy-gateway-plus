@@ -524,7 +524,9 @@ def _mihomo_rulesets(meta=None):
         if low.endswith(".srs") or str(info.get("format", "")) == "binary":
             continue
         if low.endswith((".yaml", ".yml")):
-            behavior, fmt = "classical", "yaml"
+            # YAML is a container, not a rule behavior. Preserve the declared
+            # domain/ipcidr semantics; legacy entries default to classical.
+            behavior, fmt = str(info.get("behavior") or "classical"), "yaml"
         elif low.endswith(".mrs") or str(info.get("format", "")) == "mrs":
             # .mrs 是编译后的二进制。元数据里没记 behavior(老机器上的旧条目就没有)时, 从本地
             # 已下好的文件二进制头认一次; 认得出就用, 认不出**不能猜** —— 猜错的后果是"规则看着

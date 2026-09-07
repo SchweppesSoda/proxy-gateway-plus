@@ -464,7 +464,7 @@ def ruleset_main():
             domain_file.write_text(
                 "payload:\n  - ai.google.dev\n  - '+.openai.com'\n", encoding="utf-8")
             source_url = base + "/ai.yaml"
-            added, message = bot.add_ruleset(source_url, "hk", "AI")
+            added, message = bot.add_ruleset(source_url, "hk", "AI", behavior="domain")
             if not added:
                 bad("domain YAML add failed: " + message)
             info = next(iter(json.load(open(bot.RS_META)).values()))
@@ -472,6 +472,13 @@ def ruleset_main():
             if parsed != {"domain": ["ai.google.dev"], "domain_suffix": ["openai.com"]}:
                 bad("domain YAML exact/suffix semantics changed")
             running = json.load(open(bot.MIHOMO_CFG))
+            provider = next(iter(running["rule-providers"].values()))
+            if provider["behavior"] != "domain" or provider["format"] != "yaml":
+                bad("domain YAML was rendered with the wrong Mihomo behavior")
+            tx = bot._pdgtx()
+            valid, expected, _, error = tx._pdg_mihomo_rule_providers(None)
+            if not valid or expected != running["rule-providers"]:
+                bad("transaction provider contract differs from rendering: " + error)
             if not any(str(rule).startswith("RULE-SET,") for rule in running.get("rules", [])):
                 bad("domain YAML is missing from running rules")
             domain_file.write_text(

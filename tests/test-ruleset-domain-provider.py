@@ -12,7 +12,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "deploy/bot/pdg-bot.py"
-WANTED = {"_fetch_surge", "_build_source", "_PHONE_DIRECT_DOMAIN_RE"}
+WANTED = {"_fetch_surge", "_build_source", "_PHONE_DIRECT_DOMAIN_RE", "_mihomo_rulesets"}
 tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
 nodes = [n for n in tree.body if (
     isinstance(n, ast.FunctionDef) and n.name in WANTED
@@ -56,6 +56,16 @@ class DomainProviderTest(unittest.TestCase):
         for entry in ("*.openai.com", ".openai.com", "foo.*.example", "+.bad..example"):
             with self.subTest(entry=entry), self.assertRaises(ValueError):
                 self.parse("payload:\n  - ai.google.dev\n  - '" + entry + "'\n")
+
+    def test_yaml_behavior_survives_runtime_rendering(self):
+        for behavior in ("domain", "ipcidr", "classical", None):
+            for suffix in ("yaml", "yml?revision=2"):
+                with self.subTest(behavior=behavior, suffix=suffix):
+                    meta = {"AI": {"url": "https://feed.example/AI." + suffix,
+                                   "outbound": "AI", "behavior": behavior}}
+                    provider = namespace["_mihomo_rulesets"](meta)["AI"]
+                    self.assertEqual(provider["behavior"], behavior or "classical")
+                    self.assertEqual(provider["format"], "yaml")
 
     def test_empty_input_is_not_success(self):
         with self.assertRaises(ValueError):

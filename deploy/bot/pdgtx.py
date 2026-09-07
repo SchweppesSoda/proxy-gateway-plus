@@ -837,7 +837,9 @@ def _pdg_mihomo_rule_providers(ctx):
         if low.endswith(".srs") or recorded_format == "binary":
             continue
         if low.endswith((".yaml", ".yml")):
-            behavior, provider_format = "classical", "yaml"
+            # YAML is a container, not a rule behavior. Preserve the declared
+            # domain/ipcidr semantics; legacy entries default to classical.
+            behavior, provider_format = str(info.get("behavior") or "classical"), "yaml"
         elif low.endswith(".mrs") or recorded_format == "mrs":
             behavior = str(info.get("behavior", ""))
             source_path = info.get("path", "")

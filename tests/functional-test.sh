@@ -68,6 +68,8 @@ else
   chmod 755 "$WORK/mihomo"; MH="$WORK/mihomo"
 fi
 
+python3 "$HERE/test-ruleset-domain-runtime.py" "$MH" || fail "domain YAML 实际匹配回归失败"
+
 # ── 2. 起 3 个 mock SOCKS5 出口 ──
 LOGA="$WORK/a.log"; LOGB="$WORK/b.log"; LOGD="$WORK/d.log"
 OUTA="$WORK/a.out"; OUTB="$WORK/b.out"; OUTD="$WORK/d.out"
