@@ -2227,7 +2227,11 @@ class WebAPITestCase(unittest.TestCase):
             calls.append(path)
             if path == "/proxies/residential":
                 return {"now": "provider / first", "all": ["provider / first", "second"]}
-            name = urllib.parse.unquote(path.split("/")[2])
+            if path == "/providers/proxies/provider":
+                return {"proxies": [{"name": "provider / first"}, {"name": "second"}]}
+            self.assertTrue(path.startswith("/providers/proxies/provider/"), path)
+            self.assertIn("/healthcheck?", path)
+            name = urllib.parse.unquote(path.split("/")[4])
             self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(path).query), {
                 "timeout": ["5000"], "url": ["https://www.gstatic.com/generate_204"]})
             if name == "second":
@@ -2240,11 +2244,25 @@ class WebAPITestCase(unittest.TestCase):
         self.assertEqual(response["json"]["data"], {"name": "residential", "items": [
             {"member": "provider / first", "status": "ok", "delayMs": 359},
             {"member": "second", "status": "unreachable"}]})
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4)
         self.assertNotIn(PLAIN_SECRET, response["text"])
         self.assertEqual(self.fake.model, before)
         self.assertFalse(self.fake.transactions)
         self.assertFalse(self.fake.runtime_selections)
+
+    def test_group_delays_direct_members_use_proxy_api_and_404_is_not_timeout(self):
+        self.login()
+        self.fake.model.setdefault("_pdg", {})["policy-groups"] = [{
+            "name": "manual", "type": "select", "proxies": ["hk"], "use": []}]
+        def clash(path):
+            if path == "/proxies/manual":
+                return {"all": ["hk"]}
+            self.assertTrue(path.startswith("/proxies/hk/delay?"))
+            raise urllib.error.HTTPError(path, 404, "not found", {}, None)
+        with mock.patch.object(self.fake, "clash_get", side_effect=clash):
+            result = self.request("POST", "/api/v1/policy-groups/manual/delays", {})
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["json"]["data"]["items"], [{"member":"hk", "status":"unreachable"}])
 
     def test_group_delays_enforce_auth_csrf_scope_and_busy_limit(self):
         path = "/api/v1/policy-groups/residential/delays"

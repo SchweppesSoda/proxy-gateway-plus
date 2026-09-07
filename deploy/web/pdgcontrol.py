@@ -1844,20 +1844,42 @@ class PDGControl:
             if len(mapping) > 64:
                 raise ValidationError("单次支持测速最多 64 个组内成员。")
 
+            # Provider proxies are not registered under /proxies/<name>.
+            # Resolve only providers used by this group, and test their actual
+            # members through the provider-specific healthcheck endpoint.
+            provider_members = {}
+            configured = set(group.get("proxies") or [])
+            try:
+                for provider in group.get("use") or []:
+                    base = "/providers/proxies/" + urllib.parse.quote(provider, safe="")
+                    data = self.bot.clash_get(base)
+                    for proxy in data.get("proxies", []):
+                        actual = proxy.get("name")
+                        if actual in mapping and actual not in configured:
+                            if actual in provider_members:
+                                raise ValueError("ambiguous provider member")
+                            provider_members[actual] = base
+            except Exception as exc:
+                raise UnavailableError() from exc
+
             def probe(pair):
                 actual, member = pair
                 result = {"member": member, "status": "unreachable"}
                 if actual in {"REJECT", "REJECT-DROP", "PASS"}:
                     return {"member": member, "status": "skipped"}
-                path = "/proxies/" + urllib.parse.quote(actual, safe="")
-                path += "/delay?timeout=5000&url=" + urllib.parse.quote(
+                encoded = urllib.parse.quote(actual, safe="")
+                if actual in provider_members:
+                    path = provider_members[actual] + "/" + encoded + "/healthcheck"
+                else:
+                    path = "/proxies/" + encoded + "/delay"
+                path += "?timeout=5000&url=" + urllib.parse.quote(
                     "https://www.gstatic.com/generate_204", safe="")
                 try:
                     delay = self.bot.clash_get(path).get("delay")
                     if type(delay) is int and 0 <= delay <= 600_000:
                         result.update(status="ok", delayMs=delay)
-                except urllib.error.HTTPError:
-                    result["status"] = "timeout"
+                except urllib.error.HTTPError as exc:
+                    result["status"] = "timeout" if exc.code in {408, 504} else "unreachable"
                 except Exception:
                     pass  # Never return backend errors, URLs or credentials.
                 return result
