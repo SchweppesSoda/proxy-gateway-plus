@@ -32,7 +32,9 @@ jobs:
             deploy/web/*.sh lib/*.sh tools/*.sh
 
       - name: Web 前端 JavaScript 语法
-        run: node --check deploy/web/static/app.js
+        run: |
+          node --check deploy/web/static/app.js
+          node tests/test-web-group-picker.cjs
 
       - name: JSON 模板渲染后可解析
         run: |

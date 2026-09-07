@@ -1040,6 +1040,12 @@ class PDGRequestHandler(http.server.BaseHTTPRequestHandler):
                 match.group(1), "tag", self.control.select_group_runtime,
                 body=True)
             return
+        match = re.fullmatch(r"/api/v1/policy-groups/([^/]+)/delays", path)
+        if match and self.command == "POST":
+            self._identifier_call(
+                match.group(1), "tag", self.control.diagnose_group_members,
+                body=True)
+            return
         match = re.fullmatch(r"/api/v1/policy-groups/([^/]+)/runtime", path)
         if match and self.command == "PUT":
             self._identifier_call(

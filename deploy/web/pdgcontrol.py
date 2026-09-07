@@ -9,6 +9,7 @@ never opened for writing here.
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import contextlib
 import hashlib
 import importlib
@@ -21,6 +22,7 @@ import sys
 import threading
 import unicodedata
 import urllib.parse
+import urllib.error
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -1813,6 +1815,58 @@ class PDGControl:
         if deprecated:
             result["deprecated"] = True
         return result
+
+    def diagnose_group_members(self, tag: str, body: dict[str, Any]) -> dict[str, Any]:
+        tag = self._tag(tag)
+        _dict_keys(body, allowed=set())
+        model = self._load()
+        group = next((item for item in (
+            (model.get("_pdg") or {}).get("policy-groups") or [])
+                      if item.get("name") == tag), None)
+        if group is None or group.get("type") != "select":
+            raise NotFoundError()
+        if not self._diagnostic_slots.acquire(blocking=False):
+            raise BusyError()
+        try:
+            direct = next((item.get("tag") for item in model.get("outbounds", [])
+                           if item.get("type") == "direct"), None)
+            blocks = {item.get("tag") for item in model.get("outbounds", [])
+                      if item.get("type") == "block"}
+            try:
+                runtime = self.bot.clash_get(
+                    "/proxies/" + urllib.parse.quote(tag, safe=""))
+                mapping = self._runtime_member_map(
+                    runtime, group, direct=direct, blocks=blocks)
+            except Exception as exc:
+                raise UnavailableError() from exc
+            if not mapping:
+                raise UnavailableError("组内暂无可用节点，请等待订阅加载后重试。")
+            if len(mapping) > 64:
+                raise ValidationError("单次支持测速最多 64 个组内成员。")
+
+            def probe(pair):
+                actual, member = pair
+                result = {"member": member, "status": "unreachable"}
+                if actual in {"REJECT", "REJECT-DROP", "PASS"}:
+                    return {"member": member, "status": "skipped"}
+                path = "/proxies/" + urllib.parse.quote(actual, safe="")
+                path += "/delay?timeout=5000&url=" + urllib.parse.quote(
+                    "https://www.gstatic.com/generate_204", safe="")
+                try:
+                    delay = self.bot.clash_get(path).get("delay")
+                    if type(delay) is int and 0 <= delay <= 600_000:
+                        result.update(status="ok", delayMs=delay)
+                except urllib.error.HTTPError:
+                    result["status"] = "timeout"
+                except Exception:
+                    pass  # Never return backend errors, URLs or credentials.
+                return result
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                items = list(pool.map(probe, mapping.items()))
+            return {"name": tag, "items": items}
+        finally:
+            self._diagnostic_slots.release()
 
     def select_group_runtime(self, tag: str, body: dict[str, Any]) -> dict[str, Any]:
         tag = self._tag(tag)

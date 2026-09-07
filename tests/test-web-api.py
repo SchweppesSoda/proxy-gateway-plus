@@ -2216,6 +2216,60 @@ class WebAPITestCase(unittest.TestCase):
         self.assertIn(
             ("start", "config-import", FakeConfigIO.IMPORT_ID), self.jobs.calls)
 
+    def test_group_delays_include_provider_members_without_changing_selection(self):
+        self.login()
+        self.fake.model.setdefault("_pdg", {})["policy-groups"] = [{
+            "name": "residential", "type": "select", "proxies": [], "use": ["provider"]}]
+        before = copy.deepcopy(self.fake.model)
+        calls = []
+
+        def clash(path):
+            calls.append(path)
+            if path == "/proxies/residential":
+                return {"now": "provider / first", "all": ["provider / first", "second"]}
+            name = urllib.parse.unquote(path.split("/")[2])
+            self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(path).query), {
+                "timeout": ["5000"], "url": ["https://www.gstatic.com/generate_204"]})
+            if name == "second":
+                raise RuntimeError("https://user:password@secret.example/" + PLAIN_SECRET)
+            return {"delay": 359, "secret": PLAIN_SECRET}
+
+        with mock.patch.object(self.fake, "clash_get", side_effect=clash):
+            response = self.request("POST", "/api/v1/policy-groups/residential/delays", {})
+        self.assertEqual(response["status"], 200, response["text"])
+        self.assertEqual(response["json"]["data"], {"name": "residential", "items": [
+            {"member": "provider / first", "status": "ok", "delayMs": 359},
+            {"member": "second", "status": "unreachable"}]})
+        self.assertEqual(len(calls), 3)
+        self.assertNotIn(PLAIN_SECRET, response["text"])
+        self.assertEqual(self.fake.model, before)
+        self.assertFalse(self.fake.transactions)
+        self.assertFalse(self.fake.runtime_selections)
+
+    def test_group_delays_enforce_auth_csrf_scope_and_busy_limit(self):
+        path = "/api/v1/policy-groups/residential/delays"
+        self.assertEqual(self.request("POST", path, {}, cookie=None)["status"], 401)
+        self.login()
+        self.fake.model.setdefault("_pdg", {})["policy-groups"] = [{
+            "name": "residential", "type": "select", "proxies": [], "use": ["provider"]}]
+        self.assertEqual(self.request("POST", path, {}, csrf=None)["status"], 403)
+        with mock.patch.object(self.fake, "clash_get") as clash:
+            self.assertEqual(self.request("POST", path, {"url": "https://other.example"})["status"], 400)
+            self.assertEqual(self.request("POST", "/api/v1/policy-groups/missing/delays", {})["status"], 404)
+            self.control._diagnostic_slots.acquire()
+            try:
+                self.assertEqual(self.request("POST", path, {})["status"], 409)
+            finally:
+                self.control._diagnostic_slots.release()
+            clash.assert_not_called()
+        with mock.patch.object(self.fake, "clash_get", return_value={"all": ["n" + str(i) for i in range(65)]}) as clash:
+            self.assertEqual(self.request("POST", path, {})["status"], 400)
+            self.assertEqual(clash.call_count, 1)
+        with mock.patch.object(self.fake, "clash_get", return_value={"all": []}):
+            self.assertEqual(self.request("POST", path, {})["status"], 503)
+        self.assertTrue(self.control._diagnostic_slots.acquire(blocking=False))
+        self.control._diagnostic_slots.release()
+
     def test_ruleset_source_failure_is_actionable_and_does_not_echo_secrets(self):
         self.login()
         with mock.patch.object(self.fake, "add_ruleset", return_value=(

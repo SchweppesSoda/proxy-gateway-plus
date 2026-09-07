@@ -17,6 +17,8 @@
     groupMembers: [],
     groupProviderSelection: [],
     groupPicker: null,
+    groupDiagnostics: new Map(),
+    groupDiagnosticsTesting: "",
     textEntryResolve: null,
     exitOrder: [],
     exitTargets: [],
@@ -1380,11 +1382,17 @@
       if (options.length) main.append(node("span", "list-card-detail", options.join(" · ")));
       if (group.type === "select") {
         main.append(node("span", "list-card-detail",
-          `临时运行态: ${group.runtimeSelected ? formatExitName(group.runtimeSelected) : "不可用"}`));
+          `当前选择：${group.runtimeSelected ? formatExitName(group.runtimeSelected) : "暂不可用"} · ${group.runtimeCandidates.length} 个可选成员`));
       }
       const actions = node("div", "list-actions");
       actions.append(makeActionButton("编辑", "edit-group"));
-      if (group.type === "select") actions.append(makeActionButton("临时切换", "select-runtime"));
+      if (group.type === "select") {
+        actions.append(makeActionButton("选择节点", "select-runtime"));
+        const test = makeActionButton(
+          state.groupDiagnosticsTesting === group.name ? "测速中…" : "测速节点", "test-group");
+        test.disabled = Boolean(state.groupDiagnosticsTesting);
+        actions.append(test);
+      }
       actions.append(makeActionButton("删除", "delete-group", "danger"));
       card.append(main, actions);
       target.append(card);
@@ -1473,8 +1481,10 @@
     empty(target);
     if (!picker) return;
     const query = $("#group-picker-search").value.trim().toLocaleLowerCase();
+    const current = picker.kind === "runtime"
+      ? state.groups.find((group) => group.name === picker.groupName)?.runtimeSelected : "";
     const selected = new Set(picker.kind === "member" ? state.groupMembers
-      : picker.kind === "provider" ? state.groupProviderSelection : []);
+      : picker.kind === "provider" ? state.groupProviderSelection : current ? [current] : []);
     picker.sections.forEach((section) => {
       const matching = section.items.filter((item) => !query
         || item.label.toLocaleLowerCase().includes(query)
@@ -1482,22 +1492,32 @@
       if (!matching.length) return;
       target.append(node("h3", "picker-section-title", section.title));
       matching.forEach((item) => {
-        const button = node("button", "picker-option");
+        const button = node("button", picker.kind === "runtime"
+          ? "picker-option runtime-option" : "picker-option");
         button.type = "button";
         button.dataset.pickerValue = item.value;
         button.setAttribute("role", "option");
         button.setAttribute("aria-selected", String(selected.has(item.value)));
         button.disabled = selected.has(item.value);
         button.append(node("span", "picker-option-label", item.label));
+        if (picker.kind === "runtime") {
+          const result = state.groupDiagnostics.get(picker.groupName)?.get(item.value);
+          const label = result?.status === "ok" ? `${Math.round(result.delayMs)} ms`
+            : result?.status === "timeout" ? "超时"
+            : result?.status === "skipped" ? "无需测速"
+            : result ? "不可达" : "未测速";
+          button.append(node("span", `latency-badge ${result?.status === "ok" ? "good" : "neutral"}`, label));
+        }
         button.append(node("span", "picker-option-action",
-          selected.has(item.value) ? "已添加" : "添加"));
+          picker.kind === "runtime" ? (selected.has(item.value) ? "当前选择" : "选择此节点")
+            : selected.has(item.value) ? "已添加" : "添加"));
         target.append(button);
       });
     });
     if (!target.childElementCount) target.append(node("div", "empty-state", "没有匹配项目"));
   }
 
-  function openGroupPicker(kind, runtimeCandidates = []) {
+  function openGroupPicker(kind, runtimeCandidates = [], groupName = "") {
     const dialog = $("#group-picker-dialog");
     if (typeof dialog.showModal !== "function") {
       toast("当前浏览器不支持成员选择器，请升级浏览器后重试", "bad");
@@ -1506,14 +1526,15 @@
     if (state.groupPicker) closeGroupPicker(null);
     const sections = groupPickerSections(kind, runtimeCandidates);
     $("#group-picker-title").textContent = kind === "member" ? "添加组成员"
-      : kind === "provider" ? "添加代理提供器" : "临时切换运行成员";
+      : kind === "provider" ? "添加代理提供器" : `选择节点 · ${groupName}`;
     $("#group-picker-help").textContent = kind === "runtime"
-      ? "仅修改当前 Mihomo 运行态，不写入配置。" : "已添加项目会自动禁用，避免重复。";
+      ? "点击节点即可切换；重启后可能恢复原选择。测速显示 HTTPS 延迟，不改变当前选择。"
+      : "已添加项目会自动禁用，避免重复。";
     $("#group-picker-search").value = "";
     dialog.showModal();
     if (kind === "runtime") {
       return new Promise((resolve) => {
-        state.groupPicker = { kind, sections, resolve };
+        state.groupPicker = { kind, sections, resolve, groupName };
         renderGroupPickerOptions();
         window.setTimeout(() => $("#group-picker-search").focus(), 0);
       });
@@ -1982,6 +2003,52 @@
     $("#group-name").focus();
   }
 
+  async function chooseRuntimeNode(group) {
+    const tag = group.name;
+    const member = await openGroupPicker("runtime", group.runtimeCandidates, tag);
+    if (!member) return;
+    try {
+      const result = await api(`/policy-groups/${identifierPath(tag)}/runtime`, {
+        method: "PUT", body: { member }
+      });
+      toast(result.message || `已切换到 ${member}（重启后可能恢复原选择）`, "good");
+      await loadGroups();
+    } catch (error) {
+      toast(errorMessage(error), "bad");
+    }
+  }
+
+  async function testGroupNodes(group) {
+    if (state.groupDiagnosticsTesting) return;
+    state.groupDiagnosticsTesting = group.name;
+    state.groupDiagnostics.delete(group.name);
+    renderGroups();
+    let completed = false;
+    try {
+      const result = await api(`/policy-groups/${identifierPath(group.name)}/delays`, {
+        method: "POST", body: {}
+      });
+      const items = Array.isArray(result.data?.items) ? result.data.items : [];
+      const results = new Map();
+      items.forEach((item) => {
+        if (group.runtimeCandidates.includes(item.member)
+            && ["ok", "timeout", "unreachable", "skipped"].includes(item.status)
+            && (item.status !== "ok" || (Number.isFinite(item.delayMs) && item.delayMs >= 0))) {
+          results.set(item.member, { status: item.status, delayMs: item.delayMs });
+        }
+      });
+      state.groupDiagnostics.set(group.name, results);
+      completed = true;
+      toast(`已完成 ${results.size} 个成员的延迟测试，当前节点未改变`, "good");
+    } catch (error) {
+      toast(errorMessage(error), "bad");
+    } finally {
+      state.groupDiagnosticsTesting = "";
+      renderGroups();
+    }
+    if (completed && state.activeTab === "groups") await chooseRuntimeNode(group);
+  }
+
   async function handleGroupAction(event) {
     const button = event.target.closest("button[data-action]");
     if (!button) return;
@@ -1992,17 +2059,10 @@
       editGroup(group);
     }
     if (button.dataset.action === "select-runtime") {
-      const member = await openGroupPicker("runtime", group.runtimeCandidates);
-      if (!member) return;
-      try {
-        const result = await api(`/policy-groups/${identifierPath(tag)}/runtime`, {
-          method: "PUT", body: { member }
-        });
-        toast(result.message || `已临时切换到 ${member}（未写入配置）`, "good");
-        await loadGroups();
-      } catch (error) {
-        toast(errorMessage(error), "bad");
-      }
+      await chooseRuntimeNode(group);
+    }
+    if (button.dataset.action === "test-group") {
+      await testGroupNodes(group);
     }
     if (button.dataset.action === "delete-group") {
       const confirmed = await confirmAction(
