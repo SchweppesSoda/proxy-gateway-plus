@@ -95,6 +95,8 @@ def main():
             cfg["mixed-port"] = port
             cfg["bind-address"] = "127.0.0.1"
             cfg["rules"][-1] = "MATCH,REJECT"
+            # Fetch the local fixture independently of the deliberately rejecting fallback.
+            cfg["rule-providers"]["test-ai"]["proxy"] = "DIRECT"
             cfg["hosts"] = {host: "127.0.0.1" for host in (
                 "ai.google.dev", "api.openai.com", "unmatched.example.com")}
             path = work / "config.json"
