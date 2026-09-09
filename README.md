@@ -404,7 +404,7 @@ PDG_EXPECTED_VERSION=vX.Y.Z bash tools/deploy-release.sh
 
 ## 13. 文档
 
-本仓 `main` 拥有网关实现、安装与发布；[AGENTS.md](./AGENTS.md) 记录日常维护与生产部署边界。[VPS-Toolkit](https://github.com/SchweppesSoda/VPS-Toolkit/tree/main/scripts/vps/proxy-stack) 的代理栈入口负责跨组件编排，静态网页工具由 [vps-toolkit-web](https://github.com/SchweppesSoda/vps-toolkit-web) 维护。
+本仓 `main` 拥有网关实现、安装与发布；[AGENTS.md](./AGENTS.md) 记录日常维护；生产部署按需读取[部署合同](docs/agent-deployment.md)。[VPS-Toolkit](https://github.com/SchweppesSoda/VPS-Toolkit/tree/main/scripts/vps/proxy-stack) 的代理栈入口负责跨组件编排，静态网页工具由 [vps-toolkit-web](https://github.com/SchweppesSoda/vps-toolkit-web) 维护。
 
 构建、发布下载与临时核验输出放 `.tmp/`；设备现场记录和恢复备份应另行长期保管。`legacy/current-architecture/` 是冻结历史，按 [UPSTREAM_BASE.md](./UPSTREAM_BASE.md) 保留，不作为现行安装入口。
 

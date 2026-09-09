@@ -1,30 +1,17 @@
-# Repository agent instructions
+# Proxy Gateway Plus maintenance
 
-## Production PDG deployment
+本仓拥有独立网关实现与发布；VPS-Toolkit 代理栈入口只调用本仓组件。`legacy/current-architecture/` 是冻结历史，遵守 [UPSTREAM_BASE.md](UPSTREAM_BASE.md)。
 
-- Address the production PDG only through the opaque SSH alias `kfc-pdg`. Its real host, port,
-  user and identity file belong in the maintainer's local `~/.ssh/config`, never in this repository.
-- Do not infer a deployment target from a provider name, VPS label, an IP address, or the word
-  "KFC". Do not substitute another host when the alias is missing or its identity check fails.
-- Do not use a browser login, email address or password for deployment. Production release updates
-  use SSH and the installed `pdg` CLI.
-- After the requested GitHub Release exists, deploy it from this checkout with:
+## 本地工作与完成标准
 
-  ```bash
-  PDG_EXPECTED_VERSION=vX.Y.Z bash tools/deploy-release.sh
-  ```
+- 在主目录 `main` 自主完成范围内的编辑、可逆本地生成、相关验证和提交，不在第一版后等待 review。同仓一个写入任务；仅用户要求隔离/并行时另建工作树，完成后按内容收回并清理。
+- 开始核对仓库、分支、工作树、已有改动和上游。保留无关改动；需要刷新上游便 fetch，离线注明未核实并继续独立本地工作。安全时 fast-forward，分叉不重置/强推；发布前再确认目标。
+- 搜索和测试从变更对象与直接消费者开始；共享契约、重命名/删除或失败证据才扩大。文档检查链接/diff，行为修改跑对应测试，通过后不无理由重复；正式发布门禁保留。
+- 完成包括请求落地、相关验证/文档和范围明确的本地提交；报告限制、本地/远程及发布状态。推送、Release、部署沿用会话授权；缺少授权时先准备可审阅的本地结果，仅暂停依赖该授权的动作。
+- 临时输出用 `.tmp/`；清理前核对未跟踪、忽略文件及恢复依赖，必要备份放仓库外。保留历史 tag/冻结归档，不整目录忽略共享 `.codex/` 配置。
 
-- Treat any helper failure as blocking. A successful run must confirm the expected GitHub repository
-  origin, exact clean release tag, all four core services (`pdg-web`, `pdg-bot`, `mihomo`, `mosdns`),
-  and `pdg doctor --deep`.
+## 按需验证与部署
 
-## 日常维护与收尾
-
-- 日常在本仓主目录的 `main` 工作；同仓一次只允许一个任务写入，只读检查可以并行。
-- 开始前核对仓库、分支、工作树、未提交/未跟踪改动和远程状态。执行 `git fetch --tags --prune`，落后时在辨认遗留改动后使用 fast-forward；分叉先查明原因，不重置或强推。
-- 只有用户明确要求并行或隔离才建立临时分支/工作树。验证后将适用改动收回主目录，检查未跟踪及忽略文件，再清理临时工作树；必要备份放仓库外。
-- 已验证的改动在本仓源码主分支留下范围明确的本地提交。提交前再次核对远程和 staged 范围；推送、Release 和部署按用户已有授权执行，结束时说明本地/远程状态及剩余工作。
-- `.tmp/` 只放可重建的构建、测试和临时核验输出；现场备份与长期维护资料另行保管。历史 tag、冻结归档和兼容入口按既有合同保留。
-- 只忽略 `.codex/visualizations/`、`.codex/show-me-*.html` 等本地预览，不整目录忽略可能共享的 `.codex/` 配置。
-
-本仓拥有独立网关实现与发布；VPS-Toolkit 的代理栈入口只负责调用本仓组件。`legacy/current-architecture/` 是冻结历史，遵守 [UPSTREAM_BASE.md](./UPSTREAM_BASE.md)；整理文档不触发生产部署。
+- 实现修改查看对应模块和 workflow，仅运行受影响测试；部署 helper、共享服务编排或发布流程变化才扩大到其合同门禁。
+- 实际生产部署使用 [部署合同](docs/agent-deployment.md)，只认 SSH alias `kfc-pdg`。目标/身份校验失败不得猜另一个主机。
+- 本地文档整理不触发 GitHub Release、服务重启或 `pdg doctor --deep`；完成本地校验和提交即可。
