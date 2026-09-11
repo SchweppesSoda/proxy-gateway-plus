@@ -299,6 +299,9 @@ jobs:
       - name: "Phase3: MosDNS binary + attestation 热替换事务"
         run: bash tests/test-mosdns-swap.sh
 
+      - name: "geosite protobuf 解析边界与匹配语义"
+        run: python3 tests/test-parse-geosite.py
+
       - name: "Phase3: 首装 geosite 离线事务与 live updater 硬门"
         run: bash tests/test-update-rules-bootstrap.sh
 
