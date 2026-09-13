@@ -13,5 +13,5 @@
 ## 按需验证与部署
 
 - 实现修改查看对应模块和 workflow，仅运行受影响测试；部署 helper、共享服务编排或发布流程变化才扩大到其合同门禁。
-- 实际生产部署使用 [部署合同](docs/agent-deployment.md)，只认 SSH alias `kfc-pdg`。目标/身份校验失败不得猜另一个主机。
+- 实际生产部署使用 [部署合同](docs/agent-deployment.md)，只认 SSH alias `kfc-pdg`，统一使用 `tools/deploy-release.sh`。目标/身份校验失败不得猜另一个主机。
 - 本地文档整理不触发 GitHub Release、服务重启或 `pdg doctor --deep`；完成本地校验和提交即可。
