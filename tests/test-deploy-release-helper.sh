@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK:?}"' EXIT
-mkdir -p "$WORK/bin"
+mkdir -p "$WORK/bin" "$WORK/py"
+export PDG_TEST_ROOT="$ROOT" PDG_TEST_MODULES="$WORK/py"
 
 fail(){ echo "[FAIL] $*" >&2; exit 1; }
 pass(){ echo "[PASS] $*"; }
@@ -71,8 +72,12 @@ case "$remote" in
   "/usr/local/bin/pdg update"|"/usr/local/bin/pdg update --target "*)
     echo "已切到发布 v9.9.9"
     ;;
-  "systemctl is-active pdg-web pdg-bot mihomo mosdns")
-    printf 'active\nactive\nactive\nactive\n'
+  *"systemctl is-enabled --quiet pdg-web"*)
+    PDG_TEST_SNAPSHOT=1 bash -c "$remote"
+    ;;
+  *"checks.expected_services()"*)
+    remote="${remote//PYTHONPATH=\/opt\/pdg-bot/PYTHONPATH=$PDG_TEST_MODULES:$PDG_TEST_ROOT/deploy/bot}"
+    bash -c "$remote"
     ;;
   "/usr/local/bin/pdg doctor --deep")
     echo "全部正常 (0 失败 / 0 警告)"
@@ -84,6 +89,29 @@ case "$remote" in
 esac
 MOCK
 chmod +x "$WORK/bin/ssh"
+cat > "$WORK/py/sitecustomize.py" <<'PY'
+import os
+import checks
+checks.bot_credentials = lambda: os.environ.get("PDG_TEST_BOT", "ready")
+checks._platform = lambda: os.environ.get("PDG_TEST_PLATFORM", "ios")
+checks._core_svc = lambda: os.environ.get("PDG_TEST_CORE", "mihomo")
+PY
+cat > "$WORK/bin/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+set -eu
+command="$1"; service="${!#}"
+if [[ "$command" == is-enabled ]]; then
+  [[ "${PDG_TEST_WEB_ENABLED:-0}" == 1 ]]; exit
+fi
+if [[ "$service" == pdg-web ]]; then
+  if [[ "${PDG_TEST_SNAPSHOT:-0}" == 1 ]]; then
+    [[ "${PDG_TEST_WEB_ACTIVE:-0}" == 1 ]]; exit
+  fi
+  [[ "${PDG_TEST_WEB_AFTER:-0}" == 1 ]]; exit
+fi
+[[ "$service" != "${PDG_TEST_FAILED_SERVICE:-}" ]]
+MOCK
+chmod +x "$WORK/bin/systemctl"
 
 LOG="$WORK/ssh.log"
 OUT="$WORK/out.log"
@@ -132,24 +160,24 @@ pass "未来 agent 可发现统一入口且仓库不保存真实 IP"
 PATH="$WORK/bin:$PATH" PDG_TEST_VERSION=v9.9.9 \
   bash "$ROOT/tools/deploy-release.sh" --expected v9.9.9 > "$OUT"
 mapfile -t calls < "$LOG"
-[[ "${#calls[@]}" == 8 ]] || fail "成功流程 SSH 调用数错误: ${#calls[@]}"
+[[ "${#calls[@]}" == 9 ]] || fail "成功流程 SSH 调用数错误: ${#calls[@]}"
 [[ "${calls[0]}" == "kfc-pdg|CONFIG" ]] || fail "未先检查默认 SSH alias"
 [[ "${calls[1]}" == "kfc-pdg|test -x /usr/local/bin/pdg && test -d /opt/privdns-gateway && git -C /opt/privdns-gateway remote get-url origin" ]] \
   || fail "未在更新前核验 PDG 身份"
 [[ "${calls[2]}" == *"refs/pdg-deploy-target/v9.9.9"* ]] \
   || fail "未在写入前核验 origin 精确 target"
-[[ "${calls[3]}" == "kfc-pdg|/usr/local/bin/pdg update --dry-run --target v9.9.9" ]] \
+[[ "${calls[4]}" == "kfc-pdg|/usr/local/bin/pdg update --dry-run --target v9.9.9" ]] \
   || fail "未对精确 target 执行更新预检"
-[[ "${calls[4]}" == "kfc-pdg|/usr/local/bin/pdg update --target v9.9.9" ]] \
+[[ "${calls[5]}" == "kfc-pdg|/usr/local/bin/pdg update --target v9.9.9" ]] \
   || fail "未在预检后正式更新精确 target"
-[[ "${calls[5]}" == *"status --porcelain=v1 --untracked-files=all"* \
-   && "${calls[5]}" == *"refs/pdg-deploy-target/\$expected^{commit}"* \
-   && "${calls[5]}" == *"refs/tags/\$expected^{commit}"* \
-   && "${calls[5]}" == *"tag --points-at HEAD"* ]] \
+[[ "${calls[6]}" == *"status --porcelain=v1 --untracked-files=all"* \
+   && "${calls[6]}" == *"refs/pdg-deploy-target/\$expected^{commit}"* \
+   && "${calls[6]}" == *"refs/tags/\$expected^{commit}"* \
+   && "${calls[6]}" == *"tag --points-at HEAD"* ]] \
   || fail "未核验 origin/tag/HEAD 同一、唯一 tag 与全量 clean worktree"
-[[ "${calls[6]}" == "kfc-pdg|systemctl is-active pdg-web pdg-bot mihomo mosdns" ]] \
+[[ "${calls[7]}" == *"checks.expected_services()"* ]] \
   || fail "未核验核心服务"
-[[ "${calls[7]}" == "kfc-pdg|/usr/local/bin/pdg doctor --deep" ]] \
+[[ "${calls[8]}" == "kfc-pdg|/usr/local/bin/pdg doctor --deep" ]] \
   || fail "未以深度自检收尾"
 grep -q '\[OK\].*v9.9.9' "$OUT" || fail "成功输出缺版本"
 pass "新 updater 按精确 target 安全顺序部署"
@@ -158,9 +186,9 @@ pass "新 updater 按精确 target 安全顺序部署"
 PDG_TEST_REMOTE_PDG="$LEGACY_PDG" PATH="$WORK/bin:$PATH" PDG_TEST_VERSION=v9.9.9 \
   bash "$ROOT/tools/deploy-release.sh" --expected v9.9.9 > "$OUT"
 mapfile -t calls < "$LOG"
-[[ "${calls[3]}" == "kfc-pdg|/usr/local/bin/pdg update --dry-run" ]] \
+[[ "${calls[4]}" == "kfc-pdg|/usr/local/bin/pdg update --dry-run" ]] \
   || fail "v1.6.4 legacy updater 预检被错误传入 --target"
-[[ "${calls[4]}" == "kfc-pdg|/usr/local/bin/pdg update" ]] \
+[[ "${calls[5]}" == "kfc-pdg|/usr/local/bin/pdg update" ]] \
   || fail "v1.6.4 legacy updater 正式更新被错误传入 --target"
 [[ "${calls[2]}" == *"legacy_commit="* \
    && "${calls[2]}" == *'test "$legacy_commit" = "$commit"'* ]] \
@@ -171,11 +199,11 @@ pass "真实 v1.6.4 parser fixture 走无 target 的兼容命令序列"
 PATH="$WORK/bin:$PATH" PDG_TEST_VERSION=v9.9.9 \
   bash "$ROOT/tools/deploy-release.sh" > "$OUT"
 mapfile -t calls < "$LOG"
-[[ "${calls[2]}" == "kfc-pdg|/usr/local/bin/pdg update --dry-run" \
-   && "${calls[3]}" == "kfc-pdg|/usr/local/bin/pdg update" ]] \
+[[ "${calls[3]}" == "kfc-pdg|/usr/local/bin/pdg update --dry-run" \
+   && "${calls[4]}" == "kfc-pdg|/usr/local/bin/pdg update" ]] \
   || fail "无 expected 时未保持 latest 命令序列"
-[[ "${calls[4]}" == *'lib/release-tags.sh" select'* \
-   && "${calls[4]}" == *"tag --points-at HEAD"* ]] \
+[[ "${calls[5]}" == *'lib/release-tags.sh" select'* \
+   && "${calls[5]}" == *"tag --points-at HEAD"* ]] \
   || fail "无 expected 时未复核 origin-selected latest 与唯一本地 tag"
 pass "无 expected 保持 origin latest 并做同等级最终验收"
 
@@ -231,7 +259,7 @@ for verify_case in untracked modified co-tag; do
   fi
   grep -q 'status --porcelain=v1 --untracked-files=all' "$LOG" \
     || fail "$verify_case 未进入最终 clean/exact 验证"
-  ! grep -q '|systemctl is-active pdg-web pdg-bot mihomo mosdns' "$LOG" \
+  ! grep -q 'checks.expected_services()' "$LOG" \
     || fail "$verify_case 阻断后仍继续服务验收"
   ! grep -q '|/usr/local/bin/pdg doctor --deep' "$LOG" \
     || fail "$verify_case 阻断后仍继续 doctor"
@@ -274,3 +302,36 @@ git -C "$FIXTURE" tag poison-same-commit HEAD
 [[ "$(git -C "$FIXTURE" tag --points-at HEAD)" != v9.9.9 ]] \
   || fail "唯一 tag 验证未拒绝 co-tag"
 pass "真实 Git clean/modified/untracked/co-tag 验收原语回归"
+
+for service in pdg-quic-routing mosdns mihomo pdg-bot pdg-probe81; do
+  if PATH="$WORK/bin:$PATH" PDG_TEST_FAILED_SERVICE="$service" \
+      bash "$ROOT/tools/deploy-release.sh" >"$OUT" 2>&1; then
+    fail "inactive required service accepted: $service"
+  fi
+  grep -q "Required services inactive: $service" "$OUT" || fail "failure did not identify $service"
+done
+pass "each dynamically required service fails independently"
+PATH="$WORK/bin:$PATH" PDG_TEST_BOT=unset PDG_TEST_FAILED_SERVICE=pdg-bot \
+  bash "$ROOT/tools/deploy-release.sh" >"$OUT"
+pass "unset Bot credentials permit a stopped Bot"
+if PATH="$WORK/bin:$PATH" PDG_TEST_BOT=partial \
+    bash "$ROOT/tools/deploy-release.sh" >"$OUT" 2>&1; then fail "partial Bot credentials accepted"; fi
+pass "partial Bot credentials fail explicitly"
+PATH="$WORK/bin:$PATH" PDG_TEST_PLATFORM=android PDG_TEST_FAILED_SERVICE=pdg-probe81 \
+  bash "$ROOT/tools/deploy-release.sh" >"$OUT"
+if PATH="$WORK/bin:$PATH" PDG_TEST_CORE=custom-core PDG_TEST_FAILED_SERVICE=custom-core \
+    bash "$ROOT/tools/deploy-release.sh" >"$OUT" 2>&1; then fail "dynamic core failure accepted"; fi
+pass "platform and active core come from checks.expected_services"
+for enabled in 0 1; do
+  for active in 0 1; do
+    for after in 0 1; do
+      success=0
+      if PATH="$WORK/bin:$PATH" PDG_TEST_WEB_ENABLED="$enabled" PDG_TEST_WEB_ACTIVE="$active" \
+          PDG_TEST_WEB_AFTER="$after" bash "$ROOT/tools/deploy-release.sh" >"$OUT" 2>&1; then success=1; fi
+      expected=1
+      if [[ "$enabled$active" != 00 && "$after" == 0 ]]; then expected=0; fi
+      [[ "$success" == "$expected" ]] || fail "Web state $enabled/$active -> $after gave $success"
+    done
+  done
+done
+pass "all four Web pre-update states preserve their optional/required contract"

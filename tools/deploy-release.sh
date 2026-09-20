@@ -133,6 +133,14 @@ printf '%s\\t%s\\t%s\\n' \"\$mode\" \"\$expected\" \"\$commit\""
     esac
   fi
 
+  # Preserve an existing Web requirement without enabling the optional UI.
+  if ! web_required="$("${SSH[@]}" "$target" \
+      "if systemctl is-enabled --quiet pdg-web || systemctl is-active --quiet pdg-web; then printf required; else printf optional; fi")"; then
+    fail "[$target] 无法读取更新前 Web 状态"
+  fi
+  [[ "$web_required" == required || "$web_required" == optional ]] \
+    || fail "[$target] 更新前 Web 状态无效"
+
   echo "==> [$target] 更新预检"
   remote_dry_run="/usr/local/bin/pdg update --dry-run"
   remote_update="/usr/local/bin/pdg update"
@@ -202,8 +210,29 @@ printf "%s\t%s\n" "$tag" "$head"'
   fi
 
   echo "==> [$target] 核验核心服务"
-  "${SSH[@]}" "$target" "systemctl is-active pdg-web pdg-bot mihomo mosdns" \
-    || fail "[$target] 至少一个核心服务未运行"
+  service_verify="set -eu
+required=\$(PDG_REQUIRE_WEB=$web_required PYTHONPATH=/opt/pdg-bot python3 - <<'PY'
+import os
+import checks
+
+if checks.bot_credentials() == 'partial':
+    raise SystemExit('Bot credentials are incomplete')
+names = checks.expected_services()
+if os.environ['PDG_REQUIRE_WEB'] == 'required':
+    names.append('pdg-web')
+print('\\n'.join(names))
+PY
+)
+while IFS= read -r service; do
+  systemctl is-active --quiet \"\$service\" || {
+    printf 'Required services inactive: %s\\n' \"\$service\" >&2
+    exit 1
+  }
+done <<EOF
+\$required
+EOF"
+  "${SSH[@]}" "$target" "$service_verify" \
+    || fail "[$target] 必需服务或 Bot 配置验收失败"
 
   echo "==> [$target] 深度自检"
   "${SSH[@]}" "$target" "/usr/local/bin/pdg doctor --deep" \

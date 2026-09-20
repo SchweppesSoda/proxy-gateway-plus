@@ -136,6 +136,7 @@ def main():
     # 平台切换的校验门用的就是这个集合; 它必须与 checks.expected_services() 同语义, 否则
     # 没配 bot 的机器会因为"pdg-bot 未稳定运行"而切不了平台。
     import subprocess
+    import re
     pdg_sh = str(ROOT / "deploy/bot/pdg.sh")
     shim = tempfile.mkdtemp()
     with open(os.path.join(shim, "checks_shim.py"), "w", encoding="utf-8") as f:
@@ -148,15 +149,14 @@ def main():
         write_env(envf, token=token, allowed=allowed)
         # pdg.sh 顶层会执行调度, 不能直接 source; 抽出被测函数, 再把凭据/平台判定接到
         # **真实的** checks 上(不重写它们的逻辑)
-        body = subprocess.run(
-            ["sed", "-n", "/^_pdg_required_svcs(){/,/^}/p", pdg_sh],
-            capture_output=True, text=True).stdout
+        body = re.search(r"(?ms)^_pdg_required_svcs\(\)\{.*?^}\s*$",
+                         Path(pdg_sh).read_text(encoding="utf-8")).group(0)
         assert "_pdg_required_svcs(){" in body, "抽取 _pdg_required_svcs 失败"
         script = (
             body
             + '_pdg_core_svc(){ echo mihomo; }\n'
             + '_pdg_platform(){ echo %s; }\n' % platform
-            + '_pdg_bot_cred(){ python3 %r %r; }\n' % (os.path.join(shim, "checks_shim.py"), envf)
+            + '_pdg_bot_cred(){ python3 %r %r; }\n' % (Path(shim, "checks_shim.py").as_posix(), Path(envf).as_posix())
             + '_pdg_required_svcs\n'
         )
         r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
@@ -196,6 +196,18 @@ def main():
                 bad("CLI 与 checks 的必需服务集不一致: %s vs %s"
                     % (checks.expected_services(), required_svcs(plat, tok, al)))
     ok("CLI 与 checks.expected_services() 在四种组合下逐一一致")
+
+    for enabled in (False, True):
+        for active_web in (False, True):
+            checks._run = lambda cmd, t=10: (
+                0 if (enabled if cmd[1] == "is-enabled" else active_web) else 1, "", "")
+            level = checks.check_web_service()[0]
+            expected = "ok" if active_web else ("fail" if enabled else "info")
+            if level != expected:
+                bad("Web enabled/active state produced the wrong doctor verdict")
+            if "pdg-web" in checks.expected_services():
+                bad("optional Web leaked into the CLI/status required set")
+    ok("Web 四种启用/运行组合独立诊断，未改变必需服务集合")
 
     print("\n通过 %d 项断言" % pass_n)
 

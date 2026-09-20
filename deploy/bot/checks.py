@@ -210,6 +210,17 @@ def check_services():
         else ("ok", "服务", "核心服务均运行正常：" + "、".join(names))
 
 
+def check_web_service():
+    """Web is optional; an enabled but stopped UI is a separate doctor failure."""
+    enabled = _run(["systemctl", "is-enabled", "--quiet", "pdg-web"])[0] == 0
+    active = _run(["systemctl", "is-active", "--quiet", "pdg-web"])[0] == 0
+    if active:
+        return ("ok", "Web", "pdg-web 运行中")
+    if enabled:
+        return ("fail", "Web", "pdg-web 已启用但未运行")
+    return ("info", "Web", "pdg-web 未启用且未运行（可选功能）")
+
+
 def check_bot_credentials():
     """Bot 凭据本身的状态。没配是正常禁用态(info), 配了一半是明确的配置错误(fail)。"""
     st = bot_credentials()
@@ -1161,7 +1172,7 @@ def check_transactions():
             "<code>sudo pdg tx recover &lt;id&gt;</code> 恢复。" % (len(pend), items))
 
 
-ALL = [check_platform, check_services, check_bot_credentials, check_core_version,
+ALL = [check_platform, check_services, check_bot_credentials, check_web_service, check_core_version,
        check_mosdns_build, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_dataplane_profile, check_nft, check_nft_input_chains,
        check_redirect, check_gms,

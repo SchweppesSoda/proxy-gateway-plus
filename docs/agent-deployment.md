@@ -15,5 +15,9 @@
   ```
 
 - Treat any helper failure as blocking. A successful run must confirm the expected GitHub repository
-  origin, exact clean release tag, all four core services (`pdg-web`, `pdg-bot`, `mihomo`, `mosdns`),
-  and `pdg doctor --deep`.
+  origin, exact clean release tag, every service from `checks.expected_services()`,
+  and `pdg doctor --deep`. The required set follows the active core and platform;
+  Bot is required only with complete credentials (partial credentials fail). Web
+  remains optional and disabled by default. The helper captures whether Web was
+  enabled or active before updating and requires it active afterward when either
+  was true; it never enables Web. Doctor separately reports enabled-but-inactive Web.
