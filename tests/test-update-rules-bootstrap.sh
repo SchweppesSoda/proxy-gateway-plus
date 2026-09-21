@@ -54,6 +54,10 @@ EOF
 cat >"$WORK/bin/python3" <<'EOF'
 #!/usr/bin/env bash
 tool="$1"; shift
+if [[ "$(basename "$tool")" == rule_status.py ]]; then
+  [[ "$1" == run-geosite ]] || exit 2
+  exec bash "$2" --recorded-live
+fi
 if [[ "$(basename "$tool")" == parse-geosite.py ]]; then
   out="${@: -1}"; mkdir -p "$out"
   for f in geosite_cn geosite_geolocation-\!cn geosite_apple geosite_gfw; do

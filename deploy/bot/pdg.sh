@@ -2063,6 +2063,7 @@ cmd_rollback(){
     opt/pdg-bot/rulesets.json
     opt/pdg-bot/bot.py
     opt/pdg-bot/checks.py
+    opt/pdg-bot/rule_status.py
     opt/pdg-bot/report.py
     opt/pdg-bot/nftscan.py
     opt/pdg-bot/nftmerge.py
@@ -2796,6 +2797,7 @@ cmd_update(){
     || ! install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py       /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/checks.py            /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/rule_status.py       /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/dot_session_probe.py /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py             /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/doctor.py            /opt/pdg-bot/ \

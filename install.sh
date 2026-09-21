@@ -813,6 +813,7 @@ install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py      /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/checks.py           /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/rule_status.py      /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/dot_session_probe.py /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/nftscan.py          /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py            /opt/pdg-bot/

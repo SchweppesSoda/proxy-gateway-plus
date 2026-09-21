@@ -865,6 +865,38 @@ def check_mitm():
         return ("fail", "MITM 插件", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
     return ("ok", "MITM 插件", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
 
+def check_rule_updates(alert=False):
+    """Read receipts only; stable alert text keeps timer ticks from spamming."""
+    import rule_status
+    components = ["geosite"]
+    try:
+        with open(RS_META, encoding="utf-8") as stream:
+            metadata = json.load(stream)
+        if not isinstance(metadata, dict):
+            raise ValueError("invalid metadata")
+        if metadata:
+            components.append("rulesets")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        return ("warn", "规则更新", "规则集清单不可读，无法确认更新范围")
+    levels = {"ok": 0, "warn": 1, "fail": 2}
+    results = []
+    for component in components:
+        level, status, detail = rule_status.assessment(
+            component, os.path.join(os.path.dirname(RS_META), "rule-status"))
+        description = component + ": " + status
+        if not alert and detail is not None:
+            description += " " + json.dumps(detail, ensure_ascii=False, sort_keys=True)
+        results.append((level, description))
+    level = max((item[0] for item in results), key=levels.get)
+    return level, "规则更新", "; ".join(item[1] for item in results)
+
+
+def check_rule_update_alerts():
+    return check_rule_updates(alert=True)
+
+
 def check_rulesets():
     """规则集能否进入 mihomo 运行配置。
 
@@ -1177,10 +1209,10 @@ ALL = [check_platform, check_services, check_bot_credentials, check_web_service,
        check_internal_cidr, check_dataplane_profile, check_nft, check_nft_input_chains,
        check_redirect, check_gms,
        check_mosdns_ratelimit, check_mem,
-       check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
+       check_cert, check_dns, check_core_config, check_rulesets, check_rule_updates, check_mitm_structure, check_mitm,
        check_transactions]
 ALERT = [check_services, check_dataplane_profile, check_mosdns_build,
-         check_dns, check_cert]  # healthcheck 用的轻量子集
+         check_dns, check_cert, check_rule_update_alerts]  # healthcheck 用的轻量子集
 DEEP = [check_deep_dot_handshake, check_deep_dot_no_resumption,
         check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加

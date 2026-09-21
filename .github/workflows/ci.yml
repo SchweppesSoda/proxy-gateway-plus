@@ -468,6 +468,9 @@ jobs:
       - name: "健康通知送达状态 (部分失败/重启/有界退避/恢复合并/原子落盘；离线 mock)"
         run: python3 tests/test-health-notifications.py
 
+      - name: "规则更新新鲜度 (全量/部分失败/旧库/中断/稳定告警；离线 mock)"
+        run: python3 tests/test-rule-status.py
+
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
         run: python3 tests/test-platform-isolation.py
 

@@ -11,7 +11,8 @@ set -euo pipefail
 
 BOOTSTRAP=0
 case "${1:-}" in
-  "") ;;
+  "") exec python3 /opt/pdg-bot/rule_status.py run-geosite "$0" ;;
+  --recorded-live) ;;  # 仅由状态包装器调用；不改变 live 事务与服务校验门。
   --bootstrap) BOOTSTRAP=1 ;;
   *) echo "用法: $0 [--bootstrap]" >&2; exit 2 ;;
 esac

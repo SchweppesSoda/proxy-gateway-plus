@@ -3520,6 +3520,20 @@ def del_ruleset(name):
 
 
 def refresh_rulesets():
+    """All callers share a refresh receipt; partial success is not a fresh set."""
+    import rule_status
+    try:
+        directory = os.path.join(os.path.dirname(RS_META), "rule-status")
+        with rule_status.Update("rulesets", directory) as update:
+            receipt = {"version": rule_status.content_version({})}
+            count, failed = _refresh_rulesets(receipt)
+            update.finish(not failed, receipt["version"], partial=bool(count and failed))
+            return count, failed
+    except Exception as error:  # No URL, subscription content or raw exception in status/logs.
+        return 0, ["规则集刷新或状态记录失败(%s)" % type(error).__name__]
+
+
+def _refresh_rulesets(receipt):
     """重下全部规则集并**整批**原子提交。返回 (成功刷新数, 失败项列表)。
 
     语义(5.1 定死, 与用户可见行为一致):
@@ -3582,6 +3596,9 @@ def refresh_rulesets():
                            ruleset_direct=True, file_expects={"rs_meta": meta_sha})
         if not ok:
             return 0, failed + ["整批未更新(全部保留上一份好档): " + msg]
+        import rule_status
+        receipt["version"] = rule_status.content_version(
+            {key: data for key, data in files.items() if key.startswith("ruleset:")})
         return n, failed
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
