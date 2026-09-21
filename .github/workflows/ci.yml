@@ -465,6 +465,9 @@ jobs:
       - name: "Bot 凭据三态 (都空=正常禁用/只配一半=配置错/配齐才要求 pdg-bot 在跑)"
         run: python3 tests/test-bot-credentials.py
 
+      - name: "健康通知送达状态 (部分失败/重启/有界退避/恢复合并/原子落盘；离线 mock)"
+        run: python3 tests/test-health-notifications.py
+
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
         run: python3 tests/test-platform-isolation.py
 

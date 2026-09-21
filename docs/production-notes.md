@@ -99,3 +99,11 @@ loopback + SSH 隧道，不能把 setup 的默认端口当成机器常量。
 - 使用 `pdg snapshot` / `pdg rollback` 做人工维护窗口的恢复点。
 
 `status`、`doctor`、`log`、`traffic` 和 `report` 是只读命令，不会暗中迁移生产配置。
+
+## 健康通知状态（2026-09-21 本地实现，尚未部署）
+
+`pdg-health.timer` 继续每 10 分钟调用轻量检查。健康通知将观察结果、Telegram 确认送达结果与
+待发记录按收件人分别保存；发送失败不推进送达去重，重启后保留重试。未确认故障已经恢复时，
+发送包含此前故障的恢复说明。此机制不改变 doctor 的检查范围，也不把通知通道本身当作独立
+外部监控。兼容、退避、文件安全与上线后回退条件见
+[健康通知维护记录](maintenance/2026-09-21-health-notifications.md)。
