@@ -31,9 +31,9 @@ PDG_NONINTERACTIVE=1 PDG_SERVER_IP=<公网IP> PDG_INTERNAL_CIDR=172.22.0.0/16 \
   `pdg-probe81` `pdg-mitm`)。Bot 凭据配齐时 `pdg-bot` active;两项都未配置时允许明确禁用,
   只配一项必须由 doctor 报配置错误。**Android 上 `pdg-probe81`/`pdg-mitm` 应不存在**
   (`systemctl is-enabled` 报 not-found),81/7894 不监听。**sing-box 二进制/服务都不应存在**。
-- [ ] **平台专属模块只在对应平台**:iOS `ls /opt/pdg-bot/{mitm_ca,mitm_server,mitm_wloc}.py` 齐; **Android 这三个 + `probe81.py` + 描述文件模板都不应存在**。`sb2mihomo.py` 两平台都在。
+- [ ] **平台专属模块只在对应平台**:iOS `ls /opt/pdg-bot/{mitm_ca,mitm_server,probe81}.py` 及描述文件模板齐; `mitm_wloc.py` 不应存在(WLOC 已退役); **Android 这些 iOS 专属文件都不应存在**。`sb2mihomo.py` 两平台都在。
 - [ ] 平台门控对:**iOS** doctor 有「MITM 插件」「MITM结构」「平台=ios」无「GMS 推送」「iOS 探测」缺失;**Android** 反之(有 GMS、无 MITM/probe81)。
-- [ ] **平台隔离(硬门控)**:**Android** bot「📱 客户端」无「iOS 描述文件」按钮;点旧消息里的 iOS/WLOC 按钮被拒;`sudo pdg ios` 友好拒绝(不装 qrencode、不开 8443)。**iOS** 有描述文件/WLOC。
+- [ ] **平台隔离(硬门控)**:**Android** bot「📱 客户端」无「iOS 描述文件」按钮;点旧消息里的 iOS/WLOC 按钮被拒;`sudo pdg ios` 友好拒绝(不装 qrencode、不开 8443)。**iOS** 有描述文件和 `pdg-probe81`; WLOC 按钮、旧回调和直接启用接口都被拒绝。
 - [ ] **iOS 无 GMS 残留**:`grep -c in-gms /etc/sing-box/config.json` = 0;`nft list ruleset | grep 5228` 无。
 - [ ] **平台标记**:`cat /etc/privdns-gateway/platform` 为 ios/android;缺失时 `pdg status`/doctor 明确提示「按 Android 回退」而非静默。
 - [ ] **单 Mihomo 数据面**:`/etc/mihomo/config.yaml` 有 `redir-port: 7893`;`tproxy` 模式
@@ -62,7 +62,7 @@ pdg update                                          # 切到本版
 - [ ] `pdg update` **成功、没触发回滚**(校验门过)。
 - [ ] **新增的 bot 模块升级后就位**(`ls /opt/pdg-bot/sb2mihomo.py` 等)——靠 `migrate_deploy_botfiles` 自愈;缺了说明迁移没跑到。
 - [ ] `pdg doctor` 全绿。
-- [ ] **iOS + WLOC 开着**时再 `pdg update`:不因「pdg-mitm 未运行」误回滚(pdg-mitm 有被 `reset-failed`+重启)。
+- [ ] **存在历史 WLOC 配置或接管残留时先停下**:更新/迁移不得重新加载旧启用状态、注册 WLOC 插件或恢复 Apple location 接管;按 [WLOC 退役部署门](maintenance/2026-09-22-wloc-retirement.md) 保留回滚材料、停止旧服务、清理并核验两 Apple 域名不在 active DNS/core interception。清理失败就停止更新，不把源码退役当作现场完成。
 
 ## ③ 从 sing-box 旧版升级 → 自动迁移到 mihomo(v1.6.0 关键路径)
 
@@ -79,12 +79,12 @@ pdg update     # __migrate 里自动 sing-box → mihomo
 - [ ] **出口/分流全保留**:bot「🚦 测出口」每个出口都返回延迟、不报「超时/不通」;**direct 出口(JP)** 也通(它在 mihomo 里映射成内建 `DIRECT`)。
 - [ ] **有不可转换出口时**:config.json 里放一个 mihomo 不支持的出站,`pdg update` 应**中止并回滚到旧 sing-box 版**(数据无损),报出该出口名。
 
-## ④ WLOC(仅 iOS 装机)
+## ④ WLOC 退役残留门(所有平台)
 
-- [ ] bot「🍏 位置改写」:加地点(点按钮 **和** 直接发「名称 纬度,经度」两种都试)、切换、开启。
-- [ ] `systemctl is-active pdg-mitm` = active;`pdg doctor` 有「🟢 MITM 插件」。
-- [ ] `/etc/mihomo/config.yaml`(mihomo)有 `MITM-OUT` + `DOMAIN-SUFFIX,gs-loc*` 规则;`mitm_hijack.txt` 有 gs-loc 两域名。
-- [ ] (有真 iPhone 时)内网卡 + 控制中心关 WiFi + 定位服务关开 → 定位改到设定城市。
+- [ ] `python3 tests/test-wloc-retirement.py` 通过:旧按钮、回调和直接 mutator 拒绝;恢复的 `wloc.enabled=true` 不注册插件、不读地点、不调用服务;旧 Apple 域名不进入 DNS/core interception;doctor 对残留 fail-closed 且不泄露地点内容。
+- [ ] 新装、更新和平台修复不安装或恢复 `mitm_wloc.py`，不创建 WLOC 启用入口；通用 MITM host/CA 与事务资源仍按普通代理规则的需要保留。
+- [ ] 现场替换已有实例前，按 [WLOC 退役记录](maintenance/2026-09-22-wloc-retirement.md) 保存回滚材料，使用旧的已验证事务停用旧插件，确认两 Apple 域名已从 active DNS/core interception 消失且普通 DNS/代理正常，再停止旧 WLOC 服务并替换代码。清理失败时停止部署，不删除地点/CA 恢复资料。
+- [ ] 历史 iOS 26 真机成功只作事故背景;当前发布不宣称 WLOC 功能或 iOS 27 真机定位通过。若需要 iOS 兼容性结论，另行安排有界设备验收。
 
 ## ⑤ 卸载
 
