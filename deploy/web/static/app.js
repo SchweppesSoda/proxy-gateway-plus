@@ -818,7 +818,7 @@
       "pdg-bot": "Telegram Bot",
       "pdg-web": "Web 控制台",
       "pdg-probe81": "iOS 网络探测",
-      "pdg-mitm": "定位服务插件"
+      "pdg-mitm": "代理插件服务"
     })[name] || formatLabel(name);
   }
 
