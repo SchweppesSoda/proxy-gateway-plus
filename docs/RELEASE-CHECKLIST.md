@@ -62,7 +62,7 @@ pdg update                                          # 切到本版
 - [ ] `pdg update` **成功、没触发回滚**(校验门过)。
 - [ ] **新增的 bot 模块升级后就位**(`ls /opt/pdg-bot/sb2mihomo.py` 等)——靠 `migrate_deploy_botfiles` 自愈;缺了说明迁移没跑到。
 - [ ] `pdg doctor` 全绿。
-- [ ] **存在历史 WLOC 配置或接管残留时先停下**:更新/迁移不得重新加载旧启用状态、注册 WLOC 插件或恢复 Apple location 接管;按 [WLOC 退役部署门](maintenance/2026-09-22-wloc-retirement.md) 保留回滚材料、停止旧服务、清理并核验两 Apple 域名不在 active DNS/core interception。清理失败就停止更新，不把源码退役当作现场完成。
+- [ ] **存在历史 WLOC 配置或接管残留时先停下**:更新/迁移不得重新加载旧启用状态、注册 WLOC 插件或恢复 Apple location 接管;按 [WLOC 退役部署门](maintenance/2026-09-22-wloc-retirement.md) 保留回滚材料，使用旧事务停用旧插件，清理并核验两 Apple 域名不在 active DNS/core interception 且普通 DNS/代理正常，再停止旧服务并替换代码。清理失败就停止更新，不把源码退役当作现场完成。
 
 ## ③ 从 sing-box 旧版升级 → 自动迁移到 mihomo(v1.6.0 关键路径)
 
