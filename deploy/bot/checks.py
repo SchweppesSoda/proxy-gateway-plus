@@ -817,37 +817,37 @@ def check_mitm():
         if not isinstance(cfg, dict):
             raise ValueError("configuration shape")
         if (cfg.get("wloc") or {}).get("enabled"):
-            residue.append("legacy enabled flag")
+            residue.append("定位插件启用标志")
     except FileNotFoundError:
         pass
     except Exception:
-        return ("fail", "WLOC 退役", "旧配置无法核验；保留资料并人工检查，不自动启用。")
+        return ("fail", "配置残留", "旧插件配置无法读取，请检查文件格式和访问权限。")
     try:
         with open("/etc/mosdns/rules/mitm_hijack.txt", encoding="utf-8") as stream:
             domains = {line.split("#", 1)[0].strip().removeprefix("domain:").lower().rstrip(".")
                        for line in stream}
         if domains.intersection(GS_LOC):
-            residue.append("DNS interception")
+            residue.append("DNS 定位接管")
     except FileNotFoundError:
         pass
     except Exception:
-        return ("fail", "WLOC 退役", "旧劫持清单无法核验；未确认退役完成。")
+        return ("fail", "配置残留", "旧接管域名清单无法读取，请检查文件格式和访问权限。")
     try:
         with open("/etc/mihomo/config.yaml", encoding="utf-8") as stream:
             mc = yaml.safe_load(stream) or {}
         for rule in mc.get("rules", []):
             fields = [part.strip() for part in str(rule).split(",")]
             if len(fields) >= 3 and fields[0] in {"DOMAIN", "DOMAIN-SUFFIX"} and fields[1].lower().rstrip(".") in GS_LOC and fields[2] == "MITM-OUT":
-                residue.append("core interception")
+                residue.append("代理定位接管")
                 break
     except FileNotFoundError:
         pass
     except Exception:
-        return ("fail", "WLOC 退役", "内核接管状态无法核验；未确认退役完成。")
+        return ("fail", "配置残留", "代理配置无法读取，暂时无法确认旧接管规则是否已移除。")
     if residue:
-        return ("fail", "WLOC 退役", "检测到旧 WLOC 残留：" + ", ".join(residue)
-                + "；部署/恢复前先按退役记录撤除接管并验证，保留地点与 CA，不重新开启。")
-    return ("info", "WLOC 退役", "未发现旧启用标志或定位域名接管；通用 DNS/代理功能保留。")
+        return ("fail", "配置残留", "检测到已移除功能的旧配置：" + ", ".join(residue)
+                + "；请按维护记录清除接管规则，再重试更新或恢复。")
+    return None  # A removed feature has no healthy-state entry in current diagnostics.
 
 def check_rule_updates(alert=False):
     """Read receipts only; stable alert text keeps timer ticks from spamming."""
@@ -869,12 +869,11 @@ def check_rule_updates(alert=False):
     for component in components:
         level, status, detail = rule_status.assessment(
             component, os.path.join(os.path.dirname(RS_META), "rule-status"))
-        description = component + ": " + status
-        if not alert and detail is not None:
-            description += " " + json.dumps(detail, ensure_ascii=False, sort_keys=True)
-        results.append((level, description))
+        label = {"geosite": "域名规则库", "rulesets": "自定义规则集"}[component]
+        description = rule_status.description(status, detail, include_age=not alert)
+        results.append((level, label + "：" + description))
     level = max((item[0] for item in results), key=levels.get)
-    return level, "规则更新", "; ".join(item[1] for item in results)
+    return level, "规则更新", "；".join(item[1] for item in results)
 
 
 def check_rule_update_alerts():

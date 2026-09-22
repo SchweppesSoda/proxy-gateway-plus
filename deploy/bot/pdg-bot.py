@@ -225,8 +225,6 @@ OPS_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回运维", "callback_data"
                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
 DNS_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回 DNS 上游", "callback_data": "dnsup"}],
                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
-WLOC_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}],
-                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
 
 def _back_rows(kb):
     return [row[:] for row in kb["inline_keyboard"]]
@@ -281,17 +279,6 @@ def send_plain(chat, text):
     p.pop("parse_mode", None)
     post("sendMessage", p)
 
-def send_tracked(chat, text, kb=None):
-    """发一条消息并返回它的 message_id(失败返回 None) —— 之后还要原地编辑它时用。"""
-    p = {"chat_id": chat, "text": text, "parse_mode": "HTML",
-         "disable_web_page_preview": True}
-    if kb:
-        p["reply_markup"] = kb
-    r = post("sendMessage", p)
-    if not r.get("ok"):
-        p.pop("parse_mode", None)
-        r = post("sendMessage", p)
-    return (r.get("result") or {}).get("message_id") if r.get("ok") else None
 
 def edit(chat, mid, text, kb=None):
     p = {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML",
@@ -303,23 +290,6 @@ def edit(chat, mid, text, kb=None):
         return
     send(chat, text, kb)             # 仍不行(如消息已删)再发新消息
 
-def edit_only(chat, mid, text, kb=None):
-    """只尝试原地编辑, **绝不退化成发新消息**。成功 True, 失败 False。
-
-    给后台监听这类"事后回报"用: 用户可能早就把那条消息删了, 这时普通 edit() 的 fallback
-    会凭空发一条新消息弹到聊天里 —— 用户刚清掉的东西又冒出来。编辑不成就安静结束,
-    只在日志里留一行(不含正文)。"""
-    p = {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML",
-         "reply_markup": kb or MENU, "disable_web_page_preview": True}
-    r = post("editMessageText", p)
-    if r.get("ok"):
-        return True
-    p.pop("parse_mode", None)        # HTML 解析失败(文本含 < & 等)→ 退回纯文本再试一次
-    r = post("editMessageText", p)
-    if r.get("ok"):
-        return True
-    print("wloc watch edit skipped", (r or {}).get("error_code"), flush=True)
-    return False
 
 def delete_message(chat, mid):
     """尽力删除一条消息(用于抹掉含节点凭据的原始链接消息)。失败返回 False, 不抛、不回显内容。"""
@@ -556,9 +526,9 @@ def _mitm_domains():
         pass
     return out
 
-# ── MITM 插件(Feature B / iOS): WLOC 位置改写 ──
+# ── 共享 MITM 配置与旧入口兼容拒绝 ──
 MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
-WLOC_RETIRED = "WLOC 已退役；旧设置仅保留作恢复资料，请勿重新启用。"
+REMOVED_FEATURE = "此功能已移除，请返回当前菜单。"
 MITM_PLUGIN_DOMAINS = {}   # 插件 → 接管域名(与 mitm_server.PLUGIN_DOMAINS 同源)
 
 def _mitm_config():
@@ -616,250 +586,30 @@ def _mitm_domains_from(mitm_json_bytes):
     return doms
 
 
-def _mitm_json_bytes(cur, w):
-    """把 WLOC 目标态并进现有 mitm.json, 返回候选字节(纯函数, 不落盘)。
-
-    只改 wloc 这一段 —— 别的插件段(以后有)原样保留, 这与 _wloc_save 的语义一致。"""
-    try:
-        cfg = json.loads((cur or b"{}").decode("utf-8"))
-        if not isinstance(cfg, dict):
-            cfg = {}
-    except Exception:  # noqa: BLE001
-        cfg = {}
-    cfg["wloc"] = _wloc_doc(w)
-    return (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-
-
+# Compatibility refusals for old integrations; there is no active feature API.
 def _mitm_transact(new_wloc):
-    """Retired endpoint: preserve stored locations and perform no I/O."""
-    return False, WLOC_RETIRED
+    return False, REMOVED_FEATURE
 
-def _wloc_state():
-    """归一化 WLOC 配置(迁移老单坐标格式)→ {enabled, accuracy, active, generation, locations:[…]}。"""
-    return _wloc_state_from_cfg(_mitm_config())
-
-
-def _wloc_state_from(mitm_json_bytes):
-    """同 _wloc_state, 但基于**给定的 mitm.json 字节**(事务候选阶段用: 读到的那一份才算数)。"""
-    try:
-        cfg = json.loads((mitm_json_bytes or b"{}").decode("utf-8"))
-        if not isinstance(cfg, dict):
-            cfg = {}
-    except Exception:  # noqa: BLE001
-        cfg = {}
-    return _wloc_state_from_cfg(cfg)
-
-
-def _wloc_state_from_cfg(cfg):
-    w = dict((cfg or {}).get("wloc") or {})
-    locs = w.get("locations")
-    if locs is None:                              # 迁移老格式 {lat,lon} → 一个"默认"地点
-        locs = [{"name": "默认", "lat": w["lat"], "lon": w["lon"]}] if "lat" in w and "lon" in w else []
-    w["locations"] = locs
-    w.setdefault("accuracy", 50)
-    w.setdefault("enabled", False)
-    try:
-        w["generation"] = int(w.get("generation") or 0)
-    except (TypeError, ValueError):
-        w["generation"] = 0
-    if w.get("active") not in [l["name"] for l in locs]:
-        w["active"] = locs[0]["name"] if locs else None
-    return w
-
-def _wloc_active(w=None):
-    w = w or _wloc_state()
-    for l in w.get("locations", []):
-        if l["name"] == w.get("active"):
-            return l
-    return None
-
-def _wloc_doc(w):
-    """WLOC 目标态 → 写进 mitm.json 的那一段(纯函数, 事务候选与热路径共用同一份形态)。"""
-    return {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
-            "active": w.get("active"), "generation": int(w.get("generation") or 0),
-            "locations": w.get("locations", [])}
-
-
-def _wloc_save(w):
-    raise _WlocAbort(WLOC_RETIRED)
-
-class _WlocAbort(Exception):
-    """目标态还没落地就发现不该做(如没有可用地点)→ 带着给用户的话原样返回, 不动任何东西。"""
-
-def _wloc_edit_locked(mutate):
-    raise _WlocAbort(WLOC_RETIRED)
-
-
-def _wloc_hot_audit(op, result, gen_before, gen_after):
-    """给热路径写一条审计。**审计失败绝不能让已经成功的切换报失败** —— 坐标已经落盘了,
-    这时回一句"失败"会让用户以为没生效而反复重试。只把脱敏后的异常类型记进日志。"""
-    try:
-        _pdgtx().audit_event("bot", op, result,
-                             extra={"generation_before": gen_before, "generation_after": gen_after,
-                                    "generation_changed": gen_after != gen_before})
-    except Exception as e:  # noqa: BLE001
-        print("[wloc] 审计写入失败(%s), 切换本身已生效" % type(e).__name__, file=sys.stderr)
-
-def _wloc_bump(w):
-    """generation +1 —— bot 靠它认出"这次 WLOC 命中对应的是我刚才那次切换"。"""
-    w["generation"] = int(w.get("generation") or 0) + 1
-
-def wloc_add_gen(name, lat, lon):
-    """Retired endpoint: no coordinate/configuration write or service action."""
-    return False, WLOC_RETIRED, 0
 
 def wloc_add(name, lat, lon):
-    """加/改地点(兼容 2 元组返回)。"""
-    ok, msg, _gen = wloc_add_gen(name, lat, lon)
-    return ok, msg
+    return False, REMOVED_FEATURE
+
 
 def wloc_del(name):
-    """Retired endpoint: preserve stored locations and perform no I/O."""
-    return False, WLOC_RETIRED
+    return False, REMOVED_FEATURE
 
-def wloc_switch_gen(name):
-    """Retired endpoint: no coordinate/configuration write or service action."""
-    return False, WLOC_RETIRED, 0
 
 def wloc_switch(name):
-    """切换激活地点(兼容 2 元组返回)。"""
-    ok, msg, _gen = wloc_switch_gen(name)
-    return ok, msg
+    return False, REMOVED_FEATURE
+
 
 def wloc_enable(on):
-    """Retired endpoint: preserve stored locations and perform no I/O."""
-    return False, WLOC_RETIRED
+    return False, REMOVED_FEATURE
 
-def wloc_add_reply(chat, name, lat, lon):
-    """加/改地点并回话。改的就是当前目标且 WLOC 开着 = 一次热切换 → 和点列表切换一样,
-    也进入命中监听(此前这条路径只会让用户"再去列表点一次", 点了其实也没有新意义)。"""
-    since = time.time()
-    ok, msg, gen = wloc_add_gen(name, lat, lon)
-    if ok and gen:
-        mid = send_tracked(chat, msg, WLOC_BACK)
-        if mid:
-            _wloc_watch_async(chat, mid, gen, name, kb=WLOC_BACK, since=since)
-            return
-    send_plain(chat, msg if ok else ("❌ " + msg))
-
-def wloc_generation():
-    """当前 WLOC 目标代号(bot 等命中用)。"""
-    return int(_wloc_state().get("generation") or 0)
-
-# ── 等一次真实的 WLOC 命中 ───────────────────────────────────────────────────
-# 网关能保证的只有"下一次 WLOC 请求会用新坐标"; 手机什么时候发那次请求、locationd 缓存要不要
-# 清, 都不归网关管。所以这里等的是**手机真的来过请求**这件事实, 措辞也只说到这一步 ——
-# 绝不把"网关改写了响应"说成"手机位置已经变了"。
-WLOC_STATUS_FILE = os.environ.get("PDG_WLOC_STATUS", "/run/privdns-gateway/wloc-status.json")
-# (chat, message_id) -> token: 那条消息当前归谁管。任何新回调都会换掉 token,
-# 于是还在等的旧监听立刻失效 —— 否则用户点了「返回菜单」, 30 秒后监听把菜单覆盖成一句
-# "尚未收到请求", 用户正看着的界面就没了。
-_wloc_watch_token: dict[tuple, str] = {}
-_wloc_watch_gen: dict[int, int] = {}             # chat -> 最近一次切换的 generation
-_wloc_watch_lock = threading.Lock()
-
-def wloc_invalidate_watch(chat, mid):
-    """让绑在这条消息上的监听失效(任何新回调都该调一次)。"""
-    with _wloc_watch_lock:
-        _wloc_watch_token.pop((chat, mid), None)
-
-def _wloc_read_status():
-    try:
-        with open(WLOC_STATUS_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else None
-    except Exception:  # noqa: BLE001            # 文件还没有 / 正在被替换 / 坏档 → 当作还没命中
-        return None
-
-def _wloc_status_hit(st, gen, target, since):
-    """这条状态算不算"我这次切换的命中"。
-
-    三项都要对得上: generation 相同、目标名相同、时间不早于本次切换开始 —— 只看 generation
-    的话, 上次运行留下的历史状态(/run 没清干净、或 generation 回绕)会被当成刚刚的命中,
-    用户还没开关定位服务就先看到"已收到新请求"。字段类型不对一律当作没命中, 不抛异常:
-    这是后台线程, 抛出去就是静默死掉, 该出现的超时提示也没了。"""
-    if not isinstance(st, dict):
-        return False
-    try:
-        if int(st.get("generation")) != int(gen):
-            return False
-        if str(st.get("target_name") or "") != str(target or ""):
-            return False
-        return float(st.get("received_at") or 0) >= float(since)
-    except (TypeError, ValueError):
-        return False
-
-def _wloc_hit_text(st, target):
-    """把一次命中翻译成给用户的话。区分三种结局, 不含糊。"""
-    if st.get("upstream_ok") and st.get("patched"):
-        return (f"✅ 已收到 iPhone 的新定位请求\n"
-                f"Apple 网络定位响应已改写为：<b>{_esc(target)}</b>\n\n"
-                "若地图仍显示旧位置，属于 iOS 缓存或 GPS 覆盖。")
-    if not st.get("upstream_ok"):
-        return (f"❌ 收到了 iPhone 的新定位请求，但网关取 Apple 原始响应失败"
-                f"（{st.get('error_type') or '未知'}），本次未改写。\n"
-                "请检查网关到 Apple 的出网是否正常，稍后再试一次开关定位服务。")
-    return (f"⚠️ 收到了 iPhone 的新定位请求，Apple 响应也拿到了，但里面没有可改写的坐标字段"
-            f"（{st.get('error_type') or '未知'}），本次未改写。")
-
-WLOC_MISS_TEXT = ("⚠️ 网关目标已切换，但尚未收到 iPhone 的新 WLOC 请求。\n\n"
-                  "请检查：\n"
-                  "· 当前使用内网卡\n"
-                  "· 控制中心 Wi-Fi 已点灰\n"
-                  "· 网关 CA 已信任\n"
-                  "· iOS 定位缓存；iOS 26 必要时重启")
-
-def _wloc_watch_async(chat, mid, gen, target, timeout=30.0, interval=0.5, kb=None, since=None):
-    """后台等这一代 generation 的命中, 最多 timeout 秒, 然后原地编辑那条消息。
-
-    放后台执行器里跑 —— 主 getUpdates 循环一秒都不等它。不走 run_bg: 那会占住 per-chat BUSY,
-    等待期间用户连再切一次地点都做不了。
-
-    监听绑定 (chat, message_id, token): 用户对这条消息做**任何**新操作(再切一次、返回菜单、
-    关 WLOC、删地点)都会换掉 token, 旧监听立刻失效, 不会把用户正在看的界面覆盖掉。
-    since = 本次切换开始的时间, 用来把历史状态挡在外面。"""
-    token = uuid.uuid4().hex
-    key = (chat, mid)
-    start = time.time() if since is None else since
-    with _wloc_watch_lock:
-        _wloc_watch_token[key] = token
-        _wloc_watch_gen[chat] = gen
-    def superseded():
-        """两种作废: 这条消息被新回调接管了(别覆盖用户正看的界面), 或者用户已经切到了
-        更新的一代(旧目标的结果再报出来就是误导)。"""
-        with _wloc_watch_lock:
-            return (_wloc_watch_token.get(key) != token
-                    or _wloc_watch_gen.get(chat, gen) != gen)
-    def done():
-        """结束时把自己的 token 摘掉, 免得残留在表里。"""
-        with _wloc_watch_lock:
-            if _wloc_watch_token.get(key) == token:
-                _wloc_watch_token.pop(key, None)
-    def go():
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if superseded():
-                return
-            st = _wloc_read_status()
-            if _wloc_status_hit(st, gen, target, start):
-                if not superseded():
-                    edit_only(chat, mid, _wloc_hit_text(st, target), kb or WLOC_BACK)
-                    done()
-                return
-            time.sleep(interval)
-        if not superseded():
-            edit_only(chat, mid, WLOC_MISS_TEXT, kb or WLOC_BACK)
-            done()
-    try:
-        return _EXEC.submit(go)
-    except Exception:  # noqa: BLE001            # 执行器满/已关 → 不等了, 消息保持"已切换"即可
-        with _wloc_watch_lock:
-            _wloc_watch_token.pop(key, None)
-        return None
 
 def set_wloc(on, lat=None, lon=None):
-    """Retired endpoint: preserve stored locations and perform no I/O."""
-    return False, WLOC_RETIRED
+    return False, REMOVED_FEATURE
+
 
 def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
     """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
@@ -867,7 +617,7 @@ def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
     事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
     一起落盘 —— 否则"model 写进去了、渲染失败"就会留下两份不一致的配置。
 
-    mitm_domains: 显式给出接管域名(WLOC 事务用**候选** mitm.json 推出来的那一份)。不给就读
+    mitm_domains: 显式给出从候选插件配置推导的接管域名。不给就读
     生产的 mitm_hijack.txt —— 那是"这次不改 MITM"的路径才成立的默认值。"""
     import sb2mihomo
     cfg, meta = sb2mihomo.singbox_to_mihomo(
@@ -1088,7 +838,7 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
     except tx.TxBusy:
         # 直接用 BUSY_MSG, **不要**走 busy_msg(): 后者看的是本线程上一次 _cfg_guard() 的结果,
         # 而这里的失败来自 pdgtx 自己的锁。线程池会复用线程 —— 同一个工作线程先前若碰上过
-        # "锁文件不可用"(比如一次 WLOC 操作), 那份状态还在, TxBusy 就会被错报成 NOLOCK。
+        # "锁文件不可用"(比如一次配置操作), 那份状态还在, TxBusy 就会被错报成 NOLOCK。
         # pdgtx._Lock 已经把两件事分开了: 打不开锁文件 → TxRefused, 锁被占 → TxBusy。
         return False, BUSY_MSG
     except tx.TxRefused as e:
@@ -4719,7 +4469,7 @@ def _mitm_ca_der():
 
 def _ios_profile(ssids=()):
     """iOS DoT 描述文件。ssids 非空时在 OnDemandRules 最前插一条「命中这些 SSID 强制直连」;
-    WLOC(MITM 插件)启用时附上根 CA payload, 让设备信任本网关 CA(先开 WLOC 再重新生成即含 CA)。
+    有受支持的 MITM 插件启用时附上根 CA payload, 让设备信任本网关 CA。
     用 plistlib 插入, SSID 含 &<> 等也不会破 XML。"""
     if _platform() != "ios":         # 最底层门控: 即便某路径绕过按钮/回调, 也生成不了 iOS 描述文件
         raise RuntimeError("iOS 描述文件仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed())
@@ -5776,16 +5526,12 @@ def kb_pick_named(prefix, items, back=BACK):
 
 # ── 回调 (原地编辑) ──
 def handle_cb(chat, mid, data):
-    # 用户对这条消息做了新操作 → 还挂在它上面的 WLOC 监听立即作废。否则用户点了「返回菜单」,
-    # 30 秒后监听把菜单原地改成一句"尚未收到请求", 正看着的界面就没了。
-    wloc_invalidate_watch(chat, mid)
     if data == "wloc" or data.startswith("wloc:"):
         state.pop(chat, None)
-        edit(chat, mid, WLOC_RETIRED, OPS_BACK)
+        edit(chat, mid, REMOVED_FEATURE, OPS_BACK)
         return
-    # iOS 专属功能的统一后端门控(不只隐藏按钮): 旧 TG 消息里的 iOS 描述文件 / WLOC 按钮被点也拒绝。
-    if (data in ("ios", "iosgen") or data == "wloc" or data.startswith("wloc:")) \
-       and not _ios_only(chat, mid):
+    # iOS 专属功能的统一后端门控，不只隐藏按钮。
+    if data in ("ios", "iosgen") and not _ios_only(chat, mid):
         return
     if data in ("menu", "status") or data.startswith("nav:"):
         state.pop(chat, None); del_sel.pop(chat, None)   # 返回/切页 = 放弃进行中的输入流程和勾选, 免得下一条文字被旧状态误吃
@@ -6261,7 +6007,7 @@ def handle_text(chat, text, mid=None):
             send_plain(chat, "格式: remote|local 地址1 [地址2 …]"); return
         ok, msg = set_mosdns_upstream(p[0].lower(), p[1:]); send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "wloc_add":
-        send_plain(chat, WLOC_RETIRED); return
+        send_plain(chat, REMOVED_FEATURE); return
     if act == "set_dot":
         send_plain(chat, "正在校验域名并签发证书(约 30-60 秒, 期间代理短暂中断)…")
         ok, msg = set_dot_domain(text); send_plain(chat, msg if ok else ("❌ " + msg)); return

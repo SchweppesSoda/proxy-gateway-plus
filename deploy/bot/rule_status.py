@@ -159,6 +159,43 @@ def assessment(component, directory=DIRECTORY, now=None):
     return "ok", "fresh", detail
 
 
+def description(status, detail, *, include_age=True):
+    """User-facing summary; receipt fields and hashes remain in the state files.
+
+    Alert callers omit ages so time passing cannot create repeat notifications.
+    """
+    messages = {
+        "fresh": "更新正常",
+        "unknown": "尚无成功更新记录，请执行一次规则更新",
+        "invalid": "更新记录无法读取，暂时无法确认更新时间",
+        "clock": "系统时间异常，暂时无法判断规则是否过期",
+        "stale-48h": "超过两天未完整更新，请检查更新任务",
+        "stale-7d": "超过七天未完整更新，请尽快检查更新任务",
+        "interrupted": "更新超过一小时未结束，请检查更新任务",
+        "refresh_failed": "最近一次更新失败，继续使用上次成功的规则",
+        "partial": "部分规则更新失败，失败项继续使用原规则",
+        "exception": "最近一次更新未完成，请检查更新任务",
+    }
+    text = messages.get(status, "暂时无法确认更新状态")
+    if detail and detail.get("running") and status in ("fresh", "unknown"):
+        text = "正在更新"
+    age = detail.get("ageSeconds") if detail else None
+    if include_age and age is not None and status != "clock":
+        minutes = max(0, int(age)) // 60
+        if minutes == 0:
+            elapsed = "刚刚"
+        elif minutes < 60:
+            elapsed = f"{minutes} 分钟前"
+        elif minutes < 48 * 60:
+            hours, remainder = divmod(minutes, 60)
+            elapsed = f"{hours} 小时" + (f" {remainder} 分钟" if remainder else "") + "前"
+        else:
+            days, hours = divmod(minutes // 60, 24)
+            elapsed = f"{days} 天" + (f" {hours} 小时" if hours else "") + "前"
+        text += "（上次全部更新成功：" + elapsed + "）"
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["run-geosite"])

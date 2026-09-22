@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """平台文案/门控回归 + README 一致性(本次文案任务)。
 
-覆盖:
-  1. Android 客户端菜单不含 iOS 描述文件; 4. iOS 客户端菜单含 iOS 描述文件。
-  2. Android 运维菜单不含 WLOC; 7. iOS+mihomo 可进入 WLOC。
-  3. Android 状态显示 Android 私密 DNS; 5. iOS 状态显示 iOS 描述文件。
-  6. iOS+sing-box 不能开启 WLOC, 提示切 mihomo。
-  8. WLOC 开启时不能切回 sing-box。
-  9. 故障组/内核切换/更新文案与 README 一致。
- 10. 所有 README 相对链接存在。
+覆盖 Android/iOS 菜单、旧入口拒绝、当前状态文案和 README 链接。
 """
 import importlib.util as u
 import sys
@@ -84,9 +77,9 @@ def main():
     assert "（iOS 描述文件）" in bot.status_text()
     ok("iOS 状态: DoT 显示 iOS 描述文件")
 
-    # 6 iOS 可进入 WLOC 菜单(v1.6.0: mihomo 唯一内核, 不再有"需切 mihomo"的门控)
+    # 6 旧消息的已移除入口只返回当前菜单提示
     bot._platform = lambda: "ios"; CAP.clear(); bot.handle_cb(1, 2, "wloc")
-    assert CAP and "已退役" in CAP[-1]
+    assert CAP and CAP[-1] == "此功能已移除，请返回当前菜单。"
     ok("iOS: 旧 WLOC 按钮明确拒绝")
     # 7 换核入口已随 switch-core 一起移除: 运维菜单不该再有它
     CAP.clear(); bot.handle_cb(1, 2, "nav:ops")
@@ -95,6 +88,7 @@ def main():
 
     # 9 文案与 README 一致
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "WLOC" not in readme
     src = (ROOT / "deploy" / "bot" / "pdg-bot.py").read_text(encoding="utf-8")
     for phrase in ("按探测延迟选择出口，并在出口不可用时切换",   # 故障组
                    "指定并校验过的内核版本"):                     # 更新页

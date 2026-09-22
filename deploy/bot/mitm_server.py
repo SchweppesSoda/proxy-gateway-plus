@@ -130,19 +130,6 @@ MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
 PLUGIN_DOMAINS = {}  # WLOC retired; restored legacy configuration never registers it.
 
 
-def _wloc_active(w):
-    """取 WLOC 激活地点坐标; 兼容老单坐标格式 {lat,lon}。返回 {lat,lon} 或 None。"""
-    locs = w.get("locations")
-    if locs:
-        for loc in locs:
-            if loc.get("name") == w.get("active"):
-                return loc
-        return locs[0]
-    if "lat" in w and "lon" in w:                 # 老格式(单坐标)
-        return {"lat": w["lat"], "lon": w["lon"]}
-    return None
-
-
 def load_from_config(path=None):
     """No supported configured plugins remain; legacy WLOC stays inert.
 

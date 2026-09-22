@@ -201,12 +201,43 @@ class RuleStatus(unittest.TestCase):
         self.clock.return_value = 10000 + 49 * 3600
         first_alert = checks["check_rule_update_alerts"]()
         first_doctor = checks["check_rule_updates"]()
-        self.clock.return_value += 600
+        self.clock.return_value += 3600
         self.assertEqual(first_alert, checks["check_rule_update_alerts"]())
         self.assertNotEqual(first_doctor, checks["check_rule_updates"]())
-        self.assertNotIn("rulesets:", first_alert[2])
+        self.assertNotIn("自定义规则集", first_alert[2])
         Path(self.root, "rulesets.json").write_text('{"synthetic": {}}', encoding="utf-8")
-        self.assertIn("rulesets: unknown", checks["check_rule_update_alerts"]()[2])
+        self.assertIn("自定义规则集：尚无成功更新记录", checks["check_rule_update_alerts"]()[2])
+
+    def test_user_copy_explains_freshness_without_internal_receipt_fields(self):
+        Path(self.root, "rulesets.json").write_text('{"synthetic": {}}', encoding="utf-8")
+        self.success()
+        self.success("rulesets")
+        self.clock.return_value += 480
+        checks = functions("deploy/bot/checks.py", {"check_rule_updates"},
+                           {"os": os, "json": json, "RS_META": str(self.root / "rulesets.json")})
+        level, label, text = checks["check_rule_updates"]()
+        self.assertEqual((level, label), ("ok", "规则更新"))
+        self.assertEqual(text, "域名规则库：更新正常（上次全部更新成功：8 分钟前）；自定义规则集：更新正常（上次全部更新成功：8 分钟前）")
+        for raw in ("geosite", "rulesets", "fresh", "lastSuccess", "ageSeconds", "sourceVersion", "sha256:", "{", "null"):
+            self.assertNotIn(raw, text)
+
+    def test_user_copy_keeps_failures_distinct_from_success(self):
+        cases = {
+            "unknown": "尚无成功更新记录", "invalid": "更新记录无法读取",
+            "clock": "系统时间异常", "stale-48h": "超过两天",
+            "stale-7d": "超过七天", "interrupted": "超过一小时",
+            "refresh_failed": "更新失败", "partial": "部分规则更新失败",
+            "exception": "更新未完成",
+        }
+        for status, phrase in cases.items():
+            text = self.status.description(status, {"ageSeconds": 7200, "running": False})
+            self.assertIn(phrase, text)
+            self.assertNotIn("更新正常", text)
+            if status == "clock": self.assertNotIn("前", text)
+        self.assertIn("失败项继续使用原规则", self.status.description("partial", None))
+        self.assertEqual(self.status.description("fresh", {"ageSeconds": 480, "running": True}),
+                         "正在更新（上次全部更新成功：8 分钟前）")
+        self.assertEqual(self.status.description("fresh", {"ageSeconds": 480}, include_age=False), "更新正常")
 
     def test_geosite_wrapper_records_only_after_worker_success(self):
         update_class = self.status.Update

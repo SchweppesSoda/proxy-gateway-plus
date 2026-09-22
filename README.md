@@ -125,8 +125,8 @@ MosDNS binary 和 attestation。
 
 一台网关对应一个手机号，平台是每台机器的固定属性，装机时确定（`PDG_PLATFORM=ios` 或 `android`；不指定则安装时询问）。平台决定客户端接入方式和是否提供 iOS 专属功能：
 
-- Android：手机在系统「私密 DNS」里直接填 DoT 域名。不安装 iOS 描述文件、pdg-probe81、MITM/WLOC 相关组件。
-- iOS：通过 iOS 描述文件接入，另外安装 pdg-probe81（`:81` 探测）；WLOC 已退役。
+- Android：手机在系统「私密 DNS」里直接填 DoT 域名。不安装 iOS 描述文件、pdg-probe81、iOS 专属 MITM 组件。
+- iOS：通过 iOS 描述文件接入，另外安装 pdg-probe81（`:81` 探测）。
 
 ## 6. 流量内核（mihomo）
 
@@ -324,14 +324,7 @@ sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 规则库更新会保留关键词、正则、根域名和精确域名的匹配方式。下载数据损坏或
 包含无法识别的匹配类型时，会在替换前失败，继续使用旧规则库。
 
-## 10. WLOC 已退役
-
-iOS 27 beta 6 及以后出现证书限制，WLOC 官网当前说明没有可用方案。本项目已移除启用
-入口，旧 Bot 按钮、直接接口及备份中的启用标志都不能重新加载 WLOC。保留地点与 CA
-恢复资料；旧运行接管须在部署前单独撤除并验证。未进行本机 iOS 27 真机定位测试。
-详情与部署门见 [退役记录](docs/maintenance/2026-09-22-wloc-retirement.md)。
-
-## 11. 项目组成
+## 10. 项目组成
 
 | 层 | 组件 | 说明 |
 |---|---|---|
@@ -353,7 +346,7 @@ iOS 27 beta 6 及以后出现证书限制，WLOC 官网当前说明没有可用�
 - **观测面板前端资源（zashboard）**：固定版本 + SHA256 校验 + 暂存目录 + 原子替换，属于静态
   缓存资源，不是 DNS/分流生产配置，因此不纳入配置事务。
 
-## 12. 部署与整机编排边界
+## 11. 部署与整机编排边界
 
 本仓库负责网关应用本身，提供可重复调用的标准部署入口：非交互 `install.sh`、`pdg update`、
 显式迁移、快照/回滚、状态和 doctor。安装器与迁移脚本对自有配置采用 ownership marker、
@@ -378,7 +371,7 @@ PDG_EXPECTED_VERSION=vX.Y.Z bash tools/deploy-release.sh
 脚本依次执行只读预检、事务化 `pdg update`、精确发布 tag、核心服务状态和
 `pdg doctor --deep`；真实 IP、SSH 端口和密钥路径仍不进入仓库。
 
-## 13. 文档
+## 12. 文档
 
 本仓 `main` 拥有网关实现、安装与发布；[AGENTS.md](./AGENTS.md) 记录日常维护；生产部署按需读取[部署合同](docs/agent-deployment.md)。[VPS-Toolkit](https://github.com/SchweppesSoda/VPS-Toolkit/tree/main/scripts/vps/proxy-stack) 的代理栈入口负责跨组件编排，静态网页工具由 [vps-toolkit-web](https://github.com/SchweppesSoda/vps-toolkit-web) 维护。
 
@@ -389,11 +382,10 @@ PDG_EXPECTED_VERSION=vX.Y.Z bash tools/deploy-release.sh
 - [docs/MOSDNS-PATCHED-BUILD.md](docs/MOSDNS-PATCHED-BUILD.md) — MosDNS 修补版 provenance / 可复现构建 / KFC 部署
 - [docs/TROUBLESHOOTING-PLAYBOOK.md](docs/TROUBLESHOOTING-PLAYBOOK.md) — 排障手册（症状 → 排查 → 修复）
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与已知问题
-- [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — 已退役 WLOC 的历史设计与原理
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
-## 14. 免责声明与 License
+## 13. 免责声明与 License
 
 本项目仅供学习与合法网络管理用途。请遵守你所在地的法律法规，使用者自行承担责任，作者不对使用后果负责。
 

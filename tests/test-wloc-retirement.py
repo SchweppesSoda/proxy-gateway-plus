@@ -47,7 +47,7 @@ class Retirement(unittest.TestCase):
                 bot.state[1]='wloc_add'
                 bot.handle_cb(1,2,action)
                 self.assertNotIn(1,bot.state)
-                self.assertIn('已退役',messages[-1])
+                self.assertEqual(messages[-1], '此功能已移除，请返回当前菜单。')
             _, kb=bot._nav('ops')
             self.assertFalse(any(str(b.get('callback_data','')).startswith('wloc') for row in kb['inline_keyboard'] for b in row))
 
@@ -79,7 +79,20 @@ class Retirement(unittest.TestCase):
         for result in [self.check_state(config='{"wloc":{"enabled":true,"private":"DO_NOT_ECHO"}}'),self.check_state(hijack='domain:gs-loc.apple.com\n'),self.check_state(core='rules: ["DOMAIN-SUFFIX,gs-loc-cn.apple.com,MITM-OUT"]')]:
             self.assertEqual(result[0],'fail')
             self.assertNotIn('DO_NOT_ECHO',str(result))
-        self.assertEqual(self.check_state(config='{"wloc":{"enabled":false,"locations":[{"name":"synthetic"}]}}',hijack='domain:retained.example\n')[0],'info')
+            self.assertEqual(result[1], '配置残留')
+            self.assertNotIn('WLOC', str(result))
+        self.assertIsNone(self.check_state(config='{"wloc":{"enabled":false,"locations":[{"name":"synthetic"}]}}',hijack='domain:retained.example\n'))
+
+    def test_current_checks_and_menus_do_not_advertise_removed_feature(self):
+        self.assertIsNone(self.check_state())
+        with patch('builtins.open', side_effect=FileNotFoundError):
+            self.assertIsNone(checks.check_mitm())
+        for name in ('WLOC_BACK', '_wloc_watch_async', '_wloc_state', 'wloc_add_reply'):
+            self.assertFalse(hasattr(bot, name), name)
+        for platform in ('android', 'ios'):
+            with patch.object(bot, '_platform', return_value=platform), patch.object(bot, '_dot_host', return_value='example.invalid'):
+                for menu in ('client', 'ops'):
+                    self.assertNotIn('wloc', str(bot._nav(menu)).lower())
 
     def test_doctor_fails_closed_on_malformed_or_unreadable_state(self):
         self.assertEqual(self.check_state(config='{bad')[0],'fail')

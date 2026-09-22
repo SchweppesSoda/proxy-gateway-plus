@@ -880,8 +880,8 @@
       "clash_api": "Mihomo 控制接口",
       "DNS 上游探测": "DNS 上游连通性",
       "代理劫持验证": "透明代理范围说明",
-      "MITM结构": "定位服务接管配置",
-      "MITM 插件": "定位服务插件",
+      "MITM结构": "共享 DNS 接管规则",
+      "MITM 插件": "代理插件",
       "iOS 探测(:81)": "iOS 网络探测"
     };
     return labels[title] || title;
