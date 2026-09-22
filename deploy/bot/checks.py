@@ -796,7 +796,7 @@ def check_mitm_structure():
     if "tag: internal_sequence" not in conf or "tag: ecs_china" not in conf:
         return ("info", "MITM结构", "自定义 mosdns 配置, 跳过 force_hijack 检查")
     if "tag: force_hijack" not in conf:
-        return ("warn", "MITM结构", "缺 force_hijack 接管结构(v1.4.x 升级迁移未跑到); 开 WLOC 前 sudo pdg __migrate")
+        return ("warn", "MITM结构", "缺 force_hijack 接管结构(v1.4.x 升级迁移未跑到); 共享规则仍需要时先核对标准配置")
     blk = _internal_seq_block(conf)
     i_fh, i_cn = blk.find("qname $force_hijack"), blk.find("qname $geosite_cn")
     if i_fh < 0 or (i_cn >= 0 and i_fh > i_cn):
@@ -808,62 +808,46 @@ def check_mitm_structure():
     return ("ok", "MITM结构", "force_hijack + force_hijack_seq + 优先级规则 + mitm_hijack.txt 就位")
 
 def check_mitm():
-    """MITM 插件(Feature B / iOS): 启用时应 pdg-mitm active + CA + mitm_hijack 含接管域名 +
-    当前内核有 MITM 路由。未启用 = info。安卓不适用。(不只是 CA+active)"""
-    if _platform() != "ios":
-        return None                              # MITM/WLOC 仅 iOS, 安卓不显示此项
+    """Block deployment/restore with retired WLOC residue; never suggest enabling it."""
+    import yaml
+    residue = []
     try:
-        cfg = json.load(open("/etc/privdns-gateway/mitm.json"))
-    except Exception:  # noqa: BLE001
-        cfg = {}
-    enabled = [k for k in ("wloc",) if (cfg.get(k) or {}).get("enabled")]
-    if not enabled:
-        return ("info", "MITM 插件", "未启用")
-    # WLOC 开着就说明这几个组件是必需件: 更新时若某个装失败(旧实现 ||true 会静默跳过),
-    # 目标位置留着上一版文件 —— 光看"服务 active"发现不了新旧混装, 这里按文件在不在直接判死。
-    need = ["/opt/pdg-bot/mitm_ca.py", "/opt/pdg-bot/mitm_server.py", "/opt/pdg-bot/mitm_wloc.py",
-            "/opt/pdg-bot/probe81.py", "/opt/pdg-bot/pdg-dot.mobileconfig.tmpl"]
-    miss = [os.path.basename(p) for p in need if not os.path.isfile(p)]
-    if miss:
-        return ("fail", "MITM 插件", "已启用但缺 iOS 组件: " + ", ".join(miss)
-                + "; 运行 sudo pdg update 重新部署。")
-    # 版本一致性: 仓库在本机可读时, 逐个比对部署文件与仓库文件。装到一半失败会把上一版留在
-    # 原地, 只看"文件在不在"发现不了这种新旧混装。仓库不可用则跳过这一层(不误报)。
-    drift = []
-    for dst, src in (("mitm_ca.py", "deploy/bot/mitm_ca.py"),
-                     ("mitm_server.py", "deploy/bot/mitm_server.py"),
-                     ("mitm_wloc.py", "deploy/bot/mitm_wloc.py"),
-                     ("probe81.py", "deploy/ios/probe81.py"),
-                     ("pdg-dot.mobileconfig.tmpl", "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")):
-        sp = os.path.join(REPO_DIR, src)
-        if not os.path.isfile(sp):
-            continue
-        if _filesha(os.path.join("/opt/pdg-bot", dst)) != _filesha(sp):
-            drift.append(dst)
-    if drift:
-        return ("fail", "MITM 插件", "已启用但这些组件与当前发布不一致(疑似新旧混装): "
-                + ", ".join(drift) + "; 运行 sudo pdg update 重新部署。")
-    if _run(["systemctl", "is-active", "pdg-mitm"])[1].strip() != "active":
-        return ("fail", "MITM 插件", "已启用(" + ",".join(enabled) + ")但 pdg-mitm 未运行")
-    if not os.path.isfile("/etc/privdns-gateway/ca/ca.crt"):
-        return ("fail", "MITM 插件", "缺 CA 证书 /etc/privdns-gateway/ca/ca.crt")
-    # 接管域名集应含 gs-loc 两域名(mosdns 强制劫持源)
+        with open("/etc/privdns-gateway/mitm.json", encoding="utf-8") as stream:
+            cfg = json.load(stream)
+        if not isinstance(cfg, dict):
+            raise ValueError("configuration shape")
+        if (cfg.get("wloc") or {}).get("enabled"):
+            residue.append("legacy enabled flag")
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return ("fail", "WLOC 退役", "旧配置无法核验；保留资料并人工检查，不自动启用。")
     try:
-        hij = open("/etc/mosdns/rules/mitm_hijack.txt").read()
-    except OSError:
-        hij = ""
-    if not all(d in hij for d in GS_LOC):
-        return ("fail", "MITM 插件", "mitm_hijack.txt 未含 gs-loc 接管域名(mosdns 未强制劫持, 重开一次 WLOC)")
-    # MITM 路由(mihomo): 需 MITM-OUT 出站 + gs-loc → MITM-OUT 规则。
+        with open("/etc/mosdns/rules/mitm_hijack.txt", encoding="utf-8") as stream:
+            domains = {line.split("#", 1)[0].strip().removeprefix("domain:").lower().rstrip(".")
+                       for line in stream}
+        if domains.intersection(GS_LOC):
+            residue.append("DNS interception")
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return ("fail", "WLOC 退役", "旧劫持清单无法核验；未确认退役完成。")
     try:
-        mc = json.load(open(MIHOMO_CFG))
-        has_out = any(p.get("name") == "MITM-OUT" for p in mc.get("proxies", []))
-        has_rule = any(("MITM-OUT" in r) and ("gs-loc" in r) for r in mc.get("rules", []))
-    except Exception:  # noqa: BLE001
-        has_out = has_rule = False
-    if not (has_out and has_rule):
-        return ("fail", "MITM 插件", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
-    return ("ok", "MITM 插件", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
+        with open("/etc/mihomo/config.yaml", encoding="utf-8") as stream:
+            mc = yaml.safe_load(stream) or {}
+        for rule in mc.get("rules", []):
+            fields = [part.strip() for part in str(rule).split(",")]
+            if len(fields) >= 3 and fields[0] in {"DOMAIN", "DOMAIN-SUFFIX"} and fields[1].lower().rstrip(".") in GS_LOC and fields[2] == "MITM-OUT":
+                residue.append("core interception")
+                break
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return ("fail", "WLOC 退役", "内核接管状态无法核验；未确认退役完成。")
+    if residue:
+        return ("fail", "WLOC 退役", "检测到旧 WLOC 残留：" + ", ".join(residue)
+                + "；部署/恢复前先按退役记录撤除接管并验证，保留地点与 CA，不重新开启。")
+    return ("info", "WLOC 退役", "未发现旧启用标志或定位域名接管；通用 DNS/代理功能保留。")
 
 def check_rule_updates(alert=False):
     """Read receipts only; stable alert text keeps timer ticks from spamming."""

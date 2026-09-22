@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """文案必须与当前行为一致(历史记录不动, 但"现在怎么工作"不许说错)。
 
-守三处曾经说错的:
-  1. WLOC 热加载: 实现早就改成"每次 WLOC 请求整份读 mitm.json", 但 README / 设计文档 /
-     测试说明 / 代码注释里还写着"按 mtime(文件修改时间)加载" —— 照着文档去排错的人会以为
-     "改完文件要等 mtime 变", 而真正的边界(网关只能保证下一次请求用新坐标, 清不掉 iOS
-     locationd 缓存)反而没写清楚。
+当前文案边界(WLOC 已退役，其拒绝行为另有回归):
   2. :81 探测端点: probe81.py 一直返回 **200**(iOS 的 URLStringProbe 只认 200), 而 unit
      描述和实战记录里写成 204 —— 有人照着去"修正"实现就把探测搞挂了。
   3. 端口清单: 写死一串全平台端口, 于是 iOS 机器上 doctor 声称 GMS 5228-5230 已就位
@@ -32,34 +28,7 @@ def text(rel):
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
-# ── 1. WLOC 热加载 ──────────────────────────────────────────────────────────
-STALE = ("按 mtime 热加载", "按 mtime_ns 热加载", "按文件修改时间", "按 mtime 自己热加载")
-for rel in ("README.md", "docs/design-mitm-plugins.md", "tests/e2e-wloc.sh",
-            "tests/test-wloc-hotswitch.py", "tests/test-wloc-hotreload.py",
-            "deploy/bot/pdg-bot.py", "deploy/bot/mitm_server.py"):
-    t = text(rel)
-    for bad_phrase in STALE:
-        if bad_phrase in t:
-            bad(f"{rel} 仍写着「{bad_phrase}」, 与当前实现(每次请求整份读)不符")
-ok("README / 设计文档 / 测试 / 代码注释都不再说「按 mtime 加载」")
-
-# 实现本身必须仍是"每次请求读", 而不是又退回缓存(文案对了代码变了同样是不一致)
-wl = text("deploy/bot/mitm_wloc.py")
-assert "def snapshot" in wl
-_snap = wl.split("def snapshot", 1)[1].split("\ndef ", 1)[0]
-if "mtime" in _snap or "st_mtime" in _snap:
-    bad("WlocConfig.snapshot 又开始看 mtime 了 —— 文案与实现再次脱节")
-ok("WlocConfig.snapshot 确实是每次整份读(不看 mtime)")
-
-for rel, need in (("README.md", "下一次"), ("docs/design-mitm-plugins.md", "下一次"),
-                  ("deploy/bot/mitm_server.py", "下一次 WLOC 请求")):
-    if need not in text(rel):
-        bad(f"{rel} 没写明「网关只保证下一次请求用新坐标」这条边界")
-ok("三处都写明了边界: 只保证下一次请求用新坐标, 清不掉 iOS locationd 缓存")
-for rel in ("README.md", "docs/design-mitm-plugins.md"):
-    if "locationd" not in text(rel):
-        bad(f"{rel} 没提 locationd 缓存这条网关做不到的事")
-ok("README / 设计文档都点明了 locationd 缓存不归网关清")
+# WLOC behavior is retired; active boundary checks live in test-wloc-retirement.py.
 
 # ── 2. :81 返回 200 ─────────────────────────────────────────────────────────
 probe = text("deploy/ios/probe81.py")

@@ -127,7 +127,7 @@ def serve(listen="127.0.0.1", port=7894):
 
 MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
 # 插件名 → 接管域名(bot 与服务共识; 与 mitm_hijack.txt / 渲染器同源)
-PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com", "gs-loc-cn.apple.com"]}
+PLUGIN_DOMAINS = {}  # WLOC retired; restored legacy configuration never registers it.
 
 
 def _wloc_active(w):
@@ -144,25 +144,13 @@ def _wloc_active(w):
 
 
 def load_from_config(path=None):
-    """按 mitm.json 里启用的插件登记(WLOC 用激活地点坐标)。返回已加载插件名列表。"""
-    import json
+    """No supported configured plugins remain; legacy WLOC stays inert.
+
+    Keep the generic host/register API for shared framework tests. No CA or
+    coordinate configuration is read, modified or deleted here.
+    """
     clear()
-    try:
-        cfg = json.load(open(path or MITM_CONFIG, encoding="utf-8"))
-    except OSError:
-        return []
-    loaded = []
-    w = cfg.get("wloc") or {}
-    loc = _wloc_active(w)
-    if w.get("enabled") and loc:
-        import mitm_wloc
-        # 坐标不在这里定死: 交给 WlocConfig 在下一次 WLOC 请求开始时读当前 mitm.json ——
-        # 切地点只原子更新那个文件, 本进程
-        # 不必重启(接管域名只由 enabled 决定, 那才需要走完整事务)。
-        register(mitm_wloc.WLOCPlugin(accuracy=int(w.get("accuracy", 50)),
-                                      config=mitm_wloc.WlocConfig(path or MITM_CONFIG)))
-        loaded.append("wloc")
-    return loaded
+    return []
 
 
 if __name__ == "__main__":

@@ -2838,7 +2838,6 @@ cmd_update(){
   if [[ "$(_pdg_platform)" == ios ]]; then
     if   ! install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/ \
       || ! install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/ \
-      || ! install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/ \
       || ! install -m755 "$REPO_DIR"/deploy/ios/probe81.py          /opt/pdg-bot/ \
       || ! install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl; then
       c_y "iOS 平台组件安装失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
@@ -3385,6 +3384,7 @@ migrate_deploy_botfiles(){
   for f in "$REPO_DIR"/deploy/bot/*.py; do
     base=$(basename "$f")
     [[ "$base" == "pdg-bot.py" ]] && continue
+    [[ "$base" == mitm_wloc.py ]] && continue  # retired; do not restore from checkout
     case "$base" in                                   # iOS 专属 MITM 模块: 仅 iOS 装, Android 不装/不复活
       mitm_ca.py|mitm_server.py|mitm_wloc.py) [[ "$plat" == ios ]] || continue;;
     esac
@@ -5035,7 +5035,6 @@ _PLAT_IOS_REQUIRED=(
   "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl|/opt/pdg-bot/pdg-dot.mobileconfig.tmpl|644"
   "deploy/bot/mitm_ca.py|/opt/pdg-bot/mitm_ca.py|755"
   "deploy/bot/mitm_server.py|/opt/pdg-bot/mitm_server.py|755"
-  "deploy/bot/mitm_wloc.py|/opt/pdg-bot/mitm_wloc.py|755"
   "deploy/ios/pdg-probe81.service|/etc/systemd/system/pdg-probe81.service|644"
 )
 

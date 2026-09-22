@@ -134,11 +134,20 @@ import sys; sys.path.insert(0, "/opt/pdg-bot")
 import bot
 w = {"enabled": True, "accuracy": 50, "active": "大阪", "generation": 1,
      "locations": [{"name": "大阪", "lat": 34.6937, "lon": 135.5023}]}
-okr, msg = bot._mitm_transact(w)
-print(("OK|" if okr else "FAIL|") + (msg or ""))
+import json, yaml
+from pathlib import Path
+Path(bot.MITM_CONFIG).write_text(json.dumps({"wloc": w}))
+Path(bot.MITM_HIJACK_FILE).write_text("domain:gs-loc.apple.com\n")
+config = yaml.safe_load(Path(bot.MIHOMO_CFG).read_text())
+config.setdefault("proxies", []).append({"name": "MITM-OUT", "type": "socks5", "server": "127.0.0.1", "port": 7894})
+config.setdefault("rules", []).insert(0, "DOMAIN-SUFFIX,gs-loc.apple.com,MITM-OUT")
+Path(bot.MIHOMO_CFG).write_text(yaml.safe_dump(config))
+import mitm_ca
+mitm_ca.ensure_ca()
+print("OK|legacy WLOC fixture seeded")
 PY
-grep -q '^OK|' /tmp/plat-wloc-on.out && ok "先把 WLOC 开起来(真实事务)" || bad "2: 开 WLOC 失败: $(cat /tmp/plat-wloc-on.out)"
-mitm_out_in_core && ok "开启后 mihomo 配置里有 MITM-OUT(切换前的现场)" || bad "2b: MITM-OUT 没进内核配置"
+grep -q '^OK|' /tmp/plat-wloc-on.out && ok "准备历史 WLOC 残留 fixture" || bad "legacy fixture failed"
+mitm_out_in_core && ok "历史 fixture 含 MITM-OUT" || bad "legacy route missing"
 
 out=$(pdg platform android 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "切回 Android 返回 0" || bad "2c: rc=$rc: $(tail -5 <<<"$out")"
@@ -205,7 +214,7 @@ grep -q '^PDG_PLATFORM=android$' /etc/privdns-gateway/profile.env \
 grep -q '已恢复到原平台' <<<"$out" && ok "回滚有明确提示" || bad "5e: 没有回滚提示: $(tail -3 <<<"$out")"
 # 平台专属文件必须一并回去 —— 否则平台标记明明回到 android, 盘上却留着半个 iOS 现场
 for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
-         /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
+         /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py \
          /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
   [[ -e "$f" ]] && bad "5f: 回滚后仍残留 $f(半个 iOS 现场)" || ok "回滚已清除 $(basename "$f")"
 done
@@ -293,7 +302,7 @@ snapshot_state(){
     sha256sum /etc/privdns-gateway/profile.env 2>/dev/null
     sha256sum /etc/nftables.conf /etc/mihomo/config.yaml 2>/dev/null
     for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
-             /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
+             /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py \
              /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
       printf '%s=%s\n' "$f" "$([[ -e $f ]] && echo yes || echo no)"
     done
@@ -303,7 +312,7 @@ snapshot_state(){
   } | sha256sum | cut -d' ' -f1
 }
 # 注入: 让指定源文件"装不上"(改成不可读, install 必失败)。真实失败, 不是打桩返回值。
-for target in deploy/bot/mitm_server.py deploy/bot/mitm_ca.py deploy/bot/mitm_wloc.py \
+for target in deploy/bot/mitm_server.py deploy/bot/mitm_ca.py \
               deploy/ios/probe81.py deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl \
               deploy/ios/pdg-probe81.service; do
   BEFORE="$(snapshot_state)"
@@ -321,7 +330,7 @@ done
 # 修好之后照常能切过去(证明上面失败不是因为环境坏了)
 out=$(pdg platform ios 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "源文件恢复后切 iOS 正常成功" || bad "8d: rc=$rc: $(tail -4 <<<"$out")"
-for f in /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
+for f in /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py \
          /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
          /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
   [[ -s "$f" ]] || bad "8e: 成功路径缺 $f"

@@ -842,7 +842,6 @@ install -m644 "$REPO_DIR"/deploy/web/static/templates/mosdns-import.example.yaml
 if [[ "$PLATFORM" == ios ]]; then
   install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/
   install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/
-  install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/
   install -m755 "$REPO_DIR"/deploy/ios/probe81.py           /opt/pdg-bot/
   install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
 fi

@@ -160,7 +160,7 @@ r=$(run "DOCTOR_OUT=warn"); rc="${r%%|*}"; out="${r#*|}"
   && ok "仅 warn: 正常完成 + 警告被解析展示" || bad "warn 路径: rc=$rc out=$out"
 
 # ══ iOS 平台组件: 在 iOS 上是必需件, 装失败必须回滚(不能 ||true 后留旧版混装) ══
-for f in mitm_ca.py mitm_server.py mitm_wloc.py probe81.py pdg-dot-ondemand.mobileconfig.tmpl; do
+for f in mitm_ca.py mitm_server.py probe81.py pdg-dot-ondemand.mobileconfig.tmpl; do
   assert_fail_rollback "iOS: $f 安装失败" "PLATFORM=ios FAIL_INSTALL=$f"
 done
 

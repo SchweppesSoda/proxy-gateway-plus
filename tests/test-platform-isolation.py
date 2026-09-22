@@ -112,8 +112,8 @@ def main():
     prof = bot._ios_profile()
     assert prof and b"PayloadContent" in prof, "iOS _ios_profile() 应正常生成"
     _, opskb = bot._nav("ops")
-    assert any("位置改写" in t for t in kb_texts(opskb)), "iOS 运维菜单应有 WLOC"
-    ok("iOS: _ios_profile 正常生成 + 运维菜单含 WLOC(原功能保持)")
+    assert not any("位置改写" in t for t in kb_texts(opskb)), "WLOC 已退役"
+    ok("iOS: _ios_profile 正常生成，WLOC 入口已移除")
 
     # ── checks: 平台一致的服务集 + deep probe81 + 平台标记 ──
     checks._run = lambda cmd, t=10: (0, "active", "")   # systemctl is-active → active

@@ -1,5 +1,7 @@
 # 设计:MITM 插件框架 + Apple WLOC 位置改写(v1.5.0 特性 B)
 
+> 2026-09-22：WLOC 已退役。下文为历史实现及 iOS 26 验证记录，不是当前启用步骤。见[退役记录](maintenance/2026-09-22-wloc-retirement.md)。
+
 > **阅读提示(v1.6.0 后)**:本文写于"sing-box / mihomo 双核并存"时期,文中"两核对称""sing-box:
 > outbound+route"等描述属**当时的设计背景**。v1.6.0 已彻底移除 sing-box 运行时,mihomo 是唯一
 > 内核 —— 实际实现里只剩 mihomo 一侧(`proxies` + `rules`)。其余设计要点(mosdns 强制劫持、

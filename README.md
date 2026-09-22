@@ -126,7 +126,7 @@ MosDNS binary 和 attestation。
 一台网关对应一个手机号，平台是每台机器的固定属性，装机时确定（`PDG_PLATFORM=ios` 或 `android`；不指定则安装时询问）。平台决定客户端接入方式和是否提供 iOS 专属功能：
 
 - Android：手机在系统「私密 DNS」里直接填 DoT 域名。不安装 iOS 描述文件、pdg-probe81、MITM/WLOC 相关组件。
-- iOS：通过 iOS 描述文件接入，另外安装 pdg-probe81（`:81` 探测）和 MITM/WLOC 组件。
+- iOS：通过 iOS 描述文件接入，另外安装 pdg-probe81（`:81` 探测）；WLOC 已退役。
 
 ## 6. 流量内核（mihomo）
 
@@ -196,7 +196,7 @@ SNI / Host / QUIC 与规则选择出口。提供 clash_api，可按需临时开�
 - 🔀 策略组：Bot 完整只读展示全部组；保留的写入口可维护 url-test 组。四种组类型、嵌套组、
   provider 与 select 临时运行态切换由 Web 的独立“策略组”页面管理。
 - 📱 客户端：Android 显示私密 DNS 主机名；iOS 显示 iOS 描述文件入口。两个平台都提供「🌐 DoT 自定义域名」和「✈️ Telegram 出口」。
-- 🛠 运维：重启服务、更新规则库、备份/恢复、DNS 上游、TFO、观测面板；iOS 平台另有「🍏 位置改写（WLOC）」。
+- 🛠 运维：重启服务、更新规则库、备份/恢复、DNS 上游、TFO、观测面板。
 
 Telegram 出口（Bot 内置 SOCKS5，端口 8445）用于给手机上的 Telegram 单独指定出口，在客户端菜单里配置。
 
@@ -319,39 +319,17 @@ sudo pdg hijack-mode <all|gfw>          # 切换劫持模式
 sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 ```
 
-`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）主要用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置可在 Telegram Bot 或可选 PDG Web 中管理。Web 覆盖出口与默认出口、故障组、单域名规则、规则集、DNS 上游、TFO、状态/日志/流量查看、服务重启、规则库更新、本机配置快照与回滚、软件更新，以及 PDG/Mihomo/MosDNS 配置导入导出；概览页自检按失败、警告和正常项分组展示。Web 的本机快照仍是服务端恢复点，不是下载文件；需要离线保存或跨机迁移时，应使用 Web 的「PDG 配置包」导出。DoT 域名和证书签发、iOS 描述文件、WLOC、平台切换、安装/卸载和 Bot token 管理仍通过 SSH 下的 `pdg` 或 Telegram Bot 完成。
+`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）主要用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置可在 Telegram Bot 或可选 PDG Web 中管理。Web 覆盖出口与默认出口、故障组、单域名规则、规则集、DNS 上游、TFO、状态/日志/流量查看、服务重启、规则库更新、本机配置快照与回滚、软件更新，以及 PDG/Mihomo/MosDNS 配置导入导出；概览页自检按失败、警告和正常项分组展示。Web 的本机快照仍是服务端恢复点，不是下载文件；需要离线保存或跨机迁移时，应使用 Web 的「PDG 配置包」导出。DoT 域名和证书签发、iOS 描述文件、平台切换、安装/卸载和 Bot token 管理仍通过 SSH 下的 `pdg` 或 Telegram Bot 完成。
 
 规则库更新会保留关键词、正则、根域名和精确域名的匹配方式。下载数据损坏或
 包含无法识别的匹配类型时，会在替换前失败，继续使用旧规则库。
 
-## 10. iOS 位置改写（WLOC，可选）
+## 10. WLOC 已退役
 
-WLOC 只修改 Apple 网络定位响应中的坐标，不修改 GPS 数据。它把 `gs-loc.apple.com` 的定位查询转发给 Apple，取回真实响应后只替换其中的坐标。适用于依赖网络定位的场景；连续 GPS 定位（导航、打车等）不适用，户外 GPS 信号较强时也会覆盖它。WLOC 仅 iOS 平台提供。
-
-首次使用顺序：
-
-1. 在 Bot「🛠 运维 → 🍏 位置改写」里「➕ 添加地点」（发送「`名称 纬度,经度`」，例如 `上海 31.2304,121.4737`），然后「✅ 开启」。
-2. 返回「📱 客户端 → iOS 描述文件」，重新生成并安装 iOS 描述文件。
-3. 在「设置 → 通用 → 关于本机 → 证书信任设置」中，信任 PrivDNS Gateway MITM CA。
-
-**切换地点的推荐顺序（全程用内网卡）：**
-
-1. 控制中心把 Wi-Fi 点灰（不是在设置里关 Wi-Fi）
-2. 在 Bot「📍 地点 / 切换」里点目标地点
-3. 等 Bot 显示「WLOC 已热加载」
-4. 设置 → 隐私与安全性 → 定位服务：关闭，等 2 秒后重新开启
-5. 打开目标 App
-6. iOS 26 如果一直没有发起新的 WLOC 请求，可能仍需重启手机
-
-切换地点只原子更新 `mitm.json`；`pdg-mitm` 在下一次 WLOC 请求开始时读取当前配置，因此无需重启服务，进程不重启、DNS 也不会断。网关只能保证下一次请求使用新坐标，不能主动清除 iOS locationd 缓存。开关 WLOC（接管域名发生变化）才走完整事务。
-
-Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 请求：收到了就回报「已收到 iPhone 的新定位请求」，没收到就如实提示还没等到，并给出排查项。
-
-**边界（网关做不到的部分）：** 网关只能保证**下一次** Apple 网络定位请求使用新坐标，无法让 iOS 清除 locationd 缓存，也无法强制手机立刻发起新请求。「网关已改写响应」不等于「手机显示的位置已经变了」——地图仍显示旧位置可能是 iOS 缓存或户外 GPS 覆盖。
-
-长期无法定位时：设置 → 通用 → 传输或还原 iPhone → 还原 → 还原位置与隐私 → 重启手机
-
-多个地点可以随时增删，开启状态下可切换。原理与配置见 [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md)。
+iOS 27 beta 6 及以后出现证书限制，WLOC 官网当前说明没有可用方案。本项目已移除启用
+入口，旧 Bot 按钮、直接接口及备份中的启用标志都不能重新加载 WLOC。保留地点与 CA
+恢复资料；旧运行接管须在部署前单独撤除并验证。未进行本机 iOS 27 真机定位测试。
+详情与部署门见 [退役记录](docs/maintenance/2026-09-22-wloc-retirement.md)。
 
 ## 11. 项目组成
 
@@ -359,8 +337,7 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 |---|---|---|
 | DNS | mosdns v5.3.4 no-ticket 修补版 | 关闭 DoT session ticket/恢复；国内直连；代理域名 A 记录劫持到本机、AAAA / HTTPS 置空；按来源 IP 分支；ECS 处理；缓存；DoT（853）；可选 GFWList 劫持模式 |
 | 流量 | mihomo（clash.meta） | 单进程；TCP source-scoped REDIRECT → `:7893`，UDP/443 默认 TPROXY → `:7895`；按域名规则支持多出口与故障组；提供 clash_api（观测面板） |
-| 管理 | Telegram Bot + 可选 Web 管理面（Python + PyYAML） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；Web 另支持 PDG/Mihomo/MosDNS 受管配置导入导出与模板下载，默认禁用并使用独立 root-only 认证配置；事务管理的变更先校验候选并支持失败回滚 |
-| 位置改写 | pdg-mitm（可选，iOS） | 自签 CA + 终止 TLS + 转发并替换 `gs-loc` 响应坐标 |
+| 管理 | Telegram Bot + 可选 Web 管理面（Python + PyYAML） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名；Web 另支持 PDG/Mihomo/MosDNS 受管配置导入导出与模板下载，默认禁用并使用独立 root-only 认证配置；事务管理的变更先校验候选并支持失败回滚 |
 | 证书 | certbot standalone | Let's Encrypt，自动续期 |
 | 防火墙 | nftables | `managed` 维护 source-aware input policy；`external` 不创建 input hook。两种模式的数据面均只按内网卡来源段透明接管 |
 
@@ -371,12 +348,8 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 进程被杀后可用 `sudo pdg tx recover <id>` 收尾，`sudo pdg doctor` 会点名未完成的事务。
 这项保证不覆盖手工改文件、独立维护脚本或 `external` 模式下的主机 input policy /
 公网暴露控制。非事务路径应先留快照，并用 `sudo pdg doctor`、`sudo pdg report` 与对应的
-人工恢复步骤确认和修复状态。两个采用专门一致性机制的例子：
+人工恢复步骤确认和修复状态。采用专门一致性机制的例子：
 
-- **WLOC 切地点 / 改坐标**：只改一个文件（`mitm.json`）、一次原子替换、不动任何服务
-  （pdg-mitm 在下一次 WLOC 请求开始时读当前配置），没有多组件半成功的可能，因此走快路径以保证
-  切换在 1 秒内完成；它仍在同一把全局配置锁内，并写一条脱敏审计（只记操作与 generation 变化，
-  不记地点名与经纬度）。
 - **观测面板前端资源（zashboard）**：固定版本 + SHA256 校验 + 暂存目录 + 原子替换，属于静态
   缓存资源，不是 DNS/分流生产配置，因此不纳入配置事务。
 
@@ -416,7 +389,7 @@ PDG_EXPECTED_VERSION=vX.Y.Z bash tools/deploy-release.sh
 - [docs/MOSDNS-PATCHED-BUILD.md](docs/MOSDNS-PATCHED-BUILD.md) — MosDNS 修补版 provenance / 可复现构建 / KFC 部署
 - [docs/TROUBLESHOOTING-PLAYBOOK.md](docs/TROUBLESHOOTING-PLAYBOOK.md) — 排障手册（症状 → 排查 → 修复）
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与已知问题
-- [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — iOS 位置改写（WLOC）设计与原理
+- [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — 已退役 WLOC 的历史设计与原理
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 

@@ -460,6 +460,9 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
         rules = rules[:i] + in_rules + rules[i:]; i += len(in_rules)
 
     # MITM(Feature B / iOS): 接管域名路由到本地 MITM 服务(socks5 出站, 由它终止 TLS 交插件)。
+    # Retired WLOC must not be restored through old hijack files or callers.
+    mitm_domains = [d for d in (mitm_domains or [])
+                    if str(d).lower().rstrip(".") not in {"gs-loc.apple.com", "gs-loc-cn.apple.com"}]
     if mitm_domains:
         proxies.append({"name": "MITM-OUT", "type": "socks5",
                         "server": "127.0.0.1", "port": mitm_port, "udp": False})

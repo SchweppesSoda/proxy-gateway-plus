@@ -73,8 +73,8 @@ def main():
     ok("Android 运维菜单: 无 WLOC")
     bot._platform = lambda: "ios"
     _, opskb = bot._nav("ops")
-    assert any("位置改写" in x for x in texts(opskb))
-    ok("iOS 运维菜单: 含 WLOC")
+    assert not any("位置改写" in x for x in texts(opskb))
+    ok("iOS 运维菜单: WLOC 已移除")
 
     # 3 / 5 状态 DoT 文案
     bot._platform = lambda: "android"
@@ -86,8 +86,8 @@ def main():
 
     # 6 iOS 可进入 WLOC 菜单(v1.6.0: mihomo 唯一内核, 不再有"需切 mihomo"的门控)
     bot._platform = lambda: "ios"; CAP.clear(); bot.handle_cb(1, 2, "wloc")
-    assert CAP and "位置改写" in CAP[-1] and "需要 mihomo" not in CAP[-1]
-    ok("iOS: 正常进入 WLOC 菜单(无内核门控)")
+    assert CAP and "已退役" in CAP[-1]
+    ok("iOS: 旧 WLOC 按钮明确拒绝")
     # 7 换核入口已随 switch-core 一起移除: 运维菜单不该再有它
     CAP.clear(); bot.handle_cb(1, 2, "nav:ops")
     assert CAP and "换到 mihomo" not in CAP[-1] and "换回 sing-box" not in CAP[-1]

@@ -435,11 +435,11 @@ jobs:
       - name: "MITM 服务回归 (socks5→CA叶子终止TLS→插件; 客户端CA验链; 非接管兜底关闭)"
         run: python3 tests/test-mitm-server.py
 
-      - name: "Apple WLOC 插件回归 (gs-loc protobuf 编解码 + 坐标改写 + 负坐标)"
-        run: python3 tests/test-mitm-wloc.py
+      - name: "WLOC retirement: old commands/config cannot reactivate"
+        run: python3 tests/test-wloc-retirement.py
 
-      - name: "WLOC bot 后端回归 (set_wloc 开关/坐标/平台门控/接管域名同源)"
-        run: python3 tests/test-mitm-wloc-bot.py
+      - name: "历史 Apple WLOC 编解码回归 (gs-loc protobuf 编解码 + 坐标改写 + 负坐标)"
+        run: python3 tests/test-mitm-wloc.py
 
       - name: "平台文案/门控回归 (客户端·状态·WLOC 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
@@ -447,19 +447,7 @@ jobs:
       - name: "诊断报告内核一致性 (版本/日志按当前后端取, mihomo 机上不再固定问 sing-box)"
         run: python3 tests/test-report-backend.py
 
-      - name: "WLOC 手机端文案一致性 (README/Bot 同一套三步 + 平台隔离)"
-        run: python3 tests/test-wloc-copy.py
-
-      - name: "WLOC 事务化回归 (BUSY/CA/内核/pdg-mitm/mosdns 故障注入均回滚, 不留 enabled=true)"
-        run: python3 tests/test-mitm-wloc-txn.py
-
-      - name: "WLOC 热切换回归 (切地点零 systemctl/零重渲 + 配置锁 + 加改语义 + 监听不覆盖菜单)"
-        run: python3 tests/test-wloc-hotswitch.py
-
-      - name: "WLOC 热加载回归 (真起 pdg-mitm: 同 PID 换坐标 + 并发不混坐标 + 状态文件)"
-        run: python3 tests/test-wloc-hotreload.py
-
-      - name: "文案与当前行为一致 (WLOC 热加载/:81 返回 200/端口按平台)"
+      - name: "文案与当前行为一致 (:81 返回 200/端口按平台)"
         run: python3 tests/test-wording-accuracy.py
 
       - name: "Bot 凭据三态 (都空=正常禁用/只配一半=配置错/配齐才要求 pdg-bot 在跑)"
@@ -532,7 +520,6 @@ jobs:
           - e2e-install-nft.sh
           - e2e-platform-switch.sh
           - e2e-update.sh
-          - e2e-wloc.sh
           - e2e-cli-ops.sh
           - e2e-config-transaction.sh
           - e2e-config-transaction-recovery.sh
@@ -595,7 +582,7 @@ jobs:
           PDG_SERIAL_SCRIPTS: >-
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
-            e2e-platform-switch.sh e2e-update.sh e2e-wloc.sh e2e-cli-ops.sh
+            e2e-platform-switch.sh e2e-update.sh e2e-cli-ops.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
             e2e-config-import.sh
         run: bash tests/e2e-serial-hermetic.sh
