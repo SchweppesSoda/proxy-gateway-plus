@@ -21,3 +21,15 @@
   remains optional and disabled by default. The helper captures whether Web was
   enabled or active before updating and requires it active afterward when either
   was true; it never enables Web. Doctor separately reports enabled-but-inactive Web.
+
+## WLOC retirement gate
+
+Source retirement does not clean or stop a running server. Before replacing live code, the authorized
+operator must preserve rollback material, disable the existing WLOC plugin using the old validated
+transaction, verify both Apple domains are absent from the active DNS/core interception and confirm
+normal DNS/proxy service. Stop the old WLOC-serving process before replacing it. If cleanup fails,
+stop deployment; do not report source retirement as runtime completion. Do not delete locations/CA
+or disable shared force-hijack/proxy features. A later backup restore must pass the same residue gate.
+An old full-software rollback remains historical code and is not evidence of a safe current release.
+
+Restored enabled flags or Apple location interception are invalid current configuration. Retained locations, CA material, snapshots and frozen history remain separate recovery assets; shared DNS/proxy features must stay intact.

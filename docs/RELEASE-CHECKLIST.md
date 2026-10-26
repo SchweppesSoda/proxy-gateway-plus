@@ -62,7 +62,7 @@ pdg update                                          # 切到本版
 - [ ] `pdg update` **成功、没触发回滚**(校验门过)。
 - [ ] **新增的 bot 模块升级后就位**(`ls /opt/pdg-bot/sb2mihomo.py` 等)——靠 `migrate_deploy_botfiles` 自愈;缺了说明迁移没跑到。
 - [ ] `pdg doctor` 全绿。
-- [ ] **存在历史 WLOC 配置或接管残留时先停下**:更新/迁移不得重新加载旧启用状态、注册 WLOC 插件或恢复 Apple location 接管;按 [WLOC 退役部署门](maintenance/2026-09-22-wloc-retirement.md) 保留回滚材料，使用旧事务停用旧插件，清理并核验两 Apple 域名不在 active DNS/core interception 且普通 DNS/代理正常，再停止旧服务并替换代码。清理失败就停止更新，不把源码退役当作现场完成。
+- [ ] **存在历史 WLOC 配置或接管残留时先停下**:更新/迁移不得重新加载旧启用状态、注册 WLOC 插件或恢复 Apple location 接管;按 [WLOC 退役部署门](agent-deployment.md#wloc-retirement-gate) 保留回滚材料，使用旧事务停用旧插件，清理并核验两 Apple 域名不在 active DNS/core interception 且普通 DNS/代理正常，再停止旧服务并替换代码。清理失败就停止更新，不把源码退役当作现场完成。
 
 ## ③ 从 sing-box 旧版升级 → 自动迁移到 mihomo(v1.6.0 关键路径)
 
@@ -83,7 +83,7 @@ pdg update     # __migrate 里自动 sing-box → mihomo
 
 - [ ] `python3 tests/test-wloc-retirement.py` 通过:旧按钮、回调和直接 mutator 拒绝;恢复的 `wloc.enabled=true` 不注册插件、不读地点、不调用服务;旧 Apple 域名不进入 DNS/core interception;doctor 对残留 fail-closed 且不泄露地点内容。
 - [ ] 新装、更新和平台修复不安装或恢复 `mitm_wloc.py`，不创建 WLOC 启用入口；通用 MITM host/CA 与事务资源仍按普通代理规则的需要保留。
-- [ ] 现场替换已有实例前，按 [WLOC 退役记录](maintenance/2026-09-22-wloc-retirement.md) 保存回滚材料，使用旧的已验证事务停用旧插件，确认两 Apple 域名已从 active DNS/core interception 消失且普通 DNS/代理正常，再停止旧 WLOC 服务并替换代码。清理失败时停止部署，不删除地点/CA 恢复资料。
+- [ ] 现场替换已有实例前，按 [WLOC 退役记录](agent-deployment.md#wloc-retirement-gate) 保存回滚材料，使用旧的已验证事务停用旧插件，确认两 Apple 域名已从 active DNS/core interception 消失且普通 DNS/代理正常，再停止旧 WLOC 服务并替换代码。清理失败时停止部署，不删除地点/CA 恢复资料。
 - [ ] 历史 iOS 26 真机成功只作事故背景;当前发布不宣称 WLOC 功能或 iOS 27 真机定位通过。若需要 iOS 兼容性结论，另行安排有界设备验收。
 
 ## ⑤ 卸载
